@@ -3,7 +3,7 @@ use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
     MobileTransferView, MonitorDisplayMode, NodeInfo, PeerInfo, TransferOffer, TransferProgress,
     TransferStatus, WireMessage, MAX_MOBILE_SESSIONS, MAX_MOBILE_TRANSFERS_PER_SESSION,
-    METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -585,6 +585,9 @@ impl NodeRuntime {
         if transfers.contains_key(&offer.transfer_id) {
             return;
         }
+        if !evict_terminal_transfer_if_needed(&mut transfers) {
+            return;
+        }
         transfers.insert(
             offer.transfer_id.clone(),
             TransferRecord {
@@ -606,6 +609,12 @@ impl NodeRuntime {
             return record.progress.clone();
         }
         let progress = transfer_progress(&offer, "send");
+        if !evict_terminal_transfer_if_needed(&mut transfers) {
+            let mut failed = progress;
+            failed.status = TransferStatus::Failed;
+            failed.error = Some("传输任务数量已达到上限".to_string());
+            return failed;
+        }
         transfers.insert(
             offer.transfer_id.clone(),
             TransferRecord {
@@ -1215,6 +1224,31 @@ impl NodeRuntime {
     }
 }
 
+fn evict_terminal_transfer_if_needed(transfers: &mut HashMap<String, TransferRecord>) -> bool {
+    if transfers.len() < MAX_TRANSFER_RECORDS {
+        return true;
+    }
+    let terminal_id = transfers
+        .iter()
+        .filter(|(_, record)| {
+            matches!(
+                record.progress.status,
+                TransferStatus::Completed
+                    | TransferStatus::Rejected
+                    | TransferStatus::Failed
+                    | TransferStatus::Cancelled
+            )
+        })
+        .min_by_key(|(_, record)| record.updated_at_ms)
+        .map(|(transfer_id, _)| transfer_id.clone());
+    if let Some(transfer_id) = terminal_id {
+        transfers.remove(&transfer_id);
+        true
+    } else {
+        false
+    }
+}
+
 fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
     let path = data_dir.join("node.json");
     if let Ok(contents) = std::fs::read_to_string(&path) {
@@ -1370,7 +1404,7 @@ mod tests {
     use crate::model::{
         ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
         TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
-        MAX_MOBILE_STAGING_BYTES_PER_SESSION, METRICS_SYSTEM_CAPABILITY,
+        MAX_MOBILE_STAGING_BYTES_PER_SESSION, MAX_TRANSFER_RECORDS, METRICS_SYSTEM_CAPABILITY,
     };
     use std::path::PathBuf;
     use tokio::sync::mpsc;
@@ -1530,6 +1564,20 @@ mod tests {
                 .status,
             TransferStatus::Accepted
         );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn active_transfer_records_have_a_bounded_count() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        for index in 0..MAX_TRANSFER_RECORDS {
+            runtime.add_transfer(mobile_offer(&runtime, &format!("transfer-{index}"), 1));
+        }
+        runtime.add_transfer(mobile_offer(&runtime, "overflow", 1));
+        assert_eq!(runtime.transfers.read().len(), MAX_TRANSFER_RECORDS);
+        assert!(runtime.transfer("overflow").is_none());
         let _ = std::fs::remove_dir_all(path);
     }
 
