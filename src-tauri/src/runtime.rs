@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -50,11 +50,14 @@ pub struct NodeRuntime {
     pub mobile_transfers: RwLock<HashMap<String, MobileTransferRecord>>,
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
     pub monitor_display: RwLock<MonitorDisplayMode>,
+    listening_addresses: RwLock<Option<Vec<Ipv4Addr>>>,
     config: Mutex<PersistedConfig>,
     data_dir: PathBuf,
+    clipboard_update: Mutex<()>,
     seen_events: Mutex<HashMap<String, i64>>,
     suppression: Mutex<Option<(String, i64)>>,
     peer_channels: Mutex<HashMap<String, mpsc::Sender<WireMessage>>>,
+    pending_clipboard_resync: Mutex<HashSet<String>>,
     connecting_peers: Mutex<HashSet<String>>,
     transfer_locks: Mutex<HashSet<(String, String)>>,
     pub events: broadcast::Sender<WireMessage>,
@@ -87,9 +90,22 @@ fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     }
 }
 
+fn is_clipboard_message(message: &WireMessage) -> bool {
+    matches!(
+        message,
+        WireMessage::ClipboardUpdate { .. } | WireMessage::ClipboardSnapshot { .. }
+    )
+}
+
 impl NodeRuntime {
     pub fn new(data_dir: PathBuf, port: u16, version: String) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)?;
+        let staging_root = data_dir.join("mobile-transfers");
+        match std::fs::remove_dir_all(&staging_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         let config = load_or_create_config(&data_dir)?;
         let addresses = network_addresses(port);
         let node = NodeInfo {
@@ -121,11 +137,14 @@ impl NodeRuntime {
             mobile_transfers: RwLock::new(HashMap::new()),
             local_metrics: RwLock::new(None),
             monitor_display: RwLock::new(config.monitor_display.clone()),
+            listening_addresses: RwLock::new(None),
             config: Mutex::new(config),
             data_dir,
+            clipboard_update: Mutex::new(()),
             seen_events: Mutex::new(HashMap::new()),
             suppression: Mutex::new(None),
             peer_channels: Mutex::new(HashMap::new()),
+            pending_clipboard_resync: Mutex::new(HashSet::new()),
             connecting_peers: Mutex::new(HashSet::new()),
             transfer_locks: Mutex::new(HashSet::new()),
             events,
@@ -146,8 +165,30 @@ impl NodeRuntime {
     }
 
     pub fn update_addresses(&self) {
+        let (port, listening_addresses) = {
+            let node = self.node.read();
+            (node.port, self.listening_addresses.read().clone())
+        };
+        let addresses = listening_addresses
+            .as_deref()
+            .map(|items| network_addresses_for_bound(port, items))
+            .unwrap_or_else(|| network_addresses(port));
+        self.node.write().addresses = addresses;
+    }
+
+    pub fn set_listening_addresses(&self, addresses: Vec<Ipv4Addr>) {
+        let mut addresses = addresses
+            .into_iter()
+            .filter(|address| is_local_network_ipv4(*address))
+            .collect::<Vec<_>>();
+        addresses.sort();
+        addresses.dedup();
+        if addresses.is_empty() {
+            addresses.push(Ipv4Addr::LOCALHOST);
+        }
         let port = self.node.read().port;
-        self.node.write().addresses = network_addresses(port);
+        *self.listening_addresses.write() = Some(addresses.clone());
+        self.node.write().addresses = network_addresses_for_bound(port, &addresses);
     }
 
     pub fn publish_event(&self, message: WireMessage) {
@@ -218,6 +259,7 @@ impl NodeRuntime {
     pub fn remove_peer_channel(&self, node_id: &str) {
         self.peer_channels.lock().remove(node_id);
         self.connecting_peers.lock().remove(node_id);
+        self.pending_clipboard_resync.lock().remove(node_id);
     }
 
     pub fn begin_peer_connection(&self, node_id: &str) -> bool {
@@ -231,7 +273,22 @@ impl NodeRuntime {
 
     pub fn send_to_peer(&self, node_id: &str, message: WireMessage) -> bool {
         let channel = self.peer_channels.lock().get(node_id).cloned();
-        channel.is_some_and(|channel| channel.try_send(message).is_ok())
+        let is_clipboard = is_clipboard_message(&message);
+        let Some(channel) = channel else {
+            return false;
+        };
+        match channel.try_send(message) {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                if is_clipboard {
+                    self.pending_clipboard_resync
+                        .lock()
+                        .insert(node_id.to_string());
+                }
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     pub fn send_to_peers_except(&self, except: Option<&str>, message: WireMessage) {
@@ -240,10 +297,41 @@ impl NodeRuntime {
             .lock()
             .iter()
             .filter(|(node_id, _)| Some(node_id.as_str()) != except)
-            .map(|(_, channel)| channel.clone())
+            .map(|(node_id, channel)| (node_id.clone(), channel.clone()))
             .collect::<Vec<_>>();
-        for channel in channels {
-            let _ = channel.try_send(message.clone());
+        let is_clipboard = is_clipboard_message(&message);
+        for (node_id, channel) in channels {
+            match channel.try_send(message.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) if is_clipboard => {
+                    self.pending_clipboard_resync.lock().insert(node_id);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
+    pub fn flush_clipboard_resync(&self, node_id: &str) -> bool {
+        if !self.pending_clipboard_resync.lock().contains(node_id) {
+            return false;
+        }
+        let Some(snapshot) = self.clipboard_snapshot() else {
+            self.pending_clipboard_resync.lock().remove(node_id);
+            return false;
+        };
+        let Some(channel) = self.peer_channels.lock().get(node_id).cloned() else {
+            return false;
+        };
+        match channel.try_send(WireMessage::ClipboardSnapshot { snapshot }) {
+            Ok(()) => {
+                self.pending_clipboard_resync.lock().remove(node_id);
+                true
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.pending_clipboard_resync.lock().remove(node_id);
+                false
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => false,
         }
     }
 
@@ -348,15 +436,14 @@ impl NodeRuntime {
     }
 
     pub fn accept_clipboard(&self, event: ClipboardEvent, source_name: String) -> bool {
+        let _update_guard = self.clipboard_update.lock();
         let now = now_millis();
-        {
-            let mut seen = self.seen_events.lock();
-            seen.retain(|_, timestamp| now.saturating_sub(*timestamp) < 10 * 60 * 1000);
-            if seen.contains_key(&event.event_id) {
-                return false;
-            }
-            seen.insert(event.event_id.clone(), now);
+        let mut seen = self.seen_events.lock();
+        seen.retain(|_, timestamp| now.saturating_sub(*timestamp) < 10 * 60 * 1000);
+        if seen.contains_key(&event.event_id) {
+            return false;
         }
+        seen.insert(event.event_id.clone(), now);
         let newer = self
             .clipboard
             .read()
@@ -672,6 +759,31 @@ impl NodeRuntime {
         if self.touch_mobile_session(session_id).is_none() {
             return Err("手机会话已过期".to_string());
         }
+        if offer.total_bytes > crate::model::MAX_MOBILE_STAGING_BYTES_PER_SESSION {
+            return Err("手机临时文件超过会话配额".to_string());
+        }
+        let mut transfers = self.mobile_transfers.write();
+        if transfers
+            .values()
+            .any(|record| record.offer.transfer_id == offer.transfer_id)
+        {
+            return Err("手机传输任务已存在".to_string());
+        }
+        let reserved = transfers
+            .values()
+            .filter(|record| record.session_id == session_id)
+            .try_fold(0u64, |total, record| {
+                total.checked_add(record.offer.total_bytes)
+            })
+            .ok_or_else(|| "手机临时文件超过会话配额".to_string())?;
+        if reserved
+            .checked_add(offer.total_bytes)
+            .map_or(true, |total| {
+                total > crate::model::MAX_MOBILE_STAGING_BYTES_PER_SESSION
+            })
+        {
+            return Err("手机临时文件超过会话配额".to_string());
+        }
         let progress = transfer_progress(&offer, "receive");
         let staged_directory = self
             .data_dir
@@ -685,9 +797,7 @@ impl NodeRuntime {
             staged_items: HashSet::new(),
         };
         let view = mobile_view(&record);
-        self.mobile_transfers
-            .write()
-            .insert(record.offer.transfer_id.clone(), record);
+        transfers.insert(record.offer.transfer_id.clone(), record);
         Ok(view)
     }
 
@@ -893,6 +1003,86 @@ pub fn network_addresses(port: u16) -> Vec<AddressInfo> {
     addresses
 }
 
+fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
+    (u32::from(address) & 0xffc00000) == 0x64400000
+}
+
+fn is_local_network_ipv4(address: Ipv4Addr) -> bool {
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || is_tailscale_ipv4(address)
+}
+
+fn network_addresses_for_bound(port: u16, bound: &[Ipv4Addr]) -> Vec<AddressInfo> {
+    let interface_names = get_if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces
+                .into_iter()
+                .filter_map(|interface| match interface.ip() {
+                    IpAddr::V4(address) => Some((address, interface.name)),
+                    IpAddr::V6(_) => None,
+                })
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut addresses = bound
+        .iter()
+        .copied()
+        .filter(|address| is_local_network_ipv4(*address))
+        .map(|address| {
+            let address_text = address.to_string();
+            let kind = if address.is_loopback() {
+                "loopback"
+            } else if is_tailscale_ipv4(address) {
+                "tailscale"
+            } else if address.is_private() {
+                "lan"
+            } else {
+                "network"
+            };
+            let label = if address.is_loopback() {
+                format!("本机 · {address_text}")
+            } else {
+                format!(
+                    "{} · {address_text}",
+                    interface_names
+                        .get(&address)
+                        .map(String::as_str)
+                        .unwrap_or("network")
+                )
+            };
+            AddressInfo {
+                address: address_text.clone(),
+                url: format!("http://{address_text}:{port}"),
+                label,
+                kind: kind.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
+    addresses.sort_by(|left, right| {
+        let rank = |kind: &str| match kind {
+            "lan" => 0,
+            "tailscale" => 1,
+            "network" => 2,
+            _ => 3,
+        };
+        rank(&left.kind)
+            .cmp(&rank(&right.kind))
+            .then(left.address.cmp(&right.address))
+    });
+    addresses.dedup_by(|left, right| left.address == right.address);
+    if addresses.is_empty() {
+        addresses.push(AddressInfo {
+            address: Ipv4Addr::LOCALHOST.to_string(),
+            url: format!("http://127.0.0.1:{port}"),
+            label: "本机 · 127.0.0.1".to_string(),
+            kind: "loopback".to_string(),
+        });
+    }
+    addresses
+}
+
 pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
     let mut addresses = vec![std::net::Ipv4Addr::LOCALHOST];
     if let Ok(interfaces) = get_if_addrs::get_if_addrs() {
@@ -914,10 +1104,11 @@ pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_create_config, NodeRuntime};
+    use super::{load_or_create_config, network_addresses_for_bound, NodeRuntime};
     use crate::model::{
-        GpuMemoryKind, GpuMetrics, HardwareMetrics, PeerInfo, TransferItem, TransferOffer,
-        TransferStatus, METRICS_SYSTEM_CAPABILITY,
+        ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
+        TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_STAGING_BYTES_PER_SESSION,
+        METRICS_SYSTEM_CAPABILITY,
     };
     use std::path::PathBuf;
     use tokio::sync::mpsc;
@@ -944,6 +1135,47 @@ mod tests {
         let path = std::env::temp_dir().join(format!("meshshare-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test directory");
         path
+    }
+
+    #[test]
+    fn bound_addresses_exclude_public_addresses_and_prefer_lan() {
+        let addresses = network_addresses_for_bound(
+            37880,
+            &[
+                std::net::Ipv4Addr::LOCALHOST,
+                std::net::Ipv4Addr::new(192, 168, 1, 10),
+                std::net::Ipv4Addr::new(100, 64, 0, 2),
+                std::net::Ipv4Addr::new(8, 8, 8, 8),
+            ],
+        );
+        assert_eq!(addresses[0].address, "192.168.1.10");
+        assert!(addresses.iter().all(|address| address.address != "8.8.8.8"));
+        assert!(addresses
+            .iter()
+            .any(|address| address.address == "127.0.0.1"));
+        assert!(addresses
+            .iter()
+            .any(|address| address.address == "100.64.0.2"));
+    }
+
+    fn mobile_offer(runtime: &NodeRuntime, transfer_id: &str, total_bytes: u64) -> TransferOffer {
+        TransferOffer {
+            transfer_id: transfer_id.to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: format!("{transfer_id}-item"),
+                name: "file.bin".to_string(),
+                relative_path: "file.bin".to_string(),
+                size: total_bytes,
+                sha256: "hash".to_string(),
+                media_type: "application/octet-stream".to_string(),
+                directory: false,
+            }],
+            total_bytes,
+            created_at_ms: crate::clock::now_millis(),
+        }
     }
 
     #[test]
@@ -1067,6 +1299,121 @@ mod tests {
         assert!(runtime
             .mobile_item_path("mobile-transfer", "item")
             .is_some());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn startup_removes_stale_mobile_staging_directory() {
+        let path = temp_data_dir();
+        let staging = path.join("mobile-transfers");
+        std::fs::create_dir_all(&staging).expect("create stale staging directory");
+        std::fs::write(staging.join("stale.part"), b"stale").expect("write stale file");
+        let _runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn mobile_session_reserves_a_bounded_staging_quota() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime.create_mobile_session("test phone".to_string());
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(&runtime, "quota-full", MAX_MOBILE_STAGING_BYTES_PER_SESSION),
+            )
+            .expect("reserve full session quota");
+        let error = runtime
+            .create_mobile_transfer(&session.session_id, mobile_offer(&runtime, "quota-over", 1))
+            .expect_err("second transfer must exceed session quota");
+        assert!(error.contains("配额"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_queue_overflow_schedules_latest_snapshot_resync() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let event = runtime
+            .create_local_clipboard_named(Some("latest".to_string()), None, "local".to_string())
+            .expect("create clipboard event");
+        let (tx, mut rx) = mpsc::channel(1);
+        runtime.add_peer_channel("peer".to_string(), tx);
+        assert!(runtime.send_to_peer("peer", WireMessage::Ping { at_ms: 1 }));
+        assert!(!runtime.send_to_peer(
+            "peer",
+            WireMessage::ClipboardUpdate {
+                event: event.clone(),
+            }
+        ));
+        let _ = rx.try_recv().expect("drain full queue");
+        assert!(runtime.flush_clipboard_resync("peer"));
+        match rx.try_recv().expect("receive snapshot resync") {
+            WireMessage::ClipboardSnapshot { snapshot } => {
+                assert_eq!(snapshot.text.as_deref(), Some("latest"))
+            }
+            _ => panic!("expected clipboard snapshot"),
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn concurrent_clipboard_updates_keep_the_newest_hlc() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let older = ClipboardEvent {
+            event_id: "older".to_string(),
+            origin_node_id: "peer-a".to_string(),
+            clock: Hlc {
+                physical_ms: 1,
+                logical: 0,
+                node_id: "peer-a".to_string(),
+            },
+            text: Some("older".to_string()),
+            image_png: None,
+            updated_at_ms: 1,
+        };
+        let newer = ClipboardEvent {
+            event_id: "newer".to_string(),
+            origin_node_id: "peer-b".to_string(),
+            clock: Hlc {
+                physical_ms: 2,
+                logical: 0,
+                node_id: "peer-b".to_string(),
+            },
+            text: Some("newer".to_string()),
+            image_png: None,
+            updated_at_ms: 2,
+        };
+        let older_runtime = runtime.clone();
+        let older_barrier = barrier.clone();
+        let older_thread = std::thread::spawn(move || {
+            older_barrier.wait();
+            older_runtime.accept_clipboard(older, "older".to_string());
+        });
+        let newer_runtime = runtime.clone();
+        let newer_barrier = barrier.clone();
+        let newer_thread = std::thread::spawn(move || {
+            newer_barrier.wait();
+            newer_runtime.accept_clipboard(newer, "newer".to_string());
+        });
+        barrier.wait();
+        older_thread.join().expect("older update thread");
+        newer_thread.join().expect("newer update thread");
+        assert_eq!(
+            runtime
+                .clipboard_snapshot()
+                .expect("clipboard snapshot")
+                .text
+                .as_deref(),
+            Some("newer")
+        );
         let _ = std::fs::remove_dir_all(path);
     }
 }

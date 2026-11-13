@@ -34,8 +34,8 @@
 - `Hello` 携带节点身份和能力。
 - `Hello` 同时携带 `protocol_version`；版本不一致的节点不会建立会话。
 - `Ping` 和 `Pong` 用于连接保活。
-- `ClipboardUpdate` 的 `payload.event` 包含事件 ID、来源节点、HLC 和剪贴板内容。
-- `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新剪贴板快照，接收端仍按 HLC 比较新旧。
+- `ClipboardUpdate` 的 `payload.event` 包含事件 ID、原始来源节点、HLC 和剪贴板内容。接收端用当前 WebSocket Peer Channel 确认发送方；多跳转发时原始来源节点可以与当前发送方不同。
+- `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新剪贴板快照，`source_node_id` 保留原始产生事件的节点，接收端仍按 HLC 比较新旧并按事件 ID 去重。
 - `TransferOffer` 的 `payload.offer` 包含传输清单、总大小和发送节点。
 - `TransferAction` 表示接受、拒绝或取消。
 - `TransferProgress` 的 `payload.progress` 包含传输状态、已完成字节和错误。
@@ -59,4 +59,8 @@
 
 `relative_path` 必须是目标目录下的相对路径，禁止盘符、分隔符穿越、`.` 和 `..`。接收端在确认传输存在后逐级检查目录，拒绝符号链接；同一传输项目使用锁避免并发写入。接收端先在最终文件同目录创建随机 `.part` 文件，校验 SHA-256 和清单大小后用不可覆盖的硬链接提交为最终文件名。流读取、写入、校验或提交报错时，接收端会尝试清理临时文件。
 
-手机接收使用扫码节点上的短期会话。桌面端先把文件直接上传到该节点的临时文件区，手机确认后从同一节点通过流式 GET 下载；会话过期后临时目录随任务清理。
+手机接收使用扫码节点上的短期会话。桌面端先把文件直接上传到该节点的临时文件区，手机确认后从同一节点通过流式 GET 下载；会话空闲 90 秒后后台清理任务和临时目录，节点启动时清理遗留目录。每个会话按传输清单总大小预留 5 GiB 临时空间，超过配额的新清单会被拒绝。
+
+## 网络边界
+
+节点只绑定本机回环、RFC1918 私网、链路本地和 Tailscale 组网 IPv4 地址，并只公布实际成功监听的地址。服务使用明文 HTTP/WebSocket、无账号和无令牌，CORS 保持开放；产品边界是受信任局域网/组网，不应通过端口转发暴露到互联网。

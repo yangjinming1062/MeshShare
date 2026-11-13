@@ -12,8 +12,10 @@ use anyhow::Context;
 use model::{HardwareMetrics, MonitorDisplayMode, TransferProgress, WireMessage};
 use runtime::NodeRuntime;
 use std::fs;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::{AppHandle, Manager, State, WindowEvent};
 
@@ -241,7 +243,18 @@ async fn start_node(
             listeners.push(listener);
         }
     }
+    let listening_addresses = listeners
+        .iter()
+        .map(|listener| listener.local_addr().map(|address| address.ip()))
+        .collect::<std::io::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|address| match address {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
     let runtime = NodeRuntime::new(data_dir, actual_port, version)?;
+    runtime.set_listening_addresses(listening_addresses);
     let app = server::router(runtime.clone(), static_root);
     for listener in listeners {
         let app = app.clone();
@@ -249,6 +262,27 @@ async fn start_node(
             let _ = axum::serve(listener, app).await;
         });
     }
+    let cleanup_runtime = runtime.clone();
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            if cleanup_runtime
+                .stopping
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
+            cleanup_runtime.mobile_sessions_snapshot();
+            for directory in cleanup_runtime.prune_mobile_transfers() {
+                if let Err(error) = tokio::fs::remove_dir_all(directory).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        eprintln!("清理手机临时目录失败：{error}");
+                    }
+                }
+            }
+        }
+    });
     clipboard::start_monitor(runtime.clone());
     metrics::start(runtime.clone());
     discovery::start(runtime.clone());

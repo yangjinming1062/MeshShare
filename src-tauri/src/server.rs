@@ -228,6 +228,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
         .await;
     let mut peer_id: Option<String> = None;
     let mut owns_peer_channel = false;
+    let mut clipboard_resync = tokio::time::interval(std::time::Duration::from_secs(1));
 
     loop {
         tokio::select! {
@@ -236,14 +237,28 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
                     Some(Ok(axum::extract::ws::Message::Text(text))) => {
                         match serde_json::from_str::<WireMessage>(&text) {
                             Ok(message) => {
-                                if let Some(identified) = handle_wire_message(message, &runtime, peer_id.as_deref()).await {
-                                    peer_id = Some(identified.clone());
-                                    if !runtime.add_peer_channel(identified, outgoing_tx.clone()) {
+                                if let WireMessage::Hello { node } = &message {
+                                    if peer_id
+                                        .as_deref()
+                                        .is_some_and(|current| current != node.node_id)
+                                    {
                                         break;
                                     }
-                                    owns_peer_channel = true;
-                                    if let Some(snapshot) = runtime.clipboard_snapshot() {
-                                        let _ = outgoing_tx.try_send(WireMessage::ClipboardSnapshot { snapshot });
+                                }
+                                if let Some(identified) = handle_wire_message(message, &runtime, peer_id.as_deref()).await {
+                                    match peer_id.as_deref() {
+                                        None => {
+                                            if !runtime.add_peer_channel(identified.clone(), outgoing_tx.clone()) {
+                                                break;
+                                            }
+                                            peer_id = Some(identified);
+                                            owns_peer_channel = true;
+                                            if let Some(snapshot) = runtime.clipboard_snapshot() {
+                                                let _ = outgoing_tx.try_send(WireMessage::ClipboardSnapshot { snapshot });
+                                            }
+                                        }
+                                        Some(current) if current == identified => {}
+                                        Some(_) => break,
                                     }
                                 }
                             }
@@ -260,6 +275,11 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
                     if sender.send(axum::extract::ws::Message::Text(serde_json::to_string(&message).unwrap_or_default())).await.is_err() {
                         break;
                     }
+                }
+            }
+            _ = clipboard_resync.tick() => {
+                if let Some(peer_id) = peer_id.as_deref() {
+                    let _ = runtime.flush_clipboard_resync(peer_id);
                 }
             }
             event = events.recv() => {
@@ -333,9 +353,6 @@ pub(crate) async fn handle_wire_message(
         }
         WireMessage::ClipboardUpdate { event } => {
             let peer_id = current_peer?;
-            if event.origin_node_id != peer_id {
-                return Some(peer_id.to_string());
-            }
             let source_name = runtime
                 .peer_name(peer_id)
                 .unwrap_or_else(|| "远端设备".to_string());
@@ -354,12 +371,13 @@ pub(crate) async fn handle_wire_message(
         }
         WireMessage::ClipboardSnapshot { snapshot } => {
             let peer_id = current_peer?;
-            if snapshot.source_node_id != peer_id {
-                return Some(peer_id.to_string());
-            }
-            let source_name = runtime
-                .peer_name(peer_id)
-                .unwrap_or_else(|| "远端设备".to_string());
+            let source_name = if snapshot.source_name.trim().is_empty() {
+                runtime
+                    .peer_name(peer_id)
+                    .unwrap_or_else(|| "远端设备".to_string())
+            } else {
+                snapshot.source_name.clone()
+            };
             let event = crate::model::ClipboardEvent {
                 event_id: snapshot.event_id,
                 origin_node_id: snapshot.source_node_id,
@@ -1088,9 +1106,15 @@ fn has_parent_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{handle_wire_message, has_parent_component};
-    use crate::model::{HardwareMetrics, PeerInfo, WireMessage, METRICS_SYSTEM_CAPABILITY};
+    use crate::model::{
+        ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, WireMessage,
+        METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
+    };
     use crate::runtime::NodeRuntime;
+    use futures_util::{SinkExt, StreamExt};
+    use std::path::PathBuf;
     use tokio::sync::mpsc;
+    use tokio_tungstenite::connect_async;
     use uuid::Uuid;
 
     #[test]
@@ -1142,6 +1166,195 @@ mod tests {
         assert_eq!(result.as_deref(), Some("peer"));
         assert!(rx.try_recv().is_err());
         assert!(runtime.peers_snapshot()[0].metrics.is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn forwarded_clipboard_events_keep_their_original_source() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-forward-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.set_peer(PeerInfo {
+            node_id: "relay".to_string(),
+            node_name: "Relay".to_string(),
+            platform: "test".to_string(),
+            addresses: Vec::new(),
+            capabilities: Vec::new(),
+            online: true,
+            last_seen_ms: crate::clock::now_millis(),
+            endpoint: None,
+            source: "test".to_string(),
+            metrics: None,
+            metrics_received_at_ms: None,
+            metrics_stale: false,
+        });
+        let event = ClipboardEvent {
+            event_id: "event-from-origin".to_string(),
+            origin_node_id: "origin".to_string(),
+            clock: Hlc {
+                physical_ms: 10,
+                logical: 0,
+                node_id: "origin".to_string(),
+            },
+            text: Some("forwarded".to_string()),
+            image_png: None,
+            updated_at_ms: 10,
+        };
+        let result = handle_wire_message(
+            WireMessage::ClipboardUpdate {
+                event: event.clone(),
+            },
+            &runtime,
+            Some("relay"),
+        )
+        .await;
+        assert_eq!(result.as_deref(), Some("relay"));
+        let snapshot = runtime.clipboard_snapshot().expect("clipboard snapshot");
+        assert_eq!(snapshot.source_node_id, "origin");
+        assert_eq!(snapshot.text.as_deref(), Some("forwarded"));
+
+        let snapshot_message = WireMessage::ClipboardSnapshot {
+            snapshot: ClipboardSnapshot {
+                event_id: "snapshot-from-origin".to_string(),
+                source_node_id: "origin".to_string(),
+                source_name: "Origin".to_string(),
+                clock: Hlc {
+                    physical_ms: 20,
+                    logical: 0,
+                    node_id: "origin".to_string(),
+                },
+                text: Some("snapshot-forwarded".to_string()),
+                image_png: None,
+                updated_at_ms: 20,
+            },
+        };
+        let _ = handle_wire_message(snapshot_message, &runtime, Some("relay")).await;
+        let snapshot = runtime
+            .clipboard_snapshot()
+            .expect("newer clipboard snapshot");
+        assert_eq!(snapshot.source_node_id, "origin");
+        assert_eq!(snapshot.source_name, "Origin");
+        assert_eq!(snapshot.text.as_deref(), Some("snapshot-forwarded"));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_keeps_one_channel_for_normal_peer_messages() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-websocket-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let static_root = PathBuf::from(&data_dir).join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let (mut socket, _) = connect_async(format!("ws://{address}/api/v1/ws"))
+            .await
+            .expect("connect websocket");
+        let _ = socket
+            .next()
+            .await
+            .expect("server hello")
+            .expect("hello message");
+        let peer = NodeInfo {
+            node_id: "peer".to_string(),
+            node_name: "Peer".to_string(),
+            version: "test".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            platform: "test".to_string(),
+            port: 0,
+            addresses: Vec::new(),
+            capabilities: Vec::new(),
+        };
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::Hello { node: peer }).expect("serialize hello"),
+            ))
+            .await
+            .expect("send hello");
+        for index in 0..20 {
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(&WireMessage::Ping { at_ms: index }).expect("ping"),
+                ))
+                .await
+                .expect("send ping");
+            loop {
+                let message = socket
+                    .next()
+                    .await
+                    .expect("pong response")
+                    .expect("valid websocket message");
+                let tokio_tungstenite::tungstenite::Message::Text(body) = message else {
+                    continue;
+                };
+                if matches!(
+                    serde_json::from_str::<WireMessage>(&body).expect("decode response"),
+                    WireMessage::Pong { .. }
+                ) {
+                    break;
+                }
+            }
+        }
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::ClipboardUpdate {
+                    event: ClipboardEvent {
+                        event_id: "websocket-event".to_string(),
+                        origin_node_id: "peer".to_string(),
+                        clock: Hlc {
+                            physical_ms: 30,
+                            logical: 0,
+                            node_id: "peer".to_string(),
+                        },
+                        text: Some("hello".to_string()),
+                        image_png: None,
+                        updated_at_ms: 30,
+                    },
+                })
+                .expect("clipboard update"),
+            ))
+            .await
+            .expect("send clipboard update");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::Ping { at_ms: 21 }).expect("ping"),
+            ))
+            .await
+            .expect("send final ping");
+        let mut received_pong = false;
+        while let Some(message) = socket.next().await {
+            let message = message.expect("final websocket message");
+            if let tokio_tungstenite::tungstenite::Message::Text(body) = message {
+                if matches!(
+                    serde_json::from_str::<WireMessage>(&body).expect("decode final response"),
+                    WireMessage::Pong { .. }
+                ) {
+                    received_pong = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            received_pong,
+            "connection should remain usable after clipboard update"
+        );
+        let _ = socket.close(None).await;
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
         let _ = std::fs::remove_dir_all(data_dir);
     }
 }

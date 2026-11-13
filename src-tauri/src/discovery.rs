@@ -91,11 +91,7 @@ pub async fn connect_manual(
     runtime: Arc<NodeRuntime>,
     base_url: String,
 ) -> Result<PeerInfo, String> {
-    let base_url = base_url
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches("/mobile")
-        .to_string();
+    let base_url = normalize_http_base_url(&base_url)?;
     let info_url = format!("{base_url}/api/v1/info");
     let node: crate::model::NodeInfo = runtime
         .http
@@ -117,7 +113,7 @@ pub async fn connect_manual(
             node.protocol_version, PROTOCOL_VERSION
         ));
     }
-    let endpoint = format!("{base_url}/api/v1/ws");
+    let endpoint = websocket_endpoint(&base_url)?;
     let peer = PeerInfo {
         node_id: node.node_id.clone(),
         node_name: node.node_name.clone(),
@@ -138,6 +134,36 @@ pub async fn connect_manual(
         connect_peer(runtime_for_task, node.node_id, node.node_name, endpoint).await;
     });
     Ok(peer)
+}
+
+fn normalize_http_base_url(value: &str) -> Result<String, String> {
+    let base_url = value
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/mobile")
+        .to_string();
+    let Some((scheme, _)) = base_url.split_once("://") else {
+        return Err("节点地址必须使用 http:// 或 https://".to_string());
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return Err("节点地址必须使用 http:// 或 https://".to_string());
+    }
+    Ok(base_url)
+}
+
+fn websocket_endpoint(base_url: &str) -> Result<String, String> {
+    let Some((scheme, rest)) = base_url.split_once("://") else {
+        return Err("节点地址必须使用 http:// 或 https://".to_string());
+    };
+    let websocket_scheme = match scheme.to_ascii_lowercase().as_str() {
+        "http" => "ws",
+        "https" => "wss",
+        _ => return Err("节点地址必须使用 http:// 或 https://".to_string()),
+    };
+    if rest.is_empty() {
+        return Err("节点地址缺少主机名".to_string());
+    }
+    Ok(format!("{websocket_scheme}://{rest}/api/v1/ws"))
 }
 
 pub(crate) async fn connect_peer(
@@ -217,7 +243,9 @@ async fn run_peer_session(
         metrics_stale: false,
     });
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut clipboard_resync = tokio::time::interval(Duration::from_secs(1));
     let mut last_pong = tokio::time::Instant::now();
+    let mut received_hello = false;
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -226,6 +254,9 @@ async fn run_peer_session(
                 }
                 let body = serde_json::to_string(&WireMessage::Ping { at_ms: crate::clock::now_millis() }).unwrap_or_default();
                 if writer.send(tokio_tungstenite::tungstenite::Message::Text(body)).await.is_err() { break; }
+            }
+            _ = clipboard_resync.tick() => {
+                let _ = runtime.flush_clipboard_resync(node_id);
             }
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break };
@@ -236,10 +267,16 @@ async fn run_peer_session(
                 match inbound {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(body))) => {
                         if let Ok(message) = serde_json::from_str::<WireMessage>(&body) {
+                            if let WireMessage::Hello { node } = &message {
+                                if node.node_id != node_id {
+                                    break;
+                                }
+                            }
                             if matches!(message, WireMessage::Pong { .. }) { last_pong = tokio::time::Instant::now(); }
                             let is_hello = matches!(message, WireMessage::Hello { .. });
                             let _ = server::handle_wire_message(message, runtime, Some(node_id)).await;
-                            if is_hello {
+                            if is_hello && !received_hello {
+                                received_hello = true;
                                 if let Some(snapshot) = runtime.clipboard_snapshot() {
                                     let _ = runtime.send_to_peer(node_id, WireMessage::ClipboardSnapshot { snapshot });
                                 }
@@ -258,4 +295,36 @@ async fn run_peer_session(
     }
     runtime.remove_peer(node_id);
     Some(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_http_base_url, websocket_endpoint};
+
+    #[test]
+    fn manual_http_address_becomes_ws_endpoint() {
+        let base = normalize_http_base_url(" http://192.168.1.10:37880/mobile/ ")
+            .expect("normalize http address");
+        assert_eq!(base, "http://192.168.1.10:37880");
+        assert_eq!(
+            websocket_endpoint(&base).expect("convert websocket address"),
+            "ws://192.168.1.10:37880/api/v1/ws"
+        );
+    }
+
+    #[test]
+    fn manual_https_address_becomes_wss_endpoint() {
+        let base = normalize_http_base_url("https://meshshare.example.test")
+            .expect("normalize https address");
+        assert_eq!(
+            websocket_endpoint(&base).expect("convert websocket address"),
+            "wss://meshshare.example.test/api/v1/ws"
+        );
+    }
+
+    #[test]
+    fn manual_address_rejects_non_http_schemes() {
+        assert!(normalize_http_base_url("ws://192.168.1.10:37880").is_err());
+        assert!(websocket_endpoint("ftp://192.168.1.10:37880").is_err());
+    }
 }
