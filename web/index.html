@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#132238">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <title>MeshShare · 局域网共享板</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="shell">
+    <header class="hero">
+      <div>
+        <p class="eyebrow">LAN / LOCAL FIRST</p>
+        <h1>MeshShare</h1>
+        <p class="subtitle">把文字、链接和文件留在你的局域网里。</p>
+      </div>
+      <div id="status" class="status" data-kind="loading">连接中…</div>
+    </header>
+
+    <section class="grid">
+      <article class="card clipboard-card">
+        <div class="card-heading"><div><p class="eyebrow">LATEST CLIPBOARD</p><h2>共享剪贴板</h2></div><span id="clipboard-time" class="muted"></span></div>
+        <textarea id="clipboard-text" rows="7" placeholder="在这里粘贴或输入需要在设备间共享的文字"></textarea>
+        <div class="actions"><input id="clipboard-source" maxlength="80" placeholder="来源设备（可选）"><button id="publish-clipboard" class="primary">发布到共享板</button><button id="copy-clipboard">复制</button></div>
+      </article>
+
+      <article class="card message-card">
+        <div class="card-heading"><div><p class="eyebrow">QUICK NOTES</p><h2>消息</h2></div></div>
+        <form id="message-form"><textarea id="message-text" rows="5" maxlength="10000" placeholder="发送一段临时文字或链接"></textarea><div class="actions"><input id="message-author" maxlength="80" placeholder="你的设备名称"><button class="primary">发送消息</button></div></form>
+        <div id="messages" class="timeline" aria-live="polite"></div>
+      </article>
+
+      <article class="card files-card">
+        <div class="card-heading"><div><p class="eyebrow">LOCAL FILES</p><h2>文件</h2></div><span id="file-limit" class="muted">上传到此设备</span></div>
+        <label class="dropzone" id="dropzone"><input id="file-input" type="file" multiple><strong>选择文件或拖到这里</strong><span>文件只保存于运行 MeshShare 的设备</span></label>
+        <div id="files" class="file-list"></div>
+      </article>
+    </section>
+    <footer>同一局域网中的设备打开本页即可使用 · <a href="/api/health">服务状态</a></footer>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>

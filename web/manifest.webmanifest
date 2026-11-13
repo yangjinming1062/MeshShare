@@ -1,0 +1,10 @@
+{
+  "name": "MeshShare 局域网共享",
+  "short_name": "MeshShare",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#182338",
+  "lang": "zh-CN",
+  "icons": []
+}
