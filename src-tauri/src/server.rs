@@ -3,7 +3,7 @@ use crate::discovery;
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
     MobileTransferView, NodeInfo, PeerInfo, TransferOffer, TransferProgress, TransferStatus,
-    WireMessage, CLIPBOARD_IMAGE_LIMIT, METRICS_SYSTEM_CAPABILITY,
+    WireMessage, CLIPBOARD_IMAGE_LIMIT, MAX_TRANSFER_ITEMS, METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
@@ -267,7 +267,12 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
                                         break;
                                     }
                                 }
-                                if let Some(identified) = handle_wire_message(message, &runtime, peer_id.as_deref()).await {
+                                let is_hello = matches!(&message, WireMessage::Hello { .. });
+                                let identified = handle_wire_message(message, &runtime, peer_id.as_deref()).await;
+                                if is_hello && identified.is_none() {
+                                    break;
+                                }
+                                if let Some(identified) = identified {
                                     match peer_id.as_deref() {
                                         None => {
                                             if !runtime.add_peer_channel(identified.clone(), outgoing_tx.clone()) {
@@ -350,7 +355,7 @@ pub(crate) async fn handle_wire_message(
     }
     match message {
         WireMessage::Hello { node } => {
-            if node.node_id == runtime.node_id() {
+            if !validate_node_info(&node) || node.node_id == runtime.node_id() {
                 return None;
             }
             if node.protocol_version != crate::model::PROTOCOL_VERSION {
@@ -555,6 +560,7 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
         .iter()
         .try_fold(0u64, |total, item| total.checked_add(item.size));
     if offer.items.is_empty()
+        || offer.items.len() > MAX_TRANSFER_ITEMS
         || listed_bytes != Some(offer.total_bytes)
         || offer.total_bytes > crate::model::MAX_TRANSFER_BYTES
     {
@@ -599,6 +605,19 @@ fn validate_clipboard_event(event: &ClipboardEvent) -> bool {
         return false;
     };
     bytes.len() <= CLIPBOARD_IMAGE_LIMIT && is_valid_png(&bytes)
+}
+
+fn validate_node_info(node: &NodeInfo) -> bool {
+    !node.node_id.trim().is_empty()
+        && node.node_id.len() <= 256
+        && node.node_name.len() <= 256
+        && node.version.len() <= 64
+        && node.addresses.len() <= 32
+        && node.capabilities.len() <= 64
+        && node
+            .capabilities
+            .iter()
+            .all(|capability| !capability.is_empty() && capability.len() <= 128)
 }
 
 fn is_valid_png(bytes: &[u8]) -> bool {
@@ -1539,6 +1558,35 @@ mod tests {
         )
         .await;
         assert!(runtime.clipboard_snapshot().is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn invalid_hello_does_not_register_a_peer() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-invalid-hello-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let result = handle_wire_message(
+            WireMessage::Hello {
+                node: NodeInfo {
+                    node_id: String::new(),
+                    node_name: "peer".to_string(),
+                    version: "test".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    platform: "test".to_string(),
+                    port: 0,
+                    addresses: Vec::new(),
+                    capabilities: Vec::new(),
+                },
+            },
+            &runtime,
+            None,
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(runtime.peers_snapshot().is_empty());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

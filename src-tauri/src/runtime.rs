@@ -2,7 +2,8 @@ use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
     MobileTransferView, MonitorDisplayMode, NodeInfo, PeerInfo, TransferOffer, TransferProgress,
-    TransferStatus, WireMessage, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    TransferStatus, WireMessage, MAX_MOBILE_TRANSFERS_PER_SESSION, METRICS_GPU_CAPABILITY,
+    METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -170,6 +171,7 @@ impl NodeRuntime {
             stopping: AtomicBool::new(false),
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
         }))
     }
@@ -920,6 +922,14 @@ impl NodeRuntime {
             .any(|record| record.offer.transfer_id == offer.transfer_id)
         {
             return Err("手机传输任务已存在".to_string());
+        }
+        if transfers
+            .values()
+            .filter(|record| record.session_id == session_id)
+            .count()
+            >= MAX_MOBILE_TRANSFERS_PER_SESSION
+        {
+            return Err("手机会话传输任务过多".to_string());
         }
         let reserved = transfers
             .values()
@@ -1950,6 +1960,27 @@ mod tests {
                 .as_deref(),
             Some("newer")
         );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn local_clipboard_accepts_png_payloads() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        let event = runtime
+            .create_local_clipboard(None, Some(png))
+            .expect("create image clipboard event");
+        assert!(event.image_png.is_some());
+        assert!(runtime
+            .clipboard_snapshot()
+            .expect("clipboard snapshot")
+            .image_png
+            .is_some());
         let _ = std::fs::remove_dir_all(path);
     }
 }

@@ -348,8 +348,12 @@ async fn run_peer_session(
                                 }
                             }
                             if matches!(message, WireMessage::Pong { .. }) { last_pong = tokio::time::Instant::now(); }
-                            let is_hello = matches!(message, WireMessage::Hello { .. });
-                            let _ = server::handle_wire_message(message, runtime, Some(node_id)).await;
+                            let is_hello = matches!(&message, WireMessage::Hello { .. });
+                            let handled =
+                                server::handle_wire_message(message, runtime, Some(node_id)).await;
+                            if is_hello && handled.is_none() {
+                                break;
+                            }
                             if is_hello && !received_hello {
                                 received_hello = true;
                                 if let Some(snapshot) = runtime.clipboard_snapshot() {
