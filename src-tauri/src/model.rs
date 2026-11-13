@@ -6,6 +6,7 @@ pub const MAX_TRANSFER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const MAX_TRANSFER_ITEMS: usize = 4_096;
 pub const MAX_MOBILE_STAGING_BYTES_PER_SESSION: u64 = MAX_TRANSFER_BYTES;
 pub const MAX_MOBILE_TRANSFERS_PER_SESSION: usize = 256;
+pub const MAX_MOBILE_SESSIONS: usize = 256;
 pub const METRICS_SYSTEM_CAPABILITY: &str = "metrics.system";
 pub const METRICS_GPU_CAPABILITY: &str = "metrics.gpu";
 pub const METRICS_STALE_AFTER_MS: i64 = 5_000;

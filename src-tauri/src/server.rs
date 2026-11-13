@@ -713,13 +713,17 @@ fn progress_counts_match_status(progress: &TransferProgress) -> bool {
 async fn create_mobile_session(
     State(state): State<AppState>,
     Json(payload): Json<MobileSessionCreateRequest>,
-) -> Json<MobileSession> {
+) -> Result<Json<MobileSession>, ApiError> {
     cleanup_mobile_staging(&state).await;
     let label = payload
         .label
         .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| "手机浏览器".to_string());
-    Json(state.runtime.create_mobile_session(label))
+    state
+        .runtime
+        .create_mobile_session(label)
+        .map(Json)
+        .map_err(ApiError::conflict)
 }
 
 async fn list_mobile_sessions(State(state): State<AppState>) -> Json<Vec<MobileSession>> {
@@ -1749,7 +1753,9 @@ mod tests {
             .expect("write static index");
         let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let session = runtime.create_mobile_session("test phone".to_string());
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
         let bytes = b"hello mobile";
         let mut hasher = Sha256::new();
         hasher.update(bytes);

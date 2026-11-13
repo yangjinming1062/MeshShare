@@ -2,8 +2,8 @@ use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
     MobileTransferView, MonitorDisplayMode, NodeInfo, PeerInfo, TransferOffer, TransferProgress,
-    TransferStatus, WireMessage, MAX_MOBILE_TRANSFERS_PER_SESSION, METRICS_GPU_CAPABILITY,
-    METRICS_SYSTEM_CAPABILITY,
+    TransferStatus, WireMessage, MAX_MOBILE_SESSIONS, MAX_MOBILE_TRANSFERS_PER_SESSION,
+    METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -869,8 +869,14 @@ impl NodeRuntime {
         true
     }
 
-    pub fn create_mobile_session(&self, label: String) -> MobileSession {
+    pub fn create_mobile_session(&self, label: String) -> Result<MobileSession, String> {
         let now = now_millis();
+        let mut sessions = self.mobile_sessions.write();
+        sessions
+            .retain(|_, session| now.saturating_sub(session.last_seen_ms) <= MOBILE_SESSION_TTL_MS);
+        if sessions.len() >= MAX_MOBILE_SESSIONS {
+            return Err("手机会话数量已达到上限".to_string());
+        }
         let session = MobileSession {
             session_id: Uuid::new_v4().to_string(),
             node_id: self.node_id(),
@@ -879,10 +885,8 @@ impl NodeRuntime {
             created_at_ms: now,
             last_seen_ms: now,
         };
-        self.mobile_sessions
-            .write()
-            .insert(session.session_id.clone(), session.clone());
-        session
+        sessions.insert(session.session_id.clone(), session.clone());
+        Ok(session)
     }
 
     pub fn touch_mobile_session(&self, session_id: &str) -> Option<MobileSession> {
@@ -1364,8 +1368,8 @@ mod tests {
     use super::{bind_addresses, load_or_create_config, network_addresses_for_bound, NodeRuntime};
     use crate::model::{
         ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
-        TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_STAGING_BYTES_PER_SESSION,
-        METRICS_SYSTEM_CAPABILITY,
+        TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
+        MAX_MOBILE_STAGING_BYTES_PER_SESSION, METRICS_SYSTEM_CAPABILITY,
     };
     use std::path::PathBuf;
     use tokio::sync::mpsc;
@@ -1581,7 +1585,9 @@ mod tests {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let session = runtime.create_mobile_session("test phone".to_string());
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
         let offer = TransferOffer {
             transfer_id: "mobile-transfer".to_string(),
             source_node_id: runtime.node_id(),
@@ -1629,7 +1635,9 @@ mod tests {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let session = runtime.create_mobile_session("test phone".to_string());
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
         let transfer_id = "../outside";
         runtime
             .create_mobile_transfer(&session.session_id, mobile_offer(&runtime, transfer_id, 1))
@@ -1692,7 +1700,9 @@ mod tests {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let session = runtime.create_mobile_session("test phone".to_string());
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
         runtime
             .create_mobile_transfer(
                 &session.session_id,
@@ -1707,11 +1717,29 @@ mod tests {
     }
 
     #[test]
+    fn mobile_sessions_have_a_bounded_active_count() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        for index in 0..MAX_MOBILE_SESSIONS {
+            runtime
+                .create_mobile_session(format!("phone-{index}"))
+                .expect("create mobile session");
+        }
+        assert!(runtime
+            .create_mobile_session("overflow".to_string())
+            .is_err());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn rejected_mobile_transfer_releases_session_quota() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let session = runtime.create_mobile_session("test phone".to_string());
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
         runtime
             .create_mobile_transfer(
                 &session.session_id,
@@ -1747,7 +1775,9 @@ mod tests {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let session = runtime.create_mobile_session("test phone".to_string());
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
         runtime
             .create_mobile_transfer(
                 &session.session_id,
@@ -1786,7 +1816,9 @@ mod tests {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let session = runtime.create_mobile_session("test phone".to_string());
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
         let first_size = MAX_MOBILE_STAGING_BYTES_PER_SESSION - 1;
         let first_offer = TransferOffer {
             transfer_id: "quota-failed".to_string(),
