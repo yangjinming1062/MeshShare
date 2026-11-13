@@ -499,6 +499,14 @@ mod tests {
         .await
         .expect("peer should connect");
 
+        client_runtime
+            .create_local_clipboard_named(
+                Some("reconnect-state".to_string()),
+                None,
+                "client".to_string(),
+            )
+            .expect("create reconnect clipboard state");
+
         server_runtime.stopping.store(true, Ordering::SeqCst);
         server_task.abort();
         let _ = (&mut server_task).await;
@@ -545,6 +553,20 @@ mod tests {
         })
         .await
         .expect("peer should reconnect");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if server_runtime
+                    .clipboard_snapshot()
+                    .is_some_and(|snapshot| snapshot.text.as_deref() == Some("reconnect-state"))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("reconnect should exchange the latest clipboard snapshot");
 
         client_runtime.stopping.store(true, Ordering::SeqCst);
         server_runtime.stopping.store(true, Ordering::SeqCst);
