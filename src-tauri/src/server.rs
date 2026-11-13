@@ -1827,6 +1827,177 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    #[tokio::test]
+    async fn checksum_failure_removes_partial_file_and_fails_transfer() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-upload-failure-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        let destination = data_dir.join("received");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut hasher = Sha256::new();
+        hasher.update(b"expected");
+        let offer = TransferOffer {
+            transfer_id: "checksum-failure".to_string(),
+            source_node_id: "peer".to_string(),
+            source_name: "peer".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "payload.bin".to_string(),
+                relative_path: "payload.bin".to_string(),
+                size: 8,
+                sha256: format!("{:x}", hasher.finalize()),
+                media_type: "application/octet-stream".to_string(),
+                directory: false,
+            }],
+            total_bytes: 8,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime.add_transfer(offer);
+        runtime
+            .set_transfer_acceptance("checksum-failure", destination.clone())
+            .expect("accept transfer");
+
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let response = runtime
+            .http
+            .put(format!(
+                "http://{address}/api/v1/transfers/checksum-failure/items/item"
+            ))
+            .body("wrong")
+            .send()
+            .await
+            .expect("upload wrong payload");
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            runtime
+                .transfer("checksum-failure")
+                .expect("find failed transfer")
+                .progress
+                .status,
+            TransferStatus::Failed
+        );
+        assert!(
+            std::fs::read_dir(&destination)
+                .expect("read destination")
+                .next()
+                .is_none(),
+            "checksum failure must remove partial files"
+        );
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn multi_file_upload_preserves_relative_paths_and_completes_once() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-multi-upload-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        let destination = data_dir.join("received");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let digest = |bytes: &[u8]| {
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            format!("{:x}", hasher.finalize())
+        };
+        let first = b"one";
+        let second = b"two2";
+        let offer = TransferOffer {
+            transfer_id: "multi-upload".to_string(),
+            source_node_id: "peer".to_string(),
+            source_name: "peer".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![
+                TransferItem {
+                    item_id: "first".to_string(),
+                    name: "one.txt".to_string(),
+                    relative_path: "folder/one.txt".to_string(),
+                    size: first.len() as u64,
+                    sha256: digest(first),
+                    media_type: "text/plain".to_string(),
+                    directory: false,
+                },
+                TransferItem {
+                    item_id: "second".to_string(),
+                    name: "two.txt".to_string(),
+                    relative_path: "folder/two.txt".to_string(),
+                    size: second.len() as u64,
+                    sha256: digest(second),
+                    media_type: "text/plain".to_string(),
+                    directory: false,
+                },
+            ],
+            total_bytes: (first.len() + second.len()) as u64,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime.add_transfer(offer);
+        runtime
+            .set_transfer_acceptance("multi-upload", destination.clone())
+            .expect("accept transfer");
+
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        for (item_id, bytes) in [("first", first.as_slice()), ("second", second.as_slice())] {
+            let response = runtime
+                .http
+                .put(format!(
+                    "http://{address}/api/v1/transfers/multi-upload/items/{item_id}"
+                ))
+                .body(bytes.to_vec())
+                .send()
+                .await
+                .expect("upload item");
+            assert!(response.status().is_success());
+        }
+        assert_eq!(
+            runtime
+                .transfer("multi-upload")
+                .expect("find completed transfer")
+                .progress
+                .status,
+            TransferStatus::Completed
+        );
+        assert_eq!(
+            std::fs::read(destination.join("folder/one.txt")).expect("read first file"),
+            first
+        );
+        assert_eq!(
+            std::fs::read(destination.join("folder/two.txt")).expect("read second file"),
+            second
+        );
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn prepare_target_rejects_symlinked_directories() {
