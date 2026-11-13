@@ -74,7 +74,7 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
         .route("/api/v1/transfers/:id/status", get(transfer_status))
         .route("/api/v1/transfers/:id/items/:item_id", put(upload_item))
         .route(
-            "/api/{*path}",
+            "/api/*path",
             get(api_not_found)
                 .post(api_not_found)
                 .put(api_not_found)
