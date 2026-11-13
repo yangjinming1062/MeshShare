@@ -171,6 +171,7 @@ impl NodeRuntime {
             stopping: AtomicBool::new(false),
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
+                .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
         }))
