@@ -28,7 +28,7 @@ npm run dev
 
 ```bash
 cargo install tauri-cli --version '^2'
-cargo tauri dev --manifest-path src-tauri/Cargo.toml
+cargo tauri dev
 ```
 
 前端静态构建和检查：
