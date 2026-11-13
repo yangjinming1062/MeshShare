@@ -413,7 +413,12 @@ async fn run_peer_session(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_http_base_url, websocket_endpoint};
+    use super::{connect_peer, normalize_http_base_url, websocket_endpoint};
+    use crate::runtime::NodeRuntime;
+    use crate::server;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use uuid::Uuid;
 
     #[test]
     fn manual_http_address_becomes_ws_endpoint() {
@@ -442,5 +447,112 @@ mod tests {
         assert!(normalize_http_base_url("http://8.8.8.8").is_err());
         assert!(normalize_http_base_url("http://[::1]").is_err());
         assert!(normalize_http_base_url("http://meshshare.example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn peer_reconnects_after_server_restart() {
+        let server_data =
+            std::env::temp_dir().join(format!("meshshare-reconnect-server-{}", Uuid::new_v4()));
+        let client_data =
+            std::env::temp_dir().join(format!("meshshare-reconnect-client-{}", Uuid::new_v4()));
+        let static_root = server_data.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let server_runtime =
+            NodeRuntime::new(server_data.clone(), 0, env!("CARGO_PKG_VERSION").into())
+                .expect("create server runtime");
+        let client_runtime =
+            NodeRuntime::new(client_data.clone(), 0, env!("CARGO_PKG_VERSION").into())
+                .expect("create client runtime");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind server listener");
+        let address = listener.local_addr().expect("server address");
+        let server_app = server::router(server_runtime.clone(), static_root.clone());
+        let mut server_task = tokio::spawn(async move {
+            axum::serve(listener, server_app)
+                .await
+                .expect("serve server router");
+        });
+        let peer_id = server_runtime.node_id();
+        let client_task = tokio::spawn(connect_peer(
+            client_runtime.clone(),
+            peer_id.clone(),
+            "server".to_string(),
+            format!("ws://{address}/api/v1/ws"),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client_runtime
+                    .peers
+                    .read()
+                    .get(&peer_id)
+                    .is_some_and(|peer| peer.online)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("peer should connect");
+
+        server_runtime.stopping.store(true, Ordering::SeqCst);
+        server_task.abort();
+        let _ = (&mut server_task).await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client_runtime
+                    .peers
+                    .read()
+                    .get(&peer_id)
+                    .map_or(true, |peer| !peer.online)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("peer should be marked offline");
+
+        server_runtime.stopping.store(false, Ordering::SeqCst);
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .expect("rebind server listener");
+        let server_app = server::router(server_runtime.clone(), static_root);
+        server_task = tokio::spawn(async move {
+            axum::serve(listener, server_app)
+                .await
+                .expect("serve restarted router");
+        });
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if client_runtime
+                    .peers
+                    .read()
+                    .get(&peer_id)
+                    .is_some_and(|peer| peer.online)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("peer should reconnect");
+
+        client_runtime.stopping.store(true, Ordering::SeqCst);
+        server_runtime.stopping.store(true, Ordering::SeqCst);
+        client_task.abort();
+        server_task.abort();
+        let _ = client_task.await;
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(server_data);
+        let _ = std::fs::remove_dir_all(client_data);
     }
 }
