@@ -374,10 +374,27 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
     tray.set_menu(Some(menu))?;
     let mut events = runtime.subscribe();
     let metrics_summary_for_task = metrics_summary.clone();
+    let tray_runtime = runtime.clone();
     tauri::async_runtime::spawn(async move {
-        while let Ok(message) = events.recv().await {
-            if let WireMessage::MetricsUpdate { metrics } = message {
-                let _ = metrics_summary_for_task.set_text(format_tray_metrics(&metrics));
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    if tray_runtime
+                        .stopping
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        break;
+                    }
+                }
+                message = events.recv() => {
+                    match message {
+                        Ok(WireMessage::MetricsUpdate { metrics }) => {
+                            let _ = metrics_summary_for_task.set_text(format_tray_metrics(&metrics));
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
             }
         }
     });

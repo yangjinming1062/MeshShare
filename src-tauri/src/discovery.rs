@@ -323,6 +323,11 @@ async fn run_peer_session(
     let mut received_hello = false;
     loop {
         tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+            }
             _ = heartbeat.tick() => {
                 if last_pong.elapsed() > Duration::from_secs(30) {
                     break;
