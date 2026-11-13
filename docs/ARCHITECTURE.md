@@ -6,12 +6,12 @@ MeshShare 是一个在同一局域网内共享短文本、剪贴板内容和文�
 
 当前版本以单房间为边界。服务端绑定一个本地数据目录，重启后仍保留消息、剪贴板快照和已上传文件。多客户端通过 HTTP API 读写状态，通过 Server-Sent Events（SSE）接收变更通知；SSE 断线后由客户端重新拉取完整状态恢复。
 
-这是对参考方案的首版收敛：用一个局域网共享中心和浏览器客户端替代桌面节点全互联、mDNS 和原生剪贴板守护进程。这样手机、平板和三种桌面系统可以立即共用同一客户端，服务端的领域服务与事件边界也为后续增加桌面节点互联保留了位置。
+这是对参考方案的首版收敛：用一个局域网共享中心和原生桌面客户端替代桌面节点全互联、mDNS 和原生剪贴板守护进程；手机和平板仍使用浏览器客户端。这样电脑端不需要再打开浏览器，服务端的领域服务与事件边界也为后续增加桌面节点互联保留了位置。
 
 ## 模块与依赖方向
 
 ```text
-桌面 GUI 启动器 (`meshshare/gui.py`)
+桌面原生客户端 (`meshshare/gui.py`)
        │ 启动/停止
        ▼
 HTTP 服务 (`meshshare/server.py`) ◄──── HTTP/JSON、multipart、SSE ──── 浏览器 PWA (`web/`)
@@ -24,7 +24,7 @@ HTTP 服务 (`meshshare/server.py`) ◄──── HTTP/JSON、multipart、SSE 
 ```
 
 - `meshshare/server.py` 只处理 HTTP 生命周期、路由和序列化，不直接拼接 SQL。
-- `meshshare/gui.py` 管理桌面窗口和服务生命周期；它不复制共享板业务逻辑，移动端仍使用同一浏览器客户端。
+- `meshshare/gui.py` 管理桌面窗口、服务生命周期和共享板交互；移动端仍使用同一 HTTP API 的浏览器客户端。
 - `meshshare/service.py` 定义共享板的命令（新增/删除消息、更新剪贴板、上传/删除文件）和查询，负责输入约束、事务和事件。
 - `meshshare/store.py` 封装 SQLite schema、读写和 revision 分配；revision 单调递增，是客户端同步游标。
 - `meshshare/events.py` 管理进程内订阅者和 SSE 心跳。事件丢失不影响正确性，客户端收到断线或游标不连续时回到 `/api/state`。
