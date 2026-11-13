@@ -37,7 +37,11 @@ npx --yes @tauri-apps/cli@2 dev -- --locked
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 ```
 
-推送 `v*` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 构建各平台的安装包，再逐个上传到该 tag 的 GitHub Release。普通分支推送和 Pull Request 的检查在本地运行。
+推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包，核对 GitHub Release 的附件完整后自动发布。普通分支推送和 Pull Request 的检查在本地运行。
+
+发布说明由 OpenAI 兼容接口根据上一版本到当前 tag 的提交记录生成。`LLM_API_KEY` 取自 Actions Secrets，`LLM_BASE_URL` 和 `LLM_MODEL_NAME` 可配置为 Actions Secrets 或 Variables。生成失败时发布任务等待重跑。
+
+发布失败后可重跑失败的任务，沿用 tag 和已构建的安装包。如果发布任务报告有额外附件，先到对应 Release 核对并清理旧附件，再重跑发布任务。
 
 ## 检查
 

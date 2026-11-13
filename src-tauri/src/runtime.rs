@@ -51,14 +51,14 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
-    pub fn new(data_dir: PathBuf, port: u16) -> anyhow::Result<Arc<Self>> {
+    pub fn new(data_dir: PathBuf, port: u16, version: String) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)?;
         let config = load_or_create_config(&data_dir)?;
         let addresses = network_addresses(port);
         let node = NodeInfo {
             node_id: config.node_id.clone(),
             node_name: config.node_name.clone(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version,
             platform: std::env::consts::OS.to_string(),
             port,
             addresses,
@@ -580,7 +580,8 @@ mod tests {
     #[test]
     fn metrics_are_only_sent_to_capable_peers() {
         let path = temp_data_dir();
-        let runtime = NodeRuntime::new(path.clone(), 0).expect("create runtime");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
         let (tx, mut rx) = mpsc::unbounded_channel();
         runtime.set_peer(test_peer(
             "capable",
@@ -624,7 +625,8 @@ mod tests {
     #[test]
     fn peer_metrics_become_stale_after_timeout() {
         let path = temp_data_dir();
-        let runtime = NodeRuntime::new(path.clone(), 0).expect("create runtime");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
         let mut peer = test_peer("peer", vec![METRICS_SYSTEM_CAPABILITY.to_string()]);
         peer.metrics = Some(HardwareMetrics {
             node_id: "peer".to_string(),

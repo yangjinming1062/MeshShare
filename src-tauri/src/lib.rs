@@ -164,7 +164,11 @@ fn format_rate(value: Option<u64>) -> String {
     }
 }
 
-async fn start_node(data_dir: PathBuf, static_root: PathBuf) -> anyhow::Result<Arc<NodeRuntime>> {
+async fn start_node(
+    data_dir: PathBuf,
+    static_root: PathBuf,
+    version: String,
+) -> anyhow::Result<Arc<NodeRuntime>> {
     let preferred_port = std::env::var("MESHSHARE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -174,7 +178,7 @@ async fn start_node(data_dir: PathBuf, static_root: PathBuf) -> anyhow::Result<A
         Err(_) => tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?,
     };
     let actual_port = listener.local_addr()?.port();
-    let runtime = NodeRuntime::new(data_dir, actual_port)?;
+    let runtime = NodeRuntime::new(data_dir, actual_port, version)?;
     let app = server::router(runtime.clone(), static_root);
     tauri::async_runtime::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -333,8 +337,11 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".meshshare"));
-            let runtime =
-                tauri::async_runtime::block_on(start_node(data_dir, static_root(app.handle())))?;
+            let runtime = tauri::async_runtime::block_on(start_node(
+                data_dir,
+                static_root(app.handle()),
+                app.package_info().version.to_string(),
+            ))?;
             app.manage(ManagedNode {
                 runtime: runtime.clone(),
             });

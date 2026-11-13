@@ -575,7 +575,8 @@ mod tests {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-server-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("create test directory");
-        let runtime = NodeRuntime::new(data_dir.clone(), 0).expect("create runtime");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
         runtime.set_peer(PeerInfo {
             node_id: "peer".to_string(),
             node_name: "peer".to_string(),

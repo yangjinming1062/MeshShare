@@ -7,8 +7,31 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+
 jobs:
+  notes:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Generate Chinese release notes
+        env:
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL || vars.LLM_BASE_URL }}
+          LLM_MODEL_NAME: ${{ secrets.LLM_MODEL_NAME || vars.LLM_MODEL_NAME }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: python3 .github/scripts/gen_release_notes.py "$GITHUB_REF_NAME" release-notes.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
   build:
+    name: Build (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +56,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set application version from tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected a release tag such as v1.2.3"
+            exit 1
+          fi
+          printf '{"version":"%s"}\n' "${GITHUB_REF_NAME#v}" > release-version.json
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -47,7 +78,7 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2' --locked
       - name: Build application
-        run: cargo tauri build
+        run: cargo tauri build --config release-version.json
       - uses: actions/upload-artifact@v4
         with:
           name: MeshShare-${{ matrix.name }}
@@ -55,7 +86,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [notes, build]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -64,9 +95,74 @@ jobs:
         with:
           pattern: MeshShare-*
           path: release-assets
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/download-artifact@v4
         with:
-          generate_release_notes: true
-          files: release-assets/MeshShare-*/**/*
-          fail_on_unmatched_files: true
-          preserve_order: true
+          name: release-notes
+      - name: Publish verified installers
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          shopt -s globstar nullglob
+          if [[ ! -s release-notes.md ]]; then
+            echo "::error::Release notes are missing"
+            exit 1
+          fi
+          version="${GITHUB_REF_NAME#v}"
+          expected=(
+            "MeshShare_${version}_x64-setup.exe"
+            "MeshShare_${version}_x64_en-US.msi"
+            "MeshShare_${version}_x64.dmg"
+            "MeshShare_${version}_aarch64.dmg"
+            "MeshShare_${version}_amd64.AppImage"
+            "MeshShare_${version}_amd64.deb"
+            "MeshShare-${version}-1.x86_64.rpm"
+          )
+          installers=()
+          for name in "${expected[@]}"; do
+            matches=(release-assets/MeshShare-*/**/"$name")
+            if (( ${#matches[@]} != 1 )) || [[ ! -s "${matches[0]}" ]]; then
+              echo "::error::Expected exactly one nonempty installer named $name"
+              exit 1
+            fi
+            installers+=("${matches[0]}")
+          done
+
+          # The release-by-tag endpoint only returns published releases.
+          release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id")
+          if [[ "$release_id" == *$'\n'* ]]; then
+            echo "::error::Multiple releases for $GITHUB_REF_NAME. Resolve the duplicate drafts before retrying."
+            exit 1
+          fi
+          if [[ -z "$release_id" ]]; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+              --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+            release_id=$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq '.databaseId')
+          fi
+
+          assets_url="repos/$GH_REPO/releases/$release_id/assets?per_page=100"
+          existing=$(gh api --paginate "$assets_url" --jq '.[].name')
+          if [[ -n "$existing" ]]; then
+            for name in "${expected[@]}"; do
+              existing=$(awk -v name="$name" '$0 != name' <<< "$existing")
+            done
+            if [[ -n "$existing" ]]; then
+              echo "::error::Unexpected assets in $GITHUB_REF_NAME. Review them before retrying."
+              printf '%s\n' "$existing"
+              exit 1
+            fi
+          fi
+
+          for installer in "${installers[@]}"; do
+            gh release upload "$GITHUB_REF_NAME" --clobber "$installer"
+          done
+
+          uploaded=$(gh api --paginate "$assets_url" --jq '.[] | if .state == "uploaded" and .size > 0 then .name else "Incomplete upload: " + .name end')
+          expected_names=$(printf '%s\n' "${expected[@]}" | sort)
+          if [[ "$(sort <<< "$uploaded")" != "$expected_names" ]]; then
+            echo "::error::Release assets do not match the seven installers for $GITHUB_REF_NAME"
+            exit 1
+          fi
+          gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md --draft=false
