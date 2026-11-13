@@ -243,11 +243,18 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
     let hello = WireMessage::Hello {
         node: runtime.node_info(),
     };
-    let _ = sender
-        .send(axum::extract::ws::Message::Text(
-            serde_json::to_string(&hello).unwrap_or_default(),
-        ))
-        .await;
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send(axum::extract::ws::Message::Text(
+                serde_json::to_string(&hello).unwrap_or_default(),
+            )),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        return;
+    }
     let mut peer_id: Option<String> = None;
     let mut owns_peer_channel = false;
     let mut clipboard_resync = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -299,7 +306,14 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
             }
             outbound = outgoing_rx.recv() => {
                 if let Some(message) = outbound {
-                    if sender.send(axum::extract::ws::Message::Text(serde_json::to_string(&message).unwrap_or_default())).await.is_err() {
+                    if !matches!(
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            sender.send(axum::extract::ws::Message::Text(serde_json::to_string(&message).unwrap_or_default())),
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    ) {
                         break;
                     }
                 }
@@ -328,7 +342,14 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
                         if peer_id.is_some() {
                             continue;
                         }
-                        if sender.send(axum::extract::ws::Message::Text(serde_json::to_string(&message).unwrap_or_default())).await.is_err() {
+                        if !matches!(
+                            tokio::time::timeout(
+                                Duration::from_secs(10),
+                                sender.send(axum::extract::ws::Message::Text(serde_json::to_string(&message).unwrap_or_default())),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
                             break;
                         }
                     }

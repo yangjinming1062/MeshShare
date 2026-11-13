@@ -254,18 +254,19 @@ pub(crate) async fn connect_peer(
         if !runtime.begin_peer_connection(&node_id) {
             return;
         }
-        let connected = match connect_async(&endpoint).await {
-            Ok((socket, _)) => {
-                let Some(connected) =
-                    run_peer_session(&runtime, &node_id, &node_name, &endpoint, socket).await
-                else {
-                    runtime.cancel_peer_connection(&node_id);
-                    return;
-                };
-                connected
-            }
-            Err(_) => false,
-        };
+        let connected =
+            match tokio::time::timeout(Duration::from_secs(5), connect_async(&endpoint)).await {
+                Ok(Ok((socket, _))) => {
+                    let Some(connected) =
+                        run_peer_session(&runtime, &node_id, &node_name, &endpoint, socket).await
+                    else {
+                        runtime.cancel_peer_connection(&node_id);
+                        return;
+                    };
+                    connected
+                }
+                Ok(Err(_)) | Err(_) => false,
+            };
         runtime.remove_peer(&node_id);
         if connected {
             attempt = 0;
@@ -295,14 +296,22 @@ async fn run_peer_session(
     if !runtime.add_peer_channel(node_id.to_string(), tx) {
         return None;
     }
-    let _ = writer
-        .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&WireMessage::Hello {
-                node: runtime.node_info(),
-            })
-            .unwrap_or_default(),
-        ))
-        .await;
+    if !matches!(
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            writer.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::Hello {
+                    node: runtime.node_info(),
+                })
+                .unwrap_or_default(),
+            )),
+        )
+        .await,
+        Ok(Ok(()))
+    ) {
+        runtime.remove_peer(node_id);
+        return Some(false);
+    }
     runtime.set_peer(PeerInfo {
         node_id: node_id.to_string(),
         node_name: node_name.to_string(),
@@ -333,7 +342,14 @@ async fn run_peer_session(
                     break;
                 }
                 let body = serde_json::to_string(&WireMessage::Ping { at_ms: crate::clock::now_millis() }).unwrap_or_default();
-                if writer.send(tokio_tungstenite::tungstenite::Message::Text(body)).await.is_err() { break; }
+                if !matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        writer.send(tokio_tungstenite::tungstenite::Message::Text(body)),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) { break; }
             }
             _ = clipboard_resync.tick() => {
                 let _ = runtime.flush_clipboard_resync(node_id);
@@ -341,7 +357,14 @@ async fn run_peer_session(
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break };
                 let Ok(body) = serde_json::to_string(&message) else { break };
-                if writer.send(tokio_tungstenite::tungstenite::Message::Text(body)).await.is_err() { break; }
+                if !matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        writer.send(tokio_tungstenite::tungstenite::Message::Text(body)),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) { break; }
             }
             inbound = reader.next() => {
                 match inbound {
@@ -368,7 +391,14 @@ async fn run_peer_session(
                         }
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
-                        if writer.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.is_err() { break; }
+                        if !matches!(
+                            tokio::time::timeout(
+                                Duration::from_secs(10),
+                                writer.send(tokio_tungstenite::tungstenite::Message::Pong(payload)),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) { break; }
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
