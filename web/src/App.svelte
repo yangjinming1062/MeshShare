@@ -73,7 +73,13 @@
         await refresh();
         syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
         connectWebSocket();
-        timer = window.setInterval(refresh, 2500);
+        timer = window.setInterval(() => {
+          void refresh().catch((error) => {
+            if (pageStopped) return;
+            status = error instanceof Error ? error.message : '无法刷新节点状态';
+            statusKind = 'error';
+          });
+        }, 2500);
       } catch (error) {
         if (pageStopped) return;
         status = error instanceof Error ? error.message : '无法连接节点';
@@ -96,7 +102,7 @@
     const [nextNode, nextPeers, nextClipboard, nextMetrics] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics()]);
     const nextTransfers = isMobile ? [] : await getTransfers();
     if (isMobile) {
-      mobileTransfers = await getMobileTransfers(mobileSessionId);
+      mobileTransfers = await getMobileTransfersWithRecovery();
     } else {
       mobileSessions = await getMobileSessions();
       mobileTransfers = await getMobileTransfers();
@@ -221,6 +227,19 @@
       return;
     }
     qrData = await QRCode.toDataURL(mobileUrl, { width: 192, margin: 1, color: { dark: '#111827', light: '#ffffff' } });
+  }
+
+  async function getMobileTransfersWithRecovery(): Promise<MobileTransferView[]> {
+    try {
+      return await getMobileTransfers(mobileSessionId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      if (!message.includes('404') && !message.includes('过期')) throw error;
+      mobileSessionId = '';
+      window.sessionStorage.removeItem('meshshare-mobile-session');
+      await ensureMobileSession();
+      return await getMobileTransfers(mobileSessionId);
+    }
   }
 
   async function toggleSync() {

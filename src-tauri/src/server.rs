@@ -1052,16 +1052,25 @@ async fn download_mobile_item(
         item_id.clone(),
     ));
     let stream = futures_util::stream::unfold(
-        (ReaderStream::new(file), completion),
-        |(mut stream, completion)| async move {
+        (ReaderStream::new(file), completion, 0u64),
+        move |(mut stream, completion, sent)| async move {
             match stream.next().await {
                 Some(Ok(chunk)) => {
                     if let Some((runtime, session_id, _, _)) = completion.as_ref() {
                         let _ = runtime.touch_mobile_session(session_id);
                     }
-                    Some((Ok(chunk), (stream, completion)))
+                    let sent = sent.saturating_add(chunk.len() as u64);
+                    let completion = if sent >= size {
+                        if let Some((runtime, _, transfer_id, item_id)) = completion {
+                            let _ = runtime.mark_mobile_item_downloaded(&transfer_id, &item_id);
+                        }
+                        None
+                    } else {
+                        completion
+                    };
+                    Some((Ok(chunk), (stream, completion, sent)))
                 }
-                Some(Err(error)) => Some((Err(error), (stream, None))),
+                Some(Err(error)) => Some((Err(error), (stream, None, sent))),
                 None => {
                     if let Some((runtime, _, transfer_id, item_id)) = completion {
                         let _ = runtime.mark_mobile_item_downloaded(&transfer_id, &item_id);
@@ -1483,10 +1492,11 @@ mod tests {
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, TransferItem,
-        TransferOffer, WireMessage, METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
+        TransferOffer, TransferStatus, WireMessage, METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
     };
     use crate::runtime::NodeRuntime;
     use futures_util::{SinkExt, StreamExt};
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
     use tokio::sync::mpsc;
     use tokio_tungstenite::connect_async;
@@ -1605,6 +1615,94 @@ mod tests {
         assert!(directory.join("complete.bin").exists());
         assert!(!nested.join("upload.meshshare-id.part").exists());
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn mobile_download_marks_completion_after_stream_finishes() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-mobile-download-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime.create_mobile_session("test phone".to_string());
+        let bytes = b"hello mobile";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let offer = TransferOffer {
+            transfer_id: "mobile-download".to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "hello.txt".to_string(),
+                relative_path: "hello.txt".to_string(),
+                size: bytes.len() as u64,
+                sha256: format!("{:x}", hasher.finalize()),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: bytes.len() as u64,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        runtime
+            .set_mobile_transfer_status(
+                "mobile-download",
+                &session.session_id,
+                TransferStatus::Accepted,
+            )
+            .expect("accept mobile transfer");
+        let record = runtime
+            .mobile_transfer("mobile-download")
+            .expect("find mobile transfer");
+        std::fs::create_dir_all(&record.staged_directory).expect("create staged directory");
+        std::fs::write(record.staged_directory.join("hello.txt"), bytes)
+            .expect("write staged file");
+        runtime
+            .stage_mobile_item("mobile-download", "item", bytes.len() as u64)
+            .expect("stage mobile item");
+
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let response = runtime
+            .http
+            .get(format!(
+                "http://{address}/api/v1/mobile/transfers/mobile-download/items/item/download?session_id={}",
+                session.session_id
+            ))
+            .send()
+            .await
+            .expect("download mobile item");
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.bytes().await.expect("read download").as_ref(),
+            bytes
+        );
+        assert_eq!(
+            runtime
+                .mobile_transfer("mobile-download")
+                .expect("find completed transfer")
+                .progress
+                .status,
+            TransferStatus::Completed
+        );
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[cfg(unix)]
