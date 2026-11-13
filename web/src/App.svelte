@@ -36,9 +36,11 @@
   const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[] }>();
   const uploading = new Set<string>();
   const watching = new Set<string>();
-  const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[] }>();
+  const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[]; completedItemIds: Set<string> }>();
   const mobileUploading = new Set<string>();
   const mobileWatching = new Set<string>();
+  const mobileUploadAttempts = new Map<string, number>();
+  const MOBILE_UPLOAD_MAX_ATTEMPTS = 3;
   let pageStopped = false;
 
   $: selectedUrl = selectedAddress || node?.addresses[0]?.url || '';
@@ -419,7 +421,7 @@
         method: 'POST',
         body: JSON.stringify({ session_id: session.session_id, offer }),
       });
-      pendingMobileUploads.set(offer.transfer_id, { files, items });
+      pendingMobileUploads.set(offer.transfer_id, { files, items, completedItemIds: new Set() });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
       void watchMobileTransfer(offer.transfer_id);
       notice = '已发送到手机，等待手机确认';
@@ -438,9 +440,12 @@
         const progress = view.progress;
         const existing = transfers.find((item) => item.transfer_id === id);
         transfers = [{ ...existing, ...progress, direction: 'send' }, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (progress.status === 'accepted' && !mobileUploading.has(id)) await uploadMobileTransfer(id);
+        if (['accepted', 'uploading'].includes(progress.status) && !mobileUploading.has(id)) {
+          await uploadMobileTransfer(id);
+        }
         if (['ready', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
           pendingMobileUploads.delete(id);
+          mobileUploadAttempts.delete(id);
           mobileWatching.delete(id);
           return;
         }
@@ -457,7 +462,12 @@
     if (!pending) return;
     mobileUploading.add(id);
     try {
+      const latest = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
+      if (!latest || ['ready', 'rejected', 'failed', 'cancelled'].includes(latest.progress.status)) return;
       for (const item of pending.items) {
+        // Keep the exact item IDs confirmed by this page. The server also
+        // treats an already-staged item as idempotent after a lost response.
+        if (pending.completedItemIds.has(item.item_id)) continue;
         const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
         const response = await fetch(apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`), {
@@ -466,10 +476,23 @@
           body: file,
         });
         if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `上传失败 (${response.status})`);
+        pending.completedItemIds.add(item.item_id);
       }
+      mobileUploadAttempts.delete(id);
       notice = '文件已准备好，手机可以下载';
     } catch (error) {
-      notice = error instanceof Error ? error.message : '手机文件上传失败';
+      const attempts = (mobileUploadAttempts.get(id) ?? 0) + 1;
+      mobileUploadAttempts.set(id, attempts);
+      const message = error instanceof Error ? error.message : '手机文件上传失败';
+      if (attempts >= MOBILE_UPLOAD_MAX_ATTEMPTS) {
+        await request(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/fail`, {
+          method: 'POST',
+          body: JSON.stringify({ error: message }),
+        }).catch(() => undefined);
+        notice = `${message}，已停止重试`;
+      } else {
+        notice = `${message}，正在重试（${attempts}/${MOBILE_UPLOAD_MAX_ATTEMPTS}）`;
+      }
     } finally {
       mobileUploading.delete(id);
     }

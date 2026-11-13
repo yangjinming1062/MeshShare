@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -90,6 +90,17 @@ fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     }
 }
 
+fn mobile_reserved_bytes(record: &MobileTransferRecord) -> u64 {
+    match &record.progress.status {
+        TransferStatus::Waiting
+        | TransferStatus::Accepted
+        | TransferStatus::Uploading
+        | TransferStatus::Ready => record.offer.total_bytes,
+        TransferStatus::Failed => record.progress.completed_bytes,
+        TransferStatus::Rejected | TransferStatus::Cancelled | TransferStatus::Completed => 0,
+    }
+}
+
 fn is_clipboard_message(message: &WireMessage) -> bool {
     matches!(
         message,
@@ -162,6 +173,23 @@ impl NodeRuntime {
 
     pub fn node_id(&self) -> String {
         self.node.read().node_id.clone()
+    }
+
+    fn mobile_staging_root(&self) -> PathBuf {
+        self.data_dir.join("mobile-transfers")
+    }
+
+    /// Only return directories that are direct children of the staging root.
+    ///
+    /// The path is kept in the in-memory record, so this check is intentionally
+    /// lexical and rejects the root itself, parent components, and nested paths.
+    /// It is the final guard before a cleanup caller performs recursive removal.
+    fn is_mobile_staging_directory(&self, directory: &Path) -> bool {
+        let Ok(relative) = directory.strip_prefix(self.mobile_staging_root()) else {
+            return false;
+        };
+        let mut components = relative.components();
+        matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
     }
 
     pub fn update_addresses(&self) {
@@ -773,7 +801,7 @@ impl NodeRuntime {
             .values()
             .filter(|record| record.session_id == session_id)
             .try_fold(0u64, |total, record| {
-                total.checked_add(record.offer.total_bytes)
+                total.checked_add(mobile_reserved_bytes(record))
             })
             .ok_or_else(|| "手机临时文件超过会话配额".to_string())?;
         if reserved
@@ -785,10 +813,11 @@ impl NodeRuntime {
             return Err("手机临时文件超过会话配额".to_string());
         }
         let progress = transfer_progress(&offer, "receive");
-        let staged_directory = self
-            .data_dir
-            .join("mobile-transfers")
-            .join(&offer.transfer_id);
+        // `transfer_id` is supplied by the peer and is also exposed in the
+        // HTTP API.  Keep it as the protocol key, but never use it as a path
+        // component: a fresh UUID gives every transfer an opaque staging
+        // directory with no traversal or root-directory collision risk.
+        let staged_directory = self.mobile_staging_root().join(Uuid::new_v4().to_string());
         let record = MobileTransferRecord {
             session_id: session_id.to_string(),
             offer,
@@ -830,7 +859,10 @@ impl NodeRuntime {
         }
         expired
             .into_iter()
-            .map(|(_, directory)| directory)
+            .filter_map(|(_, directory)| {
+                self.is_mobile_staging_directory(&directory)
+                    .then_some(directory)
+            })
             .collect()
     }
 
@@ -917,6 +949,18 @@ impl NodeRuntime {
             .iter()
             .find(|item| item.item_id == item_id)?;
         Some(record.staged_directory.join(&item.relative_path))
+    }
+
+    pub fn mobile_item_already_staged(
+        &self,
+        transfer_id: &str,
+        item_id: &str,
+    ) -> Option<MobileTransferView> {
+        let record = self.mobile_transfers.read().get(transfer_id)?.clone();
+        record
+            .staged_items
+            .contains(item_id)
+            .then(|| mobile_view(&record))
     }
 }
 
@@ -1303,6 +1347,57 @@ mod tests {
     }
 
     #[test]
+    fn mobile_transfer_staging_directory_is_internal_and_cleanup_is_bounded() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime.create_mobile_session("test phone".to_string());
+        let transfer_id = "../outside";
+        runtime
+            .create_mobile_transfer(&session.session_id, mobile_offer(&runtime, transfer_id, 1))
+            .expect("create mobile transfer");
+        let record = runtime
+            .mobile_transfer(transfer_id)
+            .expect("find mobile transfer");
+        runtime
+            .create_mobile_transfer(&session.session_id, mobile_offer(&runtime, "", 1))
+            .expect("create empty-id mobile transfer");
+        let empty_id_record = runtime
+            .mobile_transfer("")
+            .expect("find empty-id mobile transfer");
+        let staging_root = path.join("mobile-transfers");
+        assert_eq!(
+            record.staged_directory.parent(),
+            Some(staging_root.as_path())
+        );
+        assert_eq!(
+            empty_id_record.staged_directory.parent(),
+            Some(staging_root.as_path())
+        );
+        assert!(record.staged_directory != staging_root);
+        assert!(empty_id_record.staged_directory != staging_root);
+        assert!(record
+            .staged_directory
+            .file_name()
+            .is_some_and(|name| { Uuid::parse_str(&name.to_string_lossy()).is_ok() }));
+
+        let outside = path.join("outside");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        std::fs::write(outside.join("keep.txt"), b"keep").expect("write outside marker");
+        runtime.mobile_sessions.write().clear();
+        runtime
+            .mobile_transfers
+            .write()
+            .get_mut(transfer_id)
+            .expect("find transfer record")
+            .staged_directory = staging_root.join("..").join("outside");
+        let directories = runtime.prune_mobile_transfers();
+        assert!(directories.iter().all(|directory| directory != &outside));
+        assert!(outside.join("keep.txt").exists());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn startup_removes_stale_mobile_staging_directory() {
         let path = temp_data_dir();
         let staging = path.join("mobile-transfers");
@@ -1330,6 +1425,102 @@ mod tests {
             .create_mobile_transfer(&session.session_id, mobile_offer(&runtime, "quota-over", 1))
             .expect_err("second transfer must exceed session quota");
         assert!(error.contains("配额"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn rejected_mobile_transfer_releases_session_quota() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime.create_mobile_session("test phone".to_string());
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(
+                    &runtime,
+                    "quota-rejected",
+                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
+                ),
+            )
+            .expect("reserve session quota");
+        runtime
+            .set_mobile_transfer_status(
+                "quota-rejected",
+                &session.session_id,
+                TransferStatus::Rejected,
+            )
+            .expect("reject mobile transfer");
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(
+                    &runtime,
+                    "quota-reused",
+                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
+                ),
+            )
+            .expect("rejected transfer no longer reserves quota");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn failed_mobile_transfer_reserves_only_staged_bytes() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime.create_mobile_session("test phone".to_string());
+        let first_size = MAX_MOBILE_STAGING_BYTES_PER_SESSION - 1;
+        let first_offer = TransferOffer {
+            transfer_id: "quota-failed".to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![
+                TransferItem {
+                    item_id: "first".to_string(),
+                    name: "first.bin".to_string(),
+                    relative_path: "first.bin".to_string(),
+                    size: first_size,
+                    sha256: "hash".to_string(),
+                    media_type: "application/octet-stream".to_string(),
+                    directory: false,
+                },
+                TransferItem {
+                    item_id: "second".to_string(),
+                    name: "second.bin".to_string(),
+                    relative_path: "second.bin".to_string(),
+                    size: 1,
+                    sha256: "hash".to_string(),
+                    media_type: "application/octet-stream".to_string(),
+                    directory: false,
+                },
+            ],
+            total_bytes: MAX_MOBILE_STAGING_BYTES_PER_SESSION,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime
+            .create_mobile_transfer(&session.session_id, first_offer)
+            .expect("reserve full session quota");
+        runtime
+            .set_mobile_transfer_status(
+                "quota-failed",
+                &session.session_id,
+                TransferStatus::Accepted,
+            )
+            .expect("accept mobile transfer");
+        runtime
+            .stage_mobile_item("quota-failed", "first", first_size)
+            .expect("stage first item");
+        runtime
+            .fail_mobile_transfer("quota-failed", "network error".to_string())
+            .expect("fail mobile transfer");
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(&runtime, "quota-after-failure", 1),
+            )
+            .expect("failed transfer reserves only staged bytes");
         let _ = std::fs::remove_dir_all(path);
     }
 

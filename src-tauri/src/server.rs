@@ -64,6 +64,11 @@ pub struct MobileSessionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct MobileTransferFailureRequest {
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct MobileTransferCreateRequest {
     pub session_id: String,
     pub offer: TransferOffer,
@@ -105,6 +110,10 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
         .route(
             "/api/v1/mobile/transfers/:id/reject",
             post(reject_mobile_transfer),
+        )
+        .route(
+            "/api/v1/mobile/transfers/:id/fail",
+            post(fail_mobile_transfer),
         )
         .route(
             "/api/v1/mobile/transfers/:id/items/:item_id",
@@ -541,6 +550,36 @@ async fn cleanup_mobile_staging(state: &AppState) {
     }
 }
 
+async fn cleanup_mobile_partial_files(directory: &Path) {
+    let Ok(metadata) = fs::symlink_metadata(directory).await else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    let mut directories = vec![directory.to_path_buf()];
+    while let Some(current) = directories.pop() {
+        let Ok(mut entries) = fs::read_dir(current).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type().await else {
+                continue;
+            };
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".part"))
+            {
+                let _ = fs::remove_file(path).await;
+            }
+        }
+    }
+}
+
 async fn create_mobile_transfer(
     State(state): State<AppState>,
     Json(mut payload): Json<MobileTransferCreateRequest>,
@@ -590,6 +629,30 @@ async fn reject_mobile_transfer(
         .ok_or_else(|| ApiError::not_found("手机传输不存在"))
 }
 
+async fn fail_mobile_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileTransferFailureRequest>,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    let record = state
+        .runtime
+        .mobile_transfer(&id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    if record.offer.source_node_id != state.runtime.node_id() {
+        return Err(ApiError::forbidden("手机传输来源不匹配"));
+    }
+    let message = payload
+        .error
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "手机文件上传失败".to_string());
+    let progress = state
+        .runtime
+        .fail_mobile_transfer(&id, message)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    cleanup_mobile_partial_files(&record.staged_directory).await;
+    Ok(Json(progress))
+}
+
 async fn upload_mobile_item(
     AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
     State(state): State<AppState>,
@@ -618,6 +681,12 @@ async fn upload_mobile_item(
         return Err(ApiError::bad_request("传输路径无效"));
     }
     let _item_lock = TransferItemLock::new(&state.runtime, &transfer_id, &item_id)?;
+    if let Some(progress) = state
+        .runtime
+        .mobile_item_already_staged(&transfer_id, &item_id)
+    {
+        return Ok(Json(progress));
+    }
     fs::create_dir_all(&record.staged_directory)
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -1105,7 +1174,7 @@ fn has_parent_component(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_wire_message, has_parent_component};
+    use super::{cleanup_mobile_partial_files, handle_wire_message, has_parent_component};
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, WireMessage,
         METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
@@ -1122,6 +1191,23 @@ mod tests {
         assert!(has_parent_component("../secret.txt"));
         assert!(has_parent_component("/tmp/secret.txt"));
         assert!(!has_parent_component("folder/secret.txt"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_mobile_partial_files_preserves_completed_files() {
+        let directory =
+            std::env::temp_dir().join(format!("meshshare-partial-test-{}", Uuid::new_v4()));
+        let nested = directory.join("nested");
+        std::fs::create_dir_all(&nested).expect("create partial test directory");
+        std::fs::write(directory.join("complete.bin"), b"complete").expect("write complete file");
+        std::fs::write(nested.join("upload.meshshare-id.part"), b"partial")
+            .expect("write partial file");
+
+        cleanup_mobile_partial_files(&directory).await;
+
+        assert!(directory.join("complete.bin").exists());
+        assert!(!nested.join("upload.meshshare-id.part").exists());
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test]
