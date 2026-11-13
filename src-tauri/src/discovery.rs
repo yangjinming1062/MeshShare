@@ -1,8 +1,9 @@
-use crate::model::{PeerInfo, WireMessage, PROTOCOL_VERSION};
+use crate::model::{NodeInfo, PeerInfo, WireMessage, PROTOCOL_VERSION};
 use crate::runtime::NodeRuntime;
 use crate::server;
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -21,34 +22,25 @@ pub fn start(runtime: Arc<NodeRuntime>) {
             let Ok(daemon) = ServiceDaemon::new() else {
                 return;
             };
-            let host = format!("{}.local.", node.node_id.replace('-', ""));
-            let address = node
-                .addresses
-                .first()
-                .map(|item| item.address.clone())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            let protocol = PROTOCOL_VERSION.to_string();
-            let properties = [
-                ("node_id", node.node_id.as_str()),
-                ("node_name", node.node_name.as_str()),
-                ("protocol", protocol.as_str()),
-                ("features", "clipboard,transfer,web,metrics"),
-            ];
-            if let Ok(info) = ServiceInfo::new(
-                SERVICE_TYPE,
-                &node.node_id,
-                &host,
-                address.as_str(),
-                node.port,
-                &properties[..],
-            ) {
-                let _ = daemon.register(info);
-            }
+            let mut registered_address = register_service(&daemon, &node);
             let Ok(receiver) = daemon.browse(SERVICE_TYPE) else {
                 return;
             };
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                let Ok(event) = receiver.recv() else { break };
+                let event = match receiver.recv_timeout(Duration::from_secs(1)) {
+                    Ok(event) => event,
+                    Err(_) => {
+                        runtime.update_addresses();
+                        let current_node = runtime.node_info();
+                        let current_address = service_address(&current_node);
+                        if current_address != registered_address {
+                            let fullname = format!("{}{}", current_node.node_id, SERVICE_TYPE);
+                            let _ = daemon.unregister(&fullname);
+                            registered_address = register_service(&daemon, &current_node);
+                        }
+                        continue;
+                    }
+                };
                 if let ServiceEvent::ServiceResolved(info) = event {
                     let properties = info.get_properties();
                     let Some(node_id) = properties.iter().find_map(|item| {
@@ -66,7 +58,12 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     if node_id == node.node_id || node.node_id.as_str() > node_id.as_str() {
                         continue;
                     }
-                    let Some(address) = info.get_addresses().iter().next() else {
+                    let Some(address) = info.get_addresses().iter().find_map(|address| {
+                        let IpAddr::V4(address) = address else {
+                            return None;
+                        };
+                        is_allowed_ipv4(*address).then_some(*address)
+                    }) else {
                         continue;
                     };
                     let endpoint = format!("ws://{}:{}/api/v1/ws", address, info.get_port());
@@ -85,6 +82,36 @@ pub fn start(runtime: Arc<NodeRuntime>) {
             let _ = daemon.shutdown();
         })
         .expect("mDNS discovery thread");
+}
+
+fn service_address(node: &NodeInfo) -> Option<String> {
+    node.addresses
+        .iter()
+        .find(|address| address.kind != "loopback")
+        .map(|address| address.address.clone())
+}
+
+fn register_service(daemon: &ServiceDaemon, node: &NodeInfo) -> Option<String> {
+    let address = service_address(node)?;
+    let host = format!("{}.local.", node.node_id.replace('-', ""));
+    let protocol = PROTOCOL_VERSION.to_string();
+    let properties = [
+        ("node_id", node.node_id.as_str()),
+        ("node_name", node.node_name.as_str()),
+        ("protocol", protocol.as_str()),
+        ("features", "clipboard,transfer,web,metrics"),
+    ];
+    let info = ServiceInfo::new(
+        SERVICE_TYPE,
+        &node.node_id,
+        &host,
+        address.as_str(),
+        node.port,
+        &properties[..],
+    )
+    .ok()?;
+    daemon.register(info).ok()?;
+    Some(address)
 }
 
 pub async fn connect_manual(
@@ -114,7 +141,7 @@ pub async fn connect_manual(
         ));
     }
     let endpoint = websocket_endpoint(&base_url)?;
-    let peer = PeerInfo {
+    let mut peer = PeerInfo {
         node_id: node.node_id.clone(),
         node_name: node.node_name.clone(),
         platform: node.platform.clone(),
@@ -128,6 +155,16 @@ pub async fn connect_manual(
         metrics_received_at_ms: None,
         metrics_stale: false,
     };
+    peer.addresses.retain(|address| {
+        address
+            .address
+            .parse::<IpAddr>()
+            .ok()
+            .is_some_and(|address| match address {
+                IpAddr::V4(address) => is_allowed_ipv4(address),
+                IpAddr::V6(_) => false,
+            })
+    });
     runtime.set_peer(peer.clone());
     let runtime_for_task = runtime.clone();
     tokio::spawn(async move {
@@ -142,13 +179,50 @@ fn normalize_http_base_url(value: &str) -> Result<String, String> {
         .trim_end_matches('/')
         .trim_end_matches("/mobile")
         .to_string();
-    let Some((scheme, _)) = base_url.split_once("://") else {
-        return Err("节点地址必须使用 http:// 或 https://".to_string());
-    };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+    let parsed = reqwest::Url::parse(&base_url)
+        .map_err(|_| "节点地址必须使用有效的 http:// 或 https:// 地址".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err("节点地址必须使用 http:// 或 https://".to_string());
     }
-    Ok(base_url)
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("节点地址不能包含用户名或密码".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("节点地址不能包含查询参数或片段".to_string());
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err("节点地址缺少主机名".to_string());
+    };
+    if !is_allowed_manual_host(host) {
+        return Err("节点地址必须是本机、局域网、链路本地或 Tailscale 地址".to_string());
+    }
+    let path = parsed.path().trim_end_matches('/');
+    if !path.is_empty() && path != "/mobile" {
+        return Err("节点地址只能包含根路径或 /mobile".to_string());
+    }
+    let mut normalized = parsed;
+    normalized.set_path("");
+    Ok(normalized.to_string().trim_end_matches('/').to_string())
+}
+
+fn is_allowed_manual_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .ok()
+        .is_some_and(|address| match address {
+            IpAddr::V4(address) => is_allowed_ipv4(address),
+            IpAddr::V6(_) => false,
+        })
+}
+
+fn is_allowed_ipv4(address: Ipv4Addr) -> bool {
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || (u32::from(address) & 0xffc0_0000) == 0x6440_0000
 }
 
 fn websocket_endpoint(base_url: &str) -> Result<String, String> {
@@ -185,6 +259,7 @@ pub(crate) async fn connect_peer(
                 let Some(connected) =
                     run_peer_session(&runtime, &node_id, &node_name, &endpoint, socket).await
                 else {
+                    runtime.cancel_peer_connection(&node_id);
                     return;
                 };
                 connected
@@ -314,11 +389,10 @@ mod tests {
 
     #[test]
     fn manual_https_address_becomes_wss_endpoint() {
-        let base = normalize_http_base_url("https://meshshare.example.test")
-            .expect("normalize https address");
+        let base = normalize_http_base_url("https://100.64.0.2").expect("normalize https address");
         assert_eq!(
             websocket_endpoint(&base).expect("convert websocket address"),
-            "wss://meshshare.example.test/api/v1/ws"
+            "wss://100.64.0.2/api/v1/ws"
         );
     }
 
@@ -326,5 +400,8 @@ mod tests {
     fn manual_address_rejects_non_http_schemes() {
         assert!(normalize_http_base_url("ws://192.168.1.10:37880").is_err());
         assert!(websocket_endpoint("ftp://192.168.1.10:37880").is_err());
+        assert!(normalize_http_base_url("http://8.8.8.8").is_err());
+        assert!(normalize_http_base_url("http://[::1]").is_err());
+        assert!(normalize_http_base_url("http://meshshare.example.test").is_err());
     }
 }

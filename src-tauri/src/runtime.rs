@@ -29,6 +29,7 @@ pub struct TransferRecord {
     pub progress: TransferProgress,
     pub accepted_destination: Option<PathBuf>,
     pub received_items: HashSet<String>,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,7 @@ pub struct MobileTransferRecord {
     pub progress: TransferProgress,
     pub staged_directory: PathBuf,
     pub staged_items: HashSet<String>,
+    pub downloaded_items: HashSet<String>,
 }
 
 pub struct NodeRuntime {
@@ -82,6 +84,11 @@ fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress
 }
 
 const MOBILE_SESSION_TTL_MS: i64 = 90_000;
+const TRANSFER_RETENTION_MS: i64 = 10 * 60 * 1000;
+const TRANSFER_ACTIVITY_TIMEOUT_MS: i64 = 5 * 60 * 1000;
+const MAX_TERMINAL_TRANSFERS: usize = 256;
+const MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION: usize = 128;
+const MAX_SEEN_CLIPBOARD_EVENTS: usize = 4_096;
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     MobileTransferView {
@@ -118,7 +125,7 @@ impl NodeRuntime {
             Err(error) => return Err(error.into()),
         }
         let config = load_or_create_config(&data_dir)?;
-        let addresses = network_addresses(port);
+        let addresses = network_addresses_for_bound(port, &[Ipv4Addr::LOCALHOST]);
         let node = NodeInfo {
             node_id: config.node_id.clone(),
             node_name: config.node_name.clone(),
@@ -148,7 +155,7 @@ impl NodeRuntime {
             mobile_transfers: RwLock::new(HashMap::new()),
             local_metrics: RwLock::new(None),
             monitor_display: RwLock::new(config.monitor_display.clone()),
-            listening_addresses: RwLock::new(None),
+            listening_addresses: RwLock::new(Some(vec![Ipv4Addr::LOCALHOST])),
             config: Mutex::new(config),
             data_dir,
             clipboard_update: Mutex::new(()),
@@ -193,14 +200,12 @@ impl NodeRuntime {
     }
 
     pub fn update_addresses(&self) {
-        let (port, listening_addresses) = {
-            let node = self.node.read();
-            (node.port, self.listening_addresses.read().clone())
-        };
-        let addresses = listening_addresses
-            .as_deref()
-            .map(|items| network_addresses_for_bound(port, items))
-            .unwrap_or_else(|| network_addresses(port));
+        let port = self.node.read().port;
+        let listening_addresses = self.listening_addresses.read().clone();
+        let addresses = network_addresses_for_bound(
+            port,
+            &currently_available_bound_addresses(listening_addresses.as_deref().unwrap_or(&[])),
+        );
         self.node.write().addresses = addresses;
     }
 
@@ -288,6 +293,10 @@ impl NodeRuntime {
         self.peer_channels.lock().remove(node_id);
         self.connecting_peers.lock().remove(node_id);
         self.pending_clipboard_resync.lock().remove(node_id);
+    }
+
+    pub fn cancel_peer_connection(&self, node_id: &str) {
+        self.connecting_peers.lock().remove(node_id);
     }
 
     pub fn begin_peer_connection(&self, node_id: &str) -> bool {
@@ -380,9 +389,7 @@ impl NodeRuntime {
     }
 
     pub fn remove_peer(&self, node_id: &str) {
-        if let Some(peer) = self.peers.write().get_mut(node_id) {
-            peer.online = false;
-        }
+        self.peers.write().remove(node_id);
         self.remove_peer_channel(node_id);
     }
 
@@ -415,6 +422,13 @@ impl NodeRuntime {
         let Some(peer) = peers.get_mut(node_id) else {
             return false;
         };
+        if peer
+            .metrics
+            .as_ref()
+            .is_some_and(|current| metrics.sampled_at_ms < current.sampled_at_ms)
+        {
+            return false;
+        }
         peer.metrics = Some(metrics);
         peer.metrics_received_at_ms = Some(now_millis());
         peer.metrics_stale = false;
@@ -472,6 +486,16 @@ impl NodeRuntime {
             return false;
         }
         seen.insert(event.event_id.clone(), now);
+        while seen.len() > MAX_SEEN_CLIPBOARD_EVENTS {
+            let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, timestamp)| **timestamp)
+                .map(|(event_id, _)| event_id.clone())
+            else {
+                break;
+            };
+            seen.remove(&oldest);
+        }
         let newer = self
             .clipboard
             .read()
@@ -554,30 +578,42 @@ impl NodeRuntime {
 
     pub fn add_transfer(&self, offer: TransferOffer) {
         let progress = transfer_progress(&offer, "receive");
-        self.transfers.write().insert(
+        let mut transfers = self.transfers.write();
+        if transfers.contains_key(&offer.transfer_id) {
+            return;
+        }
+        transfers.insert(
             offer.transfer_id.clone(),
             TransferRecord {
                 offer: offer.clone(),
                 progress: progress.clone(),
                 accepted_destination: None,
                 received_items: HashSet::new(),
+                updated_at_ms: now_millis(),
             },
         );
+        drop(transfers);
         self.publish_event(WireMessage::TransferOffer { offer });
         self.publish_event(WireMessage::TransferProgress { progress });
     }
 
     pub fn add_outgoing_transfer(&self, offer: TransferOffer) -> TransferProgress {
+        let mut transfers = self.transfers.write();
+        if let Some(record) = transfers.get(&offer.transfer_id) {
+            return record.progress.clone();
+        }
         let progress = transfer_progress(&offer, "send");
-        self.transfers.write().insert(
+        transfers.insert(
             offer.transfer_id.clone(),
             TransferRecord {
                 offer,
                 progress: progress.clone(),
                 accepted_destination: None,
                 received_items: HashSet::new(),
+                updated_at_ms: now_millis(),
             },
         );
+        drop(transfers);
         self.publish_event(WireMessage::TransferProgress {
             progress: progress.clone(),
         });
@@ -594,6 +630,7 @@ impl NodeRuntime {
                 record.progress.direction.clone()
             };
             record.progress = progress.clone();
+            record.updated_at_ms = now_millis();
             self.publish_event(WireMessage::TransferProgress { progress });
             return;
         }
@@ -615,6 +652,7 @@ impl NodeRuntime {
             return None;
         }
         record.accepted_destination = Some(destination.clone());
+        record.updated_at_ms = now_millis();
         record.progress.destination = Some(destination.to_string_lossy().to_string());
         record.progress.status = TransferStatus::Accepted;
         record.progress.offer = Some(record.offer.clone());
@@ -639,10 +677,19 @@ impl NodeRuntime {
         ) {
             return None;
         }
+        let item = record
+            .offer
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)?;
+        if item.size != bytes {
+            return None;
+        }
         if record.received_items.insert(item_id.to_string()) {
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
             record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
         }
+        record.updated_at_ms = now_millis();
         if record.progress.completed_items >= record.progress.total_items {
             record.progress.status = TransferStatus::Completed;
         } else {
@@ -672,11 +719,13 @@ impl NodeRuntime {
         }
         record.progress.status = status;
         record.progress.error = Some(message);
+        record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
     }
 
     pub fn transfers_snapshot(&self, status: Option<TransferStatus>) -> Vec<TransferProgress> {
+        self.prune_transfers();
         let mut transfers = self
             .transfers
             .read()
@@ -690,6 +739,50 @@ impl NodeRuntime {
             .collect::<Vec<_>>();
         transfers.sort_by_key(|progress| progress.transfer_id.clone());
         transfers
+    }
+
+    pub fn prune_transfers(&self) {
+        let now = now_millis();
+        let mut transfers = self.transfers.write();
+        let terminal = |status: &TransferStatus| {
+            matches!(
+                status,
+                TransferStatus::Completed
+                    | TransferStatus::Rejected
+                    | TransferStatus::Failed
+                    | TransferStatus::Cancelled
+            )
+        };
+        let mut stale = Vec::new();
+        for record in transfers.values_mut() {
+            if !terminal(&record.progress.status)
+                && now.saturating_sub(record.updated_at_ms) > TRANSFER_ACTIVITY_TIMEOUT_MS
+            {
+                record.progress.status = TransferStatus::Failed;
+                record.progress.error = Some("传输长时间没有进展，已自动失败".to_string());
+                record.progress.offer = Some(record.offer.clone());
+                record.updated_at_ms = now;
+                stale.push(record.progress.clone());
+            }
+        }
+        transfers.retain(|_, record| {
+            !terminal(&record.progress.status)
+                || now.saturating_sub(record.updated_at_ms) <= TRANSFER_RETENTION_MS
+        });
+        let mut terminal_ids = transfers
+            .iter()
+            .filter(|(_, record)| terminal(&record.progress.status))
+            .map(|(id, record)| (id.clone(), record.updated_at_ms))
+            .collect::<Vec<_>>();
+        terminal_ids.sort_by_key(|(_, created_at)| *created_at);
+        let remove_count = terminal_ids.len().saturating_sub(MAX_TERMINAL_TRANSFERS);
+        for (transfer_id, _) in terminal_ids.into_iter().take(remove_count) {
+            transfers.remove(&transfer_id);
+        }
+        drop(transfers);
+        for progress in stale {
+            self.publish_event(WireMessage::TransferProgress { progress });
+        }
     }
 
     pub fn transfer_source_id(&self, transfer_id: &str) -> Option<String> {
@@ -715,6 +808,7 @@ impl NodeRuntime {
             return Some(record.progress.clone());
         }
         record.progress.status = TransferStatus::Accepted;
+        record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
     }
@@ -741,6 +835,36 @@ impl NodeRuntime {
                     TransferStatus::Accepted | TransferStatus::Uploading
                 )
             })
+    }
+
+    pub fn begin_transfer_upload(&self, transfer_id: &str) -> Option<TransferProgress> {
+        let mut transfers = self.transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading
+        ) {
+            return None;
+        }
+        record.progress.status = TransferStatus::Uploading;
+        record.updated_at_ms = now_millis();
+        record.progress.offer = Some(record.offer.clone());
+        Some(record.progress.clone())
+    }
+
+    pub fn touch_transfer_activity(&self, transfer_id: &str) -> bool {
+        let mut transfers = self.transfers.write();
+        let Some(record) = transfers.get_mut(transfer_id) else {
+            return false;
+        };
+        if !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading
+        ) {
+            return false;
+        }
+        record.updated_at_ms = now_millis();
+        true
     }
 
     pub fn create_mobile_session(&self, label: String) -> MobileSession {
@@ -824,6 +948,7 @@ impl NodeRuntime {
             progress,
             staged_directory,
             staged_items: HashSet::new(),
+            downloaded_items: HashSet::new(),
         };
         let view = mobile_view(&record);
         transfers.insert(record.offer.transfer_id.clone(), record);
@@ -849,15 +974,56 @@ impl NodeRuntime {
     pub fn prune_mobile_transfers(&self) -> Vec<PathBuf> {
         let sessions = self.mobile_sessions.read();
         let mut transfers = self.mobile_transfers.write();
-        let expired = transfers
+        let now = now_millis();
+        let terminal = |status: &TransferStatus| {
+            matches!(
+                status,
+                TransferStatus::Completed
+                    | TransferStatus::Rejected
+                    | TransferStatus::Failed
+                    | TransferStatus::Cancelled
+            )
+        };
+        let mut remove = transfers
             .iter()
-            .filter(|(_, record)| !sessions.contains_key(&record.session_id))
+            .filter(|(_, record)| {
+                !sessions.contains_key(&record.session_id)
+                    || (terminal(&record.progress.status)
+                        && now.saturating_sub(record.offer.created_at_ms) > TRANSFER_RETENTION_MS)
+            })
             .map(|(transfer_id, record)| (transfer_id.clone(), record.staged_directory.clone()))
             .collect::<Vec<_>>();
-        for (transfer_id, _) in &expired {
+        let mut terminal_by_session = HashMap::<String, Vec<(String, i64, PathBuf)>>::new();
+        for (transfer_id, record) in transfers.iter() {
+            if sessions.contains_key(&record.session_id) && terminal(&record.progress.status) {
+                terminal_by_session
+                    .entry(record.session_id.clone())
+                    .or_default()
+                    .push((
+                        transfer_id.clone(),
+                        record.offer.created_at_ms,
+                        record.staged_directory.clone(),
+                    ));
+            }
+        }
+        for records in terminal_by_session.values_mut() {
+            records.sort_by_key(|(_, created_at, _)| *created_at);
+            let count = records
+                .len()
+                .saturating_sub(MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION);
+            remove.extend(
+                records
+                    .iter()
+                    .take(count)
+                    .map(|(transfer_id, _, directory)| (transfer_id.clone(), directory.clone())),
+            );
+        }
+        remove.sort_by(|left, right| left.0.cmp(&right.0));
+        remove.dedup_by(|left, right| left.0 == right.0);
+        for (transfer_id, _) in &remove {
             transfers.remove(transfer_id);
         }
-        expired
+        remove
             .into_iter()
             .filter_map(|(_, directory)| {
                 self.is_mobile_staging_directory(&directory)
@@ -908,6 +1074,14 @@ impl NodeRuntime {
         ) {
             return None;
         }
+        let item = record
+            .offer
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)?;
+        if item.size != bytes {
+            return None;
+        }
         if record.staged_items.insert(item_id.to_string()) {
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
             record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
@@ -920,6 +1094,40 @@ impl NodeRuntime {
         Some(mobile_view(record))
     }
 
+    pub fn begin_mobile_upload(&self, transfer_id: &str) -> Option<MobileTransferView> {
+        let mut transfers = self.mobile_transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading
+        ) {
+            return None;
+        }
+        record.progress.status = TransferStatus::Uploading;
+        Some(mobile_view(record))
+    }
+
+    pub fn mark_mobile_item_downloaded(
+        &self,
+        transfer_id: &str,
+        item_id: &str,
+    ) -> Option<MobileTransferView> {
+        let mut transfers = self.mobile_transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if !matches!(
+            record.progress.status,
+            TransferStatus::Ready | TransferStatus::Completed
+        ) || !record.staged_items.contains(item_id)
+        {
+            return None;
+        }
+        record.downloaded_items.insert(item_id.to_string());
+        if record.downloaded_items.len() >= record.progress.total_items {
+            record.progress.status = TransferStatus::Completed;
+        }
+        Some(mobile_view(record))
+    }
+
     pub fn fail_mobile_transfer(
         &self,
         transfer_id: &str,
@@ -929,7 +1137,11 @@ impl NodeRuntime {
         let record = transfers.get_mut(transfer_id)?;
         if matches!(
             record.progress.status,
-            TransferStatus::Ready | TransferStatus::Rejected | TransferStatus::Failed
+            TransferStatus::Ready
+                | TransferStatus::Completed
+                | TransferStatus::Rejected
+                | TransferStatus::Failed
+                | TransferStatus::Cancelled
         ) {
             return Some(mobile_view(record));
         }
@@ -988,63 +1200,6 @@ fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<(
     let path = data_dir.join("node.json");
     std::fs::write(path, serde_json::to_vec_pretty(config)?)?;
     Ok(())
-}
-
-pub fn network_addresses(port: u16) -> Vec<AddressInfo> {
-    let mut addresses = get_if_addrs::get_if_addrs()
-        .map(|items| {
-            items
-                .into_iter()
-                .filter_map(|interface| {
-                    let ip = interface.ip();
-                    match ip {
-                        IpAddr::V4(ipv4) if !ipv4.is_loopback() => {
-                            let address = ipv4.to_string();
-                            let value = u32::from(ipv4);
-                            let tailscale = (value & 0xffc00000) == 0x64400000;
-                            if !ipv4.is_private() && !ipv4.is_link_local() && !tailscale {
-                                return None;
-                            }
-                            let kind = if tailscale {
-                                "tailscale"
-                            } else if ipv4.is_private() {
-                                "lan"
-                            } else {
-                                "network"
-                            };
-                            Some(AddressInfo {
-                                address: address.clone(),
-                                url: format!("http://{address}:{port}"),
-                                label: format!("{} · {}", interface.name, address),
-                                kind: kind.to_string(),
-                            })
-                        }
-                        _ => None,
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    addresses.sort_by(|left, right| {
-        let rank = |kind: &str| match kind {
-            "lan" => 0,
-            "tailscale" => 1,
-            _ => 2,
-        };
-        rank(&left.kind)
-            .cmp(&rank(&right.kind))
-            .then(left.address.cmp(&right.address))
-    });
-    addresses.dedup_by(|left, right| left.address == right.address);
-    if addresses.is_empty() {
-        addresses.push(AddressInfo {
-            address: "127.0.0.1".to_string(),
-            url: format!("http://127.0.0.1:{port}"),
-            label: "本机 · 127.0.0.1".to_string(),
-            kind: "loopback".to_string(),
-        });
-    }
-    addresses
 }
 
 fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
@@ -1123,6 +1278,30 @@ fn network_addresses_for_bound(port: u16, bound: &[Ipv4Addr]) -> Vec<AddressInfo
             label: "本机 · 127.0.0.1".to_string(),
             kind: "loopback".to_string(),
         });
+    }
+    addresses
+}
+
+fn currently_available_bound_addresses(bound: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
+    let Ok(interfaces) = get_if_addrs::get_if_addrs() else {
+        return bound.to_vec();
+    };
+    let available = interfaces
+        .into_iter()
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(address) => Some(address),
+            IpAddr::V6(_) => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut addresses = bound
+        .iter()
+        .copied()
+        .filter(|address| address.is_loopback() || available.contains(address))
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    if addresses.is_empty() {
+        addresses.push(Ipv4Addr::LOCALHOST);
     }
     addresses
 }
@@ -1281,6 +1460,42 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_transfer_offer_does_not_reset_progress() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let offer = mobile_offer(&runtime, "duplicate", 1);
+        runtime.add_transfer(offer.clone());
+        runtime
+            .mark_transfer_accepted("duplicate")
+            .expect("accept transfer");
+        runtime.add_transfer(offer);
+        assert_eq!(
+            runtime
+                .transfer("duplicate")
+                .expect("find transfer")
+                .progress
+                .status,
+            TransferStatus::Accepted
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn disconnect_removes_peer_and_channel_state() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.set_peer(test_peer("peer", Vec::new()));
+        let (tx, _rx) = mpsc::channel(1);
+        runtime.add_peer_channel("peer".to_string(), tx);
+        runtime.remove_peer("peer");
+        assert!(runtime.peers_snapshot().is_empty());
+        assert!(!runtime.send_to_peer("peer", WireMessage::Ping { at_ms: 1 }));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn peer_metrics_become_stale_after_timeout() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
@@ -1340,6 +1555,10 @@ mod tests {
             .stage_mobile_item("mobile-transfer", "item", 3)
             .expect("stage item");
         assert_eq!(ready.progress.status, TransferStatus::Ready);
+        let completed = runtime
+            .mark_mobile_item_downloaded("mobile-transfer", "item")
+            .expect("mark downloaded");
+        assert_eq!(completed.progress.status, TransferStatus::Completed);
         assert!(runtime
             .mobile_item_path("mobile-transfer", "item")
             .is_some());
@@ -1521,6 +1740,56 @@ mod tests {
                 mobile_offer(&runtime, "quota-after-failure", 1),
             )
             .expect("failed transfer reserves only staged bytes");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn old_terminal_transfers_are_pruned() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut offer = mobile_offer(&runtime, "old-terminal", 1);
+        offer.created_at_ms = crate::clock::now_millis() - 11 * 60 * 1000;
+        runtime.add_outgoing_transfer(offer);
+        runtime
+            .fail_transfer(
+                "old-terminal",
+                "done".to_string(),
+                TransferStatus::Cancelled,
+            )
+            .expect("cancel transfer");
+        runtime
+            .transfers
+            .write()
+            .get_mut("old-terminal")
+            .expect("find terminal transfer")
+            .updated_at_ms = crate::clock::now_millis() - 11 * 60 * 1000;
+        runtime.prune_transfers();
+        assert!(runtime.transfer("old-terminal").is_none());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn inactive_transfer_is_failed_by_lifecycle_cleanup() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_outgoing_transfer(mobile_offer(&runtime, "inactive", 1));
+        runtime
+            .transfers
+            .write()
+            .get_mut("inactive")
+            .expect("find transfer")
+            .updated_at_ms = crate::clock::now_millis() - 6 * 60 * 1000;
+        runtime.prune_transfers();
+        assert_eq!(
+            runtime
+                .transfer("inactive")
+                .expect("find failed transfer")
+                .progress
+                .status,
+            TransferStatus::Failed
+        );
         let _ = std::fs::remove_dir_all(path);
     }
 

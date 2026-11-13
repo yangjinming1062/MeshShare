@@ -258,8 +258,19 @@ async fn start_node(
     let app = server::router(runtime.clone(), static_root);
     for listener in listeners {
         let app = app.clone();
+        let shutdown_runtime = runtime.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let shutdown = async move {
+                while !shutdown_runtime
+                    .stopping
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            };
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown)
+                .await;
         });
     }
     let cleanup_runtime = runtime.clone();
@@ -281,6 +292,7 @@ async fn start_node(
                     }
                 }
             }
+            cleanup_runtime.prune_transfers();
         }
     });
     clipboard::start_monitor(runtime.clone());

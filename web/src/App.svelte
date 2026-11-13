@@ -391,8 +391,17 @@
         total_bytes: items.reduce((sum, item) => sum + item.size, 0),
         created_at_ms: Date.now(),
       };
-      await request<TransferProgress>('/api/v1/transfers', { method: 'POST', body: JSON.stringify(offer) }, target);
-      await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
+      const localProgress = await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
+      try {
+        await request<TransferProgress>('/api/v1/transfers', { method: 'POST', body: JSON.stringify(offer) }, target);
+      } catch (error) {
+        if (localProgress) {
+          await invoke('update_transfer_progress', {
+            progress: { ...localProgress, status: 'failed', error: error instanceof Error ? error.message : '无法创建传输' },
+          }).catch(() => undefined);
+        }
+        throw error;
+      }
       pendingUploads.set(offer.transfer_id, { target, files, items });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
       void watchTransfer(offer.transfer_id, target);
@@ -443,7 +452,7 @@
         if (['accepted', 'uploading'].includes(progress.status) && !mobileUploading.has(id)) {
           await uploadMobileTransfer(id);
         }
-        if (['ready', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
+        if (['ready', 'completed', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
           pendingMobileUploads.delete(id);
           mobileUploadAttempts.delete(id);
           mobileWatching.delete(id);
@@ -714,7 +723,7 @@
               <div class="transfer-copy"><strong>{view.progress.offer?.source_name ?? '电脑文件'}</strong><span>{view.progress.offer?.items.map((item) => item.name).join('、') ?? '文件传输'}</span></div>
               <div class="transfer-progress"><div class="progress-track"><div style={`width: ${view.progress.total_bytes ? Math.min(100, view.progress.completed_bytes / view.progress.total_bytes * 100) : 0}%`}></div></div><span>{view.progress.status === 'waiting' ? '等待确认' : view.progress.status === 'accepted' ? '准备中' : view.progress.status === 'ready' ? '可下载' : view.progress.status === 'rejected' ? '已拒绝' : view.progress.error ?? view.progress.status}</span></div>
               {#if view.progress.status === 'waiting'}<div class="transfer-actions"><button class="primary small" on:click={() => acceptMobileTransfer(view)}>接收</button><button class="ghost small" on:click={() => rejectMobileTransfer(view)}>拒绝</button></div>{/if}
-              {#if view.progress.status === 'ready' && mobileSessionId}<div class="mobile-download-list">{#each view.progress.offer?.items ?? [] as item}<a class="download-link" href={mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId)} download={item.name}>下载 {item.name}</a>{/each}</div>{/if}
+              {#if ['ready', 'completed'].includes(view.progress.status) && mobileSessionId}<div class="mobile-download-list">{#each view.progress.offer?.items ?? [] as item}<a class="download-link" href={mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId)} download={item.name}>下载 {item.name}</a>{/each}</div>{/if}
             </article>
           {:else}<div class="empty-state compact">还没有收到文件。</div>{/each}
         </div>
