@@ -2,54 +2,46 @@
 
 <img src="web/public/meshshare.svg" alt="MeshShare 标志" width="96" height="96">
 
-MeshShare 是一个去中心化的局域网跨设备共享工具。每台桌面设备都是平等节点：它们自动发现彼此，复制到一台电脑的文字或图片剪贴板可以直接在另一台电脑粘贴，文件和文件夹则由发送方直接流式传给接收方。
+换到另一台电脑时，刚复制的链接、命令或截图常常还留在原来的设备上。MeshShare 让 Windows、macOS 和 Ubuntu 电脑在局域网里共享剪贴板。
 
-## 使用方式
+在 Windows 上复制链接，切到 Mac 就能直接粘贴。要把手机里的文字发给电脑，扫描桌面端的二维码，在网页里编辑后就能同步。
 
-桌面程序启动后会显示主窗口并常驻系统托盘。主窗口列出当前在线的桌面设备：
+## 项目特点
 
-- 点击设备卡片选择文件或文件夹发送。
-- 把文件或文件夹拖到设备卡片上发送。
-- 接收端确认并选择目录后，文件直接写入目标电脑。
-- 关闭窗口只隐藏窗口，服务仍在后台运行；从托盘菜单选择“退出程序”才会停止节点。
-- 启动后会默认显示独立硬件监控条，持续显示本机 CPU、GPU、内存、显存和网络上下行；托盘菜单可以切换悬浮条、仅托盘或关闭监控。在线设备卡片也会显示对方的实时硬件摘要，打开详情可以查看逐 GPU 信息。
+- **桌面剪贴板自动同步。** 电脑之间共享文字和图片，图片以 PNG 同步。
+- **手机和平板扫码加入。** iPhone、iPad 和 Android 设备直接使用浏览器，按需查看、编辑和同步共享文字。
+- **每台电脑都能独立提供共享服务。** 同一局域网内的电脑自动发现彼此。断开互联网时仍可共享，无需账号或单独部署服务器。
+- **文件直传（设计）。** 把文件或文件夹拖到目标设备卡片，或点击「选择文件」「选择文件夹」。接收方在「传输任务」中确认并选择保存目录，文件直接写入目标电脑。当前接收确认受阻。[已知限制](#已知限制)
 
-主窗口中的“手机扫码访问”区域会列出所有可访问地址，例如物理局域网地址和 Tailscale 地址。切换地址后二维码会同步更新。手机扫描二维码进入 `/mobile` 页面，可以查看在线设备、编辑共享剪贴板并向指定桌面节点发送文件。
-
-## 开发
-
-开发环境需要 Rust、Node.js 和 Tauri 2 依赖：
-
-```bash
-cd web
-npm install
-npm run dev
+```mermaid
+flowchart TB
+    accTitle: 局域网中的 MeshShare 设备
+    accDescr: 手机或平板扫码连接一台电脑，手动共享文字。两台电脑自动同步剪贴板，并采用文件直传设计。
+    Mobile["手机或平板浏览器"] <-->|"扫码后手动共享文字"| A["电脑 A"]
+    A <-->|"自动同步剪贴板"| B["电脑 B"]
+    A <-->|"文件直传（设计）"| B
 ```
 
-另一个终端启动桌面壳：
+## 安装
 
-```bash
-cargo install tauri-cli --version '^2'
-cargo tauri dev
-```
+前往发布页，在最新版本的 **Assets** 中下载对应系统和架构的安装包，安装后打开 MeshShare。桌面构建面向 Windows x64、macOS Intel 和 Apple Silicon、Ubuntu x64。具体安装包以发布页为准。[GitHub Releases](https://github.com/yangjinming1062/MeshShare/releases/latest)
 
-前端静态构建和检查：
+## 快速上手
 
-```bash
-npm --prefix web run check
-npm --prefix web run build
-```
+1. **找到另一台电脑。** 将两台电脑接入同一受信任的局域网并启动 MeshShare。在「在线设备」里确认对方已经出现。
+2. **试一次跨设备粘贴。** 确认发送端显示「自动同步中」，复制一段文字，在另一台电脑上粘贴。也可以在「共享剪贴板」里编辑文字，再点「立即同步当前文字」。
+3. **用手机或平板扫码。** 在电脑端找到「手机扫码访问」，选一个移动设备可访问的地址，再扫描二维码。在网页的「共享剪贴板」里粘贴或编辑文字，点「同步到设备」。要把电脑上的文字带到手机，可以在同一个文本框里选中文字并复制。浏览器允许时，也可使用「读取手机剪贴板」和「写入手机剪贴板」。
 
-Rust 检查：
+关闭主窗口后，MeshShare 仍在系统托盘运行。托盘可隐藏硬件监控悬浮条，也可通过「退出程序」停止共享。在设备卡片上点击「查看监控」，可以查看对方电脑的实时指标。
 
-```bash
-cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml
-```
+## 已知限制
 
-默认节点服务监听 `37880`，如果端口被占用会自动选择空闲端口。服务只面向受信任局域网，不提供账号、配对或公网安全边界；不要把端口直接暴露到互联网。
+- **网络。** 节点服务无需账号或配对，可达的设备可以访问共享内容。请仅在受信任的网络中使用，避免将节点端口暴露到互联网。
+- **剪贴板。** MeshShare 仅保留最新的共享内容。Ubuntu 使用 Wayland 时，自动同步取决于 XWayland 和桌面环境的剪贴板桥接。移动网页的系统剪贴板按钮需要浏览器授权和安全上下文。
+- **文件。** 当前桌面端收到传输请求后无法通过界面确认接收。手机在默认 HTTP 页面上会在文件校验时失败，无法发起传输。手机端接收和下载文件是后续设计目标。
 
-硬件指标只保留当前实时快照并在受信任局域网内通过 WebSocket 共享。CPU、内存和网络指标在支持的平台上持续采集；GPU 利用率和显存受操作系统、驱动及 GPU 类型影响，无法读取时界面会明确显示不可用。
+## 开发与项目文档
 
-架构、协议和体验约束见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、[`docs/ARCHITECTURE_MAP.md`](docs/ARCHITECTURE_MAP.md)、[`docs/PROTOCOL.md`](docs/PROTOCOL.md) 和 [`docs/DESIGN.md`](docs/DESIGN.md)。
+- [开发指南](docs/DEVELOPMENT.md)
+- [产品设计](docs/DESIGN.md)
+- [系统架构](docs/ARCHITECTURE.md) · [架构图谱](docs/ARCHITECTURE_MAP.md) · [通信协议](docs/PROTOCOL.md)

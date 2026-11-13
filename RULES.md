@@ -26,6 +26,8 @@
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | 模块、依赖、状态归属、信任边界和平台支持 |
 | [ARCHITECTURE_MAP.md](docs/ARCHITECTURE_MAP.md) | 项目架构图谱：拓扑、分层、构建与部署图示 |
 | [DESIGN.md](docs/DESIGN.md) | 产品目标、体验取舍、用户可见行为及故障表现 |
+| [DEVELOPMENT.md](docs/DEVELOPMENT.md) | 开发环境、源码启动、构建和验证命令 |
+| [PROTOCOL.md](docs/PROTOCOL.md) | 节点 HTTP 接口、WebSocket 消息及传输约束 |
 | 模块 README | 模块职责、内部约束、任务导航与独有操作 |
 
 同一事实只维护一份完整定义：全局语义与跨主模块契约归 `docs/`，模块共享约束归最近共同父级，局部限制归所属模块。先检索再改写或合并；其他位置只保留不带链接的必要概述，避免重复定义、层层转跳和逐句链接。
