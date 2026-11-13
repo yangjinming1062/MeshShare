@@ -1467,6 +1467,18 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn actual_bind_addresses_accept_ephemeral_listeners_without_wildcards() {
+        for address in bind_addresses() {
+            let listener = std::net::TcpListener::bind((address, 0))
+                .expect("allowed interface address must be bindable");
+            assert_eq!(
+                listener.local_addr().expect("listener address").ip(),
+                address
+            );
+        }
+    }
+
     fn mobile_offer(runtime: &NodeRuntime, transfer_id: &str, total_bytes: u64) -> TransferOffer {
         TransferOffer {
             transfer_id: transfer_id.to_string(),
