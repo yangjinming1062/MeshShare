@@ -43,6 +43,8 @@
 - `TransferProgress` 的 `payload.progress` 包含传输状态、已完成字节和错误。
 - `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
 
+接收端只接受与当前清单总量一致且进度不回退的 `TransferProgress`；终态不会被旧消息覆盖。
+
 剪贴板事件 ID 在节点内存中去重十分钟。节点重启后从空快照开始。
 
 ## 硬件指标

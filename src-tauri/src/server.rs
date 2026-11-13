@@ -497,6 +497,7 @@ pub(crate) async fn handle_wire_message(
                             && progress.total_items == record.offer.items.len()
                             && progress.completed_bytes <= progress.total_bytes
                             && progress.completed_items <= progress.total_items
+                            && progress_is_monotonic(&record.progress, &progress)
                     });
                     if valid {
                         runtime.update_transfer(&transfer_id, progress);
@@ -652,6 +653,52 @@ fn normalize_relative_path(value: &str) -> String {
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn progress_is_monotonic(current: &TransferProgress, next: &TransferProgress) -> bool {
+    if next.completed_bytes < current.completed_bytes
+        || next.completed_items < current.completed_items
+    {
+        return false;
+    }
+    if matches!(
+        current.status,
+        TransferStatus::Completed
+            | TransferStatus::Rejected
+            | TransferStatus::Failed
+            | TransferStatus::Cancelled
+    ) {
+        return next.status == current.status;
+    }
+    match current.status {
+        TransferStatus::Waiting => true,
+        TransferStatus::Accepted => matches!(
+            next.status,
+            TransferStatus::Accepted
+                | TransferStatus::Uploading
+                | TransferStatus::Completed
+                | TransferStatus::Ready
+                | TransferStatus::Rejected
+                | TransferStatus::Failed
+                | TransferStatus::Cancelled
+        ),
+        TransferStatus::Uploading => matches!(
+            next.status,
+            TransferStatus::Uploading
+                | TransferStatus::Completed
+                | TransferStatus::Ready
+                | TransferStatus::Failed
+                | TransferStatus::Cancelled
+        ),
+        TransferStatus::Ready => matches!(
+            next.status,
+            TransferStatus::Ready | TransferStatus::Completed | TransferStatus::Cancelled
+        ),
+        TransferStatus::Rejected
+        | TransferStatus::Failed
+        | TransferStatus::Cancelled
+        | TransferStatus::Completed => false,
+    }
 }
 
 async fn create_mobile_session(
@@ -1045,12 +1092,19 @@ async fn download_mobile_item(
         }
     ))
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    let completion = Some((
-        state.runtime.clone(),
-        session_id.clone(),
-        transfer_id.clone(),
-        item_id.clone(),
-    ));
+    let completion = if size == 0 {
+        let _ = state
+            .runtime
+            .mark_mobile_item_downloaded(&transfer_id, &item_id);
+        None
+    } else {
+        Some((
+            state.runtime.clone(),
+            session_id.clone(),
+            transfer_id.clone(),
+            item_id.clone(),
+        ))
+    };
     let stream = futures_util::stream::unfold(
         (ReaderStream::new(file), completion, 0u64),
         move |(mut stream, completion, sent)| async move {
@@ -1492,7 +1546,8 @@ mod tests {
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, TransferItem,
-        TransferOffer, TransferStatus, WireMessage, METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
+        TransferOffer, TransferProgress, TransferStatus, WireMessage, METRICS_SYSTEM_CAPABILITY,
+        PROTOCOL_VERSION,
     };
     use crate::runtime::NodeRuntime;
     use futures_util::{SinkExt, StreamExt};
@@ -1597,6 +1652,64 @@ mod tests {
         .await;
         assert!(result.is_none());
         assert!(runtime.peers_snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn stale_transfer_progress_cannot_regress_a_terminal_state() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-stale-progress-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let offer = TransferOffer {
+            transfer_id: "progress-order".to_string(),
+            source_node_id: "peer".to_string(),
+            source_name: "peer".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "empty.txt".to_string(),
+                relative_path: "empty.txt".to_string(),
+                size: 0,
+                sha256: "0".repeat(64),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime.add_transfer(offer);
+        runtime
+            .mark_item_received("progress-order", "item", 0)
+            .expect("complete transfer");
+        handle_wire_message(
+            WireMessage::TransferProgress {
+                progress: TransferProgress {
+                    transfer_id: "progress-order".to_string(),
+                    status: TransferStatus::Waiting,
+                    completed_bytes: 0,
+                    total_bytes: 0,
+                    completed_items: 0,
+                    total_items: 1,
+                    destination: None,
+                    error: None,
+                    offer: None,
+                    direction: None,
+                },
+            },
+            &runtime,
+            Some("peer"),
+        )
+        .await;
+        assert_eq!(
+            runtime
+                .transfer("progress-order")
+                .expect("find transfer")
+                .progress
+                .status,
+            TransferStatus::Completed
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
