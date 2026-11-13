@@ -78,7 +78,7 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '^2' --locked
       - name: Build application
-        run: cargo tauri build --config release-version.json
+        run: cargo tauri build --config release-version.json -- --locked
       - uses: actions/upload-artifact@v4
         with:
           name: MeshShare-${{ matrix.name }}
