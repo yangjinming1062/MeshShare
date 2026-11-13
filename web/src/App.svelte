@@ -411,6 +411,9 @@
         created_at_ms: Date.now(),
       };
       const localProgress = await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
+      if (localProgress?.status === 'failed') {
+        throw new Error(localProgress.error ?? '传输任务数量已达到上限');
+      }
       try {
         await request<TransferProgress>('/api/v1/transfers', { method: 'POST', body: JSON.stringify(offer) }, target);
       } catch (error) {
