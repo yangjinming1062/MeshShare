@@ -22,6 +22,7 @@
 | `GET` | `/api/v1/mobile/transfers?session_id=...` | 查询手机会话的下载任务并续期会话 |
 | `POST` | `/api/v1/mobile/transfers/{id}/accept` | 手机确认接收文件 |
 | `POST` | `/api/v1/mobile/transfers/{id}/reject` | 手机拒绝文件 |
+| `POST` | `/api/v1/mobile/transfers/{id}/cancel` | 手机取消未完成或待下载文件 |
 | `POST` | `/api/v1/mobile/transfers/{id}/fail` | 桌面端上传无法恢复时标记失败 |
 | `PUT` | `/api/v1/mobile/transfers/{id}/items/{item_id}` | 桌面端把文件流写入手机临时文件区 |
 | `GET` | `/api/v1/mobile/transfers/{id}/items/{item_id}/download?session_id=...` | 手机按流下载已准备好的文件 |

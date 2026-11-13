@@ -102,7 +102,7 @@
       mobileTransfers = await getMobileTransfers();
       nextTransfers.push(...mobileTransfers.map((view) => ({ ...view.progress, direction: 'send' as const })));
       for (const view of mobileTransfers) {
-        if (!['ready', 'rejected', 'failed', 'cancelled'].includes(view.progress.status) && !mobileWatching.has(view.progress.transfer_id)) {
+        if (!['ready', 'completed', 'rejected', 'failed', 'cancelled'].includes(view.progress.status) && !mobileWatching.has(view.progress.transfer_id)) {
           void watchMobileTransfer(view.progress.transfer_id);
         }
       }
@@ -525,6 +525,15 @@
     await refresh();
   }
 
+  async function cancelMobileTransfer(view: MobileTransferView) {
+    if (!mobileSessionId) return;
+    await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({ session_id: mobileSessionId }),
+    }).catch((error) => { notice = error instanceof Error ? error.message : '无法取消文件'; });
+    await refresh();
+  }
+
   async function watchTransfer(id: string, target: string) {
     if (watching.has(id)) return;
     watching.add(id);
@@ -723,6 +732,7 @@
               <div class="transfer-copy"><strong>{view.progress.offer?.source_name ?? '电脑文件'}</strong><span>{view.progress.offer?.items.map((item) => item.name).join('、') ?? '文件传输'}</span></div>
               <div class="transfer-progress"><div class="progress-track"><div style={`width: ${view.progress.total_bytes ? Math.min(100, view.progress.completed_bytes / view.progress.total_bytes * 100) : 0}%`}></div></div><span>{view.progress.status === 'waiting' ? '等待确认' : view.progress.status === 'accepted' ? '准备中' : view.progress.status === 'ready' ? '可下载' : view.progress.status === 'rejected' ? '已拒绝' : view.progress.error ?? view.progress.status}</span></div>
               {#if view.progress.status === 'waiting'}<div class="transfer-actions"><button class="primary small" on:click={() => acceptMobileTransfer(view)}>接收</button><button class="ghost small" on:click={() => rejectMobileTransfer(view)}>拒绝</button></div>{/if}
+              {#if ['accepted', 'uploading', 'ready'].includes(view.progress.status)}<div class="transfer-actions"><button class="ghost small" on:click={() => cancelMobileTransfer(view)}>取消</button></div>{/if}
               {#if ['ready', 'completed'].includes(view.progress.status) && mobileSessionId}<div class="mobile-download-list">{#each view.progress.offer?.items ?? [] as item}<a class="download-link" href={mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId)} download={item.name}>下载 {item.name}</a>{/each}</div>{/if}
             </article>
           {:else}<div class="empty-state compact">还没有收到文件。</div>{/each}

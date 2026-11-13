@@ -114,6 +114,10 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
             post(reject_mobile_transfer),
         )
         .route(
+            "/api/v1/mobile/transfers/:id/cancel",
+            post(cancel_mobile_transfer),
+        )
+        .route(
             "/api/v1/mobile/transfers/:id/fail",
             post(fail_mobile_transfer),
         )
@@ -751,6 +755,40 @@ async fn reject_mobile_transfer(
         .set_mobile_transfer_status(&id, &payload.session_id, TransferStatus::Rejected)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("手机传输不存在"))
+}
+
+async fn cancel_mobile_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileSessionRequest>,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    state
+        .runtime
+        .touch_mobile_session(&payload.session_id)
+        .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+    let record = state
+        .runtime
+        .mobile_transfer(&id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    let should_cleanup = matches!(
+        record.progress.status,
+        TransferStatus::Waiting
+            | TransferStatus::Accepted
+            | TransferStatus::Uploading
+            | TransferStatus::Ready
+    );
+    let progress = state
+        .runtime
+        .cancel_mobile_transfer(&id, &payload.session_id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    if should_cleanup {
+        if let Err(error) = fs::remove_dir_all(&record.staged_directory).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("清理已取消的手机临时目录失败：{error}");
+            }
+        }
+    }
+    Ok(Json(progress))
 }
 
 async fn fail_mobile_transfer(
@@ -1690,7 +1728,7 @@ mod tests {
             platform: "test".to_string(),
             port: 0,
             addresses: Vec::new(),
-            capabilities: Vec::new(),
+            capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
         };
         socket
             .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1742,6 +1780,45 @@ mod tests {
             ))
             .await
             .expect("send clipboard update");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::ClipboardSnapshot {
+                    snapshot: ClipboardSnapshot {
+                        event_id: "websocket-snapshot".to_string(),
+                        source_node_id: "peer".to_string(),
+                        source_name: "Peer".to_string(),
+                        clock: Hlc {
+                            physical_ms: 31,
+                            logical: 0,
+                            node_id: "peer".to_string(),
+                        },
+                        text: Some("snapshot".to_string()),
+                        image_png: None,
+                        updated_at_ms: 31,
+                    },
+                })
+                .expect("clipboard snapshot"),
+            ))
+            .await
+            .expect("send clipboard snapshot");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::MetricsUpdate {
+                    metrics: HardwareMetrics {
+                        node_id: "peer".to_string(),
+                        sampled_at_ms: 31,
+                        cpu_usage_percent: Some(12.0),
+                        memory_used_bytes: None,
+                        memory_total_bytes: None,
+                        network_down_bytes_per_sec: None,
+                        network_up_bytes_per_sec: None,
+                        gpus: Vec::new(),
+                    },
+                })
+                .expect("metrics update"),
+            ))
+            .await
+            .expect("send metrics update");
         socket
             .send(tokio_tungstenite::tungstenite::Message::Text(
                 serde_json::to_string(&WireMessage::Ping { at_ms: 21 }).expect("ping"),

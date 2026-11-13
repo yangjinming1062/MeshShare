@@ -1060,6 +1060,30 @@ impl NodeRuntime {
         Some(mobile_view(record))
     }
 
+    pub fn cancel_mobile_transfer(
+        &self,
+        transfer_id: &str,
+        session_id: &str,
+    ) -> Option<MobileTransferView> {
+        let mut transfers = self.mobile_transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if record.session_id != session_id {
+            return None;
+        }
+        if matches!(
+            record.progress.status,
+            TransferStatus::Completed
+                | TransferStatus::Rejected
+                | TransferStatus::Failed
+                | TransferStatus::Cancelled
+        ) {
+            return Some(mobile_view(record));
+        }
+        record.progress.status = TransferStatus::Cancelled;
+        record.progress.error = Some("手机传输已取消".to_string());
+        Some(mobile_view(record))
+    }
+
     pub fn stage_mobile_item(
         &self,
         transfer_id: &str,
@@ -1327,7 +1351,7 @@ pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_create_config, network_addresses_for_bound, NodeRuntime};
+    use super::{bind_addresses, load_or_create_config, network_addresses_for_bound, NodeRuntime};
     use crate::model::{
         ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
         TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_STAGING_BYTES_PER_SESSION,
@@ -1379,6 +1403,19 @@ mod tests {
         assert!(addresses
             .iter()
             .any(|address| address.address == "100.64.0.2"));
+    }
+
+    #[test]
+    fn actual_bind_addresses_are_explicit_allowed_ipv4() {
+        let addresses = bind_addresses();
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().all(|address| {
+            !address.is_unspecified()
+                && (address.is_loopback()
+                    || address.is_private()
+                    || address.is_link_local()
+                    || (u32::from(*address) & 0xffc0_0000) == 0x6440_0000)
+        }));
     }
 
     fn mobile_offer(runtime: &NodeRuntime, transfer_id: &str, total_bytes: u64) -> TransferOffer {
@@ -1680,6 +1717,45 @@ mod tests {
                 ),
             )
             .expect("rejected transfer no longer reserves quota");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn cancelled_mobile_transfer_releases_session_quota() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime.create_mobile_session("test phone".to_string());
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(
+                    &runtime,
+                    "quota-cancelled",
+                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
+                ),
+            )
+            .expect("reserve session quota");
+        runtime
+            .set_mobile_transfer_status(
+                "quota-cancelled",
+                &session.session_id,
+                TransferStatus::Accepted,
+            )
+            .expect("accept mobile transfer");
+        runtime
+            .cancel_mobile_transfer("quota-cancelled", &session.session_id)
+            .expect("cancel mobile transfer");
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(
+                    &runtime,
+                    "quota-after-cancel",
+                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
+                ),
+            )
+            .expect("cancelled transfer no longer reserves quota");
         let _ = std::fs::remove_dir_all(path);
     }
 
