@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferProgress } from './types';
+import type { ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress } from './types';
 
 let baseUrl = '';
 
@@ -41,3 +41,7 @@ export const getMetrics = () => request<HardwareMetrics | null>('/api/v1/metrics
 export const getClipboard = () => request<ClipboardSnapshot | null>('/api/v1/clipboard');
 export const getTransfers = (status?: string) => request<TransferProgress[]>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`);
 export const getTransferStatus = (id: string, target?: string) => request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, target);
+export const createMobileSession = (label?: string) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) });
+export const getMobileSessions = () => request<MobileSession[]>('/api/v1/mobile/sessions');
+export const getMobileTransfers = (sessionId?: string) => request<MobileTransferView[]>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`);
+export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}`, target);

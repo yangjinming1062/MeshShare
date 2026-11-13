@@ -16,6 +16,14 @@
 | `POST` | `/api/v1/transfers/{id}/cancel` | 取消任务 |
 | `GET` | `/api/v1/transfers/{id}/status` | 查询进度 |
 | `PUT` | `/api/v1/transfers/{id}/items/{item_id}` | 直接写入单个文件流 |
+| `POST` | `/api/v1/mobile/sessions` | 创建手机接收会话 |
+| `GET` | `/api/v1/mobile/sessions` | 查询本机活跃手机会话 |
+| `POST` | `/api/v1/mobile/transfers` | 为手机会话创建待下载清单 |
+| `GET` | `/api/v1/mobile/transfers?session_id=...` | 查询手机会话的下载任务并续期会话 |
+| `POST` | `/api/v1/mobile/transfers/{id}/accept` | 手机确认接收文件 |
+| `POST` | `/api/v1/mobile/transfers/{id}/reject` | 手机拒绝文件 |
+| `PUT` | `/api/v1/mobile/transfers/{id}/items/{item_id}` | 桌面端把文件流写入手机临时文件区 |
+| `GET` | `/api/v1/mobile/transfers/{id}/items/{item_id}/download?session_id=...` | 手机按流下载已准备好的文件 |
 
 接口业务错误使用 `{ "error": "..." }`。剪贴板查询返回最新快照，文件接口按传输任务查询状态。接收端目录只能由本机 Tauri `accept_transfer` 命令选择并确认。
 
@@ -45,6 +53,10 @@
 
 节点每秒生成一次内存快照。
 
+`TransferStatus::ready` 只用于手机接收：所有清单项目已经在扫码节点的临时文件区校验完成，可以由手机下载。
+
 ## 传输安全约束
 
 `relative_path` 必须是目标目录下的相对路径，禁止盘符、分隔符穿越、`.` 和 `..`。接收端在确认传输存在后逐级检查目录，拒绝符号链接；同一传输项目使用锁避免并发写入。接收端先在最终文件同目录创建随机 `.part` 文件，校验 SHA-256 和清单大小后用不可覆盖的硬链接提交为最终文件名。流读取、写入、校验或提交报错时，接收端会尝试清理临时文件。
+
+手机接收使用扫码节点上的短期会话。桌面端先把文件直接上传到该节点的临时文件区，手机确认后从同一节点通过流式 GET 下载；会话过期后临时目录随任务清理。

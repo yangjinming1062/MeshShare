@@ -28,6 +28,16 @@ pub struct NodeInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileSession {
+    pub session_id: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub label: String,
+    pub created_at_ms: i64,
+    pub last_seen_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub node_id: String,
     pub node_name: String,
@@ -160,8 +170,9 @@ pub struct TransferOffer {
 pub enum TransferStatus {
     Waiting,
     Accepted,
-    Rejected,
     Uploading,
+    Ready,
+    Rejected,
     Completed,
     Failed,
     Cancelled,
@@ -181,6 +192,12 @@ pub struct TransferProgress {
     pub offer: Option<TransferOffer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileTransferView {
+    pub session_id: String,
+    pub progress: TransferProgress,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

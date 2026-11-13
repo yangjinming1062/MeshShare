@@ -11,7 +11,7 @@ flowchart LR
   M["监控悬浮条"] -->|本机快照 HTTP/WS| A
 ```
 
-手机通过可达的桌面节点进入网页，从该节点读取设备列表，也可以选择当前扫码节点作为文件目标。文件传输面向目标节点，手机网页使用分块哈希后直接上传。
+手机通过可达的桌面节点进入网页，从该节点读取设备列表，也可以选择当前扫码节点作为文件目标。手机建立临时接收会话后，桌面端可把文件发送到扫码节点的临时文件区，手机确认后直接从该节点下载；手机网页发送文件仍使用分块哈希直传。
 
 ## 硬件指标同步
 
@@ -61,4 +61,19 @@ sequenceDiagram
   S->>R: PUT transfer item(stream)
   R->>R: 检查路径、临时文件、SHA-256、不可覆盖提交
   R-->>S: progress/status
+```
+
+手机接收流程使用同一节点的临时文件区：
+
+```mermaid
+sequenceDiagram
+  participant P as 手机浏览器
+  participant R as 扫码节点
+  participant U as 桌面端
+  P->>R: 创建并续期 MobileSession
+  U->>R: 创建手机下载清单
+  P->>R: 确认接收
+  U->>R: PUT 文件流并校验
+  P->>R: GET 文件流下载
+  R->>R: 会话过期后清理临时文件
 ```

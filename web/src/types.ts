@@ -16,6 +16,15 @@ export type NodeInfo = {
   capabilities: string[];
 };
 
+export type MobileSession = {
+  session_id: string;
+  node_id: string;
+  node_name: string;
+  label: string;
+  created_at_ms: number;
+  last_seen_ms: number;
+};
+
 export type PeerInfo = {
   node_id: string;
   node_name: string;
@@ -83,7 +92,7 @@ export type TransferOffer = {
   created_at_ms: number;
 };
 
-export type TransferStatus = 'waiting' | 'accepted' | 'rejected' | 'uploading' | 'completed' | 'failed' | 'cancelled';
+export type TransferStatus = 'waiting' | 'accepted' | 'uploading' | 'ready' | 'rejected' | 'completed' | 'failed' | 'cancelled';
 
 export type TransferProgress = {
   transfer_id: string;
@@ -96,6 +105,11 @@ export type TransferProgress = {
   error?: string;
   offer?: TransferOffer;
   direction?: 'send' | 'receive';
+};
+
+export type MobileTransferView = {
+  session_id: string;
+  progress: TransferProgress;
 };
 
 export type WireMessage =

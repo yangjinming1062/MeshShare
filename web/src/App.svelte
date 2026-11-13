@@ -3,9 +3,9 @@
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
-  import { getClipboard, getInfo, getMetrics, getPeers, getTransfers, initApi, request, websocketUrl } from './api';
+  import { apiUrl, createMobileSession, getClipboard, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, websocketUrl } from './api';
   import { digestFile } from './sha256';
-  import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, WireMessage } from './types';
+  import type { ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
@@ -25,13 +25,20 @@
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
   let selectedPeer: PeerInfo | null = null;
+  let selectedMobileSession: MobileSession | null = null;
   let dragPeer = '';
   let notice = '';
   let transfers: TransferProgress[] = [];
+  let mobileSessions: MobileSession[] = [];
+  let mobileTransfers: MobileTransferView[] = [];
+  let mobileSessionId = '';
   let manualAddress = '';
   const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[] }>();
   const uploading = new Set<string>();
   const watching = new Set<string>();
+  const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[] }>();
+  const mobileUploading = new Set<string>();
+  const mobileWatching = new Set<string>();
   let pageStopped = false;
 
   $: selectedUrl = selectedAddress || node?.addresses[0]?.url || '';
@@ -83,7 +90,21 @@
   });
 
   async function refresh() {
-    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextTransfers] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics(), getTransfers()]);
+    if (isMobile && !mobileSessionId) await ensureMobileSession();
+    const [nextNode, nextPeers, nextClipboard, nextMetrics] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics()]);
+    const nextTransfers = isMobile ? [] : await getTransfers();
+    if (isMobile) {
+      mobileTransfers = await getMobileTransfers(mobileSessionId);
+    } else {
+      mobileSessions = await getMobileSessions();
+      mobileTransfers = await getMobileTransfers();
+      nextTransfers.push(...mobileTransfers.map((view) => ({ ...view.progress, direction: 'send' as const })));
+      for (const view of mobileTransfers) {
+        if (!['ready', 'rejected', 'failed', 'cancelled'].includes(view.progress.status) && !mobileWatching.has(view.progress.transfer_id)) {
+          void watchMobileTransfer(view.progress.transfer_id);
+        }
+      }
+    }
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
@@ -103,6 +124,23 @@
     status = '节点在线';
     statusKind = 'ok';
     if (!isMonitor) await refreshQr();
+  }
+
+  async function ensureMobileSession() {
+    if (!isMobile || mobileSessionId) return;
+    const stored = window.sessionStorage.getItem('meshshare-mobile-session');
+    if (stored) {
+      try {
+        await getMobileTransfers(stored);
+        mobileSessionId = stored;
+        return;
+      } catch {
+        window.sessionStorage.removeItem('meshshare-mobile-session');
+      }
+    }
+    const session = await createMobileSession(navigator.userAgent.slice(0, 48));
+    mobileSessionId = session.session_id;
+    window.sessionStorage.setItem('meshshare-mobile-session', mobileSessionId);
   }
 
   function connectWebSocket() {
@@ -245,13 +283,22 @@
 
   function startChoose(peer: PeerInfo, folder = false) {
     selectedPeer = peer;
+    selectedMobileSession = null;
+    if (folder) folderInput?.click();
+    else fileInput?.click();
+  }
+
+  function startChooseMobile(session: MobileSession, folder = false) {
+    selectedMobileSession = session;
+    selectedPeer = null;
     if (folder) folderInput?.click();
     else fileInput?.click();
   }
 
   async function onFileInput(event: Event) {
     const input = event.currentTarget as HTMLInputElement;
-    if (selectedPeer && input.files) await sendFiles(selectedPeer, Array.from(input.files));
+    if (input.files && selectedMobileSession) await sendFilesToMobile(selectedMobileSession, Array.from(input.files));
+    else if (input.files && selectedPeer) await sendFiles(selectedPeer, Array.from(input.files));
     input.value = '';
   }
 
@@ -260,6 +307,12 @@
     dragPeer = '';
     const files = event.dataTransfer ? await filesFromDataTransfer(event.dataTransfer) : [];
     if (files.length) await sendFiles(peer, files);
+  }
+
+  async function onDropMobile(session: MobileSession, event: DragEvent) {
+    event.preventDefault();
+    const files = event.dataTransfer ? await filesFromDataTransfer(event.dataTransfer) : [];
+    if (files.length) await sendFilesToMobile(session, files);
   }
 
   type DropEntry = FileSystemEntry & { isFile: boolean; isDirectory: boolean; file?: (callback: (file: File) => void) => void; createReader?: () => { readEntries: (callback: (entries: DropEntry[]) => void) => void } };
@@ -345,6 +398,99 @@
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法创建传输';
     }
+  }
+
+  async function sendFilesToMobile(session: MobileSession, files: File[]) {
+    if (!node) return;
+    selectedMobileSession = null;
+    notice = `正在准备发送 ${files.length} 个项目…`;
+    try {
+      const items = await Promise.all(files.map(createItem));
+      const offer: TransferOffer = {
+        transfer_id: randomId(),
+        source_node_id: node.node_id,
+        source_name: node.node_name,
+        target_node_id: node.node_id,
+        items,
+        total_bytes: items.reduce((sum, item) => sum + item.size, 0),
+        created_at_ms: Date.now(),
+      };
+      await request<MobileTransferView>('/api/v1/mobile/transfers', {
+        method: 'POST',
+        body: JSON.stringify({ session_id: session.session_id, offer }),
+      });
+      pendingMobileUploads.set(offer.transfer_id, { files, items });
+      transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
+      void watchMobileTransfer(offer.transfer_id);
+      notice = '已发送到手机，等待手机确认';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法发送到手机';
+    }
+  }
+
+  async function watchMobileTransfer(id: string) {
+    if (mobileWatching.has(id)) return;
+    mobileWatching.add(id);
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      try {
+        const view = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
+        if (!view) throw new Error('手机传输任务不存在');
+        const progress = view.progress;
+        const existing = transfers.find((item) => item.transfer_id === id);
+        transfers = [{ ...existing, ...progress, direction: 'send' }, ...transfers.filter((item) => item.transfer_id !== id)];
+        if (progress.status === 'accepted' && !mobileUploading.has(id)) await uploadMobileTransfer(id);
+        if (['ready', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
+          pendingMobileUploads.delete(id);
+          mobileWatching.delete(id);
+          return;
+        }
+      } catch (error) {
+        if (attempt === 179 && error instanceof Error) notice = error.message;
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 800));
+    }
+    mobileWatching.delete(id);
+  }
+
+  async function uploadMobileTransfer(id: string) {
+    const pending = pendingMobileUploads.get(id);
+    if (!pending) return;
+    mobileUploading.add(id);
+    try {
+      for (const item of pending.items) {
+        const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
+        if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
+        const response = await fetch(apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`), {
+          method: 'PUT',
+          headers: { 'Content-Type': item.media_type },
+          body: file,
+        });
+        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `上传失败 (${response.status})`);
+      }
+      notice = '文件已准备好，手机可以下载';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '手机文件上传失败';
+    } finally {
+      mobileUploading.delete(id);
+    }
+  }
+
+  async function acceptMobileTransfer(view: MobileTransferView) {
+    if (!mobileSessionId) return;
+    await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/accept`, {
+      method: 'POST',
+      body: JSON.stringify({ session_id: mobileSessionId }),
+    }).catch((error) => { notice = error instanceof Error ? error.message : '无法接收文件'; });
+    await refresh();
+  }
+
+  async function rejectMobileTransfer(view: MobileTransferView) {
+    if (!mobileSessionId) return;
+    await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ session_id: mobileSessionId }),
+    }).catch((error) => { notice = error instanceof Error ? error.message : '无法拒绝文件'; });
+    await refresh();
   }
 
   async function watchTransfer(id: string, target: string) {
@@ -536,6 +682,20 @@
           {:else}<div class="empty-state">暂时没有发现其他在线桌面设备。</div>{/each}
         </div>
       </section>
+      <section class="panel">
+        <div class="panel-heading"><div><div class="section-kicker">INCOMING FILES</div><h2>收到的文件</h2></div><span class="count-badge">{mobileTransfers.length}</span></div>
+        <div class="transfer-list mobile-transfer-list">
+          {#each mobileTransfers as view}
+            <article class="transfer-row mobile-transfer-row">
+              <div class="transfer-icon">↓</div>
+              <div class="transfer-copy"><strong>{view.progress.offer?.source_name ?? '电脑文件'}</strong><span>{view.progress.offer?.items.map((item) => item.name).join('、') ?? '文件传输'}</span></div>
+              <div class="transfer-progress"><div class="progress-track"><div style={`width: ${view.progress.total_bytes ? Math.min(100, view.progress.completed_bytes / view.progress.total_bytes * 100) : 0}%`}></div></div><span>{view.progress.status === 'waiting' ? '等待确认' : view.progress.status === 'accepted' ? '准备中' : view.progress.status === 'ready' ? '可下载' : view.progress.status === 'rejected' ? '已拒绝' : view.progress.error ?? view.progress.status}</span></div>
+              {#if view.progress.status === 'waiting'}<div class="transfer-actions"><button class="primary small" on:click={() => acceptMobileTransfer(view)}>接收</button><button class="ghost small" on:click={() => rejectMobileTransfer(view)}>拒绝</button></div>{/if}
+              {#if view.progress.status === 'ready' && mobileSessionId}<div class="mobile-download-list">{#each view.progress.offer?.items ?? [] as item}<a class="download-link" href={mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId)} download={item.name}>下载 {item.name}</a>{/each}</div>{/if}
+            </article>
+          {:else}<div class="empty-state compact">还没有收到文件。</div>{/each}
+        </div>
+      </section>
     </main>
   {:else}
     <main class="desktop-main">
@@ -597,6 +757,22 @@
             </article>
           {:else}<div class="empty-state">没有其他在线设备。启动另一台 MeshShare 后，它会自动出现在这里。</div>{/each}
         </div>
+        {#if mobileSessions.length}
+          <div class="mobile-device-list">
+            <div class="section-kicker">MOBILE DEVICES</div>
+            <div class="peer-grid">
+              {#each mobileSessions as session}
+                <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
+                <article role="button" tabindex="0" class="peer-card peer-target mobile-target" on:click={() => startChooseMobile(session)} on:keydown={(event) => event.key === 'Enter' && startChooseMobile(session)} on:dragover|preventDefault on:drop={(event) => onDropMobile(session, event)}>
+                  <div class="peer-icon">手机</div>
+                  <div class="peer-copy"><strong>{session.label}</strong><span>{session.node_name} · 在线</span><small>直接发送到扫码手机</small></div>
+                  <div class="online-mark"></div>
+                  <div class="peer-actions"><button on:click|stopPropagation={() => startChooseMobile(session)}>发送文件</button><button class="ghost" on:click|stopPropagation={() => startChooseMobile(session, true)}>发送文件夹</button></div>
+                </article>
+              {/each}
+            </div>
+          </div>
+        {/if}
       </section>
 
       <section class="panel transfers-panel">

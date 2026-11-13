@@ -1,8 +1,8 @@
 use crate::clipboard;
 use crate::discovery;
 use crate::model::{
-    ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferOffer, TransferProgress,
-    TransferStatus, WireMessage, METRICS_SYSTEM_CAPABILITY,
+    ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo,
+    TransferOffer, TransferProgress, TransferStatus, WireMessage, METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
@@ -21,6 +21,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
+use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -47,6 +48,27 @@ pub struct TransferListQuery {
     pub status: Option<TransferStatus>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct MobileSessionCreateRequest {
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MobileSessionQuery {
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MobileSessionRequest {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MobileTransferCreateRequest {
+    pub session_id: String,
+    pub offer: TransferOffer,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -68,6 +90,30 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
             get(clipboard_state).post(post_clipboard),
         )
         .route("/api/v1/ws", get(websocket))
+        .route(
+            "/api/v1/mobile/sessions",
+            get(list_mobile_sessions).post(create_mobile_session),
+        )
+        .route(
+            "/api/v1/mobile/transfers",
+            get(list_mobile_transfers).post(create_mobile_transfer),
+        )
+        .route(
+            "/api/v1/mobile/transfers/:id/accept",
+            post(accept_mobile_transfer),
+        )
+        .route(
+            "/api/v1/mobile/transfers/:id/reject",
+            post(reject_mobile_transfer),
+        )
+        .route(
+            "/api/v1/mobile/transfers/:id/items/:item_id",
+            put(upload_mobile_item),
+        )
+        .route(
+            "/api/v1/mobile/transfers/:id/items/:item_id/download",
+            get(download_mobile_item),
+        )
         .route(
             "/api/v1/transfers",
             get(list_transfers).post(create_transfer),
@@ -390,6 +436,26 @@ async fn create_transfer(
     State(state): State<AppState>,
     Json(mut offer): Json<TransferOffer>,
 ) -> Result<Json<TransferProgress>, ApiError> {
+    validate_offer(&offer)?;
+    offer.target_node_id = state.runtime.node_id();
+    offer.created_at_ms = crate::clock::now_millis();
+    state.runtime.add_transfer(offer.clone());
+    let progress = state
+        .runtime
+        .transfer(&offer.transfer_id)
+        .map(|record| record.progress)
+        .ok_or_else(|| ApiError::internal("无法创建传输"))?;
+    Ok(Json(progress))
+}
+
+async fn list_transfers(
+    Query(query): Query<TransferListQuery>,
+    State(state): State<AppState>,
+) -> Json<Vec<TransferProgress>> {
+    Json(state.runtime.transfers_snapshot(query.status))
+}
+
+fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
     let listed_bytes = offer
         .items
         .iter()
@@ -411,22 +477,274 @@ async fn create_transfer(
             return Err(ApiError::bad_request("传输清单包含无效项目"));
         }
     }
-    offer.target_node_id = state.runtime.node_id();
-    offer.created_at_ms = crate::clock::now_millis();
-    state.runtime.add_transfer(offer.clone());
-    let progress = state
+    Ok(())
+}
+
+async fn create_mobile_session(
+    State(state): State<AppState>,
+    Json(payload): Json<MobileSessionCreateRequest>,
+) -> Json<MobileSession> {
+    cleanup_mobile_staging(&state).await;
+    let label = payload
+        .label
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| "手机浏览器".to_string());
+    Json(state.runtime.create_mobile_session(label))
+}
+
+async fn list_mobile_sessions(State(state): State<AppState>) -> Json<Vec<MobileSession>> {
+    let sessions = state.runtime.mobile_sessions_snapshot();
+    cleanup_mobile_staging(&state).await;
+    Json(sessions)
+}
+
+async fn list_mobile_transfers(
+    Query(query): Query<MobileSessionQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<MobileTransferView>>, ApiError> {
+    if let Some(session_id) = query.session_id.as_deref() {
+        state
+            .runtime
+            .touch_mobile_session(session_id)
+            .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+    }
+    cleanup_mobile_staging(&state).await;
+    Ok(Json(
+        state
+            .runtime
+            .mobile_transfers_snapshot(query.session_id.as_deref()),
+    ))
+}
+
+async fn cleanup_mobile_staging(state: &AppState) {
+    state.runtime.mobile_sessions_snapshot();
+    for directory in state.runtime.prune_mobile_transfers() {
+        let _ = fs::remove_dir_all(directory).await;
+    }
+}
+
+async fn create_mobile_transfer(
+    State(state): State<AppState>,
+    Json(mut payload): Json<MobileTransferCreateRequest>,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    validate_offer(&payload.offer)?;
+    if payload.offer.source_node_id != state.runtime.node_id() {
+        return Err(ApiError::bad_request("手机下载暂只支持扫码节点上的文件"));
+    }
+    payload.offer.target_node_id = state.runtime.node_id();
+    payload.offer.created_at_ms = crate::clock::now_millis();
+    let view = state
         .runtime
-        .transfer(&offer.transfer_id)
-        .map(|record| record.progress)
-        .ok_or_else(|| ApiError::internal("无法创建传输"))?;
+        .create_mobile_transfer(&payload.session_id, payload.offer)
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(view))
+}
+
+async fn accept_mobile_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileSessionRequest>,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    state
+        .runtime
+        .touch_mobile_session(&payload.session_id)
+        .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+    state
+        .runtime
+        .set_mobile_transfer_status(&id, &payload.session_id, TransferStatus::Accepted)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))
+}
+
+async fn reject_mobile_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileSessionRequest>,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    state
+        .runtime
+        .touch_mobile_session(&payload.session_id)
+        .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+    state
+        .runtime
+        .set_mobile_transfer_status(&id, &payload.session_id, TransferStatus::Rejected)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))
+}
+
+async fn upload_mobile_item(
+    AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    body: Body,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    let record = state
+        .runtime
+        .mobile_transfer(&transfer_id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    if record.offer.source_node_id != state.runtime.node_id()
+        || !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading
+        )
+    {
+        return Err(ApiError::conflict("手机传输尚未被接受"));
+    }
+    let item = record
+        .offer
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)
+        .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
+    if item.directory || has_parent_component(&item.relative_path) || item.relative_path.is_empty()
+    {
+        return Err(ApiError::bad_request("传输路径无效"));
+    }
+    let _item_lock = TransferItemLock::new(&state.runtime, &transfer_id, &item_id)?;
+    fs::create_dir_all(&record.staged_directory)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let target = prepare_target(&record.staged_directory, &item.relative_path).await?;
+    let temp = target.with_extension(format!("meshshare-{}.part", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut stream = body.into_data_stream();
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let stream_result: Result<(u64, String), ApiError> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
+            total = total.saturating_add(chunk.len() as u64);
+            if total > item.size || total > crate::model::MAX_TRANSFER_BYTES {
+                return Err(ApiError::payload_too_large("传输内容超过清单大小"));
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        Ok((total, format!("{:x}", hasher.finalize())))
+    }
+    .await;
+    drop(file);
+    let (total, digest) = match stream_result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(&temp).await;
+            return Err(error);
+        }
+    };
+    if total != item.size || digest != item.sha256 {
+        let _ = fs::remove_file(&temp).await;
+        let _ = state
+            .runtime
+            .fail_mobile_transfer(&transfer_id, "文件校验失败".to_string());
+        return Err(ApiError::bad_request("文件校验失败"));
+    }
+    let target = match prepare_target(&record.staged_directory, &item.relative_path).await {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_file(&temp).await;
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::hard_link(&temp, &target).await {
+        let _ = fs::remove_file(&temp).await;
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(ApiError::conflict(format!(
+                "目标已存在：{}",
+                target.display()
+            )));
+        }
+        return Err(ApiError::internal(error.to_string()));
+    }
+    let _ = fs::remove_file(&temp).await;
+    let Some(progress) = state
+        .runtime
+        .stage_mobile_item(&transfer_id, &item_id, total)
+    else {
+        let _ = fs::remove_file(&target).await;
+        return Err(ApiError::conflict("手机传输已取消或完成"));
+    };
     Ok(Json(progress))
 }
 
-async fn list_transfers(
-    Query(query): Query<TransferListQuery>,
+async fn download_mobile_item(
+    AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
+    Query(query): Query<MobileSessionQuery>,
     State(state): State<AppState>,
-) -> Json<Vec<TransferProgress>> {
-    Json(state.runtime.transfers_snapshot(query.status))
+) -> Result<Response, ApiError> {
+    let session_id = query
+        .session_id
+        .ok_or_else(|| ApiError::bad_request("缺少手机会话"))?;
+    state
+        .runtime
+        .touch_mobile_session(&session_id)
+        .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+    let record = state
+        .runtime
+        .mobile_transfer(&transfer_id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    if record.session_id != session_id {
+        return Err(ApiError::forbidden("手机会话不匹配"));
+    }
+    let item = record
+        .offer
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)
+        .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
+    let path = state
+        .runtime
+        .mobile_item_path(&transfer_id, &item_id)
+        .ok_or_else(|| ApiError::conflict("文件尚未准备好下载"))?;
+    let file = fs::File::open(&path)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .len();
+    let filename = item
+        .name
+        .chars()
+        .map(|value| match value {
+            '"' | '\\' | '\r' | '\n' => '_',
+            value => value,
+        })
+        .collect::<String>();
+    let content_type = HeaderValue::from_str(&item.media_type)
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    let content_disposition = HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}\"",
+        if filename.is_empty() {
+            "download"
+        } else {
+            &filename
+        }
+    ))
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut response = (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CONTENT_LENGTH, HeaderValue::from(size)),
+            (header::CONTENT_DISPOSITION, content_disposition),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Body::from_stream(ReaderStream::new(file)),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 async fn reject_transfer(

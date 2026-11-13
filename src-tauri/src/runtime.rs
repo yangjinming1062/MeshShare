@@ -1,8 +1,8 @@
 use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
-    AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MonitorDisplayMode, NodeInfo,
-    PeerInfo, TransferOffer, TransferProgress, TransferStatus, WireMessage, METRICS_GPU_CAPABILITY,
-    METRICS_SYSTEM_CAPABILITY,
+    AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
+    MobileTransferView, MonitorDisplayMode, NodeInfo, PeerInfo, TransferOffer, TransferProgress,
+    TransferStatus, WireMessage, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -31,12 +31,23 @@ pub struct TransferRecord {
     pub received_items: HashSet<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct MobileTransferRecord {
+    pub session_id: String,
+    pub offer: TransferOffer,
+    pub progress: TransferProgress,
+    pub staged_directory: PathBuf,
+    pub staged_items: HashSet<String>,
+}
+
 pub struct NodeRuntime {
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
     pub clipboard: RwLock<Option<ClipboardSnapshot>>,
     pub peers: RwLock<HashMap<String, PeerInfo>>,
     pub transfers: RwLock<HashMap<String, TransferRecord>>,
+    pub mobile_sessions: RwLock<HashMap<String, MobileSession>>,
+    pub mobile_transfers: RwLock<HashMap<String, MobileTransferRecord>>,
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
     pub monitor_display: RwLock<MonitorDisplayMode>,
     config: Mutex<PersistedConfig>,
@@ -64,6 +75,15 @@ fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress
         error: None,
         offer: Some(offer.clone()),
         direction: Some(direction.to_string()),
+    }
+}
+
+const MOBILE_SESSION_TTL_MS: i64 = 90_000;
+
+fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
+    MobileTransferView {
+        session_id: record.session_id.clone(),
+        progress: record.progress.clone(),
     }
 }
 
@@ -97,6 +117,8 @@ impl NodeRuntime {
             clipboard: RwLock::new(None),
             peers: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
+            mobile_sessions: RwLock::new(HashMap::new()),
+            mobile_transfers: RwLock::new(HashMap::new()),
             local_metrics: RwLock::new(None),
             monitor_display: RwLock::new(config.monitor_display.clone()),
             config: Mutex::new(config),
@@ -495,6 +517,7 @@ impl NodeRuntime {
         if matches!(
             record.progress.status,
             TransferStatus::Completed
+                | TransferStatus::Ready
                 | TransferStatus::Rejected
                 | TransferStatus::Failed
                 | TransferStatus::Cancelled
@@ -525,6 +548,7 @@ impl NodeRuntime {
         if matches!(
             record.progress.status,
             TransferStatus::Completed
+                | TransferStatus::Ready
                 | TransferStatus::Rejected
                 | TransferStatus::Failed
                 | TransferStatus::Cancelled
@@ -602,6 +626,187 @@ impl NodeRuntime {
                     TransferStatus::Accepted | TransferStatus::Uploading
                 )
             })
+    }
+
+    pub fn create_mobile_session(&self, label: String) -> MobileSession {
+        let now = now_millis();
+        let session = MobileSession {
+            session_id: Uuid::new_v4().to_string(),
+            node_id: self.node_id(),
+            node_name: self.node_info().node_name,
+            label,
+            created_at_ms: now,
+            last_seen_ms: now,
+        };
+        self.mobile_sessions
+            .write()
+            .insert(session.session_id.clone(), session.clone());
+        session
+    }
+
+    pub fn touch_mobile_session(&self, session_id: &str) -> Option<MobileSession> {
+        let now = now_millis();
+        let mut sessions = self.mobile_sessions.write();
+        sessions
+            .retain(|_, session| now.saturating_sub(session.last_seen_ms) <= MOBILE_SESSION_TTL_MS);
+        let session = sessions.get_mut(session_id)?;
+        session.last_seen_ms = now;
+        Some(session.clone())
+    }
+
+    pub fn mobile_sessions_snapshot(&self) -> Vec<MobileSession> {
+        let now = now_millis();
+        let mut sessions = self.mobile_sessions.write();
+        sessions
+            .retain(|_, session| now.saturating_sub(session.last_seen_ms) <= MOBILE_SESSION_TTL_MS);
+        let mut result = sessions.values().cloned().collect::<Vec<_>>();
+        result.sort_by_key(|session| session.created_at_ms);
+        result
+    }
+
+    pub fn create_mobile_transfer(
+        &self,
+        session_id: &str,
+        offer: TransferOffer,
+    ) -> Result<MobileTransferView, String> {
+        if self.touch_mobile_session(session_id).is_none() {
+            return Err("手机会话已过期".to_string());
+        }
+        let progress = transfer_progress(&offer, "receive");
+        let staged_directory = self
+            .data_dir
+            .join("mobile-transfers")
+            .join(&offer.transfer_id);
+        let record = MobileTransferRecord {
+            session_id: session_id.to_string(),
+            offer,
+            progress,
+            staged_directory,
+            staged_items: HashSet::new(),
+        };
+        let view = mobile_view(&record);
+        self.mobile_transfers
+            .write()
+            .insert(record.offer.transfer_id.clone(), record);
+        Ok(view)
+    }
+
+    pub fn mobile_transfers_snapshot(&self, session_id: Option<&str>) -> Vec<MobileTransferView> {
+        let mut transfers = self
+            .mobile_transfers
+            .read()
+            .values()
+            .filter(|record| {
+                session_id
+                    .map(|value| value == record.session_id)
+                    .unwrap_or(true)
+            })
+            .map(mobile_view)
+            .collect::<Vec<_>>();
+        transfers.sort_by_key(|view| view.progress.transfer_id.clone());
+        transfers
+    }
+
+    pub fn prune_mobile_transfers(&self) -> Vec<PathBuf> {
+        let sessions = self.mobile_sessions.read();
+        let mut transfers = self.mobile_transfers.write();
+        let expired = transfers
+            .iter()
+            .filter(|(_, record)| !sessions.contains_key(&record.session_id))
+            .map(|(transfer_id, record)| (transfer_id.clone(), record.staged_directory.clone()))
+            .collect::<Vec<_>>();
+        for (transfer_id, _) in &expired {
+            transfers.remove(transfer_id);
+        }
+        expired
+            .into_iter()
+            .map(|(_, directory)| directory)
+            .collect()
+    }
+
+    pub fn mobile_transfer(&self, transfer_id: &str) -> Option<MobileTransferRecord> {
+        self.mobile_transfers.read().get(transfer_id).cloned()
+    }
+
+    pub fn set_mobile_transfer_status(
+        &self,
+        transfer_id: &str,
+        session_id: &str,
+        status: TransferStatus,
+    ) -> Option<MobileTransferView> {
+        let mut transfers = self.mobile_transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if record.session_id != session_id {
+            return None;
+        }
+        if !matches!(status, TransferStatus::Accepted | TransferStatus::Rejected) {
+            return None;
+        }
+        if !matches!(record.progress.status, TransferStatus::Waiting) {
+            return Some(mobile_view(record));
+        }
+        record.progress.status = status.clone();
+        if status == TransferStatus::Rejected {
+            record.progress.error = Some("手机端拒绝了传输".to_string());
+        }
+        Some(mobile_view(record))
+    }
+
+    pub fn stage_mobile_item(
+        &self,
+        transfer_id: &str,
+        item_id: &str,
+        bytes: u64,
+    ) -> Option<MobileTransferView> {
+        let mut transfers = self.mobile_transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading
+        ) {
+            return None;
+        }
+        if record.staged_items.insert(item_id.to_string()) {
+            record.progress.completed_items = record.progress.completed_items.saturating_add(1);
+            record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
+        }
+        record.progress.status = if record.progress.completed_items >= record.progress.total_items {
+            TransferStatus::Ready
+        } else {
+            TransferStatus::Uploading
+        };
+        Some(mobile_view(record))
+    }
+
+    pub fn fail_mobile_transfer(
+        &self,
+        transfer_id: &str,
+        message: String,
+    ) -> Option<MobileTransferView> {
+        let mut transfers = self.mobile_transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if matches!(
+            record.progress.status,
+            TransferStatus::Ready | TransferStatus::Rejected | TransferStatus::Failed
+        ) {
+            return Some(mobile_view(record));
+        }
+        record.progress.status = TransferStatus::Failed;
+        record.progress.error = Some(message);
+        Some(mobile_view(record))
+    }
+
+    pub fn mobile_item_path(&self, transfer_id: &str, item_id: &str) -> Option<PathBuf> {
+        let record = self.mobile_transfers.read().get(transfer_id)?.clone();
+        if !record.staged_items.contains(item_id) {
+            return None;
+        }
+        let item = record
+            .offer
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)?;
+        Some(record.staged_directory.join(&item.relative_path))
     }
 }
 
@@ -711,7 +916,8 @@ pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
 mod tests {
     use super::{load_or_create_config, NodeRuntime};
     use crate::model::{
-        GpuMemoryKind, GpuMetrics, HardwareMetrics, PeerInfo, METRICS_SYSTEM_CAPABILITY,
+        GpuMemoryKind, GpuMetrics, HardwareMetrics, PeerInfo, TransferItem, TransferOffer,
+        TransferStatus, METRICS_SYSTEM_CAPABILITY,
     };
     use std::path::PathBuf;
     use tokio::sync::mpsc;
@@ -817,6 +1023,50 @@ mod tests {
         peer.metrics_received_at_ms = Some(crate::clock::now_millis() - 6_000);
         runtime.set_peer(peer);
         assert!(runtime.peers_snapshot()[0].metrics_stale);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn mobile_transfer_requires_acceptance_and_becomes_ready_after_staging() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime.create_mobile_session("test phone".to_string());
+        let offer = TransferOffer {
+            transfer_id: "mobile-transfer".to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "hello.txt".to_string(),
+                relative_path: "hello.txt".to_string(),
+                size: 3,
+                sha256: "hash".to_string(),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 3,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        let waiting = runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        assert_eq!(waiting.progress.status, TransferStatus::Waiting);
+        runtime
+            .set_mobile_transfer_status(
+                "mobile-transfer",
+                &session.session_id,
+                TransferStatus::Accepted,
+            )
+            .expect("accept mobile transfer");
+        let ready = runtime
+            .stage_mobile_item("mobile-transfer", "item", 3)
+            .expect("stage item");
+        assert_eq!(ready.progress.status, TransferStatus::Ready);
+        assert!(runtime
+            .mobile_item_path("mobile-transfer", "item")
+            .is_some());
         let _ = std::fs::remove_dir_all(path);
     }
 }
