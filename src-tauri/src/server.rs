@@ -715,9 +715,12 @@ async fn download_mobile_item(
     let filename = item
         .name
         .chars()
-        .map(|value| match value {
-            '"' | '\\' | '\r' | '\n' => '_',
-            value => value,
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_' | ' ') {
+                value
+            } else {
+                '_'
+            }
         })
         .collect::<String>();
     let content_type = HeaderValue::from_str(&item.media_type)
