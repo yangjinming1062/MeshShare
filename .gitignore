@@ -1,0 +1,76 @@
+# ---------------------------------------------------------------------------
+# Editor / IDE
+# ---------------------------------------------------------------------------
+.idea/
+.mimocode/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+*~
+.#*
+.mimocode/
+.claude/
+.codex/
+.gemini/
+.mvs-tmp/
+.agents/
+
+# ---------------------------------------------------------------------------
+# Environment & Secrets
+# ---------------------------------------------------------------------------
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.development
+.env.test
+config.toml
+config.toml.local
+# 服务更新器的部署密钥与 known_hosts：仓库工作区保持干净，否则更新预检会因未跟踪文件拒绝推进。
+deploy/
+
+# ---------------------------------------------------------------------------
+# Python Runtime
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+venv.old/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Node / npm / pnpm
+# ---------------------------------------------------------------------------
+node_modules/
+.pnpm-store/
+.npm
+.yarn
+**/*.tsbuildinfo
+.eslintcache
+coverage/
+
+# ---------------------------------------------------------------------------
+# Build Output
+# ---------------------------------------------------------------------------
+# build/ —— client/scripts/write-build-stamp.cjs 写 install-stamp.json（commit/branch/dirty 构建戳）
+build/
+dist/
+dist-electron/
+release/
+
+# ---------------------------------------------------------------------------
+# Database & Cache
+# ---------------------------------------------------------------------------
+*.db
+.pip-cache/
+.uv-cache/
