@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 128 128" role="img" aria-labelledby="title">
+  <title id="title">MeshShare</title>
+  <defs>
+    <linearGradient id="tile" x1="19" y1="8" x2="112" y2="121" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3674ff"/>
+      <stop offset=".55" stop-color="#2854e4"/>
+      <stop offset="1" stop-color="#2039a6"/>
+    </linearGradient>
+  </defs>
+  <rect x="5" y="5" width="118" height="118" rx="29" fill="url(#tile)"/>
+  <rect x="5.75" y="5.75" width="116.5" height="116.5" rx="28.25" fill="none" stroke="#fff" stroke-opacity=".2" stroke-width="1.5"/>
+  <g fill="#f6faff">
+    <path d="M34 89V42L64 69L94 42V89" fill="none" stroke="#f6faff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+    <circle cx="34" cy="42" r="8.5"/>
+    <circle cx="94" cy="42" r="8.5"/>
+  </g>
+  <circle cx="64" cy="69" r="9.5" fill="#99f5dc"/>
+</svg>

@@ -25,7 +25,7 @@ button { border: 0; cursor: pointer; }
 .shell { min-height: 100vh; background: linear-gradient(180deg, #0f172a 0 238px, #f4f7fb 238px 100%); }
 .topbar { max-width: 1240px; height: 92px; margin: 0 auto; padding: 20px 34px; display: flex; align-items: center; justify-content: space-between; color: #fff; }
 .brand-block { display: flex; align-items: center; gap: 12px; }
-.brand-mark { width: 40px; height: 40px; display: grid; place-items: center; border-radius: 13px; background: linear-gradient(135deg, #5f9aff, #2d65ee); color: #fff; font-weight: 900; font-size: 21px; box-shadow: 0 7px 20px #00184f55; }
+.brand-mark { display: block; flex-shrink: 0; }
 .brand-name { font-size: 21px; font-weight: 800; letter-spacing: -.03em; }
 .brand-subtitle { margin-top: 2px; color: #aebbd0; font-size: 12px; }
 .status-pill { display: flex; align-items: center; gap: 8px; color: #b9c7db; font-size: 13px; }
@@ -155,7 +155,7 @@ footer { max-width: 1240px; margin: -8px auto 0; padding: 0 26px 26px; display: 
 .mobile-peers { grid-template-columns: 1fr; }
 
 @media (max-width: 900px) {
-  .shell { background: linear-gradient(180deg, #0f172a 0 210px, #f4f7fb 210px 100%); }
+  .shell:not(.mobile-shell) { background: linear-gradient(180deg, #0f172a 0 210px, #f4f7fb 210px 100%); }
   .topbar { padding: 18px 20px; }
   .desktop-main { padding: 16px 16px 38px; }
   .hero-grid { grid-template-columns: 1fr; }

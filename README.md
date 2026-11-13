@@ -1,5 +1,7 @@
 # MeshShare
 
+<img src="web/public/meshshare.svg" alt="MeshShare 标志" width="96" height="96">
+
 MeshShare 是一个去中心化的局域网跨设备共享工具。每台桌面设备都是平等节点：它们自动发现彼此，复制到一台电脑的文字或图片剪贴板可以直接在另一台电脑粘贴，文件和文件夹则由发送方直接流式传给接收方。
 
 ## 使用方式

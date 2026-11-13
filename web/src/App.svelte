@@ -450,7 +450,7 @@
   {:else}
   <header class="topbar">
     <div class="brand-block">
-      <div class="brand-mark">M</div>
+      <img class="brand-mark" src="/meshshare.svg" width="40" height="40" alt="" />
       <div>
         <div class="brand-name">MeshShare</div>
         <div class="brand-subtitle">{isMobile ? '扫码加入局域网' : '设备之间，直接共享'}</div>

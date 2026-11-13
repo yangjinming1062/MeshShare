@@ -8,12 +8,12 @@ mod model;
 mod runtime;
 mod server;
 
+use anyhow::Context;
 use model::{HardwareMetrics, MonitorDisplayMode, WireMessage};
 use runtime::NodeRuntime;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, State, WindowEvent};
 
 #[derive(Clone)]
@@ -204,7 +204,10 @@ fn static_root(app: &AppHandle) -> PathBuf {
     bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../web/dist"))
 }
 
-fn build_tray(app: &AppHandle, runtime: Arc<NodeRuntime>) -> tauri::Result<()> {
+fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result<()> {
+    let tray = app
+        .tray_by_id("meshshare")
+        .context("MeshShare tray icon is missing")?;
     let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
     let hide = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
     let metrics_summary = MenuItem::with_id(
@@ -252,6 +255,7 @@ fn build_tray(app: &AppHandle, runtime: Arc<NodeRuntime>) -> tauri::Result<()> {
             &exit,
         ],
     )?;
+    tray.set_menu(Some(menu))?;
     let mut events = runtime.subscribe();
     let metrics_summary_for_task = metrics_summary.clone();
     tauri::async_runtime::spawn(async move {
@@ -261,67 +265,63 @@ fn build_tray(app: &AppHandle, runtime: Arc<NodeRuntime>) -> tauri::Result<()> {
             }
         }
     });
-    TrayIconBuilder::with_id("meshshare")
-        .menu(&menu)
-        .show_menu_on_left_click(false)
-        .on_menu_event(|app, event| match event.id().as_ref() {
-            "show" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
+    tray.on_menu_event(|app, event| match event.id().as_ref() {
+        "show" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
             }
-            "hide" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
+        }
+        "hide" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
             }
-            "monitor-show" => {
-                if let Some(window) = app.get_webview_window("monitor") {
-                    let _ = window.show();
-                }
+        }
+        "monitor-show" => {
+            if let Some(window) = app.get_webview_window("monitor") {
+                let _ = window.show();
             }
-            "monitor-hide" => {
-                if let Some(window) = app.get_webview_window("monitor") {
-                    let _ = window.hide();
-                }
+        }
+        "monitor-hide" => {
+            if let Some(window) = app.get_webview_window("monitor") {
+                let _ = window.hide();
             }
-            "monitor-floating" | "monitor-tray" | "monitor-disabled" => {
-                let mode = match event.id().as_ref() {
-                    "monitor-floating" => MonitorDisplayMode::Floating,
-                    "monitor-tray" => MonitorDisplayMode::Tray,
-                    _ => MonitorDisplayMode::Disabled,
-                };
-                if let Some(state) = app.try_state::<ManagedNode>() {
-                    let _ = state.runtime.set_monitor_display_mode(mode.clone());
-                    apply_monitor_mode(app, &mode);
-                }
+        }
+        "monitor-floating" | "monitor-tray" | "monitor-disabled" => {
+            let mode = match event.id().as_ref() {
+                "monitor-floating" => MonitorDisplayMode::Floating,
+                "monitor-tray" => MonitorDisplayMode::Tray,
+                _ => MonitorDisplayMode::Disabled,
+            };
+            if let Some(state) = app.try_state::<ManagedNode>() {
+                let _ = state.runtime.set_monitor_display_mode(mode.clone());
+                apply_monitor_mode(app, &mode);
             }
-            "toggle-sync" => {
-                if let Some(state) = app.try_state::<ManagedNode>() {
-                    let enabled = !state
-                        .runtime
-                        .sync_enabled
-                        .load(std::sync::atomic::Ordering::SeqCst);
-                    state
-                        .runtime
-                        .sync_enabled
-                        .store(enabled, std::sync::atomic::Ordering::SeqCst);
-                }
+        }
+        "toggle-sync" => {
+            if let Some(state) = app.try_state::<ManagedNode>() {
+                let enabled = !state
+                    .runtime
+                    .sync_enabled
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                state
+                    .runtime
+                    .sync_enabled
+                    .store(enabled, std::sync::atomic::Ordering::SeqCst);
             }
-            "exit" => {
-                if let Some(state) = app.try_state::<ManagedNode>() {
-                    state
-                        .runtime
-                        .stopping
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                app.exit(0);
+        }
+        "exit" => {
+            if let Some(state) = app.try_state::<ManagedNode>() {
+                state
+                    .runtime
+                    .stopping
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            _ => {}
-        })
-        .build(app)?;
+            app.exit(0);
+        }
+        _ => {}
+    });
     Ok(())
 }
 
@@ -338,7 +338,7 @@ pub fn run() {
             app.manage(ManagedNode {
                 runtime: runtime.clone(),
             });
-            build_tray(app.handle(), runtime.clone())?;
+            setup_tray_menu(app.handle(), runtime.clone())?;
             apply_monitor_mode(app.handle(), &runtime.monitor_display_mode());
             if let Some(window) = app.get_webview_window("main") {
                 let window_for_close = window.clone();

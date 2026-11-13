@@ -5,5 +5,11 @@
   "display": "standalone",
   "background_color": "#f4f7fb",
   "theme_color": "#0f172a",
-  "icons": []
+  "icons": [
+    {
+      "src": "/meshshare.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
 }
