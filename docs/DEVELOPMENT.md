@@ -37,7 +37,7 @@ npx --yes @tauri-apps/cli@2 dev -- --locked
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 ```
 
-发布安装包的构建配置见 [GitHub Actions 发布工作流](../.github/workflows/release.yml)。
+推送 `v*` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 构建各平台的安装包，再逐个上传到该 tag 的 GitHub Release。普通分支推送和 Pull Request 的检查在本地运行。
 
 ## 检查
 
