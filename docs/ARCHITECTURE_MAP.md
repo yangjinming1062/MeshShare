@@ -1,52 +1,40 @@
 # MeshShare 架构图谱
 
-## 运行拓扑
+## 节点拓扑
 
 ```mermaid
 flowchart LR
-  H[主持设备\nPython 服务] -->|HTTP :8765| A[手机浏览器]
-  H -->|HTTP :8765| B[笔记本浏览器]
-  H -->|HTTP :8765| C[平板浏览器]
-  H --> D[(SQLite\n共享状态)]
-  H --> E[(data/files\n文件内容)]
+  A[桌面节点 A\nRust + Tauri] <-->|mDNS / WebSocket| B[桌面节点 B\nRust + Tauri]
+  A <-->|HTTP 直传| B
+  P[手机浏览器] -->|扫码 HTTP/WS| A
+  P -->|选择目标后直传| B
 ```
 
-主持设备和客户端必须在可互通的局域网/VLAN 中。服务只监听局域网接口，客户端不直接互相连接。
+手机通过任意可达节点进入网页。设备列表和传输目标来自节点发现结果；文件内容不会写入共享中心。
 
-## 请求与同步
+## 剪贴板同步
 
 ```mermaid
 sequenceDiagram
-  participant C as 客户端
-  participant S as 服务端
-  participant DB as SQLite
-  C->>S: GET /api/state
-  S->>DB: 读取快照与 revision
-  DB-->>S: state
-  S-->>C: JSON snapshot
-  C->>S: POST /api/messages 或 /api/files
-  S->>DB: 事务写入 + change
-  DB-->>S: 新 revision
-  S-->>C: 201/202 JSON
-  S-->>C: SSE event(revision)
-  C->>S: GET /api/state?since=revision
-  S-->>C: 新快照
+  participant A as 节点 A
+  participant B as 节点 B
+  A->>A: 系统剪贴板产生变化
+  A->>B: WebSocket clipboard.update(event_id, HLC, text/PNG)
+  B->>B: 去重、比较 HLC
+  B->>B: 写入本机系统剪贴板
+  B-->>A: 忽略被抑制的本地回调
 ```
 
-SSE 连接是通知通道，不是数据存储。服务端重启、代理缓冲或网络切换后，客户端都会回到状态快照。
-
-## 构建与部署
+## 文件直传
 
 ```mermaid
-flowchart TD
-  P[桌面程序 / python -m meshshare] --> V[校验配置]
-  V --> M[创建 data/ 与 schema]
-  M --> T[ThreadingHTTPServer]
-  T --> W[web/ 静态资源]
-  T --> API[/api/*]
-  API --> S[Service]
-  S --> DB[(SQLite)]
-  S --> F[data/files]
+sequenceDiagram
+  participant S as 发送方
+  participant R as 接收方
+  S->>R: POST transfer offer(manifest)
+  R-->>用户: 显示确认和目标目录选择
+  用户->>R: 接受
+  S->>R: PUT transfer item(stream)
+  R->>R: 临时文件、SHA-256、原子改名
+  R-->>S: progress/status
 ```
-
-无前端构建产物和第三方运行时依赖；发布包只需 Python 源码、`web/` 和空的数据目录。

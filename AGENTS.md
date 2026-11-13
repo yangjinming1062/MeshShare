@@ -8,7 +8,7 @@
 - 模块边界、状态权威、信任边界和平台：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - 拓扑、同步序列和部署图：[`docs/ARCHITECTURE_MAP.md`](docs/ARCHITECTURE_MAP.md)
 - 用户可见行为、限制和验收：[`docs/DESIGN.md`](docs/DESIGN.md)
-- Python 服务端实现：`meshshare/`
-- 浏览器客户端静态资源：`web/`
+- Rust/Tauri 节点与桌面入口：`src-tauri/`
+- Svelte/TypeScript 桌面和移动客户端：`web/`
 
 实现改动前确认生产方、消费方和恢复路径；改动公开 API、持久化 schema 或文件生命周期时同步架构文档和相关验证。不要向仓库提交为临时验证创建的测试代码；正式检查放在现有测试入口。

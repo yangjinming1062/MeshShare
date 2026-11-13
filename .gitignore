@@ -52,6 +52,8 @@ htmlcov/
 # Node / npm / pnpm
 # ---------------------------------------------------------------------------
 node_modules/
+src-tauri/target/
+src-tauri/gen/
 .pnpm-store/
 .npm
 .yarn

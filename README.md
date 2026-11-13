@@ -1,45 +1,50 @@
 # MeshShare
 
-MeshShare 是一个局域网共享桌面程序：在一台电脑双击启动后，它会显示完整 GUI 并启动服务；共享剪贴板、消息和文件都直接在程序窗口内操作。手机、平板和其他电脑用浏览器访问同一个地址即可加入共享。
+MeshShare 是一个去中心化的局域网跨设备共享工具。每台桌面设备都是平等节点：它们自动发现彼此，复制到一台电脑的文字或图片剪贴板可以直接在另一台电脑粘贴，文件和文件夹则由发送方直接流式传给接收方。
 
-## 快速开始
+## 使用方式
 
-开发环境需要 Python 3.9 或更高版本：
+桌面程序启动后会显示主窗口并常驻系统托盘。主窗口列出当前在线的桌面设备：
 
-```bash
-python3 -m meshshare
-```
+- 点击设备卡片选择文件或文件夹发送。
+- 把文件或文件夹拖到设备卡片上发送。
+- 接收端确认并选择目录后，文件直接写入目标电脑。
+- 关闭窗口只隐藏窗口，服务仍在后台运行；从托盘菜单选择“退出程序”才会停止节点。
 
-桌面程序会在窗口中显示类似 `http://192.168.1.20:8765` 的手机访问地址。在同一 Wi‑Fi/局域网的设备上打开它即可。默认监听 `0.0.0.0:8765`；可用 `--host`、`--port` 修改。
+主窗口中的“手机扫码访问”区域会列出所有可访问地址，例如物理局域网地址和 Tailscale 地址。切换地址后二维码会同步更新。手机扫描二维码进入 `/mobile` 页面，可以查看在线设备、编辑共享剪贴板并向指定桌面节点发送文件。
 
-数据默认保存在 `.meshshare`：SQLite 保存共享板状态，`.meshshare/files/` 保存上传文件。停止程序后再次启动会继续使用这些数据；也可以通过 `--data-dir ./data` 修改。
+## 开发
 
-没有桌面环境时使用无界面模式：
-
-```bash
-python3 -m meshshare --headless --data-dir ./data
-```
-
-## 主要能力
-
-- 多个浏览器同时查看和发布共享消息。
-- 共享最新剪贴板文本，用户点击后复制到本机剪贴板（浏览器安全策略不允许网页后台读取系统剪贴板）。
-- 上传、下载和删除文件，并显示大小和上传时间。
-- SSE 实时通知与断线后状态恢复。
-- 仅使用 Python 标准库，无需安装第三方服务。
-- GitHub Release 提供 Windows、macOS Intel、macOS Apple Silicon 和 Linux x64 独立程序包。
-
-这是一个“桌面原生共享中心 + 移动端浏览器”的首版：电脑端不再依赖浏览器，其他电脑、手机和平板可以访问同一个局域网地址。它把共享状态集中保存，避免每台设备安装和维护独立客户端；桌面系统级后台剪贴板监听和无中心 P2P 会在后续版本作为独立模块加入。
-
-## 验证
+开发环境需要 Rust、Node.js 和 Tauri 2 依赖：
 
 ```bash
-python3 -m compileall -q meshshare
-python3 -m meshshare --help
+cd web
+npm install
+npm run dev
 ```
 
-从源码构建桌面程序需要安装 PyInstaller；GitHub tag workflow 会在对应平台 runner 上自动完成这一步并把构建包附加到 Release。
+另一个终端启动桌面壳：
 
-服务默认只适用于可信局域网。不要把监听端口直接暴露到公网；需要跨网访问时，请在受控的 VPN 或带认证/TLS 的反向代理后使用。
+```bash
+cargo install tauri-cli --version '^2'
+cargo tauri dev --manifest-path src-tauri/Cargo.toml
+```
 
-架构和设计约束见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、[`docs/ARCHITECTURE_MAP.md`](docs/ARCHITECTURE_MAP.md) 和 [`docs/DESIGN.md`](docs/DESIGN.md)。
+前端静态构建和检查：
+
+```bash
+npm --prefix web run check
+npm --prefix web run build
+```
+
+Rust 检查：
+
+```bash
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml
+```
+
+默认节点服务监听 `37880`，如果端口被占用会自动选择空闲端口。服务只面向受信任局域网，不提供账号、配对或公网安全边界；不要把端口直接暴露到互联网。
+
+架构、协议和体验约束见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、[`docs/ARCHITECTURE_MAP.md`](docs/ARCHITECTURE_MAP.md)、[`docs/PROTOCOL.md`](docs/PROTOCOL.md) 和 [`docs/DESIGN.md`](docs/DESIGN.md)。

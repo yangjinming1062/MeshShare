@@ -3,7 +3,6 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
     branches: [main]
 
@@ -11,76 +10,39 @@ permissions:
   contents: read
 
 jobs:
-  checks:
-    name: Python ${{ matrix.python-version }}
-    runs-on: ubuntu-22.04
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12"]
+  frontend:
+    runs-on: ubuntu-24.04
     steps:
-      - name: Check out source
-        uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          python-version: ${{ matrix.python-version }}
-      - name: Compile and validate CLI
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install frontend dependencies
+        run: npm --prefix web ci
+      - name: Check frontend
+        run: npm --prefix web run check
+      - name: Build frontend
+        run: npm --prefix web run build
+
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Install Tauri Linux dependencies
         run: |
-          python -m compileall -q meshshare
-          python -m meshshare --help
-      - name: Run service smoke test
-        run: |
-          python - <<'PY'
-          import hashlib
-          import json
-          import tempfile
-          import threading
-          import urllib.error
-          import urllib.request
-          from pathlib import Path
-
-          from meshshare.server import MeshShareServer
-
-          with tempfile.TemporaryDirectory() as directory:
-              server = MeshShareServer(
-                  ("127.0.0.1", 0),
-                  data_dir=Path(directory),
-                  max_file_bytes=1024 * 1024,
-                  max_message_chars=100,
-              )
-              thread = threading.Thread(target=server.serve_forever, daemon=True)
-              thread.start()
-              base = f"http://127.0.0.1:{server.server_address[1]}"
-
-              def request(path, method="GET", body=None, headers=None):
-                  request_obj = urllib.request.Request(
-                      base + path, data=body, method=method, headers=headers or {}
-                  )
-                  with urllib.request.urlopen(request_obj, timeout=5) as response:
-                      return response.status, response.read()
-
-              assert request("/api/health")[0] == 200
-              message = json.dumps({"text": "CI smoke", "author": "runner"}).encode()
-              assert request("/api/messages", "POST", message, {"Content-Type": "application/json"})[0] == 201
-              payload = b"meshshare-ci"
-              boundary = "meshshare-ci-boundary"
-              multipart = (
-                  f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"ci.txt\"\r\n"
-                  f"Content-Type: text/plain\r\n\r\n".encode()
-                  + payload
-                  + f"\r\n--{boundary}--\r\n".encode()
-              )
-              _, uploaded_body = request(
-                  "/api/files",
-                  "POST",
-                  multipart,
-                  {"Content-Type": f"multipart/form-data; boundary={boundary}"},
-              )
-              uploaded = json.loads(uploaded_body)
-              assert uploaded["sha256"] == hashlib.sha256(payload).hexdigest()
-              assert request(f"/api/files/{uploaded['id']}")[1] == payload
-              server.shutdown()
-              server.server_close()
-              thread.join(timeout=2)
-          PY
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libayatana-appindicator3-dev
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm --prefix web ci
+      - run: npm --prefix web run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
