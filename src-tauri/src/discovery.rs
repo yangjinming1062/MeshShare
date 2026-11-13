@@ -5,8 +5,10 @@ use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
+use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_meshshare._tcp.local.";
 
@@ -54,6 +56,13 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     }) else {
                         continue;
                     };
+                    let protocol = properties
+                        .iter()
+                        .find_map(|item| (item.key() == "protocol").then(|| item.val_str()))
+                        .and_then(|value| value.parse::<u32>().ok());
+                    if protocol != Some(PROTOCOL_VERSION) {
+                        continue;
+                    }
                     if node_id == node.node_id || node.node_id.as_str() > node_id.as_str() {
                         continue;
                     }
@@ -102,6 +111,12 @@ pub async fn connect_manual(
     if node.node_id == runtime.node_id() {
         return Err("不能连接本机地址".to_string());
     }
+    if node.protocol_version != PROTOCOL_VERSION {
+        return Err(format!(
+            "协议版本不兼容：对端 {}，本机 {}",
+            node.protocol_version, PROTOCOL_VERSION
+        ));
+    }
     let endpoint = format!("{base_url}/api/v1/ws");
     let peer = PeerInfo {
         node_id: node.node_id.clone(),
@@ -131,12 +146,54 @@ pub(crate) async fn connect_peer(
     node_name: String,
     endpoint: String,
 ) {
-    let Ok((socket, _)) = connect_async(&endpoint).await else {
-        return;
-    };
+    let mut attempt = 0u32;
+    loop {
+        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        if !runtime.begin_peer_connection(&node_id) {
+            return;
+        }
+        let connected = match connect_async(&endpoint).await {
+            Ok((socket, _)) => {
+                let Some(connected) =
+                    run_peer_session(&runtime, &node_id, &node_name, &endpoint, socket).await
+                else {
+                    return;
+                };
+                connected
+            }
+            Err(_) => false,
+        };
+        runtime.remove_peer(&node_id);
+        if connected {
+            attempt = 0;
+        } else {
+            attempt = attempt.saturating_add(1);
+        }
+        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let backoff = 1u64 << attempt.min(5);
+        let jitter = (Uuid::new_v4().as_u128() % 400) as u64;
+        tokio::time::sleep(Duration::from_millis(backoff * 1_000 + jitter)).await;
+    }
+}
+
+async fn run_peer_session(
+    runtime: &Arc<NodeRuntime>,
+    node_id: &str,
+    node_name: &str,
+    endpoint: &str,
+    socket: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<bool> {
     let (mut writer, mut reader) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<WireMessage>();
-    runtime.add_peer_channel(node_id.clone(), tx);
+    let (tx, mut rx) = mpsc::channel::<WireMessage>(64);
+    if !runtime.add_peer_channel(node_id.to_string(), tx) {
+        return None;
+    }
     let _ = writer
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&WireMessage::Hello {
@@ -146,21 +203,30 @@ pub(crate) async fn connect_peer(
         ))
         .await;
     runtime.set_peer(PeerInfo {
-        node_id: node_id.clone(),
-        node_name,
+        node_id: node_id.to_string(),
+        node_name: node_name.to_string(),
         platform: "unknown".to_string(),
         addresses: Vec::new(),
         capabilities: Vec::new(),
         online: true,
         last_seen_ms: crate::clock::now_millis(),
-        endpoint: Some(endpoint),
+        endpoint: Some(endpoint.to_string()),
         source: "mdns".to_string(),
         metrics: None,
         metrics_received_at_ms: None,
         metrics_stale: false,
     });
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut last_pong = tokio::time::Instant::now();
     loop {
         tokio::select! {
+            _ = heartbeat.tick() => {
+                if last_pong.elapsed() > Duration::from_secs(30) {
+                    break;
+                }
+                let body = serde_json::to_string(&WireMessage::Ping { at_ms: crate::clock::now_millis() }).unwrap_or_default();
+                if writer.send(tokio_tungstenite::tungstenite::Message::Text(body)).await.is_err() { break; }
+            }
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break };
                 let Ok(body) = serde_json::to_string(&message) else { break };
@@ -170,7 +236,14 @@ pub(crate) async fn connect_peer(
                 match inbound {
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Text(body))) => {
                         if let Ok(message) = serde_json::from_str::<WireMessage>(&body) {
-                            let _ = server::handle_wire_message(message, &runtime, Some(&node_id)).await;
+                            if matches!(message, WireMessage::Pong { .. }) { last_pong = tokio::time::Instant::now(); }
+                            let is_hello = matches!(message, WireMessage::Hello { .. });
+                            let _ = server::handle_wire_message(message, runtime, Some(node_id)).await;
+                            if is_hello {
+                                if let Some(snapshot) = runtime.clipboard_snapshot() {
+                                    let _ = runtime.send_to_peer(node_id, WireMessage::ClipboardSnapshot { snapshot });
+                                }
+                            }
                         }
                     }
                     Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
@@ -183,5 +256,6 @@ pub(crate) async fn connect_peer(
             }
         }
     }
-    runtime.remove_peer(&node_id);
+    runtime.remove_peer(node_id);
+    Some(true)
 }

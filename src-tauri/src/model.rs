@@ -20,6 +20,7 @@ pub struct NodeInfo {
     pub node_id: String,
     pub node_name: String,
     pub version: String,
+    pub protocol_version: u32,
     pub platform: String,
     pub port: u16,
     pub addresses: Vec<AddressInfo>,
@@ -176,6 +177,10 @@ pub struct TransferProgress {
     pub total_items: usize,
     pub destination: Option<String>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offer: Option<TransferOffer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +197,9 @@ pub enum WireMessage {
     },
     ClipboardUpdate {
         event: ClipboardEvent,
+    },
+    ClipboardSnapshot {
+        snapshot: ClipboardSnapshot,
     },
     TransferOffer {
         offer: TransferOffer,
@@ -212,7 +220,11 @@ pub enum WireMessage {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuMemoryKind, GpuMetrics, HardwareMetrics, WireMessage};
+    use super::{
+        GpuMemoryKind, GpuMetrics, HardwareMetrics, TransferItem, TransferOffer, TransferProgress,
+        TransferStatus, WireMessage,
+    };
+    use serde_json::Value;
 
     #[test]
     fn metrics_message_round_trips_through_json() {
@@ -246,6 +258,74 @@ mod tests {
                 );
             }
             _ => panic!("unexpected wire message"),
+        }
+    }
+
+    #[test]
+    fn tagged_messages_keep_the_nested_payload_contract() {
+        let offer = TransferOffer {
+            transfer_id: "transfer-1".to_string(),
+            source_node_id: "node-a".to_string(),
+            source_name: "A".to_string(),
+            target_node_id: "node-b".to_string(),
+            items: vec![TransferItem {
+                item_id: "item-1".to_string(),
+                name: "hello.txt".to_string(),
+                relative_path: "hello.txt".to_string(),
+                size: 5,
+                sha256: "hash".to_string(),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 5,
+            created_at_ms: 1,
+        };
+        let cases = [
+            (
+                serde_json::to_value(WireMessage::TransferOffer {
+                    offer: offer.clone(),
+                })
+                .expect("serialize offer"),
+                "offer",
+            ),
+            (
+                serde_json::to_value(WireMessage::TransferProgress {
+                    progress: TransferProgress {
+                        transfer_id: "transfer-1".to_string(),
+                        status: TransferStatus::Waiting,
+                        completed_bytes: 0,
+                        total_bytes: 5,
+                        completed_items: 0,
+                        total_items: 1,
+                        destination: None,
+                        error: None,
+                        offer: Some(offer),
+                        direction: Some("receive".to_string()),
+                    },
+                })
+                .expect("serialize progress"),
+                "progress",
+            ),
+            (
+                serde_json::to_value(WireMessage::MetricsUpdate {
+                    metrics: HardwareMetrics {
+                        node_id: "node-a".to_string(),
+                        sampled_at_ms: 1,
+                        cpu_usage_percent: None,
+                        memory_used_bytes: None,
+                        memory_total_bytes: None,
+                        network_down_bytes_per_sec: None,
+                        network_up_bytes_per_sec: None,
+                        gpus: Vec::new(),
+                    },
+                })
+                .expect("serialize metrics"),
+                "metrics",
+            ),
+        ];
+        for (value, key) in cases {
+            assert!(value.get("payload").and_then(Value::as_object).is_some());
+            assert!(value["payload"].get(key).is_some());
         }
     }
 }

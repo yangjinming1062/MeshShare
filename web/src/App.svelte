@@ -3,8 +3,9 @@
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
-  import { getClipboard, getInfo, getMetrics, getPeers, initApi, request, websocketUrl } from './api';
-  import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress } from './types';
+  import { getClipboard, getInfo, getMetrics, getPeers, getTransfers, initApi, request, websocketUrl } from './api';
+  import { digestFile } from './sha256';
+  import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
@@ -30,16 +31,34 @@
   let manualAddress = '';
   const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[] }>();
   const uploading = new Set<string>();
+  const watching = new Set<string>();
+  let pageStopped = false;
 
   $: selectedUrl = selectedAddress || node?.addresses[0]?.url || '';
   $: mobileUrl = selectedUrl ? `${selectedUrl}/mobile` : '';
+  $: mobileTargets = node ? [{
+    node_id: node.node_id,
+    node_name: node.node_name,
+    platform: node.platform,
+    addresses: node.addresses,
+    capabilities: node.capabilities,
+    online: true,
+    last_seen_ms: Date.now(),
+    endpoint: undefined,
+    source: 'local',
+    metrics: undefined,
+    metrics_received_at_ms: undefined,
+    metrics_stale: false,
+  } satisfies PeerInfo, ...peers] : peers;
 
   onMount(() => {
+    pageStopped = false;
     folderInput?.setAttribute('webkitdirectory', '');
     folderInput?.setAttribute('directory', '');
     let timer: number | undefined;
     let stopped = false;
     const start = async () => {
+      if (pageStopped) return;
       try {
         await initApi();
         await refresh();
@@ -47,6 +66,7 @@
         connectWebSocket();
         timer = window.setInterval(refresh, 2500);
       } catch (error) {
+        if (pageStopped) return;
         status = error instanceof Error ? error.message : '无法连接节点';
         statusKind = 'error';
         timer = window.setTimeout(start, 3000);
@@ -55,6 +75,7 @@
     void start();
     return () => {
       stopped = true;
+      pageStopped = true;
       if (timer) window.clearInterval(timer);
       ws?.close();
       if (stopped) window.clearTimeout(timer);
@@ -62,11 +83,18 @@
   });
 
   async function refresh() {
-    const [nextNode, nextPeers, nextClipboard, nextMetrics] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics()]);
+    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextTransfers] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics(), getTransfers()]);
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
     metrics = nextMetrics;
+    transfers = [...nextTransfers, ...transfers.filter((item) => !nextTransfers.some((next) => next.transfer_id === item.transfer_id))];
+    for (const transfer of nextTransfers) {
+      if (transfer.direction !== 'send' || !transfer.offer || ['completed', 'rejected', 'failed', 'cancelled'].includes(transfer.status) || watching.has(transfer.transfer_id)) continue;
+      const targetPeer = peers.find((peer) => peer.node_id === transfer.offer?.target_node_id);
+      const target = targetPeer ? targetBase(targetPeer) : null;
+      if (target) void watchTransfer(transfer.transfer_id, target);
+    }
     if (selectedMetricsPeer) {
       selectedMetricsPeer = peers.find((peer) => peer.node_id === selectedMetricsPeer?.node_id) ?? null;
     }
@@ -81,19 +109,25 @@
     ws?.close();
     ws = new WebSocket(websocketUrl());
     ws.onopen = () => { status = '已连接'; statusKind = 'ok'; };
-    ws.onclose = () => { status = '连接断开，重试中…'; statusKind = 'warn'; window.setTimeout(connectWebSocket, 1800); };
+    ws.onclose = () => {
+      if (pageStopped) return;
+      status = '连接断开，重试中…';
+      statusKind = 'warn';
+      window.setTimeout(() => !pageStopped && connectWebSocket(), 1800);
+    };
     ws.onerror = () => { status = '同步连接失败'; statusKind = 'error'; };
     ws.onmessage = (event) => {
       try {
-        const message = JSON.parse(event.data) as { type: string; payload: unknown };
-        handleWireMessage(message.type, message.payload);
+        const message = JSON.parse(event.data) as WireMessage;
+        handleWireMessage(message);
       } catch {
         // A malformed event must not break the live UI.
       }
     };
   }
 
-  function handleWireMessage(type: string, payload: unknown) {
+  function handleWireMessage(message: WireMessage) {
+    const { type, payload } = message;
     if (type === 'Hello') {
       void refresh();
       return;
@@ -102,8 +136,12 @@
       void refresh();
       return;
     }
+    if (type === 'ClipboardSnapshot') {
+      void refresh();
+      return;
+    }
     if (type === 'MetricsUpdate') {
-      const nextMetrics = payload as HardwareMetrics;
+      const nextMetrics = payload.metrics;
       if (nextMetrics.node_id === node?.node_id) {
         metrics = nextMetrics;
       } else {
@@ -117,7 +155,7 @@
       return;
     }
     if (type === 'TransferOffer') {
-      const offer = payload as TransferOffer;
+      const offer = payload.offer;
       transfers = [{
         transfer_id: offer.transfer_id,
         status: 'waiting',
@@ -131,7 +169,7 @@
       return;
     }
     if (type === 'TransferProgress') {
-      const progress = payload as TransferProgress;
+      const progress = payload.progress;
       const existing = transfers.find((item) => item.transfer_id === progress.transfer_id);
       transfers = [{ ...existing, ...progress }, ...transfers.filter((item) => item.transfer_id !== progress.transfer_id)];
     }
@@ -262,10 +300,9 @@
 
   async function createItem(file: File, index: number): Promise<TransferItem> {
     const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
-    const digest = await crypto.subtle.digest('SHA-256', await file.arrayBuffer());
-    const sha256 = Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, '0')).join('');
+    const sha256 = await digestFile(file);
     return {
-      item_id: `${index}-${crypto.randomUUID()}`,
+      item_id: `${index}-${randomId()}`,
       name: file.name,
       relative_path: relativePath,
       size: file.size,
@@ -273,6 +310,11 @@
       media_type: file.type || 'application/octet-stream',
       directory: false,
     };
+  }
+
+  function randomId() {
+    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   }
 
   async function sendFiles(peer: PeerInfo, files: File[]) {
@@ -286,7 +328,7 @@
     try {
       const items = await Promise.all(files.map(createItem));
       const offer: TransferOffer = {
-        transfer_id: crypto.randomUUID(),
+        transfer_id: randomId(),
         source_node_id: node.node_id,
         source_name: node.node_name,
         target_node_id: peer.node_id,
@@ -295,6 +337,7 @@
         created_at_ms: Date.now(),
       };
       await request<TransferProgress>('/api/v1/transfers', { method: 'POST', body: JSON.stringify(offer) }, target);
+      await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
       pendingUploads.set(offer.transfer_id, { target, files, items });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
       void watchTransfer(offer.transfer_id, target);
@@ -305,13 +348,18 @@
   }
 
   async function watchTransfer(id: string, target: string) {
+    if (watching.has(id)) return;
+    watching.add(id);
     for (let attempt = 0; attempt < 180; attempt += 1) {
       try {
         const progress = await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, target);
-        transfers = [{ ...transfers.find((item) => item.transfer_id === id), ...progress }, ...transfers.filter((item) => item.transfer_id !== id)];
+        void invoke('update_transfer_progress', { progress }).catch(() => undefined);
+        const existing = transfers.find((item) => item.transfer_id === id);
+        transfers = [{ ...existing, ...progress, direction: existing?.direction ?? progress.direction }, ...transfers.filter((item) => item.transfer_id !== id)];
         if (progress.status === 'accepted' && !uploading.has(id)) await uploadTransfer(id, target);
         if (['completed', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
           pendingUploads.delete(id);
+          watching.delete(id);
           return;
         }
       } catch {
@@ -319,6 +367,7 @@
       }
       await new Promise((resolve) => window.setTimeout(resolve, 800));
     }
+    watching.delete(id);
   }
 
   async function uploadTransfer(id: string, target: string) {
@@ -328,6 +377,7 @@
     try {
       for (const item of pending.items) {
         const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
+        if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
         const response = await fetch(`${target}/api/v1/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`, {
           method: 'PUT',
           headers: { 'Content-Type': item.media_type },
@@ -358,7 +408,7 @@
       return;
     }
     try {
-      await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/accept`, { method: 'POST', body: JSON.stringify({ destination: path }) });
+      await invoke<TransferProgress>('accept_transfer', { transferId: transfer.transfer_id, destination: path });
       notice = '已接受，等待文件直传';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法接受传输';
@@ -474,9 +524,9 @@
         <div class="button-row"><button class="primary" on:click={publishClipboard}>同步到设备</button><button on:click={readMobileClipboard}>读取手机剪贴板</button><button on:click={writeMobileClipboard}>写入手机剪贴板</button></div>
       </section>
       <section class="panel">
-        <div class="panel-heading"><div><div class="section-kicker">DEVICES</div><h2>在线设备</h2></div><span class="count-badge">{peers.length}</span></div>
+        <div class="panel-heading"><div><div class="section-kicker">DEVICES</div><h2>在线设备</h2></div><span class="count-badge">{mobileTargets.length}</span></div>
         <div class="peer-grid mobile-peers">
-          {#each peers as peer}
+          {#each mobileTargets as peer}
             <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
             <article role="button" tabindex="0" class="peer-card" on:click={() => startChoose(peer)} on:keydown={(event) => event.key === 'Enter' && startChoose(peer)} on:dragover|preventDefault on:drop={(event) => onDrop(peer, event)}>
               <div class="peer-icon">{peer.node_name.slice(0, 1).toUpperCase()}</div>

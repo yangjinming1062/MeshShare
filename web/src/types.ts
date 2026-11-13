@@ -9,6 +9,7 @@ export type NodeInfo = {
   node_id: string;
   node_name: string;
   version: string;
+  protocol_version: number;
   platform: string;
   port: number;
   addresses: AddressInfo[];
@@ -96,3 +97,14 @@ export type TransferProgress = {
   offer?: TransferOffer;
   direction?: 'send' | 'receive';
 };
+
+export type WireMessage =
+  | { type: 'Hello'; payload: { node: NodeInfo } }
+  | { type: 'Ping'; payload: { at_ms: number } }
+  | { type: 'Pong'; payload: { at_ms: number } }
+  | { type: 'ClipboardUpdate'; payload: { event: unknown } }
+  | { type: 'ClipboardSnapshot'; payload: { snapshot: ClipboardSnapshot } }
+  | { type: 'TransferOffer'; payload: { offer: TransferOffer } }
+  | { type: 'TransferAction'; payload: { transfer_id: string; action: string; destination?: string; reason?: string } }
+  | { type: 'TransferProgress'; payload: { progress: TransferProgress } }
+  | { type: 'MetricsUpdate'; payload: { metrics: HardwareMetrics } };

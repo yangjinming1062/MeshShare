@@ -6,7 +6,7 @@ use crate::model::{
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
-use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
+use axum::extract::{Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -15,6 +15,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -37,13 +38,13 @@ pub struct ClipboardRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TransferAcceptance {
-    pub destination: String,
+pub struct PeerConnectionRequest {
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PeerConnectionRequest {
-    pub url: String,
+pub struct TransferListQuery {
+    pub status: Option<TransferStatus>,
 }
 
 #[derive(Debug, Serialize)]
@@ -67,8 +68,10 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
             get(clipboard_state).post(post_clipboard),
         )
         .route("/api/v1/ws", get(websocket))
-        .route("/api/v1/transfers", post(create_transfer))
-        .route("/api/v1/transfers/:id/accept", post(accept_transfer))
+        .route(
+            "/api/v1/transfers",
+            get(list_transfers).post(create_transfer),
+        )
         .route("/api/v1/transfers/:id/reject", post(reject_transfer))
         .route("/api/v1/transfers/:id/cancel", post(cancel_transfer))
         .route("/api/v1/transfers/:id/status", get(transfer_status))
@@ -150,19 +153,24 @@ async fn post_clipboard(
         .clipboard_snapshot()
         .ok_or_else(|| ApiError::internal("剪贴板状态不可用"))?;
     clipboard::apply_snapshot(&snapshot, &state.runtime).map_err(ApiError::internal)?;
+    state.runtime.publish_event(WireMessage::ClipboardUpdate {
+        event: event.clone(),
+    });
     state
         .runtime
-        .publish(WireMessage::ClipboardUpdate { event });
+        .send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
     Ok(Json(snapshot))
 }
 
 async fn websocket(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.runtime))
+    ws.max_message_size(32 * 1024 * 1024)
+        .max_frame_size(32 * 1024 * 1024)
+        .on_upgrade(move |socket| handle_socket(socket, state.runtime))
 }
 
 async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRuntime>) {
     let (mut sender, mut receiver) = socket.split();
-    let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel::<WireMessage>();
+    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<WireMessage>(64);
     let mut events = runtime.subscribe();
     let hello = WireMessage::Hello {
         node: runtime.node_info(),
@@ -173,6 +181,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
         ))
         .await;
     let mut peer_id: Option<String> = None;
+    let mut owns_peer_channel = false;
 
     loop {
         tokio::select! {
@@ -183,7 +192,13 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
                             Ok(message) => {
                                 if let Some(identified) = handle_wire_message(message, &runtime, peer_id.as_deref()).await {
                                     peer_id = Some(identified.clone());
-                                    runtime.add_peer_channel(identified, outgoing_tx.clone());
+                                    if !runtime.add_peer_channel(identified, outgoing_tx.clone()) {
+                                        break;
+                                    }
+                                    owns_peer_channel = true;
+                                    if let Some(snapshot) = runtime.clipboard_snapshot() {
+                                        let _ = outgoing_tx.try_send(WireMessage::ClipboardSnapshot { snapshot });
+                                    }
                                 }
                             }
                             Err(_) => break,
@@ -204,7 +219,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
             event = events.recv() => {
                 match event {
                     Ok(message) => {
-                        if matches!(&message, WireMessage::MetricsUpdate { .. }) && peer_id.is_some() {
+                        if peer_id.is_some() {
                             continue;
                         }
                         if sender.send(axum::extract::ws::Message::Text(serde_json::to_string(&message).unwrap_or_default())).await.is_err() {
@@ -217,8 +232,10 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
             }
         }
     }
-    if let Some(peer_id) = peer_id {
-        runtime.remove_peer(&peer_id);
+    if owns_peer_channel {
+        if let Some(peer_id) = peer_id {
+            runtime.remove_peer(&peer_id);
+        }
     }
 }
 
@@ -230,6 +247,9 @@ pub(crate) async fn handle_wire_message(
     match message {
         WireMessage::Hello { node } => {
             if node.node_id == runtime.node_id() {
+                return None;
+            }
+            if node.protocol_version != crate::model::PROTOCOL_VERSION {
                 return None;
             }
             let endpoint = node
@@ -255,8 +275,8 @@ pub(crate) async fn handle_wire_message(
         WireMessage::Ping { at_ms } => {
             if let Some(peer_id) = current_peer {
                 runtime.touch_peer(peer_id);
+                let _ = runtime.send_to_peer(peer_id, WireMessage::Pong { at_ms });
             }
-            runtime.publish(WireMessage::Pong { at_ms });
             current_peer.map(str::to_string)
         }
         WireMessage::Pong { .. } => {
@@ -266,17 +286,62 @@ pub(crate) async fn handle_wire_message(
             current_peer.map(str::to_string)
         }
         WireMessage::ClipboardUpdate { event } => {
-            if runtime.accept_clipboard(event.clone(), "远端设备".to_string()) {
-                if let Some(snapshot) = runtime.clipboard_snapshot() {
-                    let _ = clipboard::apply_snapshot(&snapshot, runtime);
-                }
-                runtime.publish(WireMessage::ClipboardUpdate { event });
+            let peer_id = current_peer?;
+            if event.origin_node_id != peer_id {
+                return Some(peer_id.to_string());
             }
-            current_peer.map(str::to_string)
+            let source_name = runtime
+                .peer_name(peer_id)
+                .unwrap_or_else(|| "远端设备".to_string());
+            if runtime.accept_clipboard(event.clone(), source_name) {
+                if let Some(snapshot) = runtime.clipboard_snapshot() {
+                    if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
+                        eprintln!("无法写入远端剪贴板：{error}");
+                    }
+                }
+                runtime.publish_event(WireMessage::ClipboardUpdate {
+                    event: event.clone(),
+                });
+                runtime.send_to_peers_except(Some(peer_id), WireMessage::ClipboardUpdate { event });
+            }
+            Some(peer_id.to_string())
+        }
+        WireMessage::ClipboardSnapshot { snapshot } => {
+            let peer_id = current_peer?;
+            if snapshot.source_node_id != peer_id {
+                return Some(peer_id.to_string());
+            }
+            let source_name = runtime
+                .peer_name(peer_id)
+                .unwrap_or_else(|| "远端设备".to_string());
+            let event = crate::model::ClipboardEvent {
+                event_id: snapshot.event_id,
+                origin_node_id: snapshot.source_node_id,
+                clock: snapshot.clock,
+                text: snapshot.text,
+                image_png: snapshot.image_png,
+                updated_at_ms: snapshot.updated_at_ms,
+            };
+            if runtime.accept_clipboard(event.clone(), source_name) {
+                if let Some(snapshot) = runtime.clipboard_snapshot() {
+                    if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
+                        eprintln!("无法写入远端剪贴板：{error}");
+                    }
+                }
+                runtime.publish_event(WireMessage::ClipboardUpdate {
+                    event: event.clone(),
+                });
+                runtime.send_to_peers_except(Some(peer_id), WireMessage::ClipboardUpdate { event });
+            }
+            Some(peer_id.to_string())
         }
         WireMessage::TransferOffer { offer } => {
+            let peer_id = current_peer?;
+            if offer.source_node_id != peer_id || offer.target_node_id != runtime.node_id() {
+                return Some(peer_id.to_string());
+            }
             runtime.add_transfer(offer);
-            current_peer.map(str::to_string)
+            Some(peer_id.to_string())
         }
         WireMessage::TransferAction {
             transfer_id,
@@ -284,13 +349,29 @@ pub(crate) async fn handle_wire_message(
             destination,
             reason,
         } => {
-            let _ =
-                apply_transfer_action(runtime, &transfer_id, &action, destination, reason).await;
+            let _ = apply_transfer_action(
+                runtime,
+                &transfer_id,
+                &action,
+                destination,
+                reason,
+                current_peer,
+            )
+            .await;
             current_peer.map(str::to_string)
         }
         WireMessage::TransferProgress { progress } => {
             let transfer_id = progress.transfer_id.clone();
-            runtime.update_transfer(&transfer_id, progress);
+            if let Some((source_node_id, target_node_id)) = runtime.transfer_peer_ids(&transfer_id)
+            {
+                if current_peer == Some(source_node_id.as_str())
+                    || current_peer == Some(target_node_id.as_str())
+                {
+                    runtime.update_transfer(&transfer_id, progress);
+                }
+            } else {
+                return current_peer.map(str::to_string);
+            }
             current_peer.map(str::to_string)
         }
         WireMessage::MetricsUpdate { metrics } => {
@@ -309,12 +390,26 @@ async fn create_transfer(
     State(state): State<AppState>,
     Json(mut offer): Json<TransferOffer>,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    let listed_bytes = offer.items.iter().map(|item| item.size).sum::<u64>();
+    let listed_bytes = offer
+        .items
+        .iter()
+        .try_fold(0u64, |total, item| total.checked_add(item.size));
     if offer.items.is_empty()
-        || listed_bytes != offer.total_bytes
+        || listed_bytes != Some(offer.total_bytes)
         || offer.total_bytes > crate::model::MAX_TRANSFER_BYTES
     {
         return Err(ApiError::payload_too_large("传输清单为空或超过大小限制"));
+    }
+    let mut item_ids = HashSet::new();
+    for item in &offer.items {
+        if item.directory
+            || item.size > crate::model::MAX_TRANSFER_BYTES
+            || has_parent_component(&item.relative_path)
+            || item.relative_path.is_empty()
+            || !item_ids.insert(item.item_id.clone())
+        {
+            return Err(ApiError::bad_request("传输清单包含无效项目"));
+        }
     }
     offer.target_node_id = state.runtime.node_id();
     offer.created_at_ms = crate::clock::now_millis();
@@ -327,32 +422,11 @@ async fn create_transfer(
     Ok(Json(progress))
 }
 
-async fn accept_transfer(
-    AxumPath(id): AxumPath<String>,
+async fn list_transfers(
+    Query(query): Query<TransferListQuery>,
     State(state): State<AppState>,
-    Json(payload): Json<TransferAcceptance>,
-) -> Result<Json<TransferProgress>, ApiError> {
-    let destination = PathBuf::from(payload.destination);
-    if !destination.is_absolute() {
-        return Err(ApiError::bad_request("接收目录必须是绝对路径"));
-    }
-    fs::create_dir_all(&destination)
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let progress = state
-        .runtime
-        .set_transfer_acceptance(&id, destination)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    state.runtime.publish(WireMessage::TransferAction {
-        transfer_id: id,
-        action: "accept".to_string(),
-        destination: progress.destination.clone(),
-        reason: None,
-    });
-    state.runtime.publish(WireMessage::TransferProgress {
-        progress: progress.clone(),
-    });
-    Ok(Json(progress))
+) -> Json<Vec<TransferProgress>> {
+    Json(state.runtime.transfers_snapshot(query.status))
 }
 
 async fn reject_transfer(
@@ -367,13 +441,24 @@ async fn reject_transfer(
             TransferStatus::Rejected,
         )
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    state.runtime.publish(WireMessage::TransferAction {
+    if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
+        let _ = state.runtime.send_to_peer(
+            &source_node_id,
+            WireMessage::TransferAction {
+                transfer_id: id.clone(),
+                action: "reject".to_string(),
+                destination: None,
+                reason: progress.error.clone(),
+            },
+        );
+    }
+    state.runtime.publish_event(WireMessage::TransferAction {
         transfer_id: id,
         action: "reject".to_string(),
         destination: None,
         reason: progress.error.clone(),
     });
-    state.runtime.publish(WireMessage::TransferProgress {
+    state.runtime.publish_event(WireMessage::TransferProgress {
         progress: progress.clone(),
     });
     Ok(Json(progress))
@@ -387,13 +472,24 @@ async fn cancel_transfer(
         .runtime
         .fail_transfer(&id, "传输已取消".to_string(), TransferStatus::Cancelled)
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    state.runtime.publish(WireMessage::TransferAction {
+    if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
+        let _ = state.runtime.send_to_peer(
+            &source_node_id,
+            WireMessage::TransferAction {
+                transfer_id: id.clone(),
+                action: "cancel".to_string(),
+                destination: None,
+                reason: progress.error.clone(),
+            },
+        );
+    }
+    state.runtime.publish_event(WireMessage::TransferAction {
         transfer_id: id,
         action: "cancel".to_string(),
         destination: None,
         reason: progress.error.clone(),
     });
-    state.runtime.publish(WireMessage::TransferProgress {
+    state.runtime.publish_event(WireMessage::TransferProgress {
         progress: progress.clone(),
     });
     Ok(Json(progress))
@@ -434,23 +530,17 @@ async fn upload_item(
         .iter()
         .find(|item| item.item_id == item_id)
         .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
-    if item.directory || has_parent_component(&item.relative_path) {
+    if item.directory || has_parent_component(&item.relative_path) || item.relative_path.is_empty()
+    {
         return Err(ApiError::bad_request("传输路径无效"));
     }
-    let target = destination.join(&item.relative_path);
-    if fs::try_exists(&target).await.unwrap_or(false) {
-        return Err(ApiError::conflict(format!(
-            "目标已存在：{}",
-            target.display()
-        )));
-    }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-    }
+    let _item_lock = TransferItemLock::new(&state.runtime, &transfer_id, &item_id)?;
+    let target = prepare_target(&destination, &item.relative_path).await?;
     let temp = target.with_extension(format!("meshshare-{}.part", uuid::Uuid::new_v4()));
-    let mut file = fs::File::create(&temp)
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let mut stream = body.into_data_stream();
@@ -458,6 +548,9 @@ async fn upload_item(
     let mut total = 0u64;
     let stream_result: Result<(u64, String), ApiError> = async {
         while let Some(chunk) = stream.next().await {
+            if !state.runtime.transfer_upload_active(&transfer_id) {
+                return Err(ApiError::conflict("传输已取消"));
+            }
             let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
             total = total.saturating_add(chunk.len() as u64);
             if total > item.size || total > crate::model::MAX_TRANSFER_BYTES {
@@ -474,6 +567,7 @@ async fn upload_item(
         Ok((total, format!("{:x}", hasher.finalize())))
     }
     .await;
+    drop(file);
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
@@ -490,37 +584,148 @@ async fn upload_item(
             .ok_or_else(|| ApiError::not_found("传输不存在"))?;
         state
             .runtime
-            .publish(WireMessage::TransferProgress { progress });
+            .publish_event(WireMessage::TransferProgress { progress });
         return Err(ApiError::bad_request(message));
     }
-    if let Err(error) = fs::rename(&temp, &target).await {
+    let target = match prepare_target(&destination, &item.relative_path).await {
+        Ok(target) => target,
+        Err(error) => {
+            let _ = fs::remove_file(&temp).await;
+            return Err(error);
+        }
+    };
+    if !state.runtime.transfer_upload_active(&transfer_id) {
         let _ = fs::remove_file(&temp).await;
+        return Err(ApiError::conflict("传输已取消"));
+    }
+    if let Err(error) = fs::hard_link(&temp, &target).await {
+        let _ = fs::remove_file(&temp).await;
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(ApiError::conflict(format!(
+                "目标已存在：{}",
+                target.display()
+            )));
+        }
         return Err(ApiError::internal(error.to_string()));
     }
-    let progress = state
+    let _ = fs::remove_file(&temp).await;
+    let Some(progress) = state
         .runtime
         .mark_item_received(&transfer_id, &item_id, total)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    state.runtime.publish(WireMessage::TransferProgress {
+    else {
+        let _ = fs::remove_file(&target).await;
+        return Err(ApiError::conflict("传输已取消或已完成"));
+    };
+    state.runtime.publish_event(WireMessage::TransferProgress {
         progress: progress.clone(),
     });
     Ok(Json(progress))
+}
+
+struct TransferItemLock {
+    runtime: Arc<NodeRuntime>,
+    transfer_id: String,
+    item_id: String,
+}
+
+impl TransferItemLock {
+    fn new(runtime: &Arc<NodeRuntime>, transfer_id: &str, item_id: &str) -> Result<Self, ApiError> {
+        if !runtime.try_lock_transfer_item(transfer_id, item_id) {
+            return Err(ApiError::conflict("文件项目正在上传"));
+        }
+        Ok(Self {
+            runtime: runtime.clone(),
+            transfer_id: transfer_id.to_string(),
+            item_id: item_id.to_string(),
+        })
+    }
+}
+
+impl Drop for TransferItemLock {
+    fn drop(&mut self) {
+        self.runtime
+            .unlock_transfer_item(&self.transfer_id, &self.item_id);
+    }
+}
+
+async fn prepare_target(destination: &Path, relative_path: &str) -> Result<PathBuf, ApiError> {
+    let mut parent = destination.to_path_buf();
+    let components = Path::new(relative_path).components().collect::<Vec<_>>();
+    let Some((file_component, directory_components)) = components.split_last() else {
+        return Err(ApiError::bad_request("传输路径为空"));
+    };
+    let Component::Normal(file_name) = file_component else {
+        return Err(ApiError::bad_request("传输文件名无效"));
+    };
+    for component in directory_components {
+        let Component::Normal(name) = component else {
+            return Err(ApiError::bad_request("传输路径无效"));
+        };
+        parent.push(name);
+        match fs::symlink_metadata(&parent).await {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(ApiError::bad_request("传输目录包含符号链接或非目录"));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&parent).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let metadata = fs::symlink_metadata(&parent)
+                            .await
+                            .map_err(|error| ApiError::internal(error.to_string()))?;
+                        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                            return Err(ApiError::bad_request("传输目录包含符号链接或非目录"));
+                        }
+                    }
+                    Err(error) => return Err(ApiError::internal(error.to_string())),
+                }
+            }
+            Err(error) => return Err(ApiError::internal(error.to_string())),
+        }
+    }
+    let target = parent.join(file_name);
+    match fs::symlink_metadata(&target).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ApiError::conflict("目标文件是符号链接"));
+            }
+            return Err(ApiError::conflict(format!(
+                "目标已存在：{}",
+                target.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ApiError::internal(error.to_string())),
+    }
+    Ok(target)
 }
 
 async fn apply_transfer_action(
     runtime: &Arc<NodeRuntime>,
     transfer_id: &str,
     action: &str,
-    destination: Option<String>,
+    _destination: Option<String>,
     reason: Option<String>,
+    current_peer: Option<&str>,
 ) -> Result<(), ApiError> {
+    let Some((source_node_id, target_node_id)) = runtime.transfer_peer_ids(transfer_id) else {
+        return Err(ApiError::not_found("传输不存在"));
+    };
+    if current_peer != Some(source_node_id.as_str())
+        && current_peer != Some(target_node_id.as_str())
+    {
+        return Err(ApiError::forbidden("传输操作来源不匹配"));
+    }
     match action {
         "accept" => {
-            if let Some(destination) = destination {
-                let progress = runtime
-                    .set_transfer_acceptance(transfer_id, PathBuf::from(destination))
-                    .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-                runtime.publish(WireMessage::TransferProgress { progress });
+            // The destination is selected locally on the receiving node and is
+            // never accepted from a peer message.
+            if current_peer == Some(target_node_id.as_str()) {
+                if let Some(progress) = runtime.mark_transfer_accepted(transfer_id) {
+                    runtime.publish_event(WireMessage::TransferProgress { progress });
+                }
             }
         }
         "reject" => {
@@ -529,7 +734,7 @@ async fn apply_transfer_action(
                 reason.unwrap_or_else(|| "接收端拒绝了传输".to_string()),
                 TransferStatus::Rejected,
             ) {
-                runtime.publish(WireMessage::TransferProgress { progress });
+                runtime.publish_event(WireMessage::TransferProgress { progress });
             }
         }
         "cancel" => {
@@ -538,7 +743,7 @@ async fn apply_transfer_action(
                 reason.unwrap_or_else(|| "传输已取消".to_string()),
                 TransferStatus::Cancelled,
             ) {
-                runtime.publish(WireMessage::TransferProgress { progress });
+                runtime.publish_event(WireMessage::TransferProgress { progress });
             }
         }
         _ => {}
@@ -547,12 +752,16 @@ async fn apply_transfer_action(
 }
 
 fn has_parent_component(value: &str) -> bool {
-    Path::new(value).components().any(|component| {
-        matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        )
-    })
+    value.contains('\\')
+        || Path::new(value).components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
+                    | Component::CurDir
+            )
+        })
 }
 
 #[cfg(test)]
@@ -591,7 +800,7 @@ mod tests {
             metrics_received_at_ms: None,
             metrics_stale: false,
         });
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(8);
         runtime.add_peer_channel("peer".to_string(), tx);
         let metrics = HardwareMetrics {
             node_id: "peer".to_string(),
@@ -632,6 +841,12 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }

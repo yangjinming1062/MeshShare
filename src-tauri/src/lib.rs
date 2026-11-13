@@ -9,8 +9,9 @@ mod runtime;
 mod server;
 
 use anyhow::Context;
-use model::{HardwareMetrics, MonitorDisplayMode, WireMessage};
+use model::{HardwareMetrics, MonitorDisplayMode, TransferProgress, WireMessage};
 use runtime::NodeRuntime;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
@@ -45,6 +46,56 @@ fn clipboard_sync_enabled(state: State<'_, ManagedNode>) -> bool {
         .runtime
         .sync_enabled
         .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn accept_transfer(
+    state: State<'_, ManagedNode>,
+    transfer_id: String,
+    destination: String,
+) -> Result<TransferProgress, String> {
+    let destination = PathBuf::from(destination);
+    if !destination.is_absolute() {
+        return Err("接收目录必须是绝对路径".to_string());
+    }
+    let metadata = fs::symlink_metadata(&destination).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("接收目录必须是实际目录，不能是符号链接".to_string());
+    }
+    let destination = fs::canonicalize(&destination).map_err(|error| error.to_string())?;
+    let progress = state
+        .runtime
+        .set_transfer_acceptance(&transfer_id, destination)
+        .ok_or_else(|| "传输不存在".to_string())?;
+    state.runtime.publish_event(WireMessage::TransferProgress {
+        progress: progress.clone(),
+    });
+    if let Some(source_node_id) = state.runtime.transfer_source_id(&transfer_id) {
+        let _ = state.runtime.send_to_peer(
+            &source_node_id,
+            WireMessage::TransferAction {
+                transfer_id,
+                action: "accept".to_string(),
+                destination: None,
+                reason: None,
+            },
+        );
+    }
+    Ok(progress)
+}
+
+#[tauri::command]
+fn register_outgoing_transfer(
+    state: State<'_, ManagedNode>,
+    offer: model::TransferOffer,
+) -> TransferProgress {
+    state.runtime.add_outgoing_transfer(offer)
+}
+
+#[tauri::command]
+fn update_transfer_progress(state: State<'_, ManagedNode>, progress: TransferProgress) {
+    let transfer_id = progress.transfer_id.clone();
+    state.runtime.update_transfer(&transfer_id, progress);
 }
 
 #[tauri::command]
@@ -173,16 +224,31 @@ async fn start_node(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(37880u16);
-    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", preferred_port)).await {
+    let bind_addresses = runtime::bind_addresses();
+    let first_address = bind_addresses
+        .first()
+        .copied()
+        .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+    let first_listener = match tokio::net::TcpListener::bind((first_address, preferred_port)).await
+    {
         Ok(listener) => listener,
-        Err(_) => tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?,
+        Err(_) => tokio::net::TcpListener::bind((first_address, 0)).await?,
     };
-    let actual_port = listener.local_addr()?.port();
+    let actual_port = first_listener.local_addr()?.port();
+    let mut listeners = vec![first_listener];
+    for address in bind_addresses.into_iter().skip(1) {
+        if let Ok(listener) = tokio::net::TcpListener::bind((address, actual_port)).await {
+            listeners.push(listener);
+        }
+    }
     let runtime = NodeRuntime::new(data_dir, actual_port, version)?;
     let app = server::router(runtime.clone(), static_root);
-    tauri::async_runtime::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
+    for listener in listeners {
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+    }
     clipboard::start_monitor(runtime.clone());
     metrics::start(runtime.clone());
     discovery::start(runtime.clone());
@@ -371,6 +437,9 @@ pub fn run() {
             node_base_url,
             toggle_clipboard_sync,
             clipboard_sync_enabled,
+            accept_transfer,
+            register_outgoing_transfer,
+            update_transfer_progress,
             monitor_display_mode,
             set_monitor_display_mode
         ])

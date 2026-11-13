@@ -20,6 +20,7 @@
         "minWidth": 920,
         "minHeight": 640,
         "resizable": true,
+        "dragDropEnabled": false,
         "visible": true
       },
       {
@@ -44,7 +45,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' http: ws:"
     },
     "trayIcon": {
       "id": "meshshare",

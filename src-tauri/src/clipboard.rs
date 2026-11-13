@@ -45,7 +45,13 @@ fn monitor_loop(runtime: Arc<NodeRuntime>) {
                     continue;
                 }
                 if let Some(event) = runtime.create_local_clipboard(text, image) {
-                    runtime.publish(crate::model::WireMessage::ClipboardUpdate { event });
+                    runtime.publish_event(crate::model::WireMessage::ClipboardUpdate {
+                        event: event.clone(),
+                    });
+                    runtime.send_to_peers_except(
+                        None,
+                        crate::model::WireMessage::ClipboardUpdate { event },
+                    );
                 }
             }
         }

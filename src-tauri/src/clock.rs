@@ -1,5 +1,5 @@
 use crate::model::Hlc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn now_ms() -> i64 {
@@ -11,23 +11,34 @@ fn now_ms() -> i64 {
 
 pub struct LogicalClock {
     node_id: String,
-    logical: AtomicU64,
+    state: Mutex<ClockState>,
+}
+
+#[derive(Debug, Default)]
+struct ClockState {
+    last_physical_ms: i64,
+    last_logical: u64,
 }
 
 impl LogicalClock {
     pub fn new(node_id: String) -> Self {
         Self {
             node_id,
-            logical: AtomicU64::new(0),
+            state: Mutex::new(ClockState::default()),
         }
     }
 
     pub fn tick(&self) -> Hlc {
-        let physical = now_ms();
-        let logical = self
-            .logical
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
+        let mut state = self.state.lock();
+        let wall_clock = now_ms();
+        let physical = wall_clock.max(state.last_physical_ms);
+        let logical = if physical > state.last_physical_ms {
+            0
+        } else {
+            state.last_logical.saturating_add(1)
+        };
+        state.last_physical_ms = physical;
+        state.last_logical = logical;
         Hlc {
             physical_ms: physical,
             logical,
@@ -36,16 +47,24 @@ impl LogicalClock {
     }
 
     pub fn observe(&self, remote: &Hlc) -> Hlc {
-        let physical = now_ms();
-        let next = self.logical.load(Ordering::SeqCst).max(remote.logical);
-        let logical = if physical > remote.physical_ms {
-            0
+        let mut state = self.state.lock();
+        let wall_clock = now_ms();
+        let physical = wall_clock
+            .max(state.last_physical_ms)
+            .max(remote.physical_ms);
+        let logical = if physical == state.last_physical_ms && physical == remote.physical_ms {
+            state.last_logical.max(remote.logical).saturating_add(1)
+        } else if physical == state.last_physical_ms {
+            state.last_logical.saturating_add(1)
+        } else if physical == remote.physical_ms {
+            remote.logical.saturating_add(1)
         } else {
-            next.saturating_add(1)
+            0
         };
-        self.logical.store(logical, Ordering::SeqCst);
+        state.last_physical_ms = physical;
+        state.last_logical = logical;
         Hlc {
-            physical_ms: physical.max(remote.physical_ms),
+            physical_ms: physical,
             logical,
             node_id: self.node_id.clone(),
         }
@@ -79,5 +98,19 @@ mod tests {
         let local = clock.observe(&remote);
         assert!(local.compare(&remote).is_gt());
         assert_eq!(local.node_id, "node-a");
+    }
+
+    #[test]
+    fn tick_keeps_remote_physical_time_until_wall_clock_catches_up() {
+        let clock = LogicalClock::new("node-a".to_string());
+        let remote = Hlc {
+            physical_ms: now_millis() + 10_000,
+            logical: 9,
+            node_id: "node-b".to_string(),
+        };
+        let observed = clock.observe(&remote);
+        let next = clock.tick();
+        assert!(next.physical_ms >= observed.physical_ms);
+        assert!(next.compare(&observed).is_gt());
     }
 }

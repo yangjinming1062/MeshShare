@@ -43,11 +43,28 @@ pub struct NodeRuntime {
     data_dir: PathBuf,
     seen_events: Mutex<HashMap<String, i64>>,
     suppression: Mutex<Option<(String, i64)>>,
-    peer_channels: Mutex<HashMap<String, mpsc::UnboundedSender<WireMessage>>>,
+    peer_channels: Mutex<HashMap<String, mpsc::Sender<WireMessage>>>,
+    connecting_peers: Mutex<HashSet<String>>,
+    transfer_locks: Mutex<HashSet<(String, String)>>,
     pub events: broadcast::Sender<WireMessage>,
     pub sync_enabled: AtomicBool,
     pub stopping: AtomicBool,
     pub http: reqwest::Client,
+}
+
+fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress {
+    TransferProgress {
+        transfer_id: offer.transfer_id.clone(),
+        status: TransferStatus::Waiting,
+        completed_bytes: 0,
+        total_bytes: offer.total_bytes,
+        completed_items: 0,
+        total_items: offer.items.len(),
+        destination: None,
+        error: None,
+        offer: Some(offer.clone()),
+        direction: Some(direction.to_string()),
+    }
 }
 
 impl NodeRuntime {
@@ -59,6 +76,7 @@ impl NodeRuntime {
             node_id: config.node_id.clone(),
             node_name: config.node_name.clone(),
             version,
+            protocol_version: crate::model::PROTOCOL_VERSION,
             platform: std::env::consts::OS.to_string(),
             port,
             addresses,
@@ -86,6 +104,8 @@ impl NodeRuntime {
             seen_events: Mutex::new(HashMap::new()),
             suppression: Mutex::new(None),
             peer_channels: Mutex::new(HashMap::new()),
+            connecting_peers: Mutex::new(HashSet::new()),
+            transfer_locks: Mutex::new(HashSet::new()),
             events,
             sync_enabled: AtomicBool::new(true),
             stopping: AtomicBool::new(false),
@@ -106,21 +126,6 @@ impl NodeRuntime {
     pub fn update_addresses(&self) {
         let port = self.node.read().port;
         self.node.write().addresses = network_addresses(port);
-    }
-
-    pub fn publish(&self, message: WireMessage) {
-        let _ = self.events.send(message.clone());
-        if matches!(&message, WireMessage::ClipboardUpdate { .. }) {
-            let channels = self
-                .peer_channels
-                .lock()
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            for channel in channels {
-                let _ = channel.send(message.clone());
-            }
-        }
     }
 
     pub fn publish_event(&self, message: WireMessage) {
@@ -170,7 +175,7 @@ impl NodeRuntime {
             })
             .collect::<Vec<_>>();
         for (channel, message) in channels {
-            let _ = channel.send(message);
+            let _ = channel.try_send(message);
         }
     }
 
@@ -178,12 +183,46 @@ impl NodeRuntime {
         self.events.subscribe()
     }
 
-    pub fn add_peer_channel(&self, node_id: String, channel: mpsc::UnboundedSender<WireMessage>) {
-        self.peer_channels.lock().insert(node_id, channel);
+    pub fn add_peer_channel(&self, node_id: String, channel: mpsc::Sender<WireMessage>) -> bool {
+        let mut channels = self.peer_channels.lock();
+        if channels.contains_key(&node_id) {
+            return false;
+        }
+        channels.insert(node_id.clone(), channel);
+        self.connecting_peers.lock().remove(&node_id);
+        true
     }
 
     pub fn remove_peer_channel(&self, node_id: &str) {
         self.peer_channels.lock().remove(node_id);
+        self.connecting_peers.lock().remove(node_id);
+    }
+
+    pub fn begin_peer_connection(&self, node_id: &str) -> bool {
+        let channels = self.peer_channels.lock();
+        if channels.contains_key(node_id) {
+            return false;
+        }
+        drop(channels);
+        self.connecting_peers.lock().insert(node_id.to_string())
+    }
+
+    pub fn send_to_peer(&self, node_id: &str, message: WireMessage) -> bool {
+        let channel = self.peer_channels.lock().get(node_id).cloned();
+        channel.is_some_and(|channel| channel.try_send(message).is_ok())
+    }
+
+    pub fn send_to_peers_except(&self, except: Option<&str>, message: WireMessage) {
+        let channels = self
+            .peer_channels
+            .lock()
+            .iter()
+            .filter(|(node_id, _)| Some(node_id.as_str()) != except)
+            .map(|(_, channel)| channel.clone())
+            .collect::<Vec<_>>();
+        for channel in channels {
+            let _ = channel.try_send(message.clone());
+        }
     }
 
     pub fn set_peer(&self, peer: PeerInfo) {
@@ -221,6 +260,13 @@ impl NodeRuntime {
             .read()
             .get(node_id)
             .is_some_and(|peer| peer.capabilities.iter().any(|item| item == capability))
+    }
+
+    pub fn peer_name(&self, node_id: &str) -> Option<String> {
+        self.peers
+            .read()
+            .get(node_id)
+            .map(|peer| peer.node_name.clone())
     }
 
     pub fn update_peer_metrics(&self, node_id: &str, metrics: HardwareMetrics) -> bool {
@@ -370,16 +416,7 @@ impl NodeRuntime {
     }
 
     pub fn add_transfer(&self, offer: TransferOffer) {
-        let progress = TransferProgress {
-            transfer_id: offer.transfer_id.clone(),
-            status: TransferStatus::Waiting,
-            completed_bytes: 0,
-            total_bytes: offer.total_bytes,
-            completed_items: 0,
-            total_items: offer.items.len(),
-            destination: None,
-            error: None,
-        };
+        let progress = transfer_progress(&offer, "receive");
         self.transfers.write().insert(
             offer.transfer_id.clone(),
             TransferRecord {
@@ -389,15 +426,41 @@ impl NodeRuntime {
                 received_items: HashSet::new(),
             },
         );
-        self.publish(WireMessage::TransferOffer { offer });
-        self.publish(WireMessage::TransferProgress { progress });
+        self.publish_event(WireMessage::TransferOffer { offer });
+        self.publish_event(WireMessage::TransferProgress { progress });
+    }
+
+    pub fn add_outgoing_transfer(&self, offer: TransferOffer) -> TransferProgress {
+        let progress = transfer_progress(&offer, "send");
+        self.transfers.write().insert(
+            offer.transfer_id.clone(),
+            TransferRecord {
+                offer,
+                progress: progress.clone(),
+                accepted_destination: None,
+                received_items: HashSet::new(),
+            },
+        );
+        self.publish_event(WireMessage::TransferProgress {
+            progress: progress.clone(),
+        });
+        progress
     }
 
     pub fn update_transfer(&self, transfer_id: &str, progress: TransferProgress) {
         if let Some(record) = self.transfers.write().get_mut(transfer_id) {
+            let mut progress = progress;
+            progress.offer = Some(record.offer.clone());
+            progress.direction = if record.progress.direction.as_deref() == Some("send") {
+                Some("send".to_string())
+            } else {
+                record.progress.direction.clone()
+            };
             record.progress = progress.clone();
+            self.publish_event(WireMessage::TransferProgress { progress });
+            return;
         }
-        self.publish(WireMessage::TransferProgress { progress });
+        self.publish_event(WireMessage::TransferProgress { progress });
     }
 
     pub fn transfer(&self, transfer_id: &str) -> Option<TransferRecord> {
@@ -411,9 +474,13 @@ impl NodeRuntime {
     ) -> Option<TransferProgress> {
         let mut transfers = self.transfers.write();
         let record = transfers.get_mut(transfer_id)?;
+        if !matches!(record.progress.status, TransferStatus::Waiting) {
+            return None;
+        }
         record.accepted_destination = Some(destination.clone());
         record.progress.destination = Some(destination.to_string_lossy().to_string());
         record.progress.status = TransferStatus::Accepted;
+        record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
     }
 
@@ -425,6 +492,15 @@ impl NodeRuntime {
     ) -> Option<TransferProgress> {
         let mut transfers = self.transfers.write();
         let record = transfers.get_mut(transfer_id)?;
+        if matches!(
+            record.progress.status,
+            TransferStatus::Completed
+                | TransferStatus::Rejected
+                | TransferStatus::Failed
+                | TransferStatus::Cancelled
+        ) {
+            return None;
+        }
         if record.received_items.insert(item_id.to_string()) {
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
             record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
@@ -434,6 +510,7 @@ impl NodeRuntime {
         } else {
             record.progress.status = TransferStatus::Uploading;
         }
+        record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
     }
 
@@ -445,9 +522,86 @@ impl NodeRuntime {
     ) -> Option<TransferProgress> {
         let mut transfers = self.transfers.write();
         let record = transfers.get_mut(transfer_id)?;
+        if matches!(
+            record.progress.status,
+            TransferStatus::Completed
+                | TransferStatus::Rejected
+                | TransferStatus::Failed
+                | TransferStatus::Cancelled
+        ) {
+            return Some(record.progress.clone());
+        }
         record.progress.status = status;
         record.progress.error = Some(message);
+        record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
+    }
+
+    pub fn transfers_snapshot(&self, status: Option<TransferStatus>) -> Vec<TransferProgress> {
+        let mut transfers = self
+            .transfers
+            .read()
+            .values()
+            .filter(|record| {
+                status
+                    .as_ref()
+                    .map_or(true, |value| &record.progress.status == value)
+            })
+            .map(|record| record.progress.clone())
+            .collect::<Vec<_>>();
+        transfers.sort_by_key(|progress| progress.transfer_id.clone());
+        transfers
+    }
+
+    pub fn transfer_source_id(&self, transfer_id: &str) -> Option<String> {
+        self.transfers
+            .read()
+            .get(transfer_id)
+            .map(|record| record.offer.source_node_id.clone())
+    }
+
+    pub fn transfer_peer_ids(&self, transfer_id: &str) -> Option<(String, String)> {
+        self.transfers.read().get(transfer_id).map(|record| {
+            (
+                record.offer.source_node_id.clone(),
+                record.offer.target_node_id.clone(),
+            )
+        })
+    }
+
+    pub fn mark_transfer_accepted(&self, transfer_id: &str) -> Option<TransferProgress> {
+        let mut transfers = self.transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if !matches!(record.progress.status, TransferStatus::Waiting) {
+            return Some(record.progress.clone());
+        }
+        record.progress.status = TransferStatus::Accepted;
+        record.progress.offer = Some(record.offer.clone());
+        Some(record.progress.clone())
+    }
+
+    pub fn try_lock_transfer_item(&self, transfer_id: &str, item_id: &str) -> bool {
+        self.transfer_locks
+            .lock()
+            .insert((transfer_id.to_string(), item_id.to_string()))
+    }
+
+    pub fn unlock_transfer_item(&self, transfer_id: &str, item_id: &str) {
+        self.transfer_locks
+            .lock()
+            .remove(&(transfer_id.to_string(), item_id.to_string()));
+    }
+
+    pub fn transfer_upload_active(&self, transfer_id: &str) -> bool {
+        self.transfers
+            .read()
+            .get(transfer_id)
+            .is_some_and(|record| {
+                matches!(
+                    record.progress.status,
+                    TransferStatus::Accepted | TransferStatus::Uploading
+                )
+            })
     }
 }
 
@@ -489,6 +643,9 @@ pub fn network_addresses(port: u16) -> Vec<AddressInfo> {
                             let address = ipv4.to_string();
                             let value = u32::from(ipv4);
                             let tailscale = (value & 0xffc00000) == 0x64400000;
+                            if !ipv4.is_private() && !ipv4.is_link_local() && !tailscale {
+                                return None;
+                            }
                             let kind = if tailscale {
                                 "tailscale"
                             } else if ipv4.is_private() {
@@ -528,6 +685,25 @@ pub fn network_addresses(port: u16) -> Vec<AddressInfo> {
             kind: "loopback".to_string(),
         });
     }
+    addresses
+}
+
+pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
+    let mut addresses = vec![std::net::Ipv4Addr::LOCALHOST];
+    if let Ok(interfaces) = get_if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            let IpAddr::V4(address) = interface.ip() else {
+                continue;
+            };
+            let value = u32::from(address);
+            let tailscale = (value & 0xffc00000) == 0x64400000;
+            if address.is_private() || address.is_link_local() || tailscale {
+                addresses.push(address);
+            }
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
     addresses
 }
 
@@ -582,14 +758,14 @@ mod tests {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(8);
         runtime.set_peer(test_peer(
             "capable",
             vec![METRICS_SYSTEM_CAPABILITY.to_string()],
         ));
         runtime.add_peer_channel("capable".to_string(), tx);
         runtime.set_peer(test_peer("legacy", Vec::new()));
-        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel();
+        let (legacy_tx, mut legacy_rx) = mpsc::channel(8);
         runtime.add_peer_channel("legacy".to_string(), legacy_tx);
         runtime.publish_metrics(HardwareMetrics {
             node_id: runtime.node_id(),

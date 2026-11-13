@@ -39,4 +39,5 @@ export const getInfo = () => request<NodeInfo>('/api/v1/info');
 export const getPeers = () => request<PeerInfo[]>('/api/v1/peers');
 export const getMetrics = () => request<HardwareMetrics | null>('/api/v1/metrics');
 export const getClipboard = () => request<ClipboardSnapshot | null>('/api/v1/clipboard');
+export const getTransfers = (status?: string) => request<TransferProgress[]>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`);
 export const getTransferStatus = (id: string, target?: string) => request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, target);
