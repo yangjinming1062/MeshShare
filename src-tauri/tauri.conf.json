@@ -21,6 +21,26 @@
         "minHeight": 640,
         "resizable": true,
         "visible": true
+      },
+      {
+        "label": "monitor",
+        "title": "MeshShare · 硬件监控",
+        "url": "index.html?window=monitor",
+        "width": 580,
+        "height": 58,
+        "minWidth": 460,
+        "minHeight": 50,
+        "maxWidth": 900,
+        "maxHeight": 100,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "visible": false,
+        "center": false,
+        "x": 40,
+        "y": 40
       }
     ],
     "security": {

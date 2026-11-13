@@ -8,7 +8,25 @@ flowchart LR
   A <-->|HTTP 直传| B
   P[手机浏览器] -->|扫码 HTTP/WS| A
   P -->|选择目标后直传| B
+  M[监控悬浮条] -->|本机快照 HTTP/WS| A
 ```
+
+## 硬件指标同步
+
+```mermaid
+sequenceDiagram
+  participant C as 节点采集器
+  participant A as 节点 A
+  participant B as 支持 metrics 的节点 B
+  participant U as 本机 UI/悬浮条
+  C->>A: 每秒采集 CPU、内存、GPU、显存、网络快照
+  A->>U: 本机 MetricsUpdate
+  A->>B: 能力过滤后的 MetricsUpdate
+  B->>B: 校验来源节点并更新 PeerInfo.metrics
+  B-->>U: 仅在本地事件流显示远端指标
+```
+
+指标只保留最新快照。远端超过 5 秒没有更新时标记为过期；GPU/显存读取失败不会影响 CPU、内存和网络指标。
 
 手机通过任意可达节点进入网页。设备列表和传输目标来自节点发现结果；文件内容不会写入共享中心。
 

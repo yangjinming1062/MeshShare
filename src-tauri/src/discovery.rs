@@ -30,7 +30,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                 ("node_id", node.node_id.as_str()),
                 ("node_name", node.node_name.as_str()),
                 ("protocol", protocol.as_str()),
-                ("features", "clipboard,transfer,web"),
+                ("features", "clipboard,transfer,web,metrics"),
             ];
             if let Ok(info) = ServiceInfo::new(
                 SERVICE_TYPE,
@@ -113,6 +113,9 @@ pub async fn connect_manual(
         last_seen_ms: crate::clock::now_millis(),
         endpoint: Some(endpoint.clone()),
         source: "manual".to_string(),
+        metrics: None,
+        metrics_received_at_ms: None,
+        metrics_stale: false,
     };
     runtime.set_peer(peer.clone());
     let runtime_for_task = runtime.clone();
@@ -152,6 +155,9 @@ pub(crate) async fn connect_peer(
         last_seen_ms: crate::clock::now_millis(),
         endpoint: Some(endpoint),
         source: "mdns".to_string(),
+        metrics: None,
+        metrics_received_at_ms: None,
+        metrics_stale: false,
     });
     loop {
         tokio::select! {

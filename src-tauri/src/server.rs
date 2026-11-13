@@ -1,8 +1,8 @@
 use crate::clipboard;
 use crate::discovery;
 use crate::model::{
-    ClipboardSnapshot, NodeInfo, PeerInfo, TransferOffer, TransferProgress, TransferStatus,
-    WireMessage,
+    ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferOffer, TransferProgress,
+    TransferStatus, WireMessage, METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
@@ -60,6 +60,7 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
     Router::new()
         .route("/api/v1/info", get(info))
         .route("/api/v1/peers", get(peers))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/peers/connect", post(connect_peer))
         .route(
             "/api/v1/clipboard",
@@ -91,6 +92,10 @@ async fn info(State(state): State<AppState>) -> Json<NodeInfo> {
 
 async fn peers(State(state): State<AppState>) -> Json<Vec<PeerInfo>> {
     Json(state.runtime.peers_snapshot())
+}
+
+async fn metrics(State(state): State<AppState>) -> Json<Option<HardwareMetrics>> {
+    Json(state.runtime.local_metrics())
 }
 
 async fn connect_peer(
@@ -199,6 +204,9 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
             event = events.recv() => {
                 match event {
                     Ok(message) => {
+                        if matches!(&message, WireMessage::MetricsUpdate { .. }) && peer_id.is_some() {
+                            continue;
+                        }
                         if sender.send(axum::extract::ws::Message::Text(serde_json::to_string(&message).unwrap_or_default())).await.is_err() {
                             break;
                         }
@@ -238,6 +246,9 @@ pub(crate) async fn handle_wire_message(
                 last_seen_ms: crate::clock::now_millis(),
                 endpoint,
                 source: "websocket".to_string(),
+                metrics: None,
+                metrics_received_at_ms: None,
+                metrics_stale: false,
             });
             Some(node.node_id)
         }
@@ -281,6 +292,15 @@ pub(crate) async fn handle_wire_message(
             let transfer_id = progress.transfer_id.clone();
             runtime.update_transfer(&transfer_id, progress);
             current_peer.map(str::to_string)
+        }
+        WireMessage::MetricsUpdate { metrics } => {
+            let peer_id = current_peer?;
+            if runtime.peer_supports(peer_id, METRICS_SYSTEM_CAPABILITY)
+                && runtime.update_peer_metrics(peer_id, metrics.clone())
+            {
+                runtime.publish_event(WireMessage::MetricsUpdate { metrics });
+            }
+            Some(peer_id.to_string())
         }
     }
 }
@@ -537,13 +557,61 @@ fn has_parent_component(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::has_parent_component;
+    use super::{handle_wire_message, has_parent_component};
+    use crate::model::{HardwareMetrics, PeerInfo, WireMessage, METRICS_SYSTEM_CAPABILITY};
+    use crate::runtime::NodeRuntime;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
 
     #[test]
     fn rejects_parent_and_absolute_paths() {
         assert!(has_parent_component("../secret.txt"));
         assert!(has_parent_component("/tmp/secret.txt"));
         assert!(!has_parent_component("folder/secret.txt"));
+    }
+
+    #[tokio::test]
+    async fn remote_metrics_update_is_not_rebroadcast() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-server-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0).expect("create runtime");
+        runtime.set_peer(PeerInfo {
+            node_id: "peer".to_string(),
+            node_name: "peer".to_string(),
+            platform: "test".to_string(),
+            addresses: Vec::new(),
+            capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
+            online: true,
+            last_seen_ms: crate::clock::now_millis(),
+            endpoint: None,
+            source: "test".to_string(),
+            metrics: None,
+            metrics_received_at_ms: None,
+            metrics_stale: false,
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime.add_peer_channel("peer".to_string(), tx);
+        let metrics = HardwareMetrics {
+            node_id: "peer".to_string(),
+            sampled_at_ms: 1,
+            cpu_usage_percent: Some(2.0),
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            network_down_bytes_per_sec: None,
+            network_up_bytes_per_sec: None,
+            gpus: Vec::new(),
+        };
+        let result = handle_wire_message(
+            WireMessage::MetricsUpdate { metrics },
+            &runtime,
+            Some("peer"),
+        )
+        .await;
+        assert_eq!(result.as_deref(), Some("peer"));
+        assert!(rx.try_recv().is_err());
+        assert!(runtime.peers_snapshot()[0].metrics.is_some());
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 }
 

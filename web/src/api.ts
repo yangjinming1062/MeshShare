@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardSnapshot, NodeInfo, PeerInfo, TransferProgress } from './types';
+import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferProgress } from './types';
 
 let baseUrl = '';
 
@@ -24,6 +24,7 @@ export function websocketUrl(target = baseUrl): string {
 export async function request<T>(path: string, options: RequestInit = {}, target = baseUrl): Promise<T> {
   const response = await fetch(apiUrl(path, target), {
     ...options,
+    cache: 'no-store',
     headers: {
       ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}),
       ...(options.headers ?? {}),
@@ -36,5 +37,6 @@ export async function request<T>(path: string, options: RequestInit = {}, target
 
 export const getInfo = () => request<NodeInfo>('/api/v1/info');
 export const getPeers = () => request<PeerInfo[]>('/api/v1/peers');
+export const getMetrics = () => request<HardwareMetrics | null>('/api/v1/metrics');
 export const getClipboard = () => request<ClipboardSnapshot | null>('/api/v1/clipboard');
 export const getTransferStatus = (id: string, target?: string) => request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, target);

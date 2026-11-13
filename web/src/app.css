@@ -88,6 +88,21 @@ button.ghost { background: transparent; color: var(--blue-dark); }
 button.small { padding: 7px 9px; font-size: 11px; }
 .hint { color: var(--muted); font-size: 11px; }
 
+.metrics-panel { min-height: 220px; }
+.metrics-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 9px; }
+.metric-card { min-width: 0; display: grid; gap: 4px; padding: 12px; border: 1px solid var(--line); border-radius: 13px; background: #fbfcfe; }
+.metric-card span { color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .08em; }
+.metric-card strong { overflow: hidden; color: var(--ink); font-size: 20px; text-overflow: ellipsis; white-space: nowrap; }
+.metric-card small { overflow: hidden; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-detail-list { display: grid; gap: 7px; margin-top: 10px; }
+.gpu-detail-row { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(120px, .65fr); gap: 12px; align-items: center; padding: 9px 11px; border-radius: 11px; background: #f5f7fb; }
+.gpu-detail-row > div { min-width: 0; display: grid; gap: 3px; }
+.gpu-detail-row strong { overflow: hidden; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.gpu-detail-row span, .gpu-detail-row small { color: var(--muted); font-size: 10px; }
+.gpu-detail-row b { font-size: 12px; }
+.gpu-detail-row em { color: #a46b20; font-size: 10px; font-style: normal; line-height: 1.4; }
+.peer-metrics-summary { color: var(--blue-dark) !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
 .peer-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 11px; }
 .peer-card { position: relative; min-height: 122px; display: grid; grid-template-columns: auto 1fr auto; align-items: start; gap: 12px; padding: 15px; overflow: hidden; border: 1px solid var(--line); border-radius: 15px; background: #fbfcfe; transition: .18s ease; }
 .peer-card:hover, .peer-card.dragging { border-color: #8cafff; background: #f4f7ff; box-shadow: 0 10px 25px #2d5fd514; }
@@ -117,6 +132,16 @@ button.small { padding: 7px 9px; font-size: 11px; }
 .notice { position: fixed; z-index: 5; top: 14px; left: 50%; transform: translateX(-50%); padding: 10px 15px; border-radius: 999px; color: #fff; background: #172033e8; box-shadow: 0 8px 24px #0f172a38; font-size: 12px; }
 footer { max-width: 1240px; margin: -8px auto 0; padding: 0 26px 26px; display: flex; justify-content: space-between; gap: 12px; color: #8895a8; font-size: 11px; }
 .hidden-input { display: none; }
+
+.monitor-shell { min-height: 0; overflow: hidden; background: #101a2c; }
+.monitor-main { height: 100vh; display: flex; align-items: center; gap: 12px; padding: 8px 12px; color: #fff; background: linear-gradient(135deg, #162640, #0f172a); user-select: none; }
+.monitor-brand { display: flex; align-items: center; gap: 6px; margin-right: 2px; color: #d8e5ff; font-size: 11px; }
+.monitor-dot { width: 7px; height: 7px; border-radius: 50%; background: #54dc9a; box-shadow: 0 0 0 4px #54dc9a22; }
+.monitor-metric { min-width: 52px; display: grid; gap: 2px; }
+.monitor-metric b { color: #8fa7ca; font-size: 9px; letter-spacing: .08em; }
+.monitor-metric span { color: #fff; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.monitor-close { width: 22px; height: 22px; margin-left: auto; padding: 0; border-radius: 7px; color: #aebbd0; background: transparent; font-size: 18px; line-height: 22px; }
+.monitor-close:hover { color: #fff; background: #ffffff16; transform: none; }
 
 .mobile-shell { background: #f4f7fb; }
 .mobile-shell .topbar { height: 76px; color: var(--ink); }
@@ -151,6 +176,9 @@ footer { max-width: 1240px; margin: -8px auto 0; padding: 0 26px 26px; display: 
   .qr, .qr-placeholder { width: 116px; height: 116px; flex-basis: 116px; }
   .clipboard-preview { grid-template-columns: 1fr; }
   .clipboard-image { width: 100%; max-height: 180px; }
+  .metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .gpu-detail-row { grid-template-columns: 1fr auto; }
+  .gpu-detail-row em { grid-column: 1 / -1; }
   .transfer-row { grid-template-columns: auto 1fr auto; }
   .transfer-progress { grid-column: 2 / -1; }
   .transfer-actions { grid-column: 1 / -1; justify-content: flex-end; }

@@ -3,13 +3,17 @@
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
-  import { apiUrl, getClipboard, getInfo, getPeers, initApi, request, websocketUrl } from './api';
-  import type { ClipboardSnapshot, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress } from './types';
+  import { getClipboard, getInfo, getMetrics, getPeers, initApi, request, websocketUrl } from './api';
+  import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
+  const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
   let node: NodeInfo | null = null;
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
+  let metrics: HardwareMetrics | null = null;
+  let selectedMetricsPeer: PeerInfo | null = null;
+  $: currentMetrics = selectedMetricsPeer?.metrics ?? metrics;
   let clipboardDraft = '';
   let status = '正在连接…';
   let statusKind: 'ok' | 'warn' | 'error' = 'warn';
@@ -58,15 +62,19 @@
   });
 
   async function refresh() {
-    const [nextNode, nextPeers, nextClipboard] = await Promise.all([getInfo(), getPeers(), getClipboard()]);
+    const [nextNode, nextPeers, nextClipboard, nextMetrics] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics()]);
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
+    metrics = nextMetrics;
+    if (selectedMetricsPeer) {
+      selectedMetricsPeer = peers.find((peer) => peer.node_id === selectedMetricsPeer?.node_id) ?? null;
+    }
     if (clipboard && document.activeElement?.id !== 'clipboard-editor') clipboardDraft = clipboard.text ?? '';
     if (!selectedAddress || !nextNode.addresses.some((address) => address.url === selectedAddress)) selectedAddress = nextNode.addresses[0]?.url ?? '';
     status = '节点在线';
     statusKind = 'ok';
-    await refreshQr();
+    if (!isMonitor) await refreshQr();
   }
 
   function connectWebSocket() {
@@ -92,6 +100,20 @@
     }
     if (type === 'ClipboardUpdate') {
       void refresh();
+      return;
+    }
+    if (type === 'MetricsUpdate') {
+      const nextMetrics = payload as HardwareMetrics;
+      if (nextMetrics.node_id === node?.node_id) {
+        metrics = nextMetrics;
+      } else {
+        peers = peers.map((peer) => peer.node_id === nextMetrics.node_id
+          ? { ...peer, metrics: nextMetrics, metrics_received_at_ms: Date.now(), metrics_stale: false }
+          : peer);
+        if (selectedMetricsPeer?.node_id === nextMetrics.node_id) {
+          selectedMetricsPeer = { ...selectedMetricsPeer, metrics: nextMetrics, metrics_received_at_ms: Date.now(), metrics_stale: false };
+        }
+      }
       return;
     }
     if (type === 'TransferOffer') {
@@ -127,6 +149,14 @@
     syncEnabled = await invoke<boolean>('toggle_clipboard_sync').catch(() => !syncEnabled);
     notice = syncEnabled ? '剪贴板自动同步已恢复' : '剪贴板自动同步已暂停';
     window.setTimeout(() => (notice = ''), 2200);
+  }
+
+  function selectMetricsPeer(peer: PeerInfo) {
+    selectedMetricsPeer = peer;
+  }
+
+  async function hideMonitor() {
+    await invoke('set_monitor_display_mode', { mode: 'tray' }).catch(() => undefined);
   }
 
   async function publishClipboard() {
@@ -346,16 +376,78 @@
     return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
   }
 
+  function formatRate(value: number | undefined) {
+    if (value === undefined) return '—';
+    if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB/s`;
+    if (value >= 1024) return `${(value / 1024).toFixed(1)} KB/s`;
+    return `${Math.round(value)} B/s`;
+  }
+
+  function formatPercent(value: number | undefined) {
+    return value === undefined ? '—' : `${Math.round(value)}%`;
+  }
+
+  function formatMemory(value: number | undefined) {
+    return value === undefined ? '—' : formatSize(value);
+  }
+
+  function memoryPercent(value: HardwareMetrics | null | undefined) {
+    if (value?.memory_used_bytes === undefined || value.memory_total_bytes === undefined) return undefined;
+    if (value.memory_total_bytes <= 0) return undefined;
+    return value.memory_used_bytes / value.memory_total_bytes * 100;
+  }
+
+  function gpuSummary(value: HardwareMetrics | null | undefined) {
+    const gpus = value?.gpus ?? [];
+    const utilization = gpus.map((gpu) => gpu.utilization_percent).filter((item): item is number => item !== undefined);
+    const used = gpus.map((gpu) => gpu.memory_used_bytes).filter((item): item is number => item !== undefined).reduce((sum, item) => sum + item, 0);
+    const total = gpus.map((gpu) => gpu.memory_total_bytes).filter((item): item is number => item !== undefined).reduce((sum, item) => sum + item, 0);
+    const usage = utilization.length ? formatPercent(Math.max(...utilization)) : '—';
+    const memory = total ? `${formatSize(used)} / ${formatSize(total)}` : '—';
+    return `${usage} · ${memory}`;
+  }
+
+  function metricAge(sampledAt: number | undefined, receivedAt?: number) {
+    const at = receivedAt ?? sampledAt;
+    if (!at) return '等待数据';
+    const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
+    return seconds <= 1 ? '刚刚更新' : `${seconds} 秒前更新`;
+  }
+
+  function metricStatus(peer: PeerInfo | null, value: HardwareMetrics | null) {
+    if (peer?.metrics_stale) return '指标已过期';
+    return metricAge(value?.sampled_at_ms, peer?.metrics_received_at_ms);
+  }
+
+  function peerSummary(peer: PeerInfo) {
+    if (peer.metrics_stale) return '指标已过期';
+    const value = peer.metrics;
+    if (!value) return '指标采集中';
+    return `CPU ${formatPercent(value.cpu_usage_percent)} · 内存 ${formatPercent(memoryPercent(value))} · ↓ ${formatRate(value.network_down_bytes_per_sec)} ↑ ${formatRate(value.network_up_bytes_per_sec)}`;
+  }
+
   function formatTime(value: number | undefined) {
     return value ? new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
   }
 </script>
 
 <svelte:head>
-  <title>{isMobile ? 'MeshShare · 手机连接' : 'MeshShare · 局域网共享'}</title>
+  <title>{isMonitor ? 'MeshShare · 硬件监控' : isMobile ? 'MeshShare · 手机连接' : 'MeshShare · 局域网共享'}</title>
 </svelte:head>
 
-<div class:mobile-shell={isMobile} class="shell">
+<div class:mobile-shell={isMobile} class:monitor-shell={isMonitor} class="shell">
+  {#if isMonitor}
+    <main class="monitor-main" data-tauri-drag-region>
+      <div class="monitor-brand" data-tauri-drag-region><span class="monitor-dot"></span><strong>MeshShare</strong></div>
+      <div class="monitor-metric"><b>CPU</b><span>{formatPercent(metrics?.cpu_usage_percent)}</span></div>
+      <div class="monitor-metric"><b>GPU</b><span>{gpuSummary(metrics).split(' · ')[0]}</span></div>
+      <div class="monitor-metric"><b>显存</b><span>{gpuSummary(metrics).split(' · ')[1] ?? '—'}</span></div>
+      <div class="monitor-metric"><b>内存</b><span>{formatPercent(memoryPercent(metrics))}</span></div>
+      <div class="monitor-metric"><b>↓</b><span>{formatRate(metrics?.network_down_bytes_per_sec)}</span></div>
+      <div class="monitor-metric"><b>↑</b><span>{formatRate(metrics?.network_up_bytes_per_sec)}</span></div>
+      <button class="monitor-close" aria-label="隐藏监控条" on:click={hideMonitor}>×</button>
+    </main>
+  {:else}
   <header class="topbar">
     <div class="brand-block">
       <div class="brand-mark">M</div>
@@ -421,6 +513,26 @@
         <div class="button-row"><button class="primary" on:click={publishClipboard}>立即同步当前文字</button><span class="hint">桌面端复制文字或图片后会自动推送到在线设备的系统剪贴板。</span></div>
       </section>
 
+      <section class="panel metrics-panel">
+        <div class="panel-heading"><div><div class="section-kicker">HARDWARE MONITOR</div><h2>{selectedMetricsPeer ? selectedMetricsPeer.node_name + ' 的硬件状态' : '本机硬件状态'}</h2></div><span class="muted">{metricStatus(selectedMetricsPeer, currentMetrics)}</span></div>
+        <div class="metrics-grid">
+          <div class="metric-card"><span>CPU</span><strong>{formatPercent(currentMetrics?.cpu_usage_percent)}</strong><small>系统总使用率</small></div>
+          <div class="metric-card"><span>内存</span><strong>{formatPercent(memoryPercent(currentMetrics))}</strong><small>{formatMemory(currentMetrics?.memory_used_bytes)} / {formatMemory(currentMetrics?.memory_total_bytes)}</small></div>
+          <div class="metric-card"><span>GPU</span><strong>{gpuSummary(currentMetrics).split(' · ')[0]}</strong><small>{currentMetrics?.gpus.length ? currentMetrics.gpus.length + ' 个 GPU' : '未检测到可读指标'}</small></div>
+          <div class="metric-card"><span>网络</span><strong>↓ {formatRate(currentMetrics?.network_down_bytes_per_sec)}</strong><small>↑ {formatRate(currentMetrics?.network_up_bytes_per_sec)}</small></div>
+        </div>
+        <div class="gpu-detail-list">
+          {#each currentMetrics?.gpus ?? [] as gpu}
+            <div class="gpu-detail-row">
+              <div><strong>{gpu.name}</strong><span>{gpu.memory_kind === 'unified' ? '统一内存' : gpu.memory_kind === 'dedicated' ? '独立显存' : '显存类型未知'}</span></div>
+              <div><b>{formatPercent(gpu.utilization_percent)}</b><small>{formatMemory(gpu.memory_used_bytes)} / {formatMemory(gpu.memory_total_bytes)}</small></div>
+              {#if gpu.unavailable_reason}<em>{gpu.unavailable_reason}</em>{/if}
+            </div>
+          {:else}<div class="empty-state compact">GPU/显存指标暂不可用，CPU、内存和网络仍会继续采集。</div>{/each}
+        </div>
+        {#if selectedMetricsPeer}<button class="ghost small" on:click={() => (selectedMetricsPeer = null)}>查看本机</button>{/if}
+      </section>
+
       <section class="panel devices-panel">
         <div class="panel-heading devices-heading"><div><div class="section-kicker">DEVICES</div><h2>在线设备</h2></div><div class="heading-actions"><span class="count-badge">{peers.length} 台</span><div class="manual-connect"><input bind:value={manualAddress} placeholder="手动输入节点地址" on:keydown={(event) => event.key === 'Enter' && connectManualPeer()} /><button class="ghost" on:click={connectManualPeer}>连接</button></div></div></div>
         <div class="peer-grid">
@@ -428,9 +540,9 @@
             <!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
             <article role="button" tabindex="0" class:dragging={dragPeer === peer.node_id} class="peer-card peer-target" on:click={() => startChoose(peer)} on:keydown={(event) => event.key === 'Enter' && startChoose(peer)} on:dragover|preventDefault={() => (dragPeer = peer.node_id)} on:dragleave={() => (dragPeer = '')} on:drop={(event) => onDrop(peer, event)}>
               <div class="peer-icon">{peer.node_name.slice(0, 1).toUpperCase()}</div>
-              <div class="peer-copy"><strong>{peer.node_name}</strong><span>{peer.platform} · {peer.addresses[0]?.address ?? '在线'}</span></div>
+              <div class="peer-copy"><strong>{peer.node_name}</strong><span>{peer.platform} · {peer.addresses[0]?.address ?? '在线'}</span><small class="peer-metrics-summary">{peerSummary(peer)}</small></div>
               <div class="online-mark"></div>
-              <div class="peer-actions"><button on:click|stopPropagation={() => startChoose(peer)}>选择文件</button><button class="ghost" on:click|stopPropagation={() => startChoose(peer, true)}>选择文件夹</button></div>
+              <div class="peer-actions"><button on:click|stopPropagation={() => startChoose(peer)}>选择文件</button><button class="ghost" on:click|stopPropagation={() => startChoose(peer, true)}>选择文件夹</button><button class="ghost" on:click|stopPropagation={() => selectMetricsPeer(peer)}>查看监控</button></div>
               {#if dragPeer === peer.node_id}<div class="drop-overlay">松开即可发送</div>{/if}
             </article>
           {:else}<div class="empty-state">没有其他在线设备。启动另一台 MeshShare 后，它会自动出现在这里。</div>{/each}
@@ -454,6 +566,7 @@
   {/if}
 
   <footer><span>MeshShare · 受信任局域网内的直接共享</span>{#if !isMobile}<span>关闭窗口后服务仍在系统托盘运行</span>{/if}</footer>
+  {/if}
 </div>
 
 <input bind:this={fileInput} class="hidden-input" type="file" multiple on:change={onFileInput} />

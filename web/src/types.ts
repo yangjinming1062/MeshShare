@@ -25,6 +25,31 @@ export type PeerInfo = {
   last_seen_ms: number;
   endpoint?: string;
   source: string;
+  metrics?: HardwareMetrics;
+  metrics_received_at_ms?: number;
+  metrics_stale?: boolean;
+};
+
+export type GpuMemoryKind = 'dedicated' | 'unified' | 'unknown';
+
+export type GpuMetrics = {
+  name: string;
+  utilization_percent?: number;
+  memory_used_bytes?: number;
+  memory_total_bytes?: number;
+  memory_kind: GpuMemoryKind;
+  unavailable_reason?: string;
+};
+
+export type HardwareMetrics = {
+  node_id: string;
+  sampled_at_ms: number;
+  cpu_usage_percent?: number;
+  memory_used_bytes?: number;
+  memory_total_bytes?: number;
+  network_down_bytes_per_sec?: number;
+  network_up_bytes_per_sec?: number;
+  gpus: GpuMetrics[];
 };
 
 export type ClipboardSnapshot = {

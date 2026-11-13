@@ -1,7 +1,8 @@
 use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
-    AddressInfo, ClipboardEvent, ClipboardSnapshot, NodeInfo, PeerInfo, TransferOffer,
-    TransferProgress, TransferStatus, WireMessage,
+    AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MonitorDisplayMode, NodeInfo,
+    PeerInfo, TransferOffer, TransferProgress, TransferStatus, WireMessage, METRICS_GPU_CAPABILITY,
+    METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -18,6 +19,8 @@ use uuid::Uuid;
 struct PersistedConfig {
     node_id: String,
     node_name: String,
+    #[serde(default)]
+    monitor_display: MonitorDisplayMode,
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,10 @@ pub struct NodeRuntime {
     pub clipboard: RwLock<Option<ClipboardSnapshot>>,
     pub peers: RwLock<HashMap<String, PeerInfo>>,
     pub transfers: RwLock<HashMap<String, TransferRecord>>,
+    pub local_metrics: RwLock<Option<HardwareMetrics>>,
+    pub monitor_display: RwLock<MonitorDisplayMode>,
+    config: Mutex<PersistedConfig>,
+    data_dir: PathBuf,
     seen_events: Mutex<HashMap<String, i64>>,
     suppression: Mutex<Option<(String, i64)>>,
     peer_channels: Mutex<HashMap<String, mpsc::UnboundedSender<WireMessage>>>,
@@ -50,7 +57,7 @@ impl NodeRuntime {
         let addresses = network_addresses(port);
         let node = NodeInfo {
             node_id: config.node_id.clone(),
-            node_name: config.node_name,
+            node_name: config.node_name.clone(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             platform: std::env::consts::OS.to_string(),
             port,
@@ -61,15 +68,21 @@ impl NodeRuntime {
                 "transfer.file".to_string(),
                 "transfer.folder".to_string(),
                 "web.mobile".to_string(),
+                METRICS_SYSTEM_CAPABILITY.to_string(),
+                METRICS_GPU_CAPABILITY.to_string(),
             ],
         };
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
-            clock: LogicalClock::new(config.node_id),
+            clock: LogicalClock::new(config.node_id.clone()),
             node: RwLock::new(node),
             clipboard: RwLock::new(None),
             peers: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
+            local_metrics: RwLock::new(None),
+            monitor_display: RwLock::new(config.monitor_display.clone()),
+            config: Mutex::new(config),
+            data_dir,
             seen_events: Mutex::new(HashMap::new()),
             suppression: Mutex::new(None),
             peer_channels: Mutex::new(HashMap::new()),
@@ -110,6 +123,57 @@ impl NodeRuntime {
         }
     }
 
+    pub fn publish_event(&self, message: WireMessage) {
+        let _ = self.events.send(message);
+    }
+
+    pub fn publish_metrics(&self, metrics: HardwareMetrics) {
+        let _ = self.events.send(WireMessage::MetricsUpdate {
+            metrics: metrics.clone(),
+        });
+        let peer_capabilities = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(_, peer)| peer.online)
+            .map(|(node_id, peer)| {
+                (
+                    node_id.clone(),
+                    (
+                        peer.capabilities
+                            .iter()
+                            .any(|capability| capability == METRICS_SYSTEM_CAPABILITY),
+                        peer.capabilities
+                            .iter()
+                            .any(|capability| capability == METRICS_GPU_CAPABILITY),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let channels = self
+            .peer_channels
+            .lock()
+            .iter()
+            .filter_map(|(node_id, channel)| {
+                let (supports_system, supports_gpu) = peer_capabilities.get(node_id)?;
+                if !*supports_system {
+                    return None;
+                }
+                let mut outgoing = metrics.clone();
+                if !*supports_gpu {
+                    outgoing.gpus.clear();
+                }
+                Some((
+                    channel.clone(),
+                    WireMessage::MetricsUpdate { metrics: outgoing },
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (channel, message) in channels {
+            let _ = channel.send(message);
+        }
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<WireMessage> {
         self.events.subscribe()
     }
@@ -123,9 +187,16 @@ impl NodeRuntime {
     }
 
     pub fn set_peer(&self, peer: PeerInfo) {
-        self.peers
-            .write()
-            .insert(peer.node_id.clone(), peer.clone());
+        let mut peers = self.peers.write();
+        let mut peer = peer;
+        if let Some(previous) = peers.get(&peer.node_id) {
+            peer.metrics = peer.metrics.or_else(|| previous.metrics.clone());
+            peer.metrics_received_at_ms = peer
+                .metrics_received_at_ms
+                .or(previous.metrics_received_at_ms);
+            peer.metrics_stale = previous.metrics_stale;
+        }
+        peers.insert(peer.node_id.clone(), peer);
         let _ = self.events.send(WireMessage::Hello {
             node: self.node_info(),
         });
@@ -145,8 +216,61 @@ impl NodeRuntime {
         }
     }
 
+    pub fn peer_supports(&self, node_id: &str, capability: &str) -> bool {
+        self.peers
+            .read()
+            .get(node_id)
+            .is_some_and(|peer| peer.capabilities.iter().any(|item| item == capability))
+    }
+
+    pub fn update_peer_metrics(&self, node_id: &str, metrics: HardwareMetrics) -> bool {
+        if metrics.node_id != node_id {
+            return false;
+        }
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(node_id) else {
+            return false;
+        };
+        peer.metrics = Some(metrics);
+        peer.metrics_received_at_ms = Some(now_millis());
+        peer.metrics_stale = false;
+        peer.online = true;
+        true
+    }
+
+    pub fn local_metrics(&self) -> Option<HardwareMetrics> {
+        self.local_metrics.read().clone()
+    }
+
+    pub fn set_local_metrics(&self, metrics: HardwareMetrics) {
+        *self.local_metrics.write() = Some(metrics);
+    }
+
+    pub fn monitor_display_mode(&self) -> MonitorDisplayMode {
+        self.monitor_display.read().clone()
+    }
+
+    pub fn set_monitor_display_mode(&self, mode: MonitorDisplayMode) -> anyhow::Result<()> {
+        *self.monitor_display.write() = mode.clone();
+        let mut config = self.config.lock();
+        config.monitor_display = mode;
+        persist_config(&self.data_dir, &config)
+    }
+
     pub fn peers_snapshot(&self) -> Vec<PeerInfo> {
-        let mut peers = self.peers.read().values().cloned().collect::<Vec<_>>();
+        let now = now_millis();
+        let mut peers = self
+            .peers
+            .read()
+            .values()
+            .cloned()
+            .map(|mut peer| {
+                peer.metrics_stale = peer.metrics_received_at_ms.is_some_and(|received_at| {
+                    now.saturating_sub(received_at) > crate::model::METRICS_STALE_AFTER_MS
+                });
+                peer
+            })
+            .collect::<Vec<_>>();
         peers.sort_by(|left, right| {
             left.node_name
                 .to_lowercase()
@@ -341,9 +465,16 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "MeshShare 节点".to_string()),
+        monitor_display: MonitorDisplayMode::default(),
     };
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)?;
+    persist_config(data_dir, &config)?;
     Ok(config)
+}
+
+fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<()> {
+    let path = data_dir.join("node.json");
+    std::fs::write(path, serde_json::to_vec_pretty(config)?)?;
+    Ok(())
 }
 
 pub fn network_addresses(port: u16) -> Vec<AddressInfo> {
@@ -398,4 +529,116 @@ pub fn network_addresses(port: u16) -> Vec<AddressInfo> {
         });
     }
     addresses
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_or_create_config, NodeRuntime};
+    use crate::model::{
+        GpuMemoryKind, GpuMetrics, HardwareMetrics, PeerInfo, METRICS_SYSTEM_CAPABILITY,
+    };
+    use std::path::PathBuf;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    fn test_peer(node_id: &str, capabilities: Vec<String>) -> PeerInfo {
+        PeerInfo {
+            node_id: node_id.to_string(),
+            node_name: "peer".to_string(),
+            platform: "test".to_string(),
+            addresses: Vec::new(),
+            capabilities,
+            online: true,
+            last_seen_ms: crate::clock::now_millis(),
+            endpoint: None,
+            source: "test".to_string(),
+            metrics: None,
+            metrics_received_at_ms: None,
+            metrics_stale: false,
+        }
+    }
+
+    fn temp_data_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("meshshare-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&path).expect("create test directory");
+        path
+    }
+
+    #[test]
+    fn old_config_uses_floating_monitor_default() {
+        let path = temp_data_dir();
+        std::fs::write(
+            path.join("node.json"),
+            r#"{"node_id":"node-a","node_name":"test"}"#,
+        )
+        .expect("write old config");
+        let config = load_or_create_config(&path).expect("load config");
+        assert_eq!(config.monitor_display.as_str(), "floating");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn metrics_are_only_sent_to_capable_peers() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0).expect("create runtime");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        runtime.set_peer(test_peer(
+            "capable",
+            vec![METRICS_SYSTEM_CAPABILITY.to_string()],
+        ));
+        runtime.add_peer_channel("capable".to_string(), tx);
+        runtime.set_peer(test_peer("legacy", Vec::new()));
+        let (legacy_tx, mut legacy_rx) = mpsc::unbounded_channel();
+        runtime.add_peer_channel("legacy".to_string(), legacy_tx);
+        runtime.publish_metrics(HardwareMetrics {
+            node_id: runtime.node_id(),
+            sampled_at_ms: 1,
+            cpu_usage_percent: Some(1.0),
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            network_down_bytes_per_sec: None,
+            network_up_bytes_per_sec: None,
+            gpus: vec![GpuMetrics {
+                name: "GPU".to_string(),
+                utilization_percent: Some(50.0),
+                memory_used_bytes: Some(1),
+                memory_total_bytes: Some(2),
+                memory_kind: GpuMemoryKind::Dedicated,
+                unavailable_reason: None,
+            }],
+        });
+        let message = rx.try_recv().expect("capable peer receives metrics");
+        match message {
+            crate::model::WireMessage::MetricsUpdate { metrics } => {
+                assert!(metrics.gpus.is_empty());
+            }
+            _ => panic!("unexpected message"),
+        }
+        assert!(legacy_rx.try_recv().is_err());
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn peer_metrics_become_stale_after_timeout() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0).expect("create runtime");
+        let mut peer = test_peer("peer", vec![METRICS_SYSTEM_CAPABILITY.to_string()]);
+        peer.metrics = Some(HardwareMetrics {
+            node_id: "peer".to_string(),
+            sampled_at_ms: 1,
+            cpu_usage_percent: Some(1.0),
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            network_down_bytes_per_sec: None,
+            network_up_bytes_per_sec: None,
+            gpus: Vec::new(),
+        });
+        peer.metrics_received_at_ms = Some(crate::clock::now_millis() - 6_000);
+        runtime.set_peer(peer);
+        assert!(runtime.peers_snapshot()[0].metrics_stale);
+        let _ = std::fs::remove_dir_all(path);
+    }
 }
