@@ -1543,6 +1543,18 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_connection_guard_can_be_released_after_handshake_race() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert!(runtime.begin_peer_connection("peer"));
+        assert!(!runtime.begin_peer_connection("peer"));
+        runtime.cancel_peer_connection("peer");
+        assert!(runtime.begin_peer_connection("peer"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn peer_metrics_become_stale_after_timeout() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())

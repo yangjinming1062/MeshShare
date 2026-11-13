@@ -497,6 +497,7 @@ pub(crate) async fn handle_wire_message(
                             && progress.total_items == record.offer.items.len()
                             && progress.completed_bytes <= progress.total_bytes
                             && progress.completed_items <= progress.total_items
+                            && progress_counts_match_status(&progress)
                             && progress_is_monotonic(&record.progress, &progress)
                     });
                     if valid {
@@ -699,6 +700,14 @@ fn progress_is_monotonic(current: &TransferProgress, next: &TransferProgress) ->
         | TransferStatus::Cancelled
         | TransferStatus::Completed => false,
     }
+}
+
+fn progress_counts_match_status(progress: &TransferProgress) -> bool {
+    !matches!(
+        progress.status,
+        TransferStatus::Completed | TransferStatus::Ready
+    ) || (progress.completed_bytes == progress.total_bytes
+        && progress.completed_items == progress.total_items)
 }
 
 async fn create_mobile_session(
