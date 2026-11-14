@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress } from './types';
+import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress, TransferStatus } from './types';
 
 let baseUrl = '';
 
@@ -44,8 +44,7 @@ export const getClipboardHistory = () => request<ClipboardHistoryResponse>('/api
 export const getClipboardHistoryDetail = (eventId: string) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`);
 export const restoreClipboardHistory = (eventId: string) => request<ClipboardSnapshot>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/restore`, { method: 'POST' });
 export const clearClipboardHistory = () => request<{ cleared: number }>('/api/v1/clipboard/history', { method: 'DELETE' });
-export const getTransfers = (status?: string) => request<TransferProgress[]>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`);
-export const getTransferStatus = (id: string, target?: string) => request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, target);
+export const getTransfers = (status?: TransferStatus) => request<TransferProgress[]>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`);
 export const createMobileSession = (label?: string) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) });
 export const getMobileSessions = () => request<MobileSession[]>('/api/v1/mobile/sessions');
 export const getMobileTransfers = (sessionId?: string) => request<MobileTransferView[]>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`);

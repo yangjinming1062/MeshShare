@@ -197,6 +197,6 @@ export type WireMessage =
   | { type: 'ClipboardUpdate'; payload: { event: unknown } }
   | { type: 'ClipboardSnapshot'; payload: { snapshot: ClipboardSnapshot } }
   | { type: 'TransferOffer'; payload: { offer: TransferOffer } }
-  | { type: 'TransferAction'; payload: { transfer_id: string; action: string; destination?: string; reason?: string } }
+  | { type: 'TransferAction'; payload: { transfer_id: string; action: string; reason?: string } }
   | { type: 'TransferProgress'; payload: { progress: TransferProgress } }
   | { type: 'MetricsUpdate'; payload: { metrics: HardwareMetrics } };

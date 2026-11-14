@@ -825,7 +825,6 @@ pub(crate) async fn handle_wire_message(
                     WireMessage::TransferAction {
                         transfer_id,
                         action: "accept".to_string(),
-                        destination: None,
                         reason: None,
                     },
                 );
@@ -835,27 +834,16 @@ pub(crate) async fn handle_wire_message(
         WireMessage::TransferAction {
             transfer_id,
             action,
-            destination,
             reason,
         } => {
-            if destination
+            if reason
                 .as_ref()
-                .is_some_and(|value| value.len() > 4_096)
-                || reason
-                    .as_ref()
-                    .is_some_and(|value| value.len() > MAX_WIRE_ERROR_LENGTH)
+                .is_some_and(|value| value.len() > MAX_WIRE_ERROR_LENGTH)
             {
                 return current_peer.map(str::to_string);
             }
-            let _ = apply_transfer_action(
-                runtime,
-                &transfer_id,
-                &action,
-                destination,
-                reason,
-                current_peer,
-            )
-            .await;
+            let _ =
+                apply_transfer_action(runtime, &transfer_id, &action, reason, current_peer).await;
             current_peer.map(str::to_string)
         }
         WireMessage::TransferProgress { progress } => {
@@ -1182,7 +1170,7 @@ async fn list_mobile_transfers(
 }
 
 async fn cleanup_mobile_staging(state: &AppState) {
-    state.runtime.mobile_sessions_snapshot();
+    state.runtime.prune_expired_mobile_sessions();
     for directory in state.runtime.prune_mobile_transfers() {
         if let Err(error) = fs::remove_dir_all(directory).await {
             if error.kind() != std::io::ErrorKind::NotFound {
@@ -1601,7 +1589,7 @@ async fn download_mobile_item(
             }
         },
     );
-    let mut response = (
+    let response = (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CONTENT_LENGTH, HeaderValue::from(size)),
@@ -1611,9 +1599,6 @@ async fn download_mobile_item(
         Body::from_stream(stream),
     )
         .into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
 }
 
@@ -1673,7 +1658,6 @@ async fn reject_transfer(
             WireMessage::TransferAction {
                 transfer_id: id.clone(),
                 action: "reject".to_string(),
-                destination: None,
                 reason: progress.error.clone(),
             },
         );
@@ -1681,7 +1665,6 @@ async fn reject_transfer(
     state.runtime.publish_event(WireMessage::TransferAction {
         transfer_id: id,
         action: "reject".to_string(),
-        destination: None,
         reason: progress.error.clone(),
     });
     state.runtime.publish_event(WireMessage::TransferProgress {
@@ -1704,7 +1687,6 @@ async fn cancel_transfer(
             WireMessage::TransferAction {
                 transfer_id: id.clone(),
                 action: "cancel".to_string(),
-                destination: None,
                 reason: progress.error.clone(),
             },
         );
@@ -1712,7 +1694,6 @@ async fn cancel_transfer(
     state.runtime.publish_event(WireMessage::TransferAction {
         transfer_id: id,
         action: "cancel".to_string(),
-        destination: None,
         reason: progress.error.clone(),
     });
     state.runtime.publish_event(WireMessage::TransferProgress {
@@ -2021,7 +2002,6 @@ async fn apply_transfer_action(
     runtime: &Arc<NodeRuntime>,
     transfer_id: &str,
     action: &str,
-    _destination: Option<String>,
     reason: Option<String>,
     current_peer: Option<&str>,
 ) -> Result<(), ApiError> {

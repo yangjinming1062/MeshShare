@@ -1495,9 +1495,8 @@ impl NodeRuntime {
 
     pub fn create_mobile_session(&self, label: String) -> Result<MobileSession, String> {
         let now = now_millis();
+        self.prune_expired_mobile_sessions_at(now);
         let mut sessions = self.mobile_sessions.write();
-        sessions
-            .retain(|_, session| now.saturating_sub(session.last_seen_ms) <= MOBILE_SESSION_TTL_MS);
         if sessions.len() >= MAX_MOBILE_SESSIONS {
             return Err("手机会话数量已达到上限".to_string());
         }
@@ -1515,19 +1514,26 @@ impl NodeRuntime {
 
     pub fn touch_mobile_session(&self, session_id: &str) -> Option<MobileSession> {
         let now = now_millis();
+        self.prune_expired_mobile_sessions_at(now);
         let mut sessions = self.mobile_sessions.write();
-        sessions
-            .retain(|_, session| now.saturating_sub(session.last_seen_ms) <= MOBILE_SESSION_TTL_MS);
         let session = sessions.get_mut(session_id)?;
         session.last_seen_ms = now;
         Some(session.clone())
     }
 
-    pub fn mobile_sessions_snapshot(&self) -> Vec<MobileSession> {
-        let now = now_millis();
-        let mut sessions = self.mobile_sessions.write();
-        sessions
+    pub fn prune_expired_mobile_sessions(&self) {
+        self.prune_expired_mobile_sessions_at(now_millis());
+    }
+
+    fn prune_expired_mobile_sessions_at(&self, now: i64) {
+        self.mobile_sessions
+            .write()
             .retain(|_, session| now.saturating_sub(session.last_seen_ms) <= MOBILE_SESSION_TTL_MS);
+    }
+
+    pub fn mobile_sessions_snapshot(&self) -> Vec<MobileSession> {
+        self.prune_expired_mobile_sessions();
+        let sessions = self.mobile_sessions.read();
         let mut result = sessions.values().cloned().collect::<Vec<_>>();
         result.sort_by_key(|session| session.created_at_ms);
         result

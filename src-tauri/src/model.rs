@@ -352,7 +352,6 @@ pub enum WireMessage {
     TransferAction {
         transfer_id: String,
         action: String,
-        destination: Option<String>,
         reason: Option<String>,
     },
     TransferProgress {

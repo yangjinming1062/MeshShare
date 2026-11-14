@@ -288,7 +288,6 @@ fn accept_transfer(
             WireMessage::TransferAction {
                 transfer_id,
                 action: "accept".to_string(),
-                destination: None,
                 reason: None,
             },
         );

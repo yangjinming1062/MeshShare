@@ -7,7 +7,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileAccess, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistoryResponse, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
@@ -149,9 +149,9 @@
           receiveSettings = await invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings);
           clipboardStatus = await invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus);
         }
-        mobileAccess = await getMobileAccess().catch(() => null);
+        if (!isMonitor) mobileAccess = await getMobileAccess().catch(() => null);
         await refresh();
-        syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
+        if (!isMobile && !isMonitor) syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
         if (!isMobile && !isMonitor) {
           try {
             autostartEnabled = await invoke<boolean>('autostart_enabled');
@@ -195,6 +195,14 @@
   });
 
   async function refresh() {
+    if (isMonitor) {
+      const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
+      node = nextNode;
+      metrics = nextMetrics;
+      status = '节点在线';
+      statusKind = 'ok';
+      return;
+    }
     if (isMobile && !mobileSessionId) await ensureMobileSession();
     const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory, nextClipboardStatus] = await Promise.all([
       getInfo(),

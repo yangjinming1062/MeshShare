@@ -47,7 +47,7 @@
 - `ClipboardUpdate` 的 `payload.event` 包含事件 ID、原始来源节点、HLC 和剪贴板内容。接收端用当前 WebSocket Peer Channel 确认发送方；多跳转发时原始来源节点可以与当前发送方不同。
 - `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新剪贴板快照，`source_node_id` 保留原始产生事件的节点，接收端仍按 HLC 比较新旧并按事件 ID 去重。
 - `TransferOffer` 的 `payload.offer` 包含传输清单、总大小和发送节点。
-- `TransferAction` 表示接受、拒绝或取消。
+- `TransferAction` 表示接受、拒绝或取消，可携带失败原因；接收目录只由接收节点本地选择，不通过节点消息传输。
 - `TransferProgress` 的 `payload.progress` 包含传输状态、已完成字节和错误。
 - `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
 
