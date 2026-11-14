@@ -1544,7 +1544,14 @@ fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<(
         }
         #[cfg(not(windows))]
         {
-            let _ = std::fs::remove_file(&temporary);
+            if let Err(cleanup_error) = std::fs::remove_file(&temporary) {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "清理配置临时文件失败 {}：{cleanup_error}",
+                        temporary.display()
+                    );
+                }
+            }
             return Err(error.into());
         }
     }
