@@ -7,7 +7,7 @@
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:1420",
-    "frontendDist": "../web/dist"
+    "frontendDist": "../frontend/dist"
   },
   "app": {
     "withGlobalTauri": false,
@@ -59,7 +59,7 @@
     "targets": "all",
     "createUpdaterArtifacts": true,
     "resources": {
-      "../web/dist": "web"
+      "../frontend/dist": "web"
     },
     "icon": [
       "icons/icon.png",

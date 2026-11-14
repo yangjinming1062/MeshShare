@@ -15,10 +15,10 @@ MeshShare 由多个平等的桌面节点组成，没有中心服务器和共享�
 ## 模块边界
 
 ```text
-Tauri/Svelte UI (`web/`, `src-tauri/src/lib.rs`)
+Tauri/Svelte UI (`frontend/`, `backend/src/lib.rs`)
         │ HTTP / WebSocket / Tauri commands
         ▼
-节点运行时 (`src-tauri/src/runtime.rs`)
+节点运行时 (`backend/src/runtime.rs`)
         ├── 剪贴板适配 (`clipboard.rs`)
         ├── 节点发现与连接 (`discovery.rs`)
         ├── 硬件指标采集 (`metrics.rs`)

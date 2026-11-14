@@ -39,7 +39,7 @@
 
 ## WebSocket 消息
 
-消息使用 `{ "type": "VariantName", "payload": ... }`。结构以 `src-tauri/src/model.rs` 中的 `WireMessage` 为准。
+消息使用 `{ "type": "VariantName", "payload": ... }`。结构以 `backend/src/model.rs` 中的 `WireMessage` 为准。
 
 - `Hello` 携带节点身份和能力。
 - `Hello` 同时携带 `protocol_version`；版本不一致的节点不会建立会话。

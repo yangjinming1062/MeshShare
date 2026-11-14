@@ -799,7 +799,7 @@ fn static_root(app: &AppHandle) -> PathBuf {
         .ok()
         .and_then(|path| path.parent().map(|parent| parent.join("web")))
         .filter(|path| path.exists());
-    bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../web/dist"))
+    bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/dist"))
 }
 
 fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result<()> {

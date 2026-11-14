@@ -7,21 +7,21 @@
 以下命令从仓库根目录执行。Tauri CLI 由 `npx` 按需运行。
 
 ```bash
-npm --prefix web ci
-npm --prefix web run build
+npm --prefix frontend ci
+npm --prefix frontend run build
 ```
 
-手机扫码访问的页面由桌面节点从 `web/dist` 构建产物提供。改动移动网页后，重新构建前端并重启桌面程序，再刷新手机页面。
+手机扫码访问的页面由桌面节点从 `frontend/dist` 构建产物提供。改动移动网页后，重新构建前端并重启桌面程序，再刷新手机页面。
 
 ## 更新项目图标
 
-项目标志和网页共用 `web/public/meshshare.svg`。修改源图后，从仓库根目录运行 Tauri CLI 生成桌面图标。
+项目标志和网页共用 `frontend/public/meshshare.svg`。修改源图后，从仓库根目录运行 Tauri CLI 生成桌面图标。
 
 ```bash
-npx --yes @tauri-apps/cli@2 icon web/public/meshshare.svg --output src-tauri/target/meshshare-icon-generation
+npx --yes @tauri-apps/cli@2 icon frontend/public/meshshare.svg --output backend/target/meshshare-icon-generation
 ```
 
-将生成的 ICO、ICNS 和 `src-tauri/tauri.conf.json` 列出的 PNG 更新到 `src-tauri/icons/`。这些文件随仓库维护，日常构建直接使用。
+将生成的 ICO、ICNS 和 `backend/tauri.conf.json` 列出的 PNG 更新到 `backend/icons/`。这些文件随仓库维护，日常构建直接使用。
 
 ## 启动与构建
 
@@ -31,7 +31,7 @@ npx --yes @tauri-apps/cli@2 icon web/public/meshshare.svg --output src-tauri/tar
 npx --yes @tauri-apps/cli@2 dev -- --locked
 ```
 
-构建本地调试程序，产物位于 `src-tauri/target/debug/`。
+构建本地调试程序，产物位于 `backend/target/debug/`。
 
 ```bash
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
@@ -45,13 +45,13 @@ npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 
 ### 自动更新发布
 
-更新包由 Tauri updater 签名。首次配置时，在仓库外生成一组 updater 密钥，并将公钥内容写入 `src-tauri/tauri.conf.json`；私钥和密码只保存到 GitHub Actions Secrets `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，不能提交到仓库。
+更新包由 Tauri updater 签名。首次配置时，在仓库外生成一组 updater 密钥，并将公钥内容写入 `backend/tauri.conf.json`；私钥和密码只保存到 GitHub Actions Secrets `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，不能提交到仓库。
 
 ```bash
 npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-updater.key
 ```
 
-将私钥文件中的完整单行 base64 值原样保存到 `TAURI_SIGNING_PRIVATE_KEY`，不要填写文件路径、密码、URL 编码值（例如 `%2B` 或 `%0A`）、引号或命令输出；密码单独保存到 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会在跨平台构建前检查该值的 base64 和 Tauri/minisign 私钥格式。若私钥丢失，必须重新生成密钥并同步更新 `src-tauri/tauri.conf.json` 中的公钥，已发布版本不会接受新公钥。
+将私钥文件中的完整单行 base64 值原样保存到 `TAURI_SIGNING_PRIVATE_KEY`，不要填写文件路径、密码、URL 编码值（例如 `%2B` 或 `%0A`）、引号或命令输出；密码单独保存到 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会在跨平台构建前检查该值的 base64 和 Tauri/minisign 私钥格式。若私钥丢失，必须重新生成密钥并同步更新 `backend/tauri.conf.json` 中的公钥，已发布版本不会接受新公钥。
 
 Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 合并成 `latest.json`。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在清单、签名和所有安装包都上传后才解除 Release 草稿状态，并保持 prerelease 标记；人工验证安装包后，在 GitHub Release 页面取消 prerelease 标记，版本才会进入 `releases/latest` 并允许客户端自动更新。已人工晋级为稳定版的 Release 不会被工作流重跑覆盖。
 
@@ -72,9 +72,9 @@ MeshShare 不强制把整个桌面壳切换到 X11。剪贴板会优先使用 Wa
 Rust 格式和 lint 检查需要 `rustfmt` 和 `clippy` 组件，可通过 `rustup component add rustfmt clippy` 安装。
 
 ```bash
-npm --prefix web run check
-npm --prefix web run build
-cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features --locked -- -D warnings
-cargo test --manifest-path src-tauri/Cargo.toml --locked
+npm --prefix frontend run check
+npm --prefix frontend run build
+cargo fmt --manifest-path backend/Cargo.toml --all -- --check
+cargo clippy --manifest-path backend/Cargo.toml --all-targets --all-features --locked -- -D warnings
+cargo test --manifest-path backend/Cargo.toml --locked
 ```
