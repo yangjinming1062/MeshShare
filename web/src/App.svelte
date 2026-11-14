@@ -11,6 +11,7 @@
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
+  if (isMonitor) document.documentElement.dataset.window = 'monitor';
   const inTauri = isTauri();
   const isDesktopWindow = inTauri && !isMobile && !isMonitor;
   let node: NodeInfo | null = null;
@@ -199,6 +200,7 @@
   });
 
   async function refresh() {
+    if (inTauri && !isMobile) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
       node = nextNode;
@@ -537,6 +539,16 @@
       notice = error instanceof Error ? error.message : '无法更新悬浮监控条状态';
     }
     window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function openMonitorMenu(event: MouseEvent) {
+    event.preventDefault();
+    if (!inTauri || monitorLocked) return;
+    try {
+      await invoke('popup_monitor_menu');
+    } catch (error) {
+      console.warn('打开悬浮监控条菜单失败', error);
+    }
   }
 
   async function publishClipboard() {
@@ -1118,14 +1130,16 @@
     return value.memory_used_bytes / value.memory_total_bytes * 100;
   }
 
-  function gpuSummary(value: HardwareMetrics | null | undefined) {
-    const gpus = value?.gpus ?? [];
-    const utilization = gpus.map((gpu) => gpu.utilization_percent).filter((item): item is number => item !== undefined);
-    const used = gpus.map((gpu) => gpu.memory_used_bytes).filter((item): item is number => item !== undefined).reduce((sum, item) => sum + item, 0);
-    const total = gpus.map((gpu) => gpu.memory_total_bytes).filter((item): item is number => item !== undefined).reduce((sum, item) => sum + item, 0);
-    const usage = utilization.length ? formatPercent(Math.max(...utilization)) : '—';
-    const memory = total ? `${formatSize(used)} / ${formatSize(total)}` : '—';
-    return `${usage} · ${memory}`;
+  function gpuUtilization(value: HardwareMetrics | null | undefined) {
+    const values = (value?.gpus ?? []).map((gpu) => gpu.utilization_percent).filter((item): item is number => item !== undefined);
+    return values.length ? Math.max(...values) : undefined;
+  }
+
+  function gpuMemoryPercent(value: HardwareMetrics | null | undefined) {
+    const values = (value?.gpus ?? [])
+      .map((gpu) => (gpu.memory_used_bytes !== undefined && gpu.memory_total_bytes ? gpu.memory_used_bytes / gpu.memory_total_bytes * 100 : undefined))
+      .filter((item): item is number => item !== undefined);
+    return values.length ? Math.max(...values) : undefined;
   }
 
   function metricAge(sampledAt: number | undefined, receivedAt?: number) {
@@ -1173,13 +1187,13 @@
 
 <div class:mobile-shell={isMobile} class:monitor-shell={isMonitor} class="shell">
   {#if isMonitor}
-    <main class="monitor-main" data-tauri-drag-region="deep">
+    <main class="monitor-main" data-tauri-drag-region="deep" on:contextmenu={openMonitorMenu}>
       <div class="monitor-metric"><b>CPU</b><span>{formatPercent(metrics?.cpu_usage_percent)}</span></div>
-      <div class="monitor-metric"><b>GPU</b><span>{gpuSummary(metrics).split(' · ')[0]}</span></div>
-      <div class="monitor-metric"><b>显存</b><span>{gpuSummary(metrics).split(' · ')[1] ?? '—'}</span></div>
-      <div class="monitor-metric"><b>内存</b><span>{formatPercent(memoryPercent(metrics))}</span></div>
-      <div class="monitor-metric"><b>↓</b><span>{formatRate(metrics?.network_down_bytes_per_sec)}</span></div>
+      <div class="monitor-metric"><b>GPU</b><span>{formatPercent(gpuUtilization(metrics))}</span></div>
       <div class="monitor-metric"><b>↑</b><span>{formatRate(metrics?.network_up_bytes_per_sec)}</span></div>
+      <div class="monitor-metric"><b>内存</b><span>{formatPercent(memoryPercent(metrics))}</span></div>
+      <div class="monitor-metric"><b>显存</b><span>{formatPercent(gpuMemoryPercent(metrics))}</span></div>
+      <div class="monitor-metric"><b>↓</b><span>{formatRate(metrics?.network_down_bytes_per_sec)}</span></div>
     </main>
   {:else}
   <header class="topbar">
@@ -1401,7 +1415,7 @@
         <div class="metrics-grid">
           <div class="metric-card"><span>CPU</span><strong>{formatPercent(currentMetrics?.cpu_usage_percent)}</strong><small>系统总使用率</small></div>
           <div class="metric-card"><span>内存</span><strong>{formatPercent(memoryPercent(currentMetrics))}</strong><small>{formatMemory(currentMetrics?.memory_used_bytes)} / {formatMemory(currentMetrics?.memory_total_bytes)}</small></div>
-          <div class="metric-card"><span>GPU</span><strong>{gpuSummary(currentMetrics).split(' · ')[0]}</strong><small>{currentMetrics?.gpus.length ? currentMetrics.gpus.length + ' 个 GPU' : '未检测到可读指标'}</small></div>
+          <div class="metric-card"><span>GPU</span><strong>{formatPercent(gpuUtilization(currentMetrics))}</strong><small>{currentMetrics?.gpus.length ? currentMetrics.gpus.length + ' 个 GPU' : '未检测到可读指标'}</small></div>
           <div class="metric-card"><span>网络</span><strong>↓ {formatRate(currentMetrics?.network_down_bytes_per_sec)}</strong><small>↑ {formatRate(currentMetrics?.network_up_bytes_per_sec)}</small></div>
         </div>
         <div class="gpu-detail-list">

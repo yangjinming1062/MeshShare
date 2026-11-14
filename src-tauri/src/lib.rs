@@ -343,31 +343,60 @@ fn monitor_locked(app: AppHandle, state: State<'_, ManagedNode>) -> bool {
     effective_monitor_locked(&app, state.runtime.as_ref())
 }
 
-#[tauri::command]
-fn set_monitor_locked(
-    app: AppHandle,
-    state: State<'_, ManagedNode>,
+fn apply_monitor_locked(
+    app: &AppHandle,
+    runtime: &NodeRuntime,
     locked: bool,
 ) -> Result<bool, String> {
-    let capabilities = current_monitor_capabilities(&app);
+    let capabilities = current_monitor_capabilities(app);
     if locked && !capabilities.can_click_through {
         return Err(
             "当前 Wayland 会话不支持悬浮条点击穿透，请从托盘隐藏悬浮条或切换为托盘模式".to_string(),
         );
     }
-    let previous = state.runtime.monitor_locked();
+    let previous = runtime.monitor_locked();
     if let Some(window) = app.get_webview_window("monitor") {
         window
             .set_ignore_cursor_events(locked)
             .map_err(|error| format!("无法更新监控条鼠标状态：{error}"))?;
     }
-    if let Err(error) = state.runtime.set_monitor_locked(locked) {
+    if let Err(error) = runtime.set_monitor_locked(locked) {
         if let Some(window) = app.get_webview_window("monitor") {
             let _ = window.set_ignore_cursor_events(previous);
         }
         return Err(error.to_string());
     }
     Ok(locked)
+}
+
+#[tauri::command]
+fn set_monitor_locked(
+    app: AppHandle,
+    state: State<'_, ManagedNode>,
+    locked: bool,
+) -> Result<bool, String> {
+    apply_monitor_locked(&app, state.runtime.as_ref(), locked)
+}
+
+#[tauri::command]
+fn popup_monitor_menu(app: AppHandle) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("monitor") else {
+        return Err("悬浮监控条尚未创建".to_string());
+    };
+    let lock = MenuItem::with_id(
+        &app,
+        "monitor-lock-now",
+        "锁定悬浮条（忽略鼠标）",
+        true,
+        None::<&str>,
+    )
+    .map_err(|error| error.to_string())?;
+    let hide = MenuItem::with_id(&app, "monitor-hide-now", "隐藏悬浮条", true, None::<&str>)
+        .map_err(|error| error.to_string())?;
+    let menu = Menu::with_items(&app, &[&lock, &hide]).map_err(|error| error.to_string())?;
+    window
+        .popup_menu(&menu)
+        .map_err(|error| format!("无法打开悬浮条菜单：{error}"))
 }
 
 #[tauri::command]
@@ -734,6 +763,13 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         MenuItem::with_id(app, "monitor-show", "显示悬浮监控条", true, None::<&str>)?;
     let monitor_hide =
         MenuItem::with_id(app, "monitor-hide", "隐藏悬浮监控条", true, None::<&str>)?;
+    let monitor_lock_toggle = MenuItem::with_id(
+        app,
+        "monitor-lock-toggle",
+        "锁定/解锁悬浮条",
+        true,
+        None::<&str>,
+    )?;
     let monitor_floating = MenuItem::with_id(
         app,
         "monitor-floating",
@@ -759,6 +795,7 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
             &metrics_summary,
             &monitor_show,
             &monitor_hide,
+            &monitor_lock_toggle,
             &monitor_floating,
             &monitor_tray,
             &monitor_disabled,
@@ -818,6 +855,14 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         "monitor-hide" => {
             if let Some(window) = app.get_webview_window("monitor") {
                 let _ = window.hide();
+            }
+        }
+        "monitor-lock-toggle" => {
+            if let Some(state) = app.try_state::<ManagedNode>() {
+                let locked = !state.runtime.monitor_locked();
+                if let Err(error) = apply_monitor_locked(app, state.runtime.as_ref(), locked) {
+                    eprintln!("{error}");
+                }
             }
         }
         "monitor-floating" | "monitor-tray" | "monitor-disabled" => {
@@ -894,6 +939,26 @@ pub fn run() {
                 &runtime.monitor_display_mode(),
                 effective_monitor_locked(app.handle(), runtime.as_ref()),
             );
+            if let Some(window) = app.get_webview_window("monitor") {
+                let app_for_menu = app.handle().clone();
+                window.on_menu_event(move |_window, event| match event.id().as_ref() {
+                    "monitor-lock-now" => {
+                        if let Some(state) = app_for_menu.try_state::<ManagedNode>() {
+                            if let Err(error) =
+                                apply_monitor_locked(&app_for_menu, state.runtime.as_ref(), true)
+                            {
+                                eprintln!("{error}");
+                            }
+                        }
+                    }
+                    "monitor-hide-now" => {
+                        if let Some(window) = app_for_menu.get_webview_window("monitor") {
+                            let _ = window.hide();
+                        }
+                    }
+                    _ => {}
+                });
+            }
             if let Some(window) = app.get_webview_window("main") {
                 if !autostart_launch {
                     show_main_window(app.handle());
@@ -940,6 +1005,7 @@ pub fn run() {
             monitor_capabilities,
             monitor_locked,
             set_monitor_locked,
+            popup_monitor_menu,
             set_monitor_position
         ])
         .build(tauri::generate_context!())
