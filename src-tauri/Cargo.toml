@@ -14,7 +14,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-arboard = "3.4"
+arboard = { version = "3.4", features = ["wayland-data-control"] }
 anyhow = "1"
 axum = { version = "0.7", features = ["ws", "multipart"] }
 axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
@@ -27,6 +27,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 mdns-sd = "0.11"
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+raw-window-handle = "0.6"
 rcgen = { version = "0.14", features = ["x509-parser"] }
  pem = "3"
 serde = { version = "1", features = ["derive"] }

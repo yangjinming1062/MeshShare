@@ -11,11 +11,14 @@ mod updater;
 
 use anyhow::Context;
 use model::{
-    ClipboardHistoryMode, ClipboardHistorySettings, HardwareMetrics, MobileAccessInfo,
-    MonitorDisplayMode, MonitorPosition, ReceiveMode, ReceiveSettings, TransferProgress,
-    WireMessage,
+    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, HardwareMetrics,
+    MobileAccessInfo, MonitorDisplayMode, MonitorPosition, ReceiveMode, ReceiveSettings,
+    TransferProgress, WireMessage,
 };
+#[cfg(target_os = "linux")]
+use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use runtime::{validate_receive_directory, NodeRuntime, UpdateFrequency};
+use serde::Serialize;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +37,74 @@ struct ManagedNode {
 #[derive(Clone)]
 struct ManagedUpdater {
     coordinator: Arc<UpdateCoordinator>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+enum MonitorBackend {
+    Wayland,
+    X11,
+    Other,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct MonitorCapabilities {
+    backend: MonitorBackend,
+    can_persist_position: bool,
+    can_click_through: bool,
+    can_keep_above: bool,
+}
+
+fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilities {
+    match backend {
+        MonitorBackend::Wayland => MonitorCapabilities {
+            backend,
+            can_persist_position: false,
+            can_click_through: false,
+            can_keep_above: false,
+        },
+        MonitorBackend::X11 | MonitorBackend::Other => MonitorCapabilities {
+            backend,
+            can_persist_position: true,
+            can_click_through: true,
+            can_keep_above: true,
+        },
+        MonitorBackend::Unknown => MonitorCapabilities {
+            backend,
+            can_persist_position: false,
+            can_click_through: false,
+            can_keep_above: false,
+        },
+    }
+}
+
+fn monitor_backend<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> MonitorBackend {
+    #[cfg(target_os = "linux")]
+    {
+        return match window.display_handle().ok().map(|handle| handle.as_raw()) {
+            Some(RawDisplayHandle::Wayland(_)) => MonitorBackend::Wayland,
+            Some(RawDisplayHandle::Xlib(_)) | Some(RawDisplayHandle::Xcb(_)) => MonitorBackend::X11,
+            Some(_) => MonitorBackend::Other,
+            None => MonitorBackend::Unknown,
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        MonitorBackend::Other
+    }
+}
+
+fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabilities {
+    app.get_webview_window("monitor")
+        .map(|window| monitor_capabilities_for_backend(monitor_backend(&window)))
+        .unwrap_or_else(|| monitor_capabilities_for_backend(MonitorBackend::Unknown))
+}
+
+fn effective_monitor_locked(app: &AppHandle, runtime: &NodeRuntime) -> bool {
+    current_monitor_capabilities(app).can_click_through && runtime.monitor_locked()
 }
 
 #[tauri::command]
@@ -60,6 +131,11 @@ fn clipboard_sync_enabled(state: State<'_, ManagedNode>) -> bool {
         .runtime
         .sync_enabled
         .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn clipboard_status(state: State<'_, ManagedNode>) -> ClipboardStatus {
+    state.runtime.clipboard_status()
 }
 
 #[tauri::command]
@@ -250,13 +326,22 @@ fn set_monitor_display_mode(
         .runtime
         .set_monitor_display_mode(mode.clone())
         .map_err(|error| error.to_string())?;
-    apply_monitor_mode(&app, &mode, state.runtime.monitor_locked());
+    apply_monitor_mode(
+        &app,
+        &mode,
+        effective_monitor_locked(&app, state.runtime.as_ref()),
+    );
     Ok(mode.as_str().to_string())
 }
 
 #[tauri::command]
-fn monitor_locked(state: State<'_, ManagedNode>) -> bool {
-    state.runtime.monitor_locked()
+fn monitor_capabilities(app: AppHandle) -> MonitorCapabilities {
+    current_monitor_capabilities(&app)
+}
+
+#[tauri::command]
+fn monitor_locked(app: AppHandle, state: State<'_, ManagedNode>) -> bool {
+    effective_monitor_locked(&app, state.runtime.as_ref())
 }
 
 #[tauri::command]
@@ -265,6 +350,12 @@ fn set_monitor_locked(
     state: State<'_, ManagedNode>,
     locked: bool,
 ) -> Result<bool, String> {
+    let capabilities = current_monitor_capabilities(&app);
+    if locked && !capabilities.can_click_through {
+        return Err(
+            "当前 Wayland 会话不支持悬浮条点击穿透，请从托盘隐藏悬浮条或切换为托盘模式".to_string(),
+        );
+    }
     let previous = state.runtime.monitor_locked();
     if let Some(window) = app.get_webview_window("monitor") {
         window
@@ -281,7 +372,15 @@ fn set_monitor_locked(
 }
 
 #[tauri::command]
-fn set_monitor_position(state: State<'_, ManagedNode>, x: i32, y: i32) -> Result<(), String> {
+fn set_monitor_position(
+    app: AppHandle,
+    state: State<'_, ManagedNode>,
+    x: i32,
+    y: i32,
+) -> Result<(), String> {
+    if !current_monitor_capabilities(&app).can_persist_position {
+        return Err("当前 Wayland 会话不支持保存悬浮条全局坐标".to_string());
+    }
     state
         .runtime
         .set_monitor_position(MonitorPosition { x, y })
@@ -301,6 +400,7 @@ fn apply_monitor_mode(app: &AppHandle, mode: &MonitorDisplayMode, locked: bool) 
     let Some(window) = app.get_webview_window("monitor") else {
         return;
     };
+    let locked = locked && current_monitor_capabilities(app).can_click_through;
     let _ = window.set_ignore_cursor_events(locked);
     match mode {
         MonitorDisplayMode::Floating => {
@@ -428,6 +528,9 @@ fn position_monitor_window<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     runtime: &NodeRuntime,
 ) {
+    if !monitor_capabilities_for_backend(monitor_backend(window)).can_persist_position {
+        return;
+    }
     let Ok(outer_size) = window.outer_size() else {
         return;
     };
@@ -867,7 +970,10 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         "monitor-show" => {
             if let Some(window) = app.get_webview_window("monitor") {
                 if let Some(state) = app.try_state::<ManagedNode>() {
-                    let _ = window.set_ignore_cursor_events(state.runtime.monitor_locked());
+                    let _ = window.set_ignore_cursor_events(effective_monitor_locked(
+                        app,
+                        state.runtime.as_ref(),
+                    ));
                 }
                 let _ = window.show();
             }
@@ -885,7 +991,7 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
             };
             if let Some(state) = app.try_state::<ManagedNode>() {
                 let _ = state.runtime.set_monitor_display_mode(mode.clone());
-                let locked = state.runtime.monitor_locked();
+                let locked = effective_monitor_locked(app, state.runtime.as_ref());
                 apply_monitor_mode(app, &mode, locked);
             }
         }
@@ -949,7 +1055,7 @@ pub fn run() {
             apply_monitor_mode(
                 app.handle(),
                 &runtime.monitor_display_mode(),
-                runtime.monitor_locked(),
+                effective_monitor_locked(app.handle(), runtime.as_ref()),
             );
             if let Some(window) = app.get_webview_window("main") {
                 if !autostart_launch {
@@ -978,6 +1084,7 @@ pub fn run() {
             node_base_url,
             toggle_clipboard_sync,
             clipboard_sync_enabled,
+            clipboard_status,
             clipboard_history_settings,
             set_clipboard_history_settings,
             update_frequency,
@@ -993,6 +1100,7 @@ pub fn run() {
             update_transfer_progress,
             monitor_display_mode,
             set_monitor_display_mode,
+            monitor_capabilities,
             monitor_locked,
             set_monitor_locked,
             set_monitor_position
@@ -1019,7 +1127,10 @@ pub fn cleanup_autostart() {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_initial_listener, clamp_position_to_work_area};
+    use super::{
+        bind_initial_listener, clamp_position_to_work_area, monitor_capabilities_for_backend,
+        MonitorBackend,
+    };
     use crate::autostart::launched_from_args;
     use crate::model::MonitorPosition;
     use std::net::{IpAddr, Ipv4Addr};
@@ -1062,6 +1173,14 @@ mod tests {
             ),
             MonitorPosition { x: 1464, y: 1022 }
         );
+    }
+
+    #[test]
+    fn wayland_monitor_capabilities_do_not_claim_global_controls() {
+        let capabilities = monitor_capabilities_for_backend(MonitorBackend::Wayland);
+        assert!(!capabilities.can_persist_position);
+        assert!(!capabilities.can_click_through);
+        assert!(!capabilities.can_keep_above);
     }
 
     #[test]

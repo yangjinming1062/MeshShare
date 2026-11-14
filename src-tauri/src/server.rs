@@ -441,7 +441,9 @@ async fn restore_clipboard_history(
         .runtime
         .clipboard_snapshot()
         .ok_or_else(|| ApiError::internal("剪贴板状态不可用"))?;
-    clipboard::apply_snapshot(&snapshot, &state.runtime).map_err(ApiError::internal)?;
+    if let Err(error) = clipboard::apply_snapshot(&snapshot, &state.runtime) {
+        eprintln!("无法写入本机剪贴板，仍继续广播恢复内容：{error}");
+    }
     state.runtime.publish_event(WireMessage::ClipboardUpdate {
         event: event.clone(),
     });
@@ -518,7 +520,9 @@ async fn post_clipboard(
         .runtime
         .clipboard_snapshot()
         .ok_or_else(|| ApiError::internal("剪贴板状态不可用"))?;
-    clipboard::apply_snapshot(&snapshot, &state.runtime).map_err(ApiError::internal)?;
+    if let Err(error) = clipboard::apply_snapshot(&snapshot, &state.runtime) {
+        eprintln!("无法写入本机剪贴板，仍继续广播主动同步内容：{error}");
+    }
     state.runtime.publish_event(WireMessage::ClipboardUpdate {
         event: event.clone(),
     });

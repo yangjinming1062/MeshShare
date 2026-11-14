@@ -7,7 +7,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileAccess, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistoryResponse, ClipboardHistorySettings, ClipboardSnapshot, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistoryResponse, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
@@ -19,6 +19,7 @@
   let selectedClipboardHistory: ClipboardHistoryDetail | null = null;
   let clipboardHistoryBusy = false;
   let clipboardHistorySettingsBusy = false;
+  let clipboardStatus: ClipboardStatus = { session: 'unknown', available: false, retrying: true, message: '正在连接系统剪贴板…' };
   let metrics: HardwareMetrics | null = null;
   let selectedMetricsPeer: PeerInfo | null = null;
   $: currentMetrics = selectedMetricsPeer?.metrics ?? metrics;
@@ -33,6 +34,7 @@
   let autostartBusy = false;
   let updateFrequency: UpdateFrequency = 'weekly';
   let updateStatus: UpdateStatus | null = null;
+  let monitorCapabilities: MonitorCapabilities = { backend: 'unknown', can_persist_position: false, can_click_through: false, can_keep_above: false };
   let updateBusy = false;
   let receiveSettings: ReceiveSettings = { mode: 'confirm' };
   let receiveSettingsBusy = false;
@@ -120,6 +122,7 @@
     };
     if (isMonitor) {
       void getCurrentWindow().onMoved(({ payload }) => {
+        if (!monitorCapabilities.can_persist_position) return;
         pendingMonitorPosition = { x: payload.x, y: payload.y };
         if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
         monitorPositionTimer = window.setTimeout(() => {
@@ -135,12 +138,16 @@
       if (pageStopped) return;
       try {
         await initApi();
-        if (!isMobile) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
+        if (!isMobile) {
+          monitorCapabilities = await invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities);
+          monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
+        }
         if (!isMobile && !isMonitor) {
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
           updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
           clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
           receiveSettings = await invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings);
+          clipboardStatus = await invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus);
         }
         mobileAccess = await getMobileAccess().catch(() => null);
         await refresh();
@@ -189,7 +196,14 @@
 
   async function refresh() {
     if (isMobile && !mobileSessionId) await ensureMobileSession();
-    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics(), getClipboardHistory()]);
+    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory, nextClipboardStatus] = await Promise.all([
+      getInfo(),
+      getPeers(),
+      getClipboard(),
+      getMetrics(),
+      getClipboardHistory(),
+      !isMobile && !isMonitor ? invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus) : Promise.resolve(clipboardStatus),
+    ]);
     const nextTransfers = isMobile ? [] : await getTransfers();
     if (isMobile) {
       mobileTransfers = await getMobileTransfersWithRecovery();
@@ -211,6 +225,7 @@
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
+    clipboardStatus = nextClipboardStatus;
     clipboardHistory = nextHistory.items;
     if (isMobile || isMonitor) clipboardHistorySettings = nextHistory.settings;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
@@ -1177,6 +1192,10 @@
 
   {#if notice}<div class="notice" role="status">{notice}</div>{/if}
 
+  {#if !isMobile && !isMonitor && !clipboardStatus.available}
+    <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
+  {/if}
+
   {#if isMobile}
     <main class="mobile-main">
       <section class="mobile-connection panel">
@@ -1347,7 +1366,11 @@
           <div class="heading-actions">
             <span class="muted">{metricStatus(selectedMetricsPeer, currentMetrics)}</span>
             {#if !selectedMetricsPeer}
-              <button class="ghost small monitor-lock-toggle" aria-pressed={monitorLocked} on:click={toggleMonitorLock}>{monitorLocked ? '解锁悬浮条' : '锁定悬浮条'}</button>
+              {#if monitorCapabilities.can_click_through}
+                <button class="ghost small monitor-lock-toggle" aria-pressed={monitorLocked} on:click={toggleMonitorLock}>{monitorLocked ? '解锁悬浮条' : '锁定悬浮条'}</button>
+              {:else}
+                <span class="muted monitor-capability-hint">Wayland 下不支持点击穿透，置顶由合成器管理</span>
+              {/if}
             {/if}
           </div>
         </div>

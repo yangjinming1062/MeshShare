@@ -94,6 +94,24 @@ export type ClipboardSnapshot = {
   updated_at_ms: number;
 };
 
+export type ClipboardSession = 'wayland' | 'x11' | 'other' | 'unknown';
+
+export type ClipboardStatus = {
+  session: ClipboardSession;
+  available: boolean;
+  retrying: boolean;
+  message?: string | null;
+};
+
+export type MonitorBackend = 'wayland' | 'x11' | 'other' | 'unknown';
+
+export type MonitorCapabilities = {
+  backend: MonitorBackend;
+  can_persist_position: boolean;
+  can_click_through: boolean;
+  can_keep_above: boolean;
+};
+
 export type ClipboardHistoryMode = 'count' | 'days';
 
 export type ClipboardHistorySettings = {

@@ -167,6 +167,34 @@ pub struct ClipboardSnapshot {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardSession {
+    Wayland,
+    X11,
+    Other,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardStatus {
+    pub session: ClipboardSession,
+    pub available: bool,
+    pub retrying: bool,
+    pub message: Option<String>,
+}
+
+impl Default for ClipboardStatus {
+    fn default() -> Self {
+        Self {
+            session: ClipboardSession::Unknown,
+            available: false,
+            retrying: true,
+            message: Some("正在连接系统剪贴板…".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipboardHistoryMode {

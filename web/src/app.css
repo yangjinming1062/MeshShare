@@ -167,6 +167,7 @@ button.small { padding: 7px 9px; font-size: 11px; }
 .download-link:hover { background: #dce7ff; }
 
 .notice { position: fixed; z-index: 5; top: 14px; left: 50%; transform: translateX(-50%); padding: 10px 15px; border-radius: 999px; color: #fff; background: #172033e8; box-shadow: 0 8px 24px #0f172a38; font-size: 12px; }
+.platform-notice { max-width: 1240px; margin: 14px auto -2px; padding: 10px 14px; border: 1px solid #f4c778; border-radius: 11px; color: #7a4b00; background: #fff8e8; font-size: 12px; line-height: 1.5; }
 footer { max-width: 1240px; margin: -8px auto 0; padding: 0 26px 26px; display: flex; justify-content: space-between; gap: 12px; color: #8895a8; font-size: 11px; }
 .hidden-input { display: none; }
 
@@ -177,6 +178,7 @@ footer { max-width: 1240px; margin: -8px auto 0; padding: 0 26px 26px; display: 
 .monitor-metric span { color: #fff; font-size: 11px; font-variant-numeric: tabular-nums; }
 .metrics-heading .heading-actions { align-items: center; }
 .monitor-lock-toggle { white-space: nowrap; }
+.monitor-capability-hint { white-space: nowrap; font-size: 11px; }
 
 .mobile-shell { background: #f4f7fb; }
 .mobile-shell .topbar { height: 76px; color: var(--ink); }

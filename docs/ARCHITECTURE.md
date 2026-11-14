@@ -46,6 +46,6 @@ Tauri/Svelte UI (`web/`, `src-tauri/src/lib.rs`)
 
 ## 平台支持
 
-Windows、macOS 和 Linux X11 通过 `arboard` 轮询系统剪贴板的文字和图片。当前构建在 Linux 上使用 X11 后端，Wayland 会话中的同步依赖 XWayland 及合成器的剪贴板桥接。剪贴板初始化失败时，后台轮询不可用，节点的网络服务继续运行。
+Windows、macOS 和 Linux 通过 `arboard` 轮询系统剪贴板的文字和图片。Linux Wayland 会话优先尝试 `wayland-data-control`，没有该协议时自动回退到可用的 X11/XWayland 后端；两者都不可用时，后台轮询会持续重试并向桌面界面报告原因。共享快照、历史和节点间广播不依赖本机系统剪贴板，写入失败不会停止网络、WebSocket 或文件传输服务。
 
 硬件采集器在 Windows、macOS 和 Linux 上共享 CPU、内存与网络采样实现。GPU 和显存数据来自平台计数器、驱动接口或 sysfs。macOS 统一内存以 `unified` 标记，无法读取的指标附带不可用状态。

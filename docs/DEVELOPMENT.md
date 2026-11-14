@@ -2,7 +2,7 @@
 
 ## 环境准备
 
-安装 Git、Rust stable（当前 Tauri 2 依赖链和 single-instance 插件要求 Rust 1.90 或更高）和 Node.js 22，准备对应系统的构建依赖。Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1 和 Ayatana AppIndicator 等开发包。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
+安装 Git、Rust stable（当前 Tauri 2 依赖链和 single-instance 插件要求 Rust 1.90 或更高）和 Node.js 22，准备对应系统的构建依赖。Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1、Wayland 开发库和 Ayatana AppIndicator 等开发包。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
 
 以下命令从仓库根目录执行。Tauri CLI 由 `npx` 按需运行。
 
@@ -54,6 +54,12 @@ npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-upda
 Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 合并成 `latest.json`。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在清单、签名和所有安装包都上传后才解除 Release 草稿状态。
 
 开发构建不会执行 GitHub 更新检查。
+
+### Wayland 运行验收
+
+在 Ubuntu GNOME Wayland 会话中，确认 `loginctl show-session <id> -p Type` 返回 `Type=wayland`，并记录是否存在 `WAYLAND_DISPLAY`、`DISPLAY` 和 `Xwayland` 进程。重点验证文字和 PNG 剪贴板的自动读取、远端写入、历史恢复、手动同步以及悬浮监控条的拖动、隐藏和托盘恢复。
+
+MeshShare 不强制把整个桌面壳切换到 X11。剪贴板会优先使用 Wayland data-control，没有该协议时尝试 XWayland；两者都不可用时，界面应报告原因，设备间共享、历史和文件传输仍应可用。Wayland 不提供全局窗口坐标、强制置顶或点击穿透保证，因此这些行为只能在 X11 会话中作为强保证验收。
 
 发布说明由 OpenAI 兼容接口根据上一版本到当前 tag 的提交记录生成。`LLM_API_KEY` 取自 Actions Secrets，`LLM_BASE_URL` 和 `LLM_MODEL_NAME` 可配置为 Actions Secrets 或 Variables。生成失败时发布任务等待重跑。
 

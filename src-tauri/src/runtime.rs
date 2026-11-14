@@ -1,13 +1,13 @@
 use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryItem,
-    ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot,
-    HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, MonitorDisplayMode,
-    MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferOffer,
-    TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
-    DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT,
-    MAX_CLIPBOARD_HISTORY_DAYS, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
-    METRICS_SYSTEM_CAPABILITY,
+    ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSession,
+    ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession,
+    MobileTransferView, MonitorDisplayMode, MonitorPosition, NodeInfo, PeerInfo, ReceiveMode,
+    ReceiveSettings, TransferOffer, TransferProgress, TransferStatus, WireMessage,
+    CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, DEFAULT_CLIPBOARD_HISTORY_COUNT,
+    DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS,
+    MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -141,6 +141,7 @@ pub struct NodeRuntime {
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
     pub clipboard: RwLock<Option<ClipboardSnapshot>>,
+    clipboard_status: RwLock<ClipboardStatus>,
     clipboard_history: Mutex<Vec<ClipboardHistoryRecord>>,
     pub peers: RwLock<HashMap<String, PeerInfo>>,
     pub transfers: RwLock<HashMap<String, TransferRecord>>,
@@ -275,6 +276,7 @@ impl NodeRuntime {
             clock,
             node: RwLock::new(node),
             clipboard: RwLock::new(clipboard),
+            clipboard_status: RwLock::new(ClipboardStatus::default()),
             clipboard_history: Mutex::new(clipboard_history),
             peers: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
@@ -316,6 +318,46 @@ impl NodeRuntime {
 
     pub fn node_info(&self) -> NodeInfo {
         self.node.read().clone()
+    }
+
+    pub fn clipboard_status(&self) -> ClipboardStatus {
+        self.clipboard_status.read().clone()
+    }
+
+    pub fn set_clipboard_status(&self, status: ClipboardStatus) {
+        *self.clipboard_status.write() = status;
+    }
+
+    pub fn set_clipboard_available(&self, session: ClipboardSession) {
+        self.set_clipboard_status(ClipboardStatus {
+            session,
+            available: true,
+            retrying: false,
+            message: None,
+        });
+    }
+
+    pub fn set_clipboard_unavailable(
+        &self,
+        session: ClipboardSession,
+        error: impl Into<String>,
+        retrying: bool,
+    ) {
+        let detail = error.into();
+        let message = match session {
+            ClipboardSession::Wayland => format!(
+                "Wayland 系统剪贴板不可用：{detail}。请启用 XWayland，或使用提供 data-control 协议的合成器"
+            ),
+            ClipboardSession::X11 => format!("X11 系统剪贴板不可用：{detail}"),
+            ClipboardSession::Other => format!("系统剪贴板不可用：{detail}"),
+            ClipboardSession::Unknown => format!("无法连接系统剪贴板：{detail}"),
+        };
+        self.set_clipboard_status(ClipboardStatus {
+            session,
+            available: false,
+            retrying,
+            message: Some(message),
+        });
     }
 
     pub fn node_id(&self) -> String {
