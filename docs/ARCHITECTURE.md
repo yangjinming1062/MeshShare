@@ -48,4 +48,4 @@ Tauri/Svelte UI (`frontend/`, `backend/src/lib.rs`)
 
 Windows、macOS 和 Linux 通过 `arboard` 轮询系统剪贴板的文字和图片。Linux Wayland 会话优先尝试 `wayland-data-control`，没有该协议时自动回退到可用的 X11/XWayland 后端；两者都不可用时，后台轮询会持续重试并向桌面界面报告原因。共享快照、历史和节点间广播不依赖本机系统剪贴板，写入失败不会停止网络、WebSocket 或文件传输服务。
 
-硬件采集器在 Windows、macOS 和 Linux 上共享 CPU、内存与网络采样实现。GPU 和显存数据来自平台计数器、驱动接口或 sysfs。macOS 统一内存以 `unified` 标记，无法读取的指标附带不可用状态。
+硬件采集器在 Windows、macOS 和 Linux 上共享 CPU、内存与网络采样实现。GPU 和显存数据来自平台计数器、驱动接口或 sysfs：Windows 读取 GPU 性能计数器的独立占用并用注册表记录的独立容量，因计数器只有适配器维度而聚合成一条记录；Linux 按 `/sys/class/drm` 逐卡读取 VRAM；macOS 按卡读取 `spdisplays_vram`，统一内存以 `unified` 标记。显存只统计独立显存，共享内存与统一内存不折算，无法读取的指标附带不可用状态。

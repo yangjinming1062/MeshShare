@@ -85,13 +85,7 @@ impl Collector {
             self.cpu_ready = true;
             None
         };
-        let mut gpus = self.gpus.sample();
-        for gpu in &mut gpus {
-            if gpu.memory_kind == GpuMemoryKind::Unified {
-                gpu.memory_used_bytes = Some(self.system.used_memory());
-                gpu.memory_total_bytes = Some(self.system.total_memory());
-            }
-        }
+        let gpus = self.gpus.sample();
 
         HardwareMetrics {
             node_id: self.node_id.clone(),
@@ -161,14 +155,12 @@ impl GpuProbe {
             {
                 gpus = probe_platform_gpus();
             }
-        } else {
-            merge_gpu_metadata(&mut gpus, &self.static_gpus);
         }
         if gpus.is_empty() {
-            self.static_gpus.clone()
-        } else {
-            gpus
+            return self.static_gpus.clone();
         }
+        merge_gpu_metadata(&mut gpus, &self.static_gpus);
+        gpus
     }
 }
 
@@ -252,22 +244,45 @@ fn probe_static_gpus() -> Vec<GpuMetrics> {
     }
     #[cfg(target_os = "windows")]
     {
-        return Vec::new();
+        return probe_windows_static_gpus();
     }
     #[allow(unreachable_code)]
     Vec::new()
 }
 
 #[cfg(target_os = "windows")]
-fn probe_windows_gpus() -> Vec<GpuMetrics> {
-    let script = r#"
-$u = (Get-Counter '\GPU Engine(*)\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum
-$m = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Usage' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum
-$t = (Get-Counter '\GPU Adapter Memory(*)\Dedicated Limit' -ErrorAction SilentlyContinue).CounterSamples | Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum
-Write-Output ("{0},{1},{2}" -f $u,$m,$t)
+const WINDOWS_GPU_FALLBACK_NAME: &str = "Windows GPU";
+
+#[cfg(target_os = "windows")]
+const WINDOWS_GPU_SCRIPT: &str = r#"
+$ProgressPreference = 'SilentlyContinue'
+$memory = Get-CimInstance -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUAdapterMemory -ErrorAction SilentlyContinue
+$engines = Get-CimInstance -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine -ErrorAction SilentlyContinue
+$dedicated = 0
+foreach ($item in $memory) { $dedicated = $dedicated + [long]$item.DedicatedUsage }
+$utilization = 0
+if ($engines) {
+  foreach ($group in ($engines | Group-Object { $_.Name -replace '^pid_[0-9]+_', '' })) {
+    $sum = ($group.Group | Measure-Object -Property UtilizationPercentage -Sum).Sum
+    if ($sum -gt $utilization) { $utilization = $sum }
+  }
+}
+$fields = @('', '')
+if ($engines) { $fields[0] = [string][long]$utilization }
+if ($memory) { $fields[1] = [string]$dedicated }
+Write-Output ($fields -join ';')
 "#;
+
+// 性能计数器只有适配器 LUID 维度、没有每卡容量，Windows 因此聚合为一条记录。
+#[cfg(target_os = "windows")]
+fn probe_windows_gpus() -> Vec<GpuMetrics> {
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            WINDOWS_GPU_SCRIPT,
+        ])
         .output();
     let Ok(output) = output else {
         return Vec::new();
@@ -276,24 +291,83 @@ Write-Output ("{0},{1},{2}" -f $u,$m,$t)
         return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let Some(line) = stdout.lines().find(|line| line.contains(',')) else {
+    let Some((utilization, dedicated)) = stdout.lines().find_map(parse_windows_gpu_line) else {
         return Vec::new();
     };
-    let mut fields = line.split(',').map(str::trim);
-    let utilization = fields.next().and_then(|value| value.parse::<f32>().ok());
-    let used = fields.next().and_then(|value| value.parse::<f64>().ok());
-    let total = fields.next().and_then(|value| value.parse::<f64>().ok());
-    if utilization.is_none() && used.is_none() && total.is_none() {
-        return Vec::new();
-    }
+    let (name, dedicated_total) = windows_display_adapter();
     vec![GpuMetrics {
-        name: "Windows GPU".to_string(),
-        utilization_percent: utilization.map(|value| value.clamp(0.0, 100.0)),
-        memory_used_bytes: used.map(|value| value.max(0.0) as u64),
-        memory_total_bytes: total.map(|value| value.max(0.0) as u64),
-        memory_kind: GpuMemoryKind::Dedicated,
+        name: name.unwrap_or_else(|| WINDOWS_GPU_FALLBACK_NAME.to_string()),
+        utilization_percent: utilization,
+        // 没有独立显存的适配器（核显）不报占用，界面保持空值。
+        memory_used_bytes: (dedicated_total > 0).then_some(dedicated.unwrap_or_default()),
+        memory_total_bytes: None,
+        memory_kind: GpuMemoryKind::Unknown,
         unavailable_reason: None,
     }]
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_gpu_line(line: &str) -> Option<(Option<f32>, Option<u64>)> {
+    let fields: Vec<&str> = line.trim().split(';').map(str::trim).collect();
+    if fields.len() != 2 {
+        return None;
+    }
+    let utilization = fields[0]
+        .parse::<f32>()
+        .ok()
+        .map(|value| value.clamp(0.0, 100.0));
+    let dedicated = fields[1].parse::<u64>().ok();
+    if utilization.is_none() && dedicated.is_none() {
+        return None;
+    }
+    Some((utilization, dedicated))
+}
+
+#[cfg(target_os = "windows")]
+fn probe_windows_static_gpus() -> Vec<GpuMetrics> {
+    let (name, dedicated_total) = windows_display_adapter();
+    vec![GpuMetrics {
+        name: name.unwrap_or_else(|| WINDOWS_GPU_FALLBACK_NAME.to_string()),
+        utilization_percent: None,
+        memory_used_bytes: None,
+        memory_total_bytes: (dedicated_total > 0).then_some(dedicated_total),
+        memory_kind: if dedicated_total > 0 {
+            GpuMemoryKind::Dedicated
+        } else {
+            GpuMemoryKind::Unknown
+        },
+        unavailable_reason: None,
+    }]
+}
+
+// 独立显存容量取自显示类驱动键的 REG_QWORD；核显通常没有该值，表示没有自带显存。
+#[cfg(target_os = "windows")]
+fn windows_display_adapter() -> (Option<String>, u64) {
+    const DISPLAY_CLASS_KEY: &str =
+        r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    let Ok(root) = windows_registry::LOCAL_MACHINE.open(DISPLAY_CLASS_KEY) else {
+        return (None, 0);
+    };
+    let Ok(children) = root.keys() else {
+        return (None, 0);
+    };
+    let mut total = 0u64;
+    let mut largest = 0u64;
+    let mut name = None;
+    for child in children {
+        let Ok(key) = root.open(child) else {
+            continue;
+        };
+        let Ok(size) = key.get_u64("HardwareInformation.qwMemorySize") else {
+            continue;
+        };
+        total = total.saturating_add(size);
+        if size > largest {
+            largest = size;
+            name = key.get_string("DriverDesc").ok();
+        }
+    }
+    (name, total)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -335,8 +409,9 @@ fn probe_linux_gpus() -> Vec<GpuMetrics> {
         if utilization.is_none() && memory_used.is_none() && memory_total.is_none() {
             continue;
         }
+        let label = read_uevent_field(&device, "PCI_SLOT_NAME").unwrap_or_else(|| name.clone());
         gpus.push(GpuMetrics {
-            name: format!("{} ({})", driver, name),
+            name: format!("{} ({})", driver, label),
             utilization_percent: utilization,
             memory_used_bytes: memory_used,
             memory_total_bytes: memory_total,
@@ -367,9 +442,15 @@ fn read_u64(path: &Path) -> Option<u64> {
 
 #[cfg(target_os = "linux")]
 fn read_driver(device: &Path) -> Option<String> {
+    read_uevent_field(device, "DRIVER")
+}
+
+#[cfg(target_os = "linux")]
+fn read_uevent_field(device: &Path, field: &str) -> Option<String> {
     read_text(&device.join("uevent")).and_then(|contents| {
         contents.lines().find_map(|line| {
-            line.strip_prefix("DRIVER=")
+            line.strip_prefix(field)
+                .and_then(|rest| rest.strip_prefix('='))
                 .map(|value| value.trim().to_string())
         })
     })
@@ -472,5 +553,18 @@ mod tests {
     fn network_totals_are_empty_for_new_collection() {
         let networks = Networks::new();
         assert_eq!(network_totals(&networks), (0, 0));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_gpu_probe_line_keeps_unavailable_fields_empty() {
+        assert_eq!(
+            super::parse_windows_gpu_line("12;1048576"),
+            Some((Some(12.0), Some(1_048_576)))
+        );
+        assert_eq!(super::parse_windows_gpu_line(";0"), Some((None, Some(0))));
+        assert_eq!(super::parse_windows_gpu_line(";"), None);
+        assert_eq!(super::parse_windows_gpu_line("12;1048576;0"), None);
+        assert_eq!(super::parse_windows_gpu_line("unexpected output"), None);
     }
 }

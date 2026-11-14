@@ -57,13 +57,13 @@
 
 ## 硬件指标
 
-`HardwareMetrics` 只包含当前快照：`node_id`、`sampled_at_ms`、系统 CPU 使用率、内存已用/总量、网络下行/上行字节速率和逐 GPU 的利用率、显存已用/总量。`memory_kind` 区分独立显存、统一内存和未知类型；平台没有对应能力时字段为空并附带 `unavailable_reason`。
+`HardwareMetrics` 只包含当前快照：`node_id`、`sampled_at_ms`、系统 CPU 使用率、内存已用/总量、网络下行/上行字节速率和逐 GPU 的利用率、显存已用/总量。显存只统计独立显存，共享显存与统一内存不折算进去，没有独立显存的核显因此字段为空：Windows 读取 GPU 性能计数器的独立占用并用注册表记录的独立容量，Linux 逐卡读取 sysfs 的 VRAM，macOS 读取 `spdisplays_vram`。Windows 的性能计数器只有适配器 LUID 维度、没有每卡容量，因此聚合成一条记录；Linux 与 macOS 按卡分别上报。`memory_kind` 只是平台内存类型提示；平台没有对应能力时字段为空并附带 `unavailable_reason`。
 
 `PeerInfo.metrics_received_at_ms` 是本地收到远端快照的时间。`metrics_stale` 由服务端按 5 秒阈值计算，供 UI 区分尚未采集和已过期状态。
 
 节点通过 `Hello` 中的 `payload.node.capabilities` 声明 `metrics.system` 和 `metrics.gpu`。发送端仅向声明 `metrics.system` 的在线对端发送 `MetricsUpdate`；对端未声明 `metrics.gpu` 时，发送的 GPU 列表为空。接收端校验快照中的 `node_id` 与当前 WebSocket 对端一致，然后更新本地 `PeerInfo.metrics` 并通知本地界面。
 
-节点每秒生成一次内存快照。
+节点以约一秒的周期生成硬件快照；GPU 采集需要调用系统性能计数器，实际间隔可能略长。
 
 剪贴板文字和 PNG 图片单项均不超过 16 MiB，图片解码还限制为不超过 8192×8192 像素和 128 MiB 解码分配；历史默认最多保留 50 条或 30 天，桌面端可分别配置到 1–500 条或 1–365 天，当前版本不设置额外总容量上限。事件 ID、来源节点 ID 和来源名称也有长度上限，接收端会在写入当前快照、历史索引或去重表前校验这些边界。
 

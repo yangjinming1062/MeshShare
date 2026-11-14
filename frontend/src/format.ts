@@ -7,43 +7,43 @@ export function formatSize(bytes: number): string {
   return (bytes / 1024 ** 3).toFixed(1) + ' GB';
 }
 
-export function formatRate(value: number | undefined): string {
-  if (value === undefined) return '—';
+export function formatRate(value: number | null | undefined): string {
+  if (value == null) return '—';
   if (value >= 1024 ** 2) return (value / 1024 ** 2).toFixed(1) + ' MB/s';
   if (value >= 1024) return (value / 1024).toFixed(1) + ' KB/s';
   return Math.round(value) + ' B/s';
 }
 
-export function formatRateCompact(value: number | undefined): string {
-  if (value === undefined) return '—';
+export function formatRateCompact(value: number | null | undefined): string {
+  if (value == null) return '—';
   if (value >= 1024 ** 2) return (value / 1024 ** 2).toFixed(1) + 'M';
   if (value >= 1024) return Math.round(value / 1024) + 'K';
   return Math.round(value) + 'B';
 }
 
-export function formatPercent(value: number | undefined): string {
-  return value === undefined ? '—' : Math.round(value) + '%';
+export function formatPercent(value: number | null | undefined): string {
+  return value == null ? '—' : Math.round(value) + '%';
 }
 
-export function formatMemory(value: number | undefined): string {
-  return value === undefined ? '—' : formatSize(value);
+export function formatMemory(value: number | null | undefined): string {
+  return value == null ? '—' : formatSize(value);
 }
 
 export function memoryPercent(value: HardwareMetrics | null | undefined): number | undefined {
-  if (value?.memory_used_bytes === undefined || value.memory_total_bytes === undefined) return undefined;
+  if (value?.memory_used_bytes == null || value.memory_total_bytes == null) return undefined;
   if (value.memory_total_bytes <= 0) return undefined;
   return value.memory_used_bytes / value.memory_total_bytes * 100;
 }
 
 export function gpuUtilization(value: HardwareMetrics | null | undefined): number | undefined {
-  const values = (value?.gpus ?? []).map((gpu) => gpu.utilization_percent).filter((item): item is number => item !== undefined);
+  const values = (value?.gpus ?? []).map((gpu) => gpu.utilization_percent).filter((item): item is number => item != null);
   return values.length ? Math.max(...values) : undefined;
 }
 
 export function gpuMemoryPercent(value: HardwareMetrics | null | undefined): number | undefined {
   const values = (value?.gpus ?? [])
-    .map((gpu) => (gpu.memory_used_bytes !== undefined && gpu.memory_total_bytes ? gpu.memory_used_bytes / gpu.memory_total_bytes * 100 : undefined))
-    .filter((item): item is number => item !== undefined);
+    .map((gpu) => (gpu.memory_used_bytes != null && gpu.memory_total_bytes ? gpu.memory_used_bytes / gpu.memory_total_bytes * 100 : undefined))
+    .filter((item): item is number => item != null);
   return values.length ? Math.max(...values) : undefined;
 }
 
