@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::Path;
+use std::path::PathBuf;
 
 pub const AUTOSTART_ARGUMENT: &str = "--meshshare-autostart";
 

@@ -17,7 +17,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
-use tauri::{AppHandle, Manager, PhysicalPosition, RunEvent, State, WindowEvent};
+#[cfg(target_os = "macos")]
+use tauri::RunEvent;
+use tauri::{AppHandle, Manager, PhysicalPosition, State, WindowEvent};
 use updater::{UpdateCoordinator, UpdateStatus};
 
 #[derive(Clone)]
@@ -842,9 +844,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
             if let RunEvent::Reopen { .. } = event {
                 show_main_window(app);
             }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
         });
 }
 
