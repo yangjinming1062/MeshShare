@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MeshShare decentralized LAN clipboard and file transfer"
 authors = ["MeshShare"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.90"
 
 [lib]
 name = "meshshare_lib"
@@ -32,6 +32,7 @@ sha2 = "0.10"
 sysinfo = { version = "0.31", default-features = false, features = ["network", "system"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2.5"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
@@ -41,3 +42,7 @@ walkdir = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+[target.'cfg(windows)'.dependencies]
+windows-registry = "0.6"
+windows-result = "0.4"

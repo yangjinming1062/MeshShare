@@ -1,0 +1,16 @@
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <CustomAction
+            Id="CleanupMeshShareAutostart"
+            FileKey="Path"
+            ExeCommand="--meshshare-cleanup-autostart"
+            Execute="deferred"
+            Impersonate="yes"
+            Return="ignore" />
+        <InstallExecuteSequence>
+            <Custom Action="CleanupMeshShareAutostart" Before="RemoveFiles">
+                REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE
+            </Custom>
+        </InstallExecuteSequence>
+    </Fragment>
+</Wix>

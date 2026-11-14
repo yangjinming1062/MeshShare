@@ -22,6 +22,9 @@
   let selectedAddress = '';
   let qrData = '';
   let syncEnabled = true;
+  let autostartEnabled = true;
+  let autostartAvailable = true;
+  let autostartBusy = false;
   let ws: WebSocket | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
@@ -110,6 +113,19 @@
         if (!isMobile) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
         await refresh();
         syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
+        if (!isMobile && !isMonitor) {
+          try {
+            autostartEnabled = await invoke<boolean>('autostart_enabled');
+          } catch (error) {
+            autostartEnabled = true;
+            const message = error instanceof Error ? error.message : '无法读取开机自启动状态';
+            autostartAvailable = !message.includes('开发构建');
+            if (autostartAvailable) {
+              notice = message;
+              window.setTimeout(() => (notice = ''), 3000);
+            }
+          }
+        }
         connectWebSocket();
         timer = window.setInterval(() => {
           void refresh().catch((error) => {
@@ -287,6 +303,21 @@
     syncEnabled = await invoke<boolean>('toggle_clipboard_sync').catch(() => !syncEnabled);
     notice = syncEnabled ? '剪贴板自动同步已恢复' : '剪贴板自动同步已暂停';
     window.setTimeout(() => (notice = ''), 2200);
+  }
+
+  async function toggleAutostart() {
+    if (autostartBusy) return;
+    const next = !autostartEnabled;
+    autostartBusy = true;
+    try {
+      autostartEnabled = await invoke<boolean>('set_autostart_enabled', { enabled: next });
+      notice = autostartEnabled ? '开机自启动已开启' : '开机自启动已关闭';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法更新开机自启动设置';
+    } finally {
+      autostartBusy = false;
+    }
+    window.setTimeout(() => (notice = ''), 2400);
   }
 
   function selectMetricsPeer(peer: PeerInfo) {
@@ -811,7 +842,7 @@
       <section class="hero-grid">
         <div class="panel hero-panel">
           <div class="section-kicker">LOCAL NODE</div>
-          <div class="hero-title-row"><div><h1>{node?.node_name ?? 'MeshShare 节点'}</h1><p>当前设备正在局域网中提供直接连接。</p></div><button class:active={syncEnabled} class="sync-toggle" on:click={toggleSync}><span></span>{syncEnabled ? '自动同步中' : '同步已暂停'}</button></div>
+          <div class="hero-title-row"><div><h1>{node?.node_name ?? 'MeshShare 节点'}</h1><p>当前设备正在局域网中提供直接连接。</p></div><div class="hero-actions"><button class:active={syncEnabled} class="sync-toggle" on:click={toggleSync}><span></span>{syncEnabled ? '自动同步中' : '同步已暂停'}</button>{#if autostartAvailable}<button class:active={autostartEnabled} class="sync-toggle" aria-pressed={autostartEnabled} disabled={autostartBusy} on:click={toggleAutostart}><span></span>{autostartEnabled ? '开机自启动' : '开机自启已关闭'}</button>{/if}</div></div>
           <div class="hero-stats"><div><b>{peers.length}</b><span>在线设备</span></div><div><b>{node?.platform ?? '—'}</b><span>运行平台</span></div><div><b>{node?.port ?? '—'}</b><span>服务端口</span></div></div>
         </div>
         <div class="panel access-panel">

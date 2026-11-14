@@ -517,7 +517,7 @@ mod tests {
                     .peers
                     .read()
                     .get(&peer_id)
-                    .map_or(true, |peer| !peer.online)
+                    .is_none_or(|peer| !peer.online)
                 {
                     break;
                 }

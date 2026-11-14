@@ -21,7 +21,7 @@
         "minHeight": 640,
         "resizable": true,
         "dragDropEnabled": false,
-        "visible": true
+        "visible": false
       },
       {
         "label": "monitor",
@@ -71,7 +71,19 @@
     "windows": {
       "nsis": {
         "installerIcon": "icons/icon.ico",
-        "uninstallerIcon": "icons/icon.ico"
+        "uninstallerIcon": "icons/icon.ico",
+        "installerHooks": "packaging/remove-autostart.nsh"
+      },
+      "wix": {
+        "fragmentPaths": ["packaging/remove-autostart.wxs"]
+      }
+    },
+    "linux": {
+      "deb": {
+        "postRemoveScript": "packaging/remove-autostart.sh"
+      },
+      "rpm": {
+        "postRemoveScript": "packaging/remove-autostart.sh"
       }
     }
   }

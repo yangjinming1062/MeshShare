@@ -2,7 +2,7 @@
 
 ## 环境准备
 
-安装 Git、Rust stable 和 Node.js 22，准备对应系统的构建依赖。Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1 和 Ayatana AppIndicator 等开发包。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
+安装 Git、Rust stable（当前 Tauri 2 依赖链和 single-instance 插件要求 Rust 1.90 或更高）和 Node.js 22，准备对应系统的构建依赖。Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1 和 Ayatana AppIndicator 等开发包。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
 
 以下命令从仓库根目录执行。Tauri CLI 由 `npx` 按需运行。
 
@@ -36,6 +36,8 @@ npx --yes @tauri-apps/cli@2 dev -- --locked
 ```bash
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 ```
+
+开发模式和调试构建不会自动写入系统登录启动项，避免把调试可执行文件注册为正式启动入口；调试界面也不显示不可用的自启动开关。开机自启动需要在正式桌面安装包中验证：首次启动应默认注册，登录后主窗口保持隐藏并可从托盘打开，重复打开应用只激活已有窗口。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
 
 推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包，核对 GitHub Release 的附件完整后自动发布。普通分支推送和 Pull Request 的检查在本地运行。
 

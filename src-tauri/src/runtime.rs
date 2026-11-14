@@ -17,6 +17,10 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+fn default_autostart_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedConfig {
     node_id: String,
@@ -27,6 +31,8 @@ struct PersistedConfig {
     monitor_position: Option<MonitorPosition>,
     #[serde(default)]
     monitor_locked: bool,
+    #[serde(default = "default_autostart_enabled")]
+    autostart_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -495,6 +501,19 @@ impl NodeRuntime {
         Ok(())
     }
 
+    pub fn autostart_enabled(&self) -> bool {
+        self.config.lock().autostart_enabled
+    }
+
+    pub fn set_autostart_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.autostart_enabled = enabled;
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        Ok(())
+    }
+
     pub fn peers_snapshot(&self) -> Vec<PeerInfo> {
         let now = now_millis();
         let mut peers = self
@@ -782,7 +801,7 @@ impl NodeRuntime {
             .filter(|record| {
                 status
                     .as_ref()
-                    .map_or(true, |value| &record.progress.status == value)
+                    .is_none_or(|value| &record.progress.status == value)
             })
             .map(|record| record.progress.clone())
             .collect::<Vec<_>>();
@@ -991,9 +1010,7 @@ impl NodeRuntime {
             .ok_or_else(|| "手机临时文件超过会话配额".to_string())?;
         if reserved
             .checked_add(offer.total_bytes)
-            .map_or(true, |total| {
-                total > crate::model::MAX_MOBILE_STAGING_BYTES_PER_SESSION
-            })
+            .is_none_or(|total| total > crate::model::MAX_MOBILE_STAGING_BYTES_PER_SESSION)
         {
             return Err("手机临时文件超过会话配额".to_string());
         }
@@ -1288,10 +1305,13 @@ fn evict_terminal_transfer_if_needed(transfers: &mut HashMap<String, TransferRec
 
 fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
     let path = data_dir.join("node.json");
-    if let Ok(contents) = std::fs::read_to_string(&path) {
-        if let Ok(config) = serde_json::from_str::<PersistedConfig>(&contents) {
-            return Ok(config);
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => {
+            return serde_json::from_str::<PersistedConfig>(&contents)
+                .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"));
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     let config = PersistedConfig {
         node_id: Uuid::new_v4().to_string(),
@@ -1303,6 +1323,7 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
         monitor_display: MonitorDisplayMode::default(),
         monitor_position: None,
         monitor_locked: false,
+        autostart_enabled: default_autostart_enabled(),
     };
     persist_config(data_dir, &config)?;
     Ok(config)
@@ -1310,7 +1331,24 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
 
 fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<()> {
     let path = data_dir.join("node.json");
-    std::fs::write(path, serde_json::to_vec_pretty(config)?)?;
+    let temporary = data_dir.join(format!("node.json.tmp-{}", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(config)?)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                std::fs::rename(&temporary, &path)?;
+            } else {
+                return Err(error.into());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 
@@ -1550,6 +1588,37 @@ mod tests {
         assert_eq!(config.monitor_display.as_str(), "floating");
         assert_eq!(config.monitor_position, None);
         assert!(!config.monitor_locked);
+        assert!(config.autostart_enabled);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn corrupted_config_is_reported_without_replacing_node_identity() {
+        let path = temp_data_dir();
+        let config_path = path.join("node.json");
+        std::fs::write(&config_path, "{\"node_id\":").expect("write corrupt config");
+
+        assert!(load_or_create_config(&path).is_err());
+        assert_eq!(
+            std::fs::read_to_string(config_path).expect("read corrupt config"),
+            "{\"node_id\":"
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn autostart_preference_is_persisted() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert!(runtime.autostart_enabled());
+        runtime
+            .set_autostart_enabled(false)
+            .expect("disable autostart");
+
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert!(!restored.autostart_enabled());
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -1590,6 +1659,8 @@ mod tests {
             .set_monitor_position(crate::model::MonitorPosition { x: 10, y: 20 })
             .is_err());
         assert_eq!(runtime.monitor_position(), None);
+        assert!(runtime.set_autostart_enabled(false).is_err());
+        assert!(runtime.autostart_enabled());
     }
 
     #[test]

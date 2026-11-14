@@ -1,3 +1,4 @@
+mod autostart;
 mod clipboard;
 mod clock;
 mod discovery;
@@ -15,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
-use tauri::{AppHandle, Manager, PhysicalPosition, State, WindowEvent};
+use tauri::{AppHandle, Manager, PhysicalPosition, RunEvent, State, WindowEvent};
 
 #[derive(Clone)]
 struct ManagedNode {
@@ -46,6 +47,72 @@ fn clipboard_sync_enabled(state: State<'_, ManagedNode>) -> bool {
         .runtime
         .sync_enabled
         .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn autostart_enabled(state: State<'_, ManagedNode>) -> Result<bool, String> {
+    if cfg!(debug_assertions) {
+        return Err("开发构建不注册开机自启动".to_string());
+    }
+    let enabled = autostart::Registration::current()
+        .and_then(|registration| registration.is_enabled())
+        .map_err(|error| format!("无法读取开机自启动状态：{error}"))?;
+    if state.runtime.autostart_enabled() && !enabled {
+        return Err("开机自启动尚未注册，请检查系统权限或重新安装正式版本".to_string());
+    }
+    Ok(enabled)
+}
+
+#[tauri::command]
+fn set_autostart_enabled(state: State<'_, ManagedNode>, enabled: bool) -> Result<bool, String> {
+    if cfg!(debug_assertions) {
+        return Err("开发构建不注册开机自启动".to_string());
+    }
+    let registration = autostart::Registration::current()
+        .map_err(|error| format!("无法准备开机自启动设置：{error}"))?;
+    let previous_registration = registration
+        .is_enabled()
+        .map_err(|error| format!("无法读取当前开机自启动状态：{error}"))?;
+    let previous_preference = state.runtime.autostart_enabled();
+    state
+        .runtime
+        .set_autostart_enabled(enabled)
+        .map_err(|error| format!("保存开机自启动设置失败：{error}"))?;
+    if let Err(error) = apply_autostart_registration(&registration, enabled) {
+        let restore_registration =
+            apply_autostart_registration(&registration, previous_registration);
+        let restore_preference = state.runtime.set_autostart_enabled(previous_preference);
+        return Err(format_registration_failure(
+            error,
+            restore_registration,
+            restore_preference,
+        ));
+    }
+    match registration.is_enabled() {
+        Ok(actual) if actual == enabled => Ok(enabled),
+        Ok(actual) => {
+            let error =
+                anyhow::anyhow!("系统报告的开机自启动状态为 {actual}，期望状态为 {enabled}");
+            let restore_registration =
+                apply_autostart_registration(&registration, previous_registration);
+            let restore_preference = state.runtime.set_autostart_enabled(previous_preference);
+            Err(format_registration_failure(
+                error,
+                restore_registration,
+                restore_preference,
+            ))
+        }
+        Err(error) => {
+            let restore_registration =
+                apply_autostart_registration(&registration, previous_registration);
+            let restore_preference = state.runtime.set_autostart_enabled(previous_preference);
+            Err(format_registration_failure(
+                error,
+                restore_registration,
+                restore_preference,
+            ))
+        }
+    }
 }
 
 #[tauri::command]
@@ -173,6 +240,64 @@ fn apply_monitor_mode(app: &AppHandle, mode: &MonitorDisplayMode, locked: bool) 
         MonitorDisplayMode::Tray | MonitorDisplayMode::Disabled => {
             let _ = window.hide();
         }
+    }
+}
+
+fn apply_autostart_registration(
+    registration: &autostart::Registration,
+    enabled: bool,
+) -> anyhow::Result<()> {
+    if enabled {
+        registration
+            .enable()
+            .map_err(|error| anyhow::anyhow!("启用开机自启动失败：{error}"))
+    } else {
+        registration
+            .disable()
+            .map_err(|error| anyhow::anyhow!("关闭开机自启动失败：{error}"))
+    }
+}
+
+fn format_registration_failure(
+    error: anyhow::Error,
+    restore_registration: anyhow::Result<()>,
+    restore_preference: anyhow::Result<()>,
+) -> String {
+    let mut message = format!("更新开机自启动失败：{error}");
+    if let Err(restore_error) = restore_registration {
+        message.push_str(&format!("；恢复系统注册状态失败：{restore_error}"));
+    }
+    if let Err(restore_error) = restore_preference {
+        message.push_str(&format!("；恢复配置失败：{restore_error}"));
+    }
+    message
+}
+
+fn sync_autostart_registration(runtime: &NodeRuntime) {
+    if cfg!(debug_assertions) {
+        return;
+    }
+    let registration = match autostart::Registration::current() {
+        Ok(registration) => registration,
+        Err(error) => {
+            eprintln!("准备开机自启动失败：{error}");
+            return;
+        }
+    };
+    if let Err(error) = apply_autostart_registration(&registration, runtime.autostart_enabled()) {
+        eprintln!("{error}");
+    }
+}
+
+fn is_autostart_launch() -> bool {
+    autostart::launched_from_args(std::env::args())
+}
+
+fn show_main_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
     }
 }
 
@@ -546,11 +671,7 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
     });
     tray.on_menu_event(|app, event| match event.id().as_ref() {
         "show" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.show();
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
         }
         "hide" => {
             if let Some(window) = app.get_webview_window("main") {
@@ -610,8 +731,12 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            let autostart_launch = is_autostart_launch();
             let data_dir = app
                 .path()
                 .app_data_dir()
@@ -624,6 +749,7 @@ pub fn run() {
             app.manage(ManagedNode {
                 runtime: runtime.clone(),
             });
+            sync_autostart_registration(runtime.as_ref());
             setup_tray_menu(app.handle(), runtime.clone())?;
             if let Some(window) = app.get_webview_window("monitor") {
                 position_monitor_window(&window, runtime.as_ref());
@@ -634,6 +760,9 @@ pub fn run() {
                 runtime.monitor_locked(),
             );
             if let Some(window) = app.get_webview_window("main") {
+                if !autostart_launch {
+                    show_main_window(app.handle());
+                }
                 let window_for_close = window.clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
@@ -657,6 +786,8 @@ pub fn run() {
             node_base_url,
             toggle_clipboard_sync,
             clipboard_sync_enabled,
+            autostart_enabled,
+            set_autostart_enabled,
             accept_transfer,
             register_outgoing_transfer,
             update_transfer_progress,
@@ -666,13 +797,27 @@ pub fn run() {
             set_monitor_locked,
             set_monitor_position
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running MeshShare");
+        .build(tauri::generate_context!())
+        .expect("error while building MeshShare")
+        .run(|app, event| {
+            if let RunEvent::Reopen { .. } = event {
+                show_main_window(app);
+            }
+        });
+}
+
+pub fn cleanup_autostart() {
+    if let Err(error) =
+        autostart::Registration::current().and_then(|registration| registration.disable())
+    {
+        eprintln!("清理开机自启动失败：{error}");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::clamp_position_to_work_area;
+    use crate::autostart::launched_from_args;
     use crate::model::MonitorPosition;
 
     #[test]
@@ -701,5 +846,11 @@ mod tests {
             ),
             MonitorPosition { x: 1464, y: 1022 }
         );
+    }
+
+    #[test]
+    fn autostart_argument_is_detected_without_matching_similar_flags() {
+        assert!(launched_from_args(["meshshare", "--meshshare-autostart"]));
+        assert!(!launched_from_args(["meshshare", "--autostart"]));
     }
 }
