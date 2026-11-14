@@ -39,7 +39,9 @@ npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 
 开发模式和调试构建不会自动写入系统登录启动项，避免把调试可执行文件注册为正式启动入口；调试界面也不显示不可用的自启动开关。开机自启动需要在正式桌面安装包中验证：首次启动应默认注册，登录后主窗口保持隐藏并可从托盘打开，重复打开应用只激活已有窗口。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
 
-推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包，核对 GitHub Release 的附件完整后发布为 prerelease。普通分支推送和 Pull Request 的检查在本地运行。
+推送到 `main` 时，[GitHub Actions 检查工作流](../.github/workflows/ci.yml) 会运行前端检查、构建、Rust 格式与 lint，并在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行 Rust 回归测试。Pull Request 不触发该工作流，仍可按本页检查命令本地验证。
+
+推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。Release 工作流不重复运行代码检查，只执行签名校验、前端构建、安装包生成和发布所需的校验。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包，核对 GitHub Release 的附件完整后发布为 prerelease。Tauri CLI 按运行器系统、架构和版本缓存，缓存未命中时从 Cargo 安装固定版本。
 
 ### 自动更新发布
 

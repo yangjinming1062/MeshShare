@@ -146,7 +146,7 @@ npm --prefix web run build
 npx --yes @tauri-apps/cli@2 dev -- --locked
 ```
 
-提交前在仓库根目录运行 `npm --prefix web run check`，并在 `src-tauri/` 下运行 `cargo fmt --check`、`cargo clippy -- -D warnings` 与 `cargo test`。完整环境、构建与发布流程见 [开发指南](docs/DEVELOPMENT.md)。
+提交前在仓库根目录运行 `npm --prefix web run check`，并在 `src-tauri/` 下运行 `cargo fmt --check`、`cargo clippy -- -D warnings` 与 `cargo test`。推送到 `main` 后，GitHub Actions 会自动执行这些检查并在四个平台运行 Rust 回归测试；版本 tag 的工作流只执行发布所需的构建与上传。完整环境、构建与发布流程见 [开发指南](docs/DEVELOPMENT.md)。
 
 ## 项目文档
 

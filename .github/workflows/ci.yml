@@ -1,0 +1,65 @@
+name: Check MeshShare
+
+on:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Static checks (Ubuntu)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libwayland-dev librsvg2-dev patchelf libayatana-appindicator3-dev
+      - run: npm --prefix web ci
+      - run: npm --prefix web run check
+      - run: npm --prefix web run build
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features --locked -- -D warnings
+
+  rust-tests:
+    name: Rust tests (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-15-intel
+            name: macos-x64
+          - os: macos-15
+            name: macos-arm64
+          - os: ubuntu-24.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libwayland-dev librsvg2-dev patchelf libayatana-appindicator3-dev
+      - run: npm --prefix web ci
+      - run: npm --prefix web run build
+      - name: Run Rust regression tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --all-features --locked

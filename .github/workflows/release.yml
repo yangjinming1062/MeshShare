@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  TAURI_CLI_VERSION: 2.12.4
+
 concurrency:
   group: release-${{ github.ref }}
 
@@ -83,6 +86,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
@@ -90,10 +95,22 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libwayland-dev librsvg2-dev patchelf libayatana-appindicator3-dev
       - run: npm --prefix web ci
       - run: npm --prefix web run build
-      - name: Run Rust regression tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml --all-features --locked
+      - name: Cache Tauri CLI
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-tauri
+            ~/.cargo/bin/cargo-tauri.exe
+          key: tauri-cli-${{ runner.os }}-${{ runner.arch }}-${{ env.TAURI_CLI_VERSION }}
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version '2.12.4' --locked
+        shell: bash
+        run: |
+          if cargo tauri --version 2>/dev/null | grep -Fq "$TAURI_CLI_VERSION"; then
+            echo "Using cached Tauri CLI $TAURI_CLI_VERSION"
+          else
+            cargo install tauri-cli --version "=$TAURI_CLI_VERSION" --locked
+          fi
+          cargo tauri --version
       - name: Build application
         run: cargo tauri build --config release-version.json -- --locked
       - name: Name macOS updater artifacts by architecture
