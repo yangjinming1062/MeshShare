@@ -29,6 +29,11 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_WIRE_ERROR_LENGTH: usize = 4_096;
+const MAX_METRIC_GPU_COUNT: usize = 64;
+const MAX_METRIC_GPU_NAME_LENGTH: usize = 256;
+const MAX_METRIC_REASON_LENGTH: usize = 512;
+const MAX_MEDIA_TYPE_LENGTH: usize = 256;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -170,6 +175,9 @@ async fn connect_peer(
     State(state): State<AppState>,
     Json(payload): Json<PeerConnectionRequest>,
 ) -> Result<Json<PeerInfo>, ApiError> {
+    if payload.url.len() > 4_096 {
+        return Err(ApiError::bad_request("节点地址过长"));
+    }
     discovery::connect_manual(state.runtime, payload.url)
         .await
         .map(Json)
@@ -526,6 +534,15 @@ pub(crate) async fn handle_wire_message(
             destination,
             reason,
         } => {
+            if destination
+                .as_ref()
+                .is_some_and(|value| value.len() > 4_096)
+                || reason
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_WIRE_ERROR_LENGTH)
+            {
+                return current_peer.map(str::to_string);
+            }
             let _ = apply_transfer_action(
                 runtime,
                 &transfer_id,
@@ -545,7 +562,8 @@ pub(crate) async fn handle_wire_message(
                     || current_peer == Some(target_node_id.as_str())
                 {
                     let valid = runtime.transfer(&transfer_id).is_some_and(|record| {
-                        progress.total_bytes == record.offer.total_bytes
+                        validate_transfer_progress_payload(&progress)
+                            && progress.total_bytes == record.offer.total_bytes
                             && progress.total_items == record.offer.items.len()
                             && progress.completed_bytes <= progress.total_bytes
                             && progress.completed_items <= progress.total_items
@@ -563,7 +581,8 @@ pub(crate) async fn handle_wire_message(
         }
         WireMessage::MetricsUpdate { metrics } => {
             let peer_id = current_peer?;
-            if runtime.peer_supports(peer_id, METRICS_SYSTEM_CAPABILITY)
+            if validate_metrics(&metrics)
+                && runtime.peer_supports(peer_id, METRICS_SYSTEM_CAPABILITY)
                 && runtime.update_peer_metrics(peer_id, metrics.clone())
             {
                 runtime.publish_event(WireMessage::MetricsUpdate { metrics });
@@ -627,6 +646,7 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
             || item.item_id.len() > 256
             || item.name.trim().is_empty()
             || item.name.len() > 1_024
+            || item.media_type.len() > MAX_MEDIA_TYPE_LENGTH
             || item.directory
             || item.size > crate::model::MAX_TRANSFER_BYTES
             || has_parent_component(&item.relative_path)
@@ -667,13 +687,52 @@ fn validate_clipboard_event(event: &ClipboardEvent) -> bool {
     bytes.len() <= CLIPBOARD_IMAGE_LIMIT && is_valid_png(&bytes)
 }
 
+fn validate_transfer_progress_payload(progress: &TransferProgress) -> bool {
+    progress
+        .error
+        .as_ref()
+        .is_none_or(|value| value.len() <= MAX_WIRE_ERROR_LENGTH)
+        && progress
+            .destination
+            .as_ref()
+            .is_none_or(|value| value.len() <= 4_096)
+        && progress
+            .direction
+            .as_deref()
+            .is_none_or(|value| matches!(value, "send" | "receive"))
+}
+
+fn validate_metrics(metrics: &HardwareMetrics) -> bool {
+    !metrics.node_id.trim().is_empty()
+        && metrics.node_id.len() <= 256
+        && metrics.gpus.len() <= MAX_METRIC_GPU_COUNT
+        && metrics.gpus.iter().all(|gpu| {
+            !gpu.name.trim().is_empty()
+                && gpu.name.len() <= MAX_METRIC_GPU_NAME_LENGTH
+                && gpu
+                    .unavailable_reason
+                    .as_ref()
+                    .is_none_or(|value| value.len() <= MAX_METRIC_REASON_LENGTH)
+                && gpu
+                    .utilization_percent
+                    .is_none_or(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+        })
+}
+
 fn validate_node_info(node: &NodeInfo) -> bool {
     !node.node_id.trim().is_empty()
         && node.node_id.len() <= 256
         && node.node_name.len() <= 256
         && node.version.len() <= 64
+        && node.platform.len() <= 64
         && node.addresses.len() <= 32
         && node.capabilities.len() <= 64
+        && node.addresses.iter().all(|address| {
+            address.address.len() <= 64
+                && address.url.len() <= 512
+                && address.label.len() <= 256
+                && address.kind.len() <= 64
+        })
         && node
             .capabilities
             .iter()
@@ -777,6 +836,9 @@ async fn create_mobile_session(
         .label
         .filter(|label| !label.trim().is_empty())
         .unwrap_or_else(|| "手机浏览器".to_string());
+    if label.len() > 256 {
+        return Err(ApiError::bad_request("手机会话名称过长"));
+    }
     state
         .runtime
         .create_mobile_session(label)
@@ -830,6 +892,14 @@ async fn cleanup_mobile_staging_directory(directory: &Path) {
     if let Err(error) = fs::remove_dir_all(directory).await {
         if error.kind() != std::io::ErrorKind::NotFound {
             eprintln!("清理手机临时目录失败：{error}");
+        }
+    }
+}
+
+async fn remove_file_with_diagnostics(path: &Path) {
+    if let Err(error) = fs::remove_file(path).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("清理临时文件失败 {}：{error}", path.display());
         }
     }
 }
@@ -943,6 +1013,9 @@ async fn fail_mobile_transfer(
         .error
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "手机文件上传失败".to_string());
+    if message.len() > MAX_WIRE_ERROR_LENGTH {
+        return Err(ApiError::bad_request("失败原因过长"));
+    }
     let progress = state
         .runtime
         .fail_mobile_transfer(&id, message)
@@ -1046,26 +1119,27 @@ async fn upload_mobile_item(
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
-            let _ = fs::remove_file(&temp).await;
+            remove_file_with_diagnostics(&temp).await;
             return Err(error);
         }
     };
     if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
-        let _ = fs::remove_file(&temp).await;
+        remove_file_with_diagnostics(&temp).await;
         let _ = state
             .runtime
             .fail_mobile_transfer(&transfer_id, "文件校验失败".to_string());
+        cleanup_mobile_staging_directory(&record.staged_directory).await;
         return Err(ApiError::bad_request("文件校验失败"));
     }
     let target = match prepare_target(&record.staged_directory, &item.relative_path).await {
         Ok(target) => target,
         Err(error) => {
-            let _ = fs::remove_file(&temp).await;
+            remove_file_with_diagnostics(&temp).await;
             return Err(error);
         }
     };
     if let Err(error) = fs::hard_link(&temp, &target).await {
-        let _ = fs::remove_file(&temp).await;
+        remove_file_with_diagnostics(&temp).await;
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             return Err(ApiError::conflict(format!(
                 "目标已存在：{}",
@@ -1074,12 +1148,12 @@ async fn upload_mobile_item(
         }
         return Err(ApiError::internal(error.to_string()));
     }
-    let _ = fs::remove_file(&temp).await;
+    remove_file_with_diagnostics(&temp).await;
     let Some(progress) = state
         .runtime
         .stage_mobile_item(&transfer_id, &item_id, total)
     else {
-        let _ = fs::remove_file(&target).await;
+        remove_file_with_diagnostics(&target).await;
         return Err(ApiError::conflict("手机传输已取消或完成"));
     };
     Ok(Json(progress))
@@ -1382,12 +1456,12 @@ async fn upload_item(
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
-            let _ = fs::remove_file(&temp).await;
+            remove_file_with_diagnostics(&temp).await;
             return Err(error);
         }
     };
     if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
-        let _ = fs::remove_file(&temp).await;
+        remove_file_with_diagnostics(&temp).await;
         let message = "文件校验失败".to_string();
         let progress = state
             .runtime
@@ -1401,16 +1475,16 @@ async fn upload_item(
     let target = match prepare_target(&destination, &item.relative_path).await {
         Ok(target) => target,
         Err(error) => {
-            let _ = fs::remove_file(&temp).await;
+            remove_file_with_diagnostics(&temp).await;
             return Err(error);
         }
     };
     if !state.runtime.transfer_upload_active(&transfer_id) {
-        let _ = fs::remove_file(&temp).await;
+        remove_file_with_diagnostics(&temp).await;
         return Err(ApiError::conflict("传输已取消"));
     }
     if let Err(error) = fs::hard_link(&temp, &target).await {
-        let _ = fs::remove_file(&temp).await;
+        remove_file_with_diagnostics(&temp).await;
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             return Err(ApiError::conflict(format!(
                 "目标已存在：{}",
@@ -1419,12 +1493,12 @@ async fn upload_item(
         }
         return Err(ApiError::internal(error.to_string()));
     }
-    let _ = fs::remove_file(&temp).await;
+    remove_file_with_diagnostics(&temp).await;
     let Some(progress) = state
         .runtime
         .mark_item_received(&transfer_id, &item_id, total)
     else {
-        let _ = fs::remove_file(&target).await;
+        remove_file_with_diagnostics(&target).await;
         return Err(ApiError::conflict("传输已取消或已完成"));
     };
     state.runtime.publish_event(WireMessage::TransferProgress {
@@ -1736,6 +1810,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_remote_metrics_payload_is_ignored() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-large-metrics-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.set_peer(PeerInfo {
+            node_id: "peer".to_string(),
+            node_name: "peer".to_string(),
+            platform: "test".to_string(),
+            addresses: Vec::new(),
+            capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
+            online: true,
+            last_seen_ms: crate::clock::now_millis(),
+            endpoint: None,
+            source: "test".to_string(),
+            metrics: None,
+            metrics_received_at_ms: None,
+            metrics_stale: false,
+        });
+        let metrics = HardwareMetrics {
+            node_id: "peer".to_string(),
+            sampled_at_ms: 1,
+            cpu_usage_percent: Some(2.0),
+            memory_used_bytes: None,
+            memory_total_bytes: None,
+            network_down_bytes_per_sec: None,
+            network_up_bytes_per_sec: None,
+            gpus: vec![crate::model::GpuMetrics {
+                name: "x".repeat(257),
+                utilization_percent: None,
+                memory_used_bytes: None,
+                memory_total_bytes: None,
+                memory_kind: crate::model::GpuMemoryKind::Unknown,
+                unavailable_reason: None,
+            }],
+        };
+        handle_wire_message(
+            WireMessage::MetricsUpdate { metrics },
+            &runtime,
+            Some("peer"),
+        )
+        .await;
+        assert!(runtime.peers_snapshot()[0].metrics.is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn invalid_hello_does_not_register_a_peer() {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-invalid-hello-{}", Uuid::new_v4()));
@@ -1922,6 +2044,90 @@ mod tests {
                 .progress
                 .status,
             TransferStatus::Rejected
+        );
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn mobile_checksum_failure_removes_staged_directory() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "meshshare-mobile-upload-failure-{}",
+            Uuid::new_v4()
+        ));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        let mut hasher = Sha256::new();
+        hasher.update(b"expected");
+        let offer = TransferOffer {
+            transfer_id: "mobile-checksum-failure".to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "payload.bin".to_string(),
+                relative_path: "payload.bin".to_string(),
+                size: 8,
+                sha256: format!("{:x}", hasher.finalize()),
+                media_type: "application/octet-stream".to_string(),
+                directory: false,
+            }],
+            total_bytes: 8,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        runtime
+            .set_mobile_transfer_status(
+                "mobile-checksum-failure",
+                &session.session_id,
+                TransferStatus::Accepted,
+            )
+            .expect("accept mobile transfer");
+        let record = runtime
+            .mobile_transfer("mobile-checksum-failure")
+            .expect("find mobile transfer");
+
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let response = runtime
+            .http
+            .put(format!(
+                "http://{address}/api/v1/mobile/transfers/mobile-checksum-failure/items/item"
+            ))
+            .body("wrong!!!")
+            .send()
+            .await
+            .expect("upload wrong mobile payload");
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(!record.staged_directory.exists());
+        assert_eq!(
+            runtime
+                .mobile_transfer("mobile-checksum-failure")
+                .expect("find failed mobile transfer")
+                .progress
+                .status,
+            TransferStatus::Failed
         );
 
         runtime

@@ -116,6 +116,13 @@ impl UpdateCoordinator {
     async fn run(self: Arc<Self>) {
         let mut retry_at_ms = None;
         loop {
+            if self
+                .runtime
+                .stopping
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                break;
+            }
             let (frequency, last_checked_at_ms, pending_version) = self.runtime.update_settings();
             let manual = self.manual_requested.load(Ordering::SeqCst);
             let now = now_millis();
@@ -176,7 +183,7 @@ impl UpdateCoordinator {
         };
         tokio::select! {
             _ = self.notify.notified() => {}
-            _ = tokio::time::sleep(Duration::from_millis(wait_ms as u64)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(wait_ms.min(1_000) as u64)) => {}
         }
     }
 
