@@ -67,9 +67,17 @@ fn available_disk_space(path: &Path) -> Option<u64> {
     sysinfo::Disks::new_with_refreshed_list()
         .list()
         .iter()
-        .filter(|disk| path.starts_with(disk.mount_point()))
-        .max_by_key(|disk| disk.mount_point().components().count())
-        .map(|disk| disk.available_space())
+        .filter_map(|disk| {
+            // `canonicalize` on Windows returns an extended-length path such as
+            // `\\?\\C:\\...`, while sysinfo reports drive-letter mount points.
+            // Canonicalize the mount point as well so the two forms can be
+            // compared component by component.
+            let mount_point = std::fs::canonicalize(disk.mount_point()).ok()?;
+            path.starts_with(&mount_point)
+                .then_some((mount_point.components().count(), disk.available_space()))
+        })
+        .max_by_key(|(component_count, _)| *component_count)
+        .map(|(_, available_space)| available_space)
 }
 
 #[derive(Clone)]
