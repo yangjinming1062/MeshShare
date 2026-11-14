@@ -3,6 +3,7 @@ mod clipboard;
 mod clock;
 mod discovery;
 mod metrics;
+mod mobile_tls;
 mod model;
 mod runtime;
 mod server;
@@ -10,11 +11,11 @@ mod updater;
 
 use anyhow::Context;
 use model::{
-    ClipboardHistoryMode, ClipboardHistorySettings, HardwareMetrics, MonitorDisplayMode,
-    MonitorPosition, TransferProgress, WireMessage,
+    ClipboardHistoryMode, ClipboardHistorySettings, HardwareMetrics, MobileAccessInfo,
+    MonitorDisplayMode, MonitorPosition, ReceiveMode, ReceiveSettings, TransferProgress,
+    WireMessage,
 };
-use runtime::{NodeRuntime, UpdateFrequency};
-use std::fs;
+use runtime::{validate_receive_directory, NodeRuntime, UpdateFrequency};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -172,20 +173,32 @@ fn set_autostart_enabled(state: State<'_, ManagedNode>, enabled: bool) -> Result
 }
 
 #[tauri::command]
+fn receive_settings(state: State<'_, ManagedNode>) -> ReceiveSettings {
+    state.runtime.receive_settings()
+}
+
+#[tauri::command]
+fn set_receive_settings(
+    state: State<'_, ManagedNode>,
+    mode: String,
+    default_path: Option<String>,
+) -> Result<ReceiveSettings, String> {
+    let mode = ReceiveMode::parse(&mode).ok_or_else(|| "接收模式无效".to_string())?;
+    let directory = default_path.map(PathBuf::from);
+    state
+        .runtime
+        .set_receive_settings(mode, directory)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 fn accept_transfer(
     state: State<'_, ManagedNode>,
     transfer_id: String,
     destination: String,
 ) -> Result<TransferProgress, String> {
-    let destination = PathBuf::from(destination);
-    if !destination.is_absolute() {
-        return Err("接收目录必须是绝对路径".to_string());
-    }
-    let metadata = fs::symlink_metadata(&destination).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err("接收目录必须是实际目录，不能是符号链接".to_string());
-    }
-    let destination = fs::canonicalize(&destination).map_err(|error| error.to_string())?;
+    let destination = validate_receive_directory(PathBuf::from(destination).as_path())
+        .map_err(|error| error.to_string())?;
     let progress = state
         .runtime
         .set_transfer_acceptance(&transfer_id, destination)
@@ -579,8 +592,44 @@ async fn start_node(
             IpAddr::V6(_) => None,
         })
         .collect::<Vec<_>>();
+    let tls_data_dir = data_dir.clone();
     let runtime = NodeRuntime::new(data_dir, actual_port, version)?;
-    runtime.set_listening_addresses(listening_addresses);
+    runtime.set_listening_addresses(listening_addresses.clone());
+    let tls_material = mobile_tls::ensure(&tls_data_dir, &listening_addresses)?;
+    let tls_first_listener = bind_initial_tls_listener(&listening_addresses).await?;
+    let tls_port = tls_first_listener.local_addr()?.port();
+    let tls_first_address = tls_first_listener.local_addr()?.ip();
+    let mut tls_listeners = vec![tls_first_listener];
+    for address in &listening_addresses {
+        if IpAddr::V4(*address) == tls_first_address {
+            continue;
+        }
+        if let Ok(listener) = tokio::net::TcpListener::bind((*address, tls_port)).await {
+            tls_listeners.push(listener);
+        }
+    }
+    let secure_urls = tls_listeners
+        .iter()
+        .filter_map(|listener| listener.local_addr().ok())
+        .filter_map(|address| match address.ip() {
+            IpAddr::V4(ip) => Some(model::AddressInfo {
+                address: ip.to_string(),
+                url: format!("https://{ip}:{tls_port}"),
+                label: format!("手机 HTTPS · {ip}"),
+                kind: "mobile_https".to_string(),
+            }),
+            IpAddr::V6(_) => None,
+        })
+        .collect::<Vec<_>>();
+    runtime.set_mobile_access_info(
+        MobileAccessInfo {
+            bootstrap_urls: runtime.node_info().addresses.clone(),
+            secure_urls,
+            ca_url: "/api/v1/mobile/ca".to_string(),
+            ca_fingerprint: tls_material.fingerprint.clone(),
+        },
+        tls_material.ca_certificate_path.clone(),
+    );
     let app = server::router(runtime.clone(), static_root);
     for listener in listeners {
         let app = app.clone();
@@ -597,6 +646,44 @@ async fn start_node(
             let _ = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown)
                 .await;
+        });
+    }
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
+        &tls_material.server_certificate_path,
+        &tls_material.server_key_path,
+    )
+    .await?;
+    let tls_app = app.clone();
+    for listener in tls_listeners {
+        let tls_config = tls_config.clone();
+        let shutdown_runtime = runtime.clone();
+        let std_listener = listener.into_std()?;
+        let tls_handle = axum_server::Handle::new();
+        let tls_server =
+            axum_server::from_tcp_rustls(std_listener, tls_config)?.handle(tls_handle.clone());
+        let tls_app = tls_app.clone();
+        tauri::async_runtime::spawn(async move {
+            let shutdown = async move {
+                while !shutdown_runtime
+                    .stopping
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                tls_handle.graceful_shutdown(None);
+            };
+            let server = tls_server.serve(tls_app.into_make_service());
+            tokio::pin!(server);
+            tokio::select! {
+                result = &mut server => {
+                    if let Err(error) = result {
+                        eprintln!("手机 HTTPS 服务停止：{error}");
+                    }
+                }
+                _ = shutdown => {
+                    let _ = server.await;
+                }
+            }
         });
     }
     let cleanup_runtime = runtime.clone();
@@ -647,6 +734,24 @@ async fn bind_initial_listener(
     }
     Err(anyhow::anyhow!(
         "无法绑定允许的本地地址：{}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "没有可用地址".to_string())
+    ))
+}
+
+async fn bind_initial_tls_listener(
+    addresses: &[Ipv4Addr],
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let mut last_error = None;
+    for address in addresses {
+        match tokio::net::TcpListener::bind((*address, 0)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "无法绑定手机 HTTPS 地址：{}",
         last_error
             .map(|error| error.to_string())
             .unwrap_or_else(|| "没有可用地址".to_string())
@@ -881,6 +986,8 @@ pub fn run() {
             update_status,
             autostart_enabled,
             set_autostart_enabled,
+            receive_settings,
+            set_receive_settings,
             accept_transfer,
             register_outgoing_transfer,
             update_transfer_progress,

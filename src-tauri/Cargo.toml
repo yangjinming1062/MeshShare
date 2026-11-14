@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 arboard = "3.4"
 anyhow = "1"
 axum = { version = "0.7", features = ["ws", "multipart"] }
+axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
 base64 = "0.22"
 futures-util = "0.3"
 get_if_addrs = "0.5"
@@ -26,10 +27,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 mdns-sd = "0.11"
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
+ pem = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-sysinfo = { version = "0.31", default-features = false, features = ["network", "system"] }
+sysinfo = { version = "0.31", default-features = false, features = ["disk", "network", "system"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2.5"

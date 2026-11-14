@@ -146,6 +146,7 @@ pub async fn connect_manual(
         node_name: node.node_name.clone(),
         platform: node.platform.clone(),
         addresses: node.addresses.clone(),
+        mobile_addresses: node.mobile_addresses.clone(),
         capabilities: node.capabilities.clone(),
         online: true,
         last_seen_ms: crate::clock::now_millis(),
@@ -164,6 +165,19 @@ pub async fn connect_manual(
                 IpAddr::V4(address) => is_allowed_ipv4(address),
                 IpAddr::V6(_) => false,
             })
+    });
+    peer.mobile_addresses.retain(|address| {
+        address
+            .url
+            .starts_with(&format!("https://{}:", address.address))
+            && address
+                .address
+                .parse::<IpAddr>()
+                .ok()
+                .is_some_and(|address| match address {
+                    IpAddr::V4(address) => is_allowed_ipv4(address),
+                    IpAddr::V6(_) => false,
+                })
     });
     runtime.set_peer(peer.clone());
     let runtime_for_task = runtime.clone();
@@ -317,6 +331,7 @@ async fn run_peer_session(
         node_name: node_name.to_string(),
         platform: "unknown".to_string(),
         addresses: Vec::new(),
+        mobile_addresses: Vec::new(),
         capabilities: Vec::new(),
         online: true,
         last_seen_ms: crate::clock::now_millis(),

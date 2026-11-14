@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress } from './types';
+import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress } from './types';
 
 let baseUrl = '';
 
@@ -38,6 +38,7 @@ export async function request<T>(path: string, options: RequestInit = {}, target
 export const getInfo = () => request<NodeInfo>('/api/v1/info');
 export const getPeers = () => request<PeerInfo[]>('/api/v1/peers');
 export const getMetrics = () => request<HardwareMetrics | null>('/api/v1/metrics');
+export const getMobileAccess = () => request<MobileAccessInfo>('/api/v1/mobile/access');
 export const getClipboard = () => request<ClipboardSnapshot | null>('/api/v1/clipboard');
 export const getClipboardHistory = () => request<ClipboardHistoryResponse>('/api/v1/clipboard/history');
 export const getClipboardHistoryDetail = (eventId: string) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`);
@@ -49,3 +50,4 @@ export const createMobileSession = (label?: string) => request<MobileSession>('/
 export const getMobileSessions = () => request<MobileSession[]>('/api/v1/mobile/sessions');
 export const getMobileTransfers = (sessionId?: string) => request<MobileTransferView[]>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`);
 export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}`, target);
+export const completeMobileItem = (transferId: string, itemId: string, sessionId: string) => request<MobileTransferView>(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/complete`, { method: 'POST', body: JSON.stringify({ session_id: sessionId }) });

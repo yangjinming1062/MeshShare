@@ -7,11 +7,7 @@ pub const DEFAULT_CLIPBOARD_HISTORY_COUNT: usize = 50;
 pub const DEFAULT_CLIPBOARD_HISTORY_DAYS: u32 = 30;
 pub const MAX_CLIPBOARD_HISTORY_COUNT: usize = 500;
 pub const MAX_CLIPBOARD_HISTORY_DAYS: u32 = 365;
-pub const MAX_TRANSFER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
-pub const MAX_TRANSFER_ITEMS: usize = 4_096;
 pub const MAX_TRANSFER_RECORDS: usize = 512;
-pub const MAX_MOBILE_STAGING_BYTES_PER_SESSION: u64 = MAX_TRANSFER_BYTES;
-pub const MAX_MOBILE_TRANSFERS_PER_SESSION: usize = 256;
 pub const MAX_MOBILE_SESSIONS: usize = 256;
 pub const METRICS_SYSTEM_CAPABILITY: &str = "metrics.system";
 pub const METRICS_GPU_CAPABILITY: &str = "metrics.gpu";
@@ -25,6 +21,14 @@ pub struct AddressInfo {
     pub kind: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MobileAccessInfo {
+    pub bootstrap_urls: Vec<AddressInfo>,
+    pub secure_urls: Vec<AddressInfo>,
+    pub ca_url: String,
+    pub ca_fingerprint: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub node_id: String,
@@ -34,6 +38,8 @@ pub struct NodeInfo {
     pub platform: String,
     pub port: u16,
     pub addresses: Vec<AddressInfo>,
+    #[serde(default)]
+    pub mobile_addresses: Vec<AddressInfo>,
     pub capabilities: Vec<String>,
 }
 
@@ -53,6 +59,8 @@ pub struct PeerInfo {
     pub node_name: String,
     pub platform: String,
     pub addresses: Vec<AddressInfo>,
+    #[serde(default)]
+    pub mobile_addresses: Vec<AddressInfo>,
     pub capabilities: Vec<String>,
     pub online: bool,
     pub last_seen_ms: i64,
@@ -209,6 +217,30 @@ pub struct ClipboardHistoryDetail {
     pub snapshot: ClipboardSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiveMode {
+    #[default]
+    Confirm,
+    Auto,
+}
+
+impl ReceiveMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "confirm" => Some(Self::Confirm),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReceiveSettings {
+    pub mode: ReceiveMode,
+    pub default_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferItem {
     pub item_id: String,
@@ -264,6 +296,8 @@ pub struct TransferProgress {
 pub struct MobileTransferView {
     pub session_id: String,
     pub progress: TransferProgress,
+    #[serde(default)]
+    pub downloaded_item_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

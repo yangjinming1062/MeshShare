@@ -13,6 +13,7 @@ export type NodeInfo = {
   platform: string;
   port: number;
   addresses: AddressInfo[];
+  mobile_addresses?: AddressInfo[];
   capabilities: string[];
 };
 
@@ -29,6 +30,13 @@ export type UpdateStatus = {
   error: string | null;
 };
 
+export type ReceiveMode = 'confirm' | 'auto';
+
+export type ReceiveSettings = {
+  mode: ReceiveMode;
+  default_path?: string | null;
+};
+
 export type MobileSession = {
   session_id: string;
   node_id: string;
@@ -43,6 +51,7 @@ export type PeerInfo = {
   node_name: string;
   platform: string;
   addresses: AddressInfo[];
+  mobile_addresses?: AddressInfo[];
   capabilities: string[];
   online: boolean;
   last_seen_ms: number;
@@ -153,6 +162,14 @@ export type TransferProgress = {
 export type MobileTransferView = {
   session_id: string;
   progress: TransferProgress;
+  downloaded_item_ids?: string[];
+};
+
+export type MobileAccessInfo = {
+  bootstrap_urls: AddressInfo[];
+  secure_urls: AddressInfo[];
+  ca_url: string;
+  ca_fingerprint: string;
 };
 
 export type WireMessage =

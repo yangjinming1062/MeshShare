@@ -2,12 +2,12 @@ use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryItem,
     ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot,
-    HardwareMetrics, MobileSession, MobileTransferView, MonitorDisplayMode, MonitorPosition,
-    NodeInfo, PeerInfo, TransferOffer, TransferProgress, TransferStatus, WireMessage,
-    CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, DEFAULT_CLIPBOARD_HISTORY_COUNT,
-    DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS,
-    MAX_MOBILE_SESSIONS, MAX_MOBILE_TRANSFERS_PER_SESSION, MAX_TRANSFER_RECORDS,
-    METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, MonitorDisplayMode,
+    MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferOffer,
+    TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
+    DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT,
+    MAX_CLIPBOARD_HISTORY_DAYS, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
+    METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
@@ -30,6 +30,10 @@ fn default_clipboard_history_count() -> usize {
 
 fn default_clipboard_history_days() -> u32 {
     DEFAULT_CLIPBOARD_HISTORY_DAYS
+}
+
+fn default_receive_mode() -> ReceiveMode {
+    ReceiveMode::Confirm
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +96,10 @@ struct PersistedConfig {
     clipboard_history_count: usize,
     #[serde(default = "default_clipboard_history_days")]
     clipboard_history_days: u32,
+    #[serde(default = "default_receive_mode")]
+    receive_mode: ReceiveMode,
+    #[serde(default)]
+    receive_directory: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,10 +146,13 @@ pub struct NodeRuntime {
     pub transfers: RwLock<HashMap<String, TransferRecord>>,
     pub mobile_sessions: RwLock<HashMap<String, MobileSession>>,
     pub mobile_transfers: RwLock<HashMap<String, MobileTransferRecord>>,
+    mobile_manifest_bytes: AtomicU64,
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
     pub monitor_display: RwLock<MonitorDisplayMode>,
     pub monitor_locked: AtomicBool,
     listening_addresses: RwLock<Option<Vec<Ipv4Addr>>>,
+    mobile_access: RwLock<MobileAccessInfo>,
+    mobile_ca_path: RwLock<Option<PathBuf>>,
     config: Mutex<PersistedConfig>,
     data_dir: PathBuf,
     clipboard_update: Mutex<()>,
@@ -157,6 +168,7 @@ pub struct NodeRuntime {
     pub stopping: AtomicBool,
     update_installing: AtomicBool,
     pub http: reqwest::Client,
+    pub proxy_http: reqwest::Client,
     transfer_update_gate: Mutex<()>,
 }
 
@@ -180,6 +192,8 @@ const TRANSFER_RETENTION_MS: i64 = 10 * 60 * 1000;
 const TRANSFER_ACTIVITY_TIMEOUT_MS: i64 = 5 * 60 * 1000;
 const MAX_TERMINAL_TRANSFERS: usize = 256;
 const MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION: usize = 128;
+const MAX_MOBILE_TRANSFER_RECORDS: usize = 512;
+const MAX_MOBILE_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SEEN_CLIPBOARD_EVENTS: usize = 4_096;
 const DESKTOP_TEMP_REGISTRY_FILE: &str = "desktop-transfer-temp-files.json";
 const MAX_DESKTOP_TEMP_FILES: usize = 512;
@@ -190,21 +204,19 @@ const CLIPBOARD_HISTORY_PREVIEW_BYTES: usize = 256;
 const CLIPBOARD_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
+    let mut downloaded_item_ids = record.downloaded_items.iter().cloned().collect::<Vec<_>>();
+    downloaded_item_ids.sort();
     MobileTransferView {
         session_id: record.session_id.clone(),
         progress: record.progress.clone(),
+        downloaded_item_ids,
     }
 }
 
-fn mobile_reserved_bytes(record: &MobileTransferRecord) -> u64 {
-    match &record.progress.status {
-        TransferStatus::Waiting
-        | TransferStatus::Accepted
-        | TransferStatus::Uploading
-        | TransferStatus::Ready => record.offer.total_bytes,
-        TransferStatus::Failed => 0,
-        TransferStatus::Rejected | TransferStatus::Cancelled | TransferStatus::Completed => 0,
-    }
+fn mobile_manifest_size(offer: &TransferOffer) -> u64 {
+    serde_json::to_vec(offer)
+        .map(|value| value.len() as u64)
+        .unwrap_or(u64::MAX)
 }
 
 fn is_clipboard_message(message: &WireMessage) -> bool {
@@ -247,6 +259,7 @@ impl NodeRuntime {
             platform: std::env::consts::OS.to_string(),
             port,
             addresses,
+            mobile_addresses: Vec::new(),
             capabilities: vec![
                 "clipboard.text".to_string(),
                 "clipboard.image/png".to_string(),
@@ -267,10 +280,13 @@ impl NodeRuntime {
             transfers: RwLock::new(HashMap::new()),
             mobile_sessions: RwLock::new(HashMap::new()),
             mobile_transfers: RwLock::new(HashMap::new()),
+            mobile_manifest_bytes: AtomicU64::new(0),
             local_metrics: RwLock::new(None),
             monitor_display: RwLock::new(config.monitor_display.clone()),
             monitor_locked: AtomicBool::new(config.monitor_locked),
             listening_addresses: RwLock::new(Some(vec![Ipv4Addr::LOCALHOST])),
+            mobile_access: RwLock::new(MobileAccessInfo::default()),
+            mobile_ca_path: RwLock::new(None),
             config: Mutex::new(config),
             data_dir,
             clipboard_update: Mutex::new(()),
@@ -290,6 +306,10 @@ impl NodeRuntime {
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            proxy_http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
             transfer_update_gate: Mutex::new(()),
         }))
     }
@@ -300,6 +320,20 @@ impl NodeRuntime {
 
     pub fn node_id(&self) -> String {
         self.node.read().node_id.clone()
+    }
+
+    pub fn mobile_access_info(&self) -> MobileAccessInfo {
+        self.mobile_access.read().clone()
+    }
+
+    pub fn set_mobile_access_info(&self, info: MobileAccessInfo, ca_path: PathBuf) {
+        self.node.write().mobile_addresses = info.secure_urls.clone();
+        *self.mobile_access.write() = info;
+        *self.mobile_ca_path.write() = Some(ca_path);
+    }
+
+    pub fn mobile_ca_path(&self) -> Option<PathBuf> {
+        self.mobile_ca_path.read().clone()
     }
 
     fn mobile_staging_root(&self) -> PathBuf {
@@ -538,6 +572,16 @@ impl NodeRuntime {
             .map(|peer| peer.node_name.clone())
     }
 
+    pub fn peer_http_base(&self, node_id: &str) -> Option<String> {
+        self.peers.read().get(node_id).and_then(|peer| {
+            peer.addresses
+                .iter()
+                .find(|address| address.kind == "lan")
+                .or_else(|| peer.addresses.first())
+                .map(|address| address.url.trim_end_matches('/').to_string())
+        })
+    }
+
     pub fn update_peer_metrics(&self, node_id: &str, metrics: HardwareMetrics) -> bool {
         if metrics.node_id != node_id {
             return false;
@@ -620,6 +664,47 @@ impl NodeRuntime {
         persist_config(&self.data_dir, &next)?;
         *config = next;
         Ok(())
+    }
+
+    pub fn receive_settings(&self) -> ReceiveSettings {
+        let config = self.config.lock();
+        ReceiveSettings {
+            mode: config.receive_mode,
+            default_path: config.receive_directory.clone(),
+        }
+    }
+
+    pub fn set_receive_settings(
+        &self,
+        mode: ReceiveMode,
+        directory: Option<PathBuf>,
+    ) -> anyhow::Result<ReceiveSettings> {
+        let canonical_directory = directory
+            .as_deref()
+            .map(validate_receive_directory)
+            .transpose()?;
+        if mode == ReceiveMode::Auto && canonical_directory.is_none() {
+            anyhow::bail!("自动接收必须设置默认目录");
+        }
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.receive_mode = mode;
+        next.receive_directory = canonical_directory
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        drop(config);
+        Ok(self.receive_settings())
+    }
+
+    fn default_receive_directory(&self) -> Option<PathBuf> {
+        let config = self.config.lock().clone();
+        if config.receive_mode != ReceiveMode::Auto {
+            return None;
+        }
+        let path = config.receive_directory.as_deref().map(Path::new)?;
+        validate_receive_directory(path).ok()
     }
 
     pub fn update_settings(&self) -> (UpdateFrequency, Option<i64>, Option<String>) {
@@ -1026,7 +1111,12 @@ impl NodeRuntime {
         if self.update_installing.load(Ordering::SeqCst) {
             return false;
         }
-        let progress = transfer_progress(&offer, "receive");
+        let mut progress = transfer_progress(&offer, "receive");
+        let accepted_destination = self.default_receive_directory();
+        if let Some(destination) = accepted_destination.as_ref() {
+            progress.destination = Some(destination.to_string_lossy().into_owned());
+            progress.status = TransferStatus::Accepted;
+        }
         let mut transfers = self.transfers.write();
         if transfers.contains_key(&offer.transfer_id) {
             return false;
@@ -1039,7 +1129,7 @@ impl NodeRuntime {
             TransferRecord {
                 offer: offer.clone(),
                 progress: progress.clone(),
-                accepted_destination: None,
+                accepted_destination,
                 received_items: HashSet::new(),
                 updated_at_ms: now_millis(),
             },
@@ -1066,7 +1156,7 @@ impl NodeRuntime {
         if !evict_terminal_transfer_if_needed(&mut transfers) {
             let mut failed = progress;
             failed.status = TransferStatus::Failed;
-            failed.error = Some("传输任务数量已达到上限".to_string());
+            failed.error = Some("节点传输记录资源暂时不足，请稍后重试".to_string());
             return failed;
         }
         transfers.insert(
@@ -1413,8 +1503,14 @@ impl NodeRuntime {
         if self.update_installing.load(Ordering::SeqCst) {
             return Err("应用正在安装更新，请稍后重试".to_string());
         }
-        if offer.total_bytes > crate::model::MAX_MOBILE_STAGING_BYTES_PER_SESSION {
-            return Err("手机临时文件超过会话配额".to_string());
+        let manifest_bytes = mobile_manifest_size(&offer);
+        if self
+            .mobile_manifest_bytes
+            .load(Ordering::SeqCst)
+            .checked_add(manifest_bytes)
+            .is_none_or(|total| total > MAX_MOBILE_MANIFEST_BYTES)
+        {
+            return Err("手机传输清单资源暂时不足，请稍后重试".to_string());
         }
         let mut transfers = self.mobile_transfers.write();
         if transfers
@@ -1423,26 +1519,8 @@ impl NodeRuntime {
         {
             return Err("手机传输任务已存在".to_string());
         }
-        if transfers
-            .values()
-            .filter(|record| record.session_id == session_id)
-            .count()
-            >= MAX_MOBILE_TRANSFERS_PER_SESSION
-        {
-            return Err("手机会话传输任务过多".to_string());
-        }
-        let reserved = transfers
-            .values()
-            .filter(|record| record.session_id == session_id)
-            .try_fold(0u64, |total, record| {
-                total.checked_add(mobile_reserved_bytes(record))
-            })
-            .ok_or_else(|| "手机临时文件超过会话配额".to_string())?;
-        if reserved
-            .checked_add(offer.total_bytes)
-            .is_none_or(|total| total > crate::model::MAX_MOBILE_STAGING_BYTES_PER_SESSION)
-        {
-            return Err("手机临时文件超过会话配额".to_string());
+        if transfers.len() >= MAX_MOBILE_TRANSFER_RECORDS {
+            return Err("手机传输记录资源暂时不足，请稍后重试".to_string());
         }
         let progress = transfer_progress(&offer, "receive");
         // `transfer_id` is supplied by the peer and is also exposed in the
@@ -1461,6 +1539,8 @@ impl NodeRuntime {
         };
         let view = mobile_view(&record);
         transfers.insert(record.offer.transfer_id.clone(), record);
+        self.mobile_manifest_bytes
+            .fetch_add(manifest_bytes, Ordering::SeqCst);
         Ok(view)
     }
 
@@ -1576,8 +1656,16 @@ impl NodeRuntime {
         }
         remove.sort_by(|left, right| left.0.cmp(&right.0));
         remove.dedup_by(|left, right| left.0 == right.0);
+        let mut released_manifest_bytes = 0u64;
         for (transfer_id, _) in &remove {
-            transfers.remove(transfer_id);
+            if let Some(record) = transfers.remove(transfer_id) {
+                released_manifest_bytes =
+                    released_manifest_bytes.saturating_add(mobile_manifest_size(&record.offer));
+            }
+        }
+        if released_manifest_bytes > 0 {
+            self.mobile_manifest_bytes
+                .fetch_sub(released_manifest_bytes, Ordering::SeqCst);
         }
         cleanup.extend(remove.into_iter().map(|(_, directory)| directory));
         cleanup
@@ -1822,9 +1910,22 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
         clipboard_history_mode: ClipboardHistoryMode::default(),
         clipboard_history_count: default_clipboard_history_count(),
         clipboard_history_days: default_clipboard_history_days(),
+        receive_mode: default_receive_mode(),
+        receive_directory: None,
     };
     persist_config(data_dir, &config)?;
     Ok(config)
+}
+
+pub fn validate_receive_directory(path: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("接收目录必须是绝对路径");
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("接收目录必须是实际目录，不能是符号链接");
+    }
+    Ok(std::fs::canonicalize(path)?)
 }
 
 fn desktop_temp_registry_path(data_dir: &Path) -> PathBuf {
@@ -2470,12 +2571,12 @@ mod tests {
     use super::{
         bind_addresses, currently_available_bound_addresses_from, load_or_create_config,
         network_addresses_for_bound, NodeRuntime, UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE,
-        TRANSFER_ACTIVITY_TIMEOUT_MS,
+        MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
-        PeerInfo, TransferItem, TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
-        MAX_MOBILE_STAGING_BYTES_PER_SESSION, MAX_TRANSFER_RECORDS, METRICS_SYSTEM_CAPABILITY,
+        PeerInfo, ReceiveMode, TransferItem, TransferOffer, TransferStatus, WireMessage,
+        MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_SYSTEM_CAPABILITY,
     };
     use std::path::PathBuf;
     use tokio::sync::mpsc;
@@ -2487,6 +2588,7 @@ mod tests {
             node_name: "peer".to_string(),
             platform: "test".to_string(),
             addresses: Vec::new(),
+            mobile_addresses: Vec::new(),
             capabilities,
             online: true,
             last_seen_ms: crate::clock::now_millis(),
@@ -2609,6 +2711,52 @@ mod tests {
         assert_eq!(
             config.clipboard_history_days,
             crate::model::DEFAULT_CLIPBOARD_HISTORY_DAYS
+        );
+        assert_eq!(config.receive_mode, ReceiveMode::Confirm);
+        assert_eq!(config.receive_directory, None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn auto_receive_settings_are_persisted_and_used_for_new_transfers() {
+        let path = temp_data_dir();
+        let destination = path.join("received");
+        std::fs::create_dir_all(&destination).expect("create receive directory");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .set_receive_settings(ReceiveMode::Auto, Some(destination.clone()))
+            .expect("save receive settings");
+        assert_eq!(runtime.receive_settings().mode, ReceiveMode::Auto);
+        assert_eq!(
+            runtime.receive_settings().default_path,
+            Some(
+                std::fs::canonicalize(&destination)
+                    .expect("canonical destination")
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        let offer = mobile_offer(&runtime, "auto-receive", 1);
+        assert!(runtime.add_transfer(offer));
+        assert_eq!(
+            runtime
+                .transfer("auto-receive")
+                .expect("auto transfer")
+                .progress
+                .status,
+            TransferStatus::Accepted
+        );
+        std::fs::remove_dir_all(&destination).expect("remove receive directory");
+        let offer = mobile_offer(&runtime, "fallback-confirm", 1);
+        assert!(runtime.add_transfer(offer));
+        assert_eq!(
+            runtime
+                .transfer("fallback-confirm")
+                .expect("fallback transfer")
+                .progress
+                .status,
+            TransferStatus::Waiting
         );
         let _ = std::fs::remove_dir_all(path);
     }
@@ -3044,27 +3192,6 @@ mod tests {
     }
 
     #[test]
-    fn mobile_session_reserves_a_bounded_staging_quota() {
-        let path = temp_data_dir();
-        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
-            .expect("create runtime");
-        let session = runtime
-            .create_mobile_session("test phone".to_string())
-            .expect("create mobile session");
-        runtime
-            .create_mobile_transfer(
-                &session.session_id,
-                mobile_offer(&runtime, "quota-full", MAX_MOBILE_STAGING_BYTES_PER_SESSION),
-            )
-            .expect("reserve full session quota");
-        let error = runtime
-            .create_mobile_transfer(&session.session_id, mobile_offer(&runtime, "quota-over", 1))
-            .expect_err("second transfer must exceed session quota");
-        assert!(error.contains("配额"));
-        let _ = std::fs::remove_dir_all(path);
-    }
-
-    #[test]
     fn mobile_sessions_have_a_bounded_active_count() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
@@ -3081,7 +3208,33 @@ mod tests {
     }
 
     #[test]
-    fn stalled_mobile_transfer_fails_and_releases_staging_quota() {
+    fn mobile_transfer_records_have_a_bounded_resource_count() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        for index in 0..MAX_MOBILE_TRANSFER_RECORDS {
+            runtime
+                .create_mobile_transfer(
+                    &session.session_id,
+                    mobile_offer(&runtime, &format!("mobile-record-{index}"), 1),
+                )
+                .expect("create mobile transfer record");
+        }
+        let error = runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(&runtime, "mobile-record-overflow", 1),
+            )
+            .expect_err("resource guard must bound mobile records");
+        assert!(error.contains("资源"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn stalled_mobile_transfer_fails_and_allows_another_large_transfer() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
@@ -3091,7 +3244,7 @@ mod tests {
         runtime
             .create_mobile_transfer(
                 &session.session_id,
-                mobile_offer(&runtime, "stalled", MAX_MOBILE_STAGING_BYTES_PER_SESSION),
+                mobile_offer(&runtime, "stalled", u64::MAX - 1),
             )
             .expect("create mobile transfer");
         runtime
@@ -3119,154 +3272,9 @@ mod tests {
         runtime
             .create_mobile_transfer(
                 &session.session_id,
-                mobile_offer(
-                    &runtime,
-                    "after-stalled",
-                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
-                ),
+                mobile_offer(&runtime, "after-stalled", 1),
             )
-            .expect("failed transfer releases session quota");
-        let _ = std::fs::remove_dir_all(path);
-    }
-
-    #[test]
-    fn rejected_mobile_transfer_releases_session_quota() {
-        let path = temp_data_dir();
-        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
-            .expect("create runtime");
-        let session = runtime
-            .create_mobile_session("test phone".to_string())
-            .expect("create mobile session");
-        runtime
-            .create_mobile_transfer(
-                &session.session_id,
-                mobile_offer(
-                    &runtime,
-                    "quota-rejected",
-                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
-                ),
-            )
-            .expect("reserve session quota");
-        runtime
-            .set_mobile_transfer_status(
-                "quota-rejected",
-                &session.session_id,
-                TransferStatus::Rejected,
-            )
-            .expect("reject mobile transfer");
-        runtime
-            .create_mobile_transfer(
-                &session.session_id,
-                mobile_offer(
-                    &runtime,
-                    "quota-reused",
-                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
-                ),
-            )
-            .expect("rejected transfer no longer reserves quota");
-        let _ = std::fs::remove_dir_all(path);
-    }
-
-    #[test]
-    fn cancelled_mobile_transfer_releases_session_quota() {
-        let path = temp_data_dir();
-        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
-            .expect("create runtime");
-        let session = runtime
-            .create_mobile_session("test phone".to_string())
-            .expect("create mobile session");
-        runtime
-            .create_mobile_transfer(
-                &session.session_id,
-                mobile_offer(
-                    &runtime,
-                    "quota-cancelled",
-                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
-                ),
-            )
-            .expect("reserve session quota");
-        runtime
-            .set_mobile_transfer_status(
-                "quota-cancelled",
-                &session.session_id,
-                TransferStatus::Accepted,
-            )
-            .expect("accept mobile transfer");
-        runtime
-            .cancel_mobile_transfer("quota-cancelled", &session.session_id)
-            .expect("cancel mobile transfer");
-        runtime
-            .create_mobile_transfer(
-                &session.session_id,
-                mobile_offer(
-                    &runtime,
-                    "quota-after-cancel",
-                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
-                ),
-            )
-            .expect("cancelled transfer no longer reserves quota");
-        let _ = std::fs::remove_dir_all(path);
-    }
-
-    #[test]
-    fn failed_mobile_transfer_releases_session_quota() {
-        let path = temp_data_dir();
-        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
-            .expect("create runtime");
-        let session = runtime
-            .create_mobile_session("test phone".to_string())
-            .expect("create mobile session");
-        let first_size = MAX_MOBILE_STAGING_BYTES_PER_SESSION - 1;
-        let first_offer = TransferOffer {
-            transfer_id: "quota-failed".to_string(),
-            source_node_id: runtime.node_id(),
-            source_name: "desktop".to_string(),
-            target_node_id: runtime.node_id(),
-            items: vec![
-                TransferItem {
-                    item_id: "first".to_string(),
-                    name: "first.bin".to_string(),
-                    relative_path: "first.bin".to_string(),
-                    size: first_size,
-                    sha256: "hash".to_string(),
-                    media_type: "application/octet-stream".to_string(),
-                    directory: false,
-                },
-                TransferItem {
-                    item_id: "second".to_string(),
-                    name: "second.bin".to_string(),
-                    relative_path: "second.bin".to_string(),
-                    size: 1,
-                    sha256: "hash".to_string(),
-                    media_type: "application/octet-stream".to_string(),
-                    directory: false,
-                },
-            ],
-            total_bytes: MAX_MOBILE_STAGING_BYTES_PER_SESSION,
-            created_at_ms: crate::clock::now_millis(),
-        };
-        runtime
-            .create_mobile_transfer(&session.session_id, first_offer)
-            .expect("reserve full session quota");
-        runtime
-            .set_mobile_transfer_status(
-                "quota-failed",
-                &session.session_id,
-                TransferStatus::Accepted,
-            )
-            .expect("accept mobile transfer");
-        runtime
-            .stage_mobile_item("quota-failed", "first", first_size)
-            .expect("stage first item");
-        runtime
-            .fail_mobile_transfer("quota-failed", "network error".to_string())
-            .expect("fail mobile transfer");
-        runtime
-            .create_mobile_transfer(
-                &session.session_id,
-                mobile_offer(&runtime, "quota-after-failure", 1),
-            )
-            .expect("failed transfer releases session quota");
+            .expect("another transfer is accepted");
         let _ = std::fs::remove_dir_all(path);
     }
 

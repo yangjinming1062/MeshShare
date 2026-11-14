@@ -4,7 +4,7 @@ use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot,
     HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferOffer,
     TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
-    MAX_TRANSFER_ITEMS, METRICS_SYSTEM_CAPABILITY,
+    METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
@@ -15,12 +15,12 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -34,6 +34,43 @@ const MAX_METRIC_GPU_COUNT: usize = 64;
 const MAX_METRIC_GPU_NAME_LENGTH: usize = 256;
 const MAX_METRIC_REASON_LENGTH: usize = 512;
 const MAX_MEDIA_TYPE_LENGTH: usize = 256;
+const MIN_FREE_DISK_BYTES: u64 = 64 * 1024 * 1024;
+
+struct DiskSpaceGuard {
+    path: PathBuf,
+    checked_at: Instant,
+    available_bytes: Option<u64>,
+}
+
+impl DiskSpaceGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            checked_at: Instant::now() - Duration::from_secs(2),
+            available_bytes: None,
+        }
+    }
+
+    fn has_headroom(&mut self, required_bytes: u64) -> bool {
+        if self.checked_at.elapsed() >= Duration::from_secs(1) {
+            self.available_bytes = available_disk_space(&self.path);
+            self.checked_at = Instant::now();
+        }
+        self.available_bytes.is_some_and(|available| {
+            available >= required_bytes.saturating_add(MIN_FREE_DISK_BYTES)
+        })
+    }
+}
+
+fn available_disk_space(path: &Path) -> Option<u64> {
+    let path = std::fs::canonicalize(path).ok()?;
+    sysinfo::Disks::new_with_refreshed_list()
+        .list()
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().components().count())
+        .map(|disk| disk.available_space())
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -68,7 +105,7 @@ pub struct MobileSessionQuery {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MobileSessionRequest {
     pub session_id: String,
 }
@@ -122,6 +159,28 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
             post(restore_clipboard_history),
         )
         .route("/api/v1/ws", get(websocket))
+        .route("/api/v1/mobile/access", get(mobile_access))
+        .route("/api/v1/mobile/ca", get(download_mobile_ca))
+        .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/transfers",
+            post(proxy_create_transfer),
+        )
+        .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/transfers/:id/status",
+            get(proxy_transfer_status),
+        )
+        .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/transfers/:id/reject",
+            post(proxy_reject_transfer),
+        )
+        .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/transfers/:id/cancel",
+            post(proxy_cancel_transfer),
+        )
+        .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/transfers/:id/items/:item_id",
+            put(proxy_upload_item),
+        )
         .route(
             "/api/v1/mobile/sessions",
             get(list_mobile_sessions).post(create_mobile_session),
@@ -155,6 +214,10 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
             get(download_mobile_item),
         )
         .route(
+            "/api/v1/mobile/transfers/:id/items/:item_id/complete",
+            post(complete_mobile_item),
+        )
+        .route(
             "/api/v1/transfers",
             get(list_transfers).post(create_transfer),
         )
@@ -186,6 +249,146 @@ async fn peers(State(state): State<AppState>) -> Json<Vec<PeerInfo>> {
 
 async fn metrics(State(state): State<AppState>) -> Json<Option<HardwareMetrics>> {
     Json(state.runtime.local_metrics())
+}
+
+async fn mobile_access(State(state): State<AppState>) -> Json<crate::model::MobileAccessInfo> {
+    Json(state.runtime.mobile_access_info())
+}
+
+async fn download_mobile_ca(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let path = state
+        .runtime
+        .mobile_ca_path()
+        .ok_or_else(|| ApiError::not_found("手机 CA 尚未生成"))?;
+    let bytes = fs::read(&path)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut response = bytes.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/x-x509-ca-cert"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=meshshare-ca.crt"),
+    );
+    Ok(response)
+}
+
+fn proxy_peer_base(state: &AppState, peer_id: &str) -> Result<String, ApiError> {
+    if peer_id == state.runtime.node_id() {
+        return Err(ApiError::bad_request("本机传输不需要代理"));
+    }
+    state
+        .runtime
+        .peer_http_base(peer_id)
+        .ok_or_else(|| ApiError::not_found("目标设备当前不可用"))
+}
+
+async fn proxy_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<Json<T>, ApiError> {
+    let status = response.status();
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !status.is_success() {
+        let message = payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("目标设备请求失败");
+        return Err(ApiError::conflict(message));
+    }
+    serde_json::from_value(payload)
+        .map(Json)
+        .map_err(|error| ApiError::internal(error.to_string()))
+}
+
+async fn proxy_create_transfer(
+    AxumPath(peer_id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(offer): Json<TransferOffer>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    if offer.target_node_id != peer_id {
+        return Err(ApiError::bad_request("目标设备标识不匹配"));
+    }
+    let base = proxy_peer_base(&state, &peer_id)?;
+    let response = state
+        .runtime
+        .proxy_http
+        .post(format!("{base}/api/v1/transfers"))
+        .json(&offer)
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
+    proxy_json(response).await
+}
+
+async fn proxy_transfer_status(
+    AxumPath((peer_id, transfer_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let base = proxy_peer_base(&state, &peer_id)?;
+    let response = state
+        .runtime
+        .proxy_http
+        .get(format!("{base}/api/v1/transfers/{transfer_id}/status"))
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
+    proxy_json(response).await
+}
+
+async fn proxy_transfer_action(
+    peer_id: String,
+    transfer_id: String,
+    action: &str,
+    state: &AppState,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let base = proxy_peer_base(state, &peer_id)?;
+    let response = state
+        .runtime
+        .proxy_http
+        .post(format!("{base}/api/v1/transfers/{transfer_id}/{action}"))
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
+    proxy_json(response).await
+}
+
+async fn proxy_reject_transfer(
+    AxumPath((peer_id, transfer_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    proxy_transfer_action(peer_id, transfer_id, "reject", &state).await
+}
+
+async fn proxy_cancel_transfer(
+    AxumPath((peer_id, transfer_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    proxy_transfer_action(peer_id, transfer_id, "cancel", &state).await
+}
+
+async fn proxy_upload_item(
+    AxumPath((peer_id, transfer_id, item_id)): AxumPath<(String, String, String)>,
+    State(state): State<AppState>,
+    body: Body,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let base = proxy_peer_base(&state, &peer_id)?;
+    let stream = body
+        .into_data_stream()
+        .map(|chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())));
+    let response = state
+        .runtime
+        .proxy_http
+        .put(format!(
+            "{base}/api/v1/transfers/{transfer_id}/items/{item_id}"
+        ))
+        .body(reqwest::Body::wrap_stream(stream))
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
+    proxy_json(response).await
 }
 
 async fn connect_peer(
@@ -488,6 +691,16 @@ pub(crate) async fn handle_wire_message(
             if current_peer.is_none() && runtime.has_peer_channel(&node.node_id) {
                 return None;
             }
+            let mobile_addresses = node
+                .mobile_addresses
+                .into_iter()
+                .filter(|address| {
+                    is_allowed_advertised_address(address)
+                        && address
+                            .url
+                            .starts_with(&format!("https://{}:", address.address))
+                })
+                .collect::<Vec<_>>();
             let addresses = node
                 .addresses
                 .into_iter()
@@ -506,6 +719,7 @@ pub(crate) async fn handle_wire_message(
                 node_name: node.node_name,
                 platform: node.platform,
                 addresses,
+                mobile_addresses,
                 capabilities: node.capabilities,
                 online: true,
                 last_seen_ms: crate::clock::now_millis(),
@@ -595,7 +809,23 @@ pub(crate) async fn handle_wire_message(
             {
                 return Some(peer_id.to_string());
             }
-            runtime.add_transfer(offer);
+            let transfer_id = offer.transfer_id.clone();
+            let added = runtime.add_transfer(offer);
+            if added
+                && runtime
+                    .transfer(&transfer_id)
+                    .is_some_and(|record| record.progress.status == TransferStatus::Accepted)
+            {
+                let _ = runtime.send_to_peer(
+                    peer_id,
+                    WireMessage::TransferAction {
+                        transfer_id,
+                        action: "accept".to_string(),
+                        destination: None,
+                        reason: None,
+                    },
+                );
+            }
             Some(peer_id.to_string())
         }
         WireMessage::TransferAction {
@@ -702,12 +932,8 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
         .items
         .iter()
         .try_fold(0u64, |total, item| total.checked_add(item.size));
-    if offer.items.is_empty()
-        || offer.items.len() > MAX_TRANSFER_ITEMS
-        || listed_bytes != Some(offer.total_bytes)
-        || offer.total_bytes > crate::model::MAX_TRANSFER_BYTES
-    {
-        return Err(ApiError::payload_too_large("传输清单为空或超过大小限制"));
+    if offer.items.is_empty() || listed_bytes != Some(offer.total_bytes) {
+        return Err(ApiError::bad_request("传输清单为空或总大小不匹配"));
     }
     let mut item_ids = HashSet::new();
     let mut relative_paths = HashSet::new();
@@ -718,7 +944,6 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
             || item.name.len() > 1_024
             || item.media_type.len() > MAX_MEDIA_TYPE_LENGTH
             || item.directory
-            || item.size > crate::model::MAX_TRANSFER_BYTES
             || has_parent_component(&item.relative_path)
             || item.relative_path.is_empty()
             || item.relative_path.len() > 4_096
@@ -796,12 +1021,23 @@ fn validate_node_info(node: &NodeInfo) -> bool {
         && node.version.len() <= 64
         && node.platform.len() <= 64
         && node.addresses.len() <= 32
+        && node.mobile_addresses.len() <= 32
         && node.capabilities.len() <= 64
         && node.addresses.iter().all(|address| {
             address.address.len() <= 64
                 && address.url.len() <= 512
                 && address.label.len() <= 256
                 && address.kind.len() <= 64
+        })
+        && node.mobile_addresses.iter().all(|address| {
+            address.address.len() <= 64
+                && address.url.len() <= 512
+                && address.label.len() <= 256
+                && address.kind.len() <= 64
+                && is_allowed_advertised_address(address)
+                && address
+                    .url
+                    .starts_with(&format!("https://{}:", address.address))
         })
         && node
             .capabilities
@@ -1175,6 +1411,7 @@ async fn upload_mobile_item(
     let mut stream = body.into_data_stream();
     let mut hasher = Sha256::new();
     let mut total = 0u64;
+    let mut disk_guard = DiskSpaceGuard::new(record.staged_directory.clone());
     let stream_result: Result<(u64, String), ApiError> = async {
         while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next())
             .await
@@ -1189,9 +1426,14 @@ async fn upload_mobile_item(
             }
             state.runtime.touch_mobile_transfer_activity(&transfer_id);
             let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
-            total = total.saturating_add(chunk.len() as u64);
-            if total > item.size || total > crate::model::MAX_TRANSFER_BYTES {
+            total = total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| ApiError::payload_too_large("传输内容大小溢出"))?;
+            if total > item.size {
                 return Err(ApiError::payload_too_large("传输内容超过清单大小"));
+            }
+            if !disk_guard.has_headroom(chunk.len() as u64) {
+                return Err(ApiError::conflict("接收磁盘可用空间不足"));
             }
             hasher.update(&chunk);
             file.write_all(&chunk)
@@ -1331,48 +1573,27 @@ async fn download_mobile_item(
         }
     ))
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    let completion = if size == 0 {
-        let _ = state
-            .runtime
-            .mark_mobile_item_downloaded(&transfer_id, &item_id);
-        None
-    } else {
-        Some((
-            state.runtime.clone(),
-            session_id.clone(),
-            transfer_id.clone(),
-            item_id.clone(),
-        ))
-    };
+    let completion = Some((
+        state.runtime.clone(),
+        session_id.clone(),
+        transfer_id.clone(),
+    ));
     let stream = futures_util::stream::unfold(
         (ReaderStream::new(file), completion, 0u64),
         move |(mut stream, completion, sent)| async move {
             match stream.next().await {
                 Some(Ok(chunk)) => {
-                    if let Some((runtime, session_id, _, _)) = completion.as_ref() {
+                    if let Some((runtime, session_id, _)) = completion.as_ref() {
                         let _ = runtime.touch_mobile_session(session_id);
                     }
-                    if let Some((runtime, _, transfer_id, _)) = completion.as_ref() {
+                    if let Some((runtime, _, transfer_id)) = completion.as_ref() {
                         let _ = runtime.touch_mobile_transfer_activity(transfer_id);
                     }
                     let sent = sent.saturating_add(chunk.len() as u64);
-                    let completion = if sent >= size {
-                        if let Some((runtime, _, transfer_id, item_id)) = completion {
-                            let _ = runtime.mark_mobile_item_downloaded(&transfer_id, &item_id);
-                        }
-                        None
-                    } else {
-                        completion
-                    };
                     Some((Ok(chunk), (stream, completion, sent)))
                 }
                 Some(Err(error)) => Some((Err(error), (stream, None, sent))),
-                None => {
-                    if let Some((runtime, _, transfer_id, item_id)) = completion {
-                        let _ = runtime.mark_mobile_item_downloaded(&transfer_id, &item_id);
-                    }
-                    None
-                }
+                None => None,
             }
         },
     );
@@ -1390,6 +1611,44 @@ async fn download_mobile_item(
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
+}
+
+async fn complete_mobile_item(
+    AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileSessionRequest>,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    state
+        .runtime
+        .touch_mobile_session(&payload.session_id)
+        .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+    let record = state
+        .runtime
+        .mobile_transfer(&transfer_id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    if record.session_id != payload.session_id {
+        return Err(ApiError::forbidden("手机会话不匹配"));
+    }
+    if !record
+        .offer
+        .items
+        .iter()
+        .any(|item| item.item_id == item_id)
+    {
+        return Err(ApiError::not_found("传输项目不存在"));
+    }
+    let path = state.runtime.mobile_item_path(&transfer_id, &item_id);
+    let progress = state
+        .runtime
+        .mark_mobile_item_downloaded(&transfer_id, &item_id)
+        .ok_or_else(|| ApiError::conflict("文件尚未准备好下载"))?;
+    if let Some(path) = path {
+        remove_file_with_diagnostics(&path).await;
+    }
+    if progress.progress.status == TransferStatus::Completed {
+        cleanup_mobile_staging_directory(&record.staged_directory).await;
+    }
+    Ok(Json(progress))
 }
 
 async fn reject_transfer(
@@ -1545,6 +1804,7 @@ async fn upload_item(
     let mut stream = body.into_data_stream();
     let mut hasher = Sha256::new();
     let mut total = 0u64;
+    let mut disk_guard = DiskSpaceGuard::new(destination.clone());
     let stream_result: Result<(u64, String), ApiError> = async {
         while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next())
             .await
@@ -1554,9 +1814,14 @@ async fn upload_item(
                 return Err(ApiError::conflict("传输已取消"));
             }
             let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
-            total = total.saturating_add(chunk.len() as u64);
-            if total > item.size || total > crate::model::MAX_TRANSFER_BYTES {
+            total = total
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| ApiError::payload_too_large("传输内容大小溢出"))?;
+            if total > item.size {
                 return Err(ApiError::payload_too_large("传输内容超过清单大小"));
+            }
+            if !disk_guard.has_headroom(chunk.len() as u64) {
+                return Err(ApiError::conflict("接收磁盘可用空间不足"));
             }
             hasher.update(&chunk);
             state.runtime.touch_transfer_activity(&transfer_id);
@@ -1813,7 +2078,8 @@ fn has_parent_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_wire_message, has_parent_component, validate_offer, PEER_HANDSHAKE_TIMEOUT,
+        handle_wire_message, has_parent_component, validate_offer, MobileSessionRequest,
+        PEER_HANDSHAKE_TIMEOUT,
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, TransferItem,
@@ -1867,6 +2133,52 @@ mod tests {
             created_at_ms: 1,
         };
         assert!(validate_offer(&offer).is_err());
+    }
+
+    #[test]
+    fn accepts_large_payloads_and_more_than_the_old_item_limit() {
+        let digest = "0".repeat(64);
+        let large_item = TransferItem {
+            item_id: "large".to_string(),
+            name: "large.bin".to_string(),
+            relative_path: "large.bin".to_string(),
+            size: 5 * 1024 * 1024 * 1024 + 1,
+            sha256: digest.clone(),
+            media_type: "application/octet-stream".to_string(),
+            directory: false,
+        };
+        let large_offer = TransferOffer {
+            transfer_id: "large-offer".to_string(),
+            source_node_id: "source".to_string(),
+            source_name: "source".to_string(),
+            target_node_id: "target".to_string(),
+            items: vec![large_item],
+            total_bytes: 5 * 1024 * 1024 * 1024 + 1,
+            created_at_ms: 0,
+        };
+        assert!(validate_offer(&large_offer).is_ok());
+
+        let items = (0..4_097)
+            .map(|index| TransferItem {
+                item_id: format!("item-{index}"),
+                name: format!("file-{index}.bin"),
+                relative_path: format!("file-{index}.bin"),
+                size: 0,
+                sha256: digest.clone(),
+                media_type: "application/octet-stream".to_string(),
+                directory: false,
+            })
+            .collect::<Vec<_>>();
+        let many_items = TransferOffer {
+            transfer_id: "many-items".to_string(),
+            source_node_id: "source".to_string(),
+            source_name: "source".to_string(),
+            target_node_id: "target".to_string(),
+            items,
+            total_bytes: 0,
+            created_at_ms: 0,
+        };
+        assert!(validate_offer(&many_items).is_ok());
     }
 
     #[tokio::test]
@@ -1939,6 +2251,7 @@ mod tests {
             node_name: "peer".to_string(),
             platform: "test".to_string(),
             addresses: Vec::new(),
+            mobile_addresses: Vec::new(),
             capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
             online: true,
             last_seen_ms: crate::clock::now_millis(),
@@ -1992,6 +2305,7 @@ mod tests {
                     platform: "test".to_string(),
                     port: 0,
                     addresses: Vec::new(),
+                    mobile_addresses: Vec::new(),
                     capabilities: Vec::new(),
                 },
             },
@@ -2020,6 +2334,7 @@ mod tests {
                 platform: "test".to_string(),
                 port: 0,
                 addresses: Vec::new(),
+                mobile_addresses: Vec::new(),
                 capabilities: Vec::new(),
             },
         };
@@ -2257,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mobile_download_marks_completion_after_stream_finishes() {
+    async fn mobile_download_requires_explicit_completion_after_stream_finishes() {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-mobile-download-{}", Uuid::new_v4()));
         let static_root = data_dir.join("web");
@@ -2331,6 +2646,18 @@ mod tests {
             response.bytes().await.expect("read download").as_ref(),
             bytes
         );
+        let completion = runtime
+            .http
+            .post(format!(
+                "http://{address}/api/v1/mobile/transfers/mobile-download/items/item/complete"
+            ))
+            .json(&MobileSessionRequest {
+                session_id: session.session_id.clone(),
+            })
+            .send()
+            .await
+            .expect("complete mobile item");
+        assert!(completion.status().is_success());
         assert_eq!(
             runtime
                 .mobile_transfer("mobile-download")
@@ -2553,6 +2880,7 @@ mod tests {
             node_name: "peer".to_string(),
             platform: "test".to_string(),
             addresses: Vec::new(),
+            mobile_addresses: Vec::new(),
             capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
             online: true,
             last_seen_ms: crate::clock::now_millis(),
@@ -2598,6 +2926,7 @@ mod tests {
             node_name: "Relay".to_string(),
             platform: "test".to_string(),
             addresses: Vec::new(),
+            mobile_addresses: Vec::new(),
             capabilities: Vec::new(),
             online: true,
             last_seen_ms: crate::clock::now_millis(),
@@ -2692,6 +3021,7 @@ mod tests {
             platform: "test".to_string(),
             port: 0,
             addresses: Vec::new(),
+            mobile_addresses: Vec::new(),
             capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
         };
         socket

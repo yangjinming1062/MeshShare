@@ -5,9 +5,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { apiUrl, clearClipboardHistory, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
-  import { digestFile } from './sha256';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistoryResponse, ClipboardHistorySettings, ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileAccess, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
+  import { Sha256, digestFile } from './sha256';
+  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistoryResponse, ClipboardHistorySettings, ClipboardSnapshot, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
@@ -34,6 +34,9 @@
   let updateFrequency: UpdateFrequency = 'weekly';
   let updateStatus: UpdateStatus | null = null;
   let updateBusy = false;
+  let receiveSettings: ReceiveSettings = { mode: 'confirm' };
+  let receiveSettingsBusy = false;
+  let mobileAccess: MobileAccessInfo | null = null;
   let ws: WebSocket | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
@@ -54,16 +57,20 @@
   const mobileUploading = new Set<string>();
   const mobileWatching = new Set<string>();
   const mobileUploadAttempts = new Map<string, number>();
+  const mobileDownloading = new Set<string>();
   const MOBILE_UPLOAD_MAX_ATTEMPTS = 3;
+  let mobileReceiveDirectory: MobileDirectoryHandle | null = null;
+  let mobileReceiveDirectoryName = '';
   let pageStopped = false;
 
   $: selectedUrl = selectedAddress || node?.addresses[0]?.url || '';
-  $: mobileUrl = selectedUrl ? `${selectedUrl}/mobile` : '';
+  let mobileUrl = '';
   $: mobileTargets = node ? [{
     node_id: node.node_id,
     node_name: node.node_name,
     platform: node.platform,
     addresses: node.addresses,
+    mobile_addresses: node.mobile_addresses,
     capabilities: node.capabilities,
     online: true,
     last_seen_ms: Date.now(),
@@ -133,7 +140,9 @@
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
           updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
           clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
+          receiveSettings = await invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings);
         }
+        mobileAccess = await getMobileAccess().catch(() => null);
         await refresh();
         syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
         if (!isMobile && !isMonitor) {
@@ -184,6 +193,11 @@
     const nextTransfers = isMobile ? [] : await getTransfers();
     if (isMobile) {
       mobileTransfers = await getMobileTransfersWithRecovery();
+      for (const view of mobileTransfers) {
+        if (view.progress.status === 'ready' && mobileReceiveDirectory && !mobileDownloading.has(view.progress.transfer_id)) {
+          void downloadMobileTransfer(view);
+        }
+      }
     } else {
       mobileSessions = await getMobileSessions();
       mobileTransfers = await getMobileTransfers();
@@ -308,6 +322,10 @@
   }
 
   async function refreshQr() {
+    mobileAccess = await getMobileAccess().catch(() => mobileAccess);
+    const addresses = mobileAccess?.bootstrap_urls?.length ? mobileAccess.bootstrap_urls : (node?.addresses ?? []);
+    const address = addresses.find((candidate) => candidate.url === selectedAddress) ?? addresses[0];
+    mobileUrl = address ? `${address.url}/mobile` : '';
     if (!mobileUrl) {
       qrData = '';
       return;
@@ -359,6 +377,44 @@
     } catch (error) {
       updateFrequency = previous;
       notice = error instanceof Error ? error.message : '无法更新自动更新设置';
+    }
+    window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function setReceiveMode(event: Event) {
+    const mode = (event.currentTarget as HTMLSelectElement).value as ReceiveMode;
+    if (mode === 'auto' && !receiveSettings.default_path) {
+      await chooseReceiveDirectory();
+      if (!receiveSettings.default_path) return;
+    }
+    await saveReceiveSettings(mode, receiveSettings.default_path);
+  }
+
+  async function chooseReceiveDirectory() {
+    let destination: string | string[] | null = null;
+    try {
+      destination = await open({ directory: true, multiple: false, title: '选择默认接收目录' });
+    } catch {
+      destination = null;
+    }
+    const path = Array.isArray(destination) ? destination[0] : destination;
+    if (!path) return;
+    await saveReceiveSettings(receiveSettings.mode, path);
+  }
+
+  async function saveReceiveSettings(mode: ReceiveMode, defaultPath?: string | null) {
+    if (receiveSettingsBusy) return;
+    receiveSettingsBusy = true;
+    try {
+      receiveSettings = await invoke<ReceiveSettings>('set_receive_settings', {
+        mode,
+        defaultPath: defaultPath ?? receiveSettings.default_path ?? null,
+      });
+      notice = mode === 'auto' ? '已启用自动接收' : '已设为每次确认';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法更新接收设置';
+    } finally {
+      receiveSettingsBusy = false;
     }
     window.setTimeout(() => (notice = ''), 2400);
   }
@@ -611,8 +667,22 @@
   }
 
   function targetBase(peer: PeerInfo): string | null {
+    if (isMobile && window.location.protocol === 'https:') {
+      if (peer.node_id === node?.node_id) return window.location.origin;
+      return `${window.location.origin}/api/v1/mobile/peers/${encodeURIComponent(peer.node_id)}`;
+    }
     const url = peer.addresses.find((address) => address.kind === 'lan')?.url ?? peer.addresses[0]?.url;
     return url ?? (peer.endpoint ? peer.endpoint.replace(/\/api\/v1\/ws$/, '') : null);
+  }
+
+  function mobileAccessUrl(value: string) {
+    return /^https?:\/\//i.test(value) ? value : apiUrl(value);
+  }
+
+  function selectedSecureMobileUrl() {
+    const selected = node?.addresses.find((address) => address.url === selectedAddress)?.address;
+    const candidates = mobileAccess?.secure_urls ?? [];
+    return selected ? (candidates.find((address) => address.address === selected)?.url ?? '') : '';
   }
 
   async function createItem(file: File, index: number): Promise<TransferItem> {
@@ -774,6 +844,7 @@
 
   async function acceptMobileTransfer(view: MobileTransferView) {
     if (!mobileSessionId) return;
+    if (!mobileReceiveDirectory && !(await chooseMobileReceiveDirectory())) return;
     await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/accept`, {
       method: 'POST',
       body: JSON.stringify({ session_id: mobileSessionId }),
@@ -843,6 +914,136 @@
       await request(`/api/v1/transfers/${encodeURIComponent(id)}/cancel`, { method: 'POST' }, target).catch(() => undefined);
     } finally {
       uploading.delete(id);
+    }
+  }
+
+  type MobileWritable = {
+    write: (data: Uint8Array) => Promise<void>;
+    close: () => Promise<void>;
+    abort?: () => Promise<void>;
+  };
+  type MobileFileHandle = {
+    getFile: () => Promise<File>;
+    createWritable: () => Promise<MobileWritable>;
+  };
+  type MobileDirectoryHandle = {
+    name: string;
+    getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<MobileDirectoryHandle>;
+    getFileHandle: (name: string, options?: { create?: boolean }) => Promise<MobileFileHandle>;
+    removeEntry: (name: string, options?: { recursive?: boolean }) => Promise<void>;
+  };
+  type MobilePickerWindow = Window & {
+    showDirectoryPicker?: (options?: { mode?: 'readwrite' }) => Promise<MobileDirectoryHandle>;
+  };
+
+  function mobileDirectoryPickerAvailable() {
+    return isMobile && window.isSecureContext && typeof (window as MobilePickerWindow).showDirectoryPicker === 'function';
+  }
+
+  async function chooseMobileReceiveDirectory() {
+    if (!mobileDirectoryPickerAvailable()) {
+      notice = window.isSecureContext ? '当前浏览器不支持选择存储目录' : '手机接收需要通过 HTTPS 打开页面';
+      window.setTimeout(() => (notice = ''), 3000);
+      return false;
+    }
+    try {
+      const picker = (window as MobilePickerWindow).showDirectoryPicker;
+      if (!picker) return false;
+      const directory = await picker({ mode: 'readwrite' });
+      mobileReceiveDirectory = directory;
+      mobileReceiveDirectoryName = directory.name;
+      notice = `已选择存储目录：${mobileReceiveDirectoryName}`;
+      window.setTimeout(() => (notice = ''), 2400);
+      return true;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return false;
+      notice = error instanceof Error ? error.message : '无法选择手机存储目录';
+      window.setTimeout(() => (notice = ''), 3000);
+      return false;
+    }
+  }
+
+  function mobilePathParts(relativePath: string) {
+    if (!relativePath || relativePath.includes('\\')) throw new Error('传输路径无效');
+    const parts = relativePath.split('/');
+    if (parts.some((part) => !part || part === '.' || part === '..')) throw new Error('传输路径无效');
+    return parts;
+  }
+
+  async function mobileTargetHandle(relativePath: string) {
+    if (!mobileReceiveDirectory) throw new Error('请先选择手机存储目录');
+    const parts = mobilePathParts(relativePath);
+    const fileName = parts.pop();
+    if (!fileName) throw new Error('传输文件名无效');
+    let directory = mobileReceiveDirectory;
+    for (const part of parts) directory = await directory.getDirectoryHandle(part, { create: true });
+    try {
+      await directory.getFileHandle(fileName);
+      throw new Error(`目标文件已存在：${relativePath}`);
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('目标文件已存在：')) throw error;
+      if (error instanceof DOMException && error.name !== 'NotFoundError') throw error;
+    }
+    return { directory, fileName };
+  }
+
+  async function downloadMobileItem(view: MobileTransferView, item: TransferItem) {
+    if (!mobileSessionId) throw new Error('手机会话已过期');
+    const { directory, fileName } = await mobileTargetHandle(item.relative_path);
+    const response = await fetch(mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId));
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.error ?? `下载失败 (${response.status})`);
+    }
+    if (!response.body) throw new Error('浏览器不支持流式下载');
+    const fileHandle = await directory.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    const reader = response.body.getReader();
+    const hasher = new Sha256();
+    let total = 0;
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        const bytes = chunk.value;
+        total += bytes.byteLength;
+        hasher.update(bytes);
+        await writable.write(bytes);
+      }
+      if (total !== item.size || hasher.digestHex().toLowerCase() !== item.sha256.toLowerCase()) {
+        throw new Error(`文件校验失败：${item.name}`);
+      }
+      await writable.close();
+      await completeMobileItem(view.progress.transfer_id, item.item_id, mobileSessionId);
+    } catch (error) {
+      await reader.cancel().catch(() => undefined);
+      await writable.abort?.().catch(() => undefined);
+      await directory.removeEntry(fileName).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async function downloadMobileTransfer(view: MobileTransferView) {
+    if (mobileDownloading.has(view.progress.transfer_id) || !mobileReceiveDirectory) return;
+    if (view.progress.status !== 'ready') return;
+    mobileDownloading.add(view.progress.transfer_id);
+    try {
+      const downloaded = new Set(view.downloaded_item_ids ?? []);
+      for (const item of view.progress.offer?.items ?? []) {
+        if (downloaded.has(item.item_id)) continue;
+        await downloadMobileItem(view, item);
+      }
+      notice = '文件已保存到手机存储目录';
+      await refresh();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '手机文件保存失败';
+      notice = message;
+      await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/fail`, {
+        method: 'POST',
+        body: JSON.stringify({ error: message }),
+      }).catch(() => undefined);
+    } finally {
+      mobileDownloading.delete(view.progress.transfer_id);
     }
   }
 
@@ -983,6 +1184,13 @@
         <h1>{node?.node_name ?? 'MeshShare 节点'}</h1>
         <p>选择下面的设备，直接发送文件或文件夹。</p>
       </section>
+      <section class="panel mobile-storage-panel">
+        <div class="panel-heading"><div><div class="section-kicker">MOBILE STORAGE</div><h2>手机接收目录</h2></div><span class="muted">接收前选择</span></div>
+        <div class="update-settings">
+          <div class="update-setting-copy"><strong>{mobileReceiveDirectoryName || '尚未选择存储目录'}</strong><span>{mobileDirectoryPickerAvailable() ? '文件会流式写入此目录，不会覆盖同名文件。' : (window.isSecureContext ? '当前浏览器不支持目录选择。' : '请通过 HTTPS 打开手机页面后选择目录。')}</span></div>
+          <div class="update-setting-actions"><button class="primary small" on:click={chooseMobileReceiveDirectory} disabled={!mobileDirectoryPickerAvailable()}>选择目录</button></div>
+        </div>
+      </section>
       <section class="panel clipboard-panel">
         <div class="panel-heading"><div><div class="section-kicker">CLIPBOARD</div><h2>共享剪贴板</h2></div><span class="muted">{clipboard ? formatTime(clipboard.updated_at_ms) : '暂无内容'}</span></div>
         <textarea id="clipboard-editor" bind:value={clipboardDraft} placeholder="粘贴或输入需要同步的文字"></textarea>
@@ -1030,10 +1238,10 @@
             <article class="transfer-row mobile-transfer-row">
               <div class="transfer-icon">↓</div>
               <div class="transfer-copy"><strong>{view.progress.offer?.source_name ?? '电脑文件'}</strong><span>{view.progress.offer?.items.map((item) => item.name).join('、') ?? '文件传输'}</span></div>
-              <div class="transfer-progress"><div class="progress-track"><div style={`width: ${view.progress.total_bytes ? Math.min(100, view.progress.completed_bytes / view.progress.total_bytes * 100) : 0}%`}></div></div><span>{view.progress.status === 'waiting' ? '等待确认' : view.progress.status === 'accepted' ? '准备中' : view.progress.status === 'ready' ? '可下载' : view.progress.status === 'rejected' ? '已拒绝' : view.progress.error ?? view.progress.status}</span></div>
-              {#if view.progress.status === 'waiting'}<div class="transfer-actions"><button class="primary small" on:click={() => acceptMobileTransfer(view)}>接收</button><button class="ghost small" on:click={() => rejectMobileTransfer(view)}>拒绝</button></div>{/if}
+              <div class="transfer-progress"><div class="progress-track"><div style={`width: ${view.progress.total_bytes ? Math.min(100, view.progress.completed_bytes / view.progress.total_bytes * 100) : 0}%`}></div></div><span>{view.progress.status === 'waiting' ? '等待选择目录' : view.progress.status === 'accepted' ? '准备中' : view.progress.status === 'uploading' ? '正在传输' : view.progress.status === 'ready' ? (mobileDownloading.has(view.progress.transfer_id) ? '正在保存' : '等待保存') : view.progress.status === 'completed' ? '已保存' : view.progress.status === 'rejected' ? '已拒绝' : view.progress.error ?? view.progress.status}</span></div>
+              {#if view.progress.status === 'waiting'}<div class="transfer-actions"><button class="primary small" on:click={() => acceptMobileTransfer(view)}>{mobileReceiveDirectory ? '开始接收' : '选择目录并接收'}</button><button class="ghost small" on:click={() => rejectMobileTransfer(view)}>拒绝</button></div>{/if}
               {#if ['accepted', 'uploading', 'ready'].includes(view.progress.status)}<div class="transfer-actions"><button class="ghost small" on:click={() => cancelMobileTransfer(view)}>取消</button></div>{/if}
-              {#if ['ready', 'completed'].includes(view.progress.status) && mobileSessionId}<div class="mobile-download-list">{#each view.progress.offer?.items ?? [] as item}<a class="download-link" href={mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId)} download={item.name}>下载 {item.name}</a>{/each}</div>{/if}
+              {#if view.progress.status === 'ready' && !mobileDownloading.has(view.progress.transfer_id)}<div class="mobile-download-list"><button class="primary small" on:click={() => mobileReceiveDirectory ? downloadMobileTransfer(view) : chooseMobileReceiveDirectory().then((selected) => { if (selected) void downloadMobileTransfer(view); })}>{mobileReceiveDirectory ? '保存到已选目录' : '选择目录并保存'}</button></div>{/if}
             </article>
           {:else}<div class="empty-state compact">还没有收到文件。</div>{/each}
         </div>
@@ -1051,7 +1259,7 @@
           <div class="panel-heading"><div><div class="section-kicker">MOBILE ACCESS</div><h2>手机扫码访问</h2></div><span class="muted">无需复制地址</span></div>
           <div class="access-content">
             {#if qrData}<img class="qr" src={qrData} alt="手机访问二维码" />{:else}<div class="qr-placeholder">二维码生成中</div>{/if}
-            <div class="access-copy"><label for="address-select">选择访问地址</label><select id="address-select" bind:value={selectedAddress} on:change={refreshQr}>{#each node?.addresses ?? [] as address}<option value={address.url}>{address.label}</option>{/each}</select><code>{mobileUrl || '等待服务启动…'}</code><p>让手机连接同一网络后扫描二维码。</p></div>
+            <div class="access-copy"><label for="address-select">选择访问地址</label><select id="address-select" bind:value={selectedAddress} on:change={refreshQr}>{#each node?.addresses ?? [] as address}<option value={address.url}>{address.label}</option>{/each}</select><code>{mobileUrl || '等待服务启动…'}</code><p>让手机连接同一网络后扫描二维码。</p>{#if selectedSecureMobileUrl()}<p>手机接收文件前请先安装 <a class="ca-link" href={mobileAccessUrl(mobileAccess?.ca_url ?? '')} target="_blank" rel="noreferrer">本节点 CA 证书</a>，再打开 HTTPS 地址。</p><code>{`${selectedSecureMobileUrl()}/mobile`}</code>{/if}</div>
           </div>
         </div>
       </section>
@@ -1076,6 +1284,14 @@
           </div>
         </div>
         <div class="update-status" data-state={updateStatus?.state ?? 'idle'}>{updateStatusLabel(updateStatus)}</div>
+      </section>
+
+      <section class="panel update-panel receive-settings-panel">
+        <div class="panel-heading"><div><div class="section-kicker">FILE RECEIVING</div><h2>文件接收行为</h2></div><span class="muted">每个节点独立设置</span></div>
+        <div class="update-settings">
+          <div class="update-setting-copy"><strong>{receiveSettings.mode === 'auto' ? '自动接收' : '每次确认'}</strong><span>{receiveSettings.mode === 'auto' ? (receiveSettings.default_path ? `默认保存到 ${receiveSettings.default_path}` : '需要先选择默认接收目录') : '收到文件后由你选择是否接收和保存位置。'}</span></div>
+          <div class="update-setting-actions"><select aria-label="文件接收行为" value={receiveSettings.mode} on:change={setReceiveMode} disabled={receiveSettingsBusy}><option value="confirm">每次确认</option><option value="auto">自动接收</option></select><button class="ghost small" on:click={chooseReceiveDirectory} disabled={receiveSettingsBusy}>选择默认目录</button></div>
+        </div>
       </section>
 
       <section class="panel update-panel clipboard-history-settings-panel">
