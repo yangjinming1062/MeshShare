@@ -152,6 +152,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: MeshShare-*
@@ -202,6 +205,14 @@ jobs:
             installers+=("${matches[0]}")
           done
 
+          python3 .github/scripts/generate_updater_manifest.py \
+            --assets-root release-assets \
+            --version "$version" \
+            --tag "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --output latest.json
+          python3 -m json.tool latest.json >/dev/null
+
           mapfile -t matching_releases < <(gh release list --repo "$GH_REPO" --limit 100 \
             --json tagName,isDraft,isPrerelease \
             --jq ".[] | select(.tagName == \"$GITHUB_REF_NAME\") | [.tagName, .isDraft, .isPrerelease] | @tsv")
@@ -241,13 +252,6 @@ jobs:
             gh release upload "$GITHUB_REF_NAME" --repo "$GH_REPO" --clobber "$installer"
           done
 
-          python3 .github/scripts/generate_updater_manifest.py \
-            --assets-root release-assets \
-            --version "$version" \
-            --tag "$GITHUB_REF_NAME" \
-            --notes-file release-notes.md \
-            --output latest.json
-          python3 -m json.tool latest.json >/dev/null
           gh release upload "$GITHUB_REF_NAME" --repo "$GH_REPO" --clobber latest.json
 
           uploaded=$(gh api --paginate "$assets_url" --jq '.[] | if .state == "uploaded" and .size > 0 then .name else "Incomplete upload: " + .name end')
