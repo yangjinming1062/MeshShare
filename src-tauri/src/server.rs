@@ -3,7 +3,8 @@ use crate::discovery;
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
     MobileTransferView, NodeInfo, PeerInfo, TransferOffer, TransferProgress, TransferStatus,
-    WireMessage, CLIPBOARD_IMAGE_LIMIT, MAX_TRANSFER_ITEMS, METRICS_SYSTEM_CAPABILITY,
+    WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, MAX_TRANSFER_ITEMS,
+    METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
@@ -26,6 +27,8 @@ use tokio::sync::mpsc;
 use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+
+const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -206,6 +209,20 @@ async fn post_clipboard(
     {
         return Err(ApiError::bad_request("image_png 不是有效的 PNG 图片"));
     }
+    if payload
+        .text
+        .as_ref()
+        .is_some_and(|value| value.len() > CLIPBOARD_TEXT_LIMIT)
+    {
+        return Err(ApiError::payload_too_large("文字超过 16 MiB 限制"));
+    }
+    if payload
+        .source_name
+        .as_ref()
+        .is_some_and(|value| value.len() > 256)
+    {
+        return Err(ApiError::bad_request("剪贴板来源名称过长"));
+    }
     let event = state
         .runtime
         .create_local_clipboard_named(
@@ -258,9 +275,15 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
     let mut peer_id: Option<String> = None;
     let mut owns_peer_channel = false;
     let mut clipboard_resync = tokio::time::interval(std::time::Duration::from_secs(1));
+    // A client must identify itself promptly.  Keeping an unauthenticated
+    // socket alive would retain the receiver task and broadcast subscription
+    // indefinitely without ever becoming a usable peer channel.
+    let handshake_deadline = tokio::time::sleep(PEER_HANDSHAKE_TIMEOUT);
+    tokio::pin!(handshake_deadline);
 
     loop {
         tokio::select! {
+            _ = &mut handshake_deadline, if peer_id.is_none() => break,
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(axum::extract::ws::Message::Text(text))) => {
@@ -382,6 +405,11 @@ pub(crate) async fn handle_wire_message(
             if node.protocol_version != crate::model::PROTOCOL_VERSION {
                 return None;
             }
+            // Reject a duplicate incoming socket before updating peer metadata;
+            // the existing channel remains the single source of truth.
+            if current_peer.is_none() && runtime.has_peer_channel(&node.node_id) {
+                return None;
+            }
             let addresses = node
                 .addresses
                 .into_iter()
@@ -447,6 +475,9 @@ pub(crate) async fn handle_wire_message(
         }
         WireMessage::ClipboardSnapshot { snapshot } => {
             let peer_id = current_peer?;
+            if snapshot.source_name.len() > 256 {
+                return Some(peer_id.to_string());
+            }
             let source_name = if snapshot.source_name.trim().is_empty() {
                 runtime
                     .peer_name(peer_id)
@@ -616,8 +647,14 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
 fn validate_clipboard_event(event: &ClipboardEvent) -> bool {
     if event.event_id.trim().is_empty()
         || event.origin_node_id.trim().is_empty()
+        || event.event_id.len() > 256
+        || event.origin_node_id.len() > 256
         || event.clock.node_id != event.origin_node_id
         || (event.text.is_none() && event.image_png.is_none())
+        || event
+            .text
+            .as_ref()
+            .is_some_and(|text| text.len() > CLIPBOARD_TEXT_LIMIT)
     {
         return false;
     }
@@ -762,6 +799,7 @@ async fn list_mobile_transfers(
             .runtime
             .touch_mobile_session(session_id)
             .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+        state.runtime.touch_mobile_session_transfers(session_id);
     }
     cleanup_mobile_staging(&state).await;
     Ok(Json(
@@ -774,36 +812,24 @@ async fn list_mobile_transfers(
 async fn cleanup_mobile_staging(state: &AppState) {
     state.runtime.mobile_sessions_snapshot();
     for directory in state.runtime.prune_mobile_transfers() {
-        let _ = fs::remove_dir_all(directory).await;
+        if let Err(error) = fs::remove_dir_all(directory).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("清理手机临时目录失败：{error}");
+            }
+        }
     }
 }
 
-async fn cleanup_mobile_partial_files(directory: &Path) {
+async fn cleanup_mobile_staging_directory(directory: &Path) {
     let Ok(metadata) = fs::symlink_metadata(directory).await else {
         return;
     };
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return;
     }
-    let mut directories = vec![directory.to_path_buf()];
-    while let Some(current) = directories.pop() {
-        let Ok(mut entries) = fs::read_dir(current).await else {
-            continue;
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type().await else {
-                continue;
-            };
-            if file_type.is_dir() {
-                directories.push(path);
-            } else if file_type.is_file()
-                && path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().ends_with(".part"))
-            {
-                let _ = fs::remove_file(path).await;
-            }
+    if let Err(error) = fs::remove_dir_all(directory).await {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("清理手机临时目录失败：{error}");
         }
     }
 }
@@ -850,11 +876,25 @@ async fn reject_mobile_transfer(
         .runtime
         .touch_mobile_session(&payload.session_id)
         .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
-    state
+    let record = state
+        .runtime
+        .mobile_transfer(&id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    let should_cleanup = matches!(
+        record.progress.status,
+        TransferStatus::Waiting
+            | TransferStatus::Accepted
+            | TransferStatus::Uploading
+            | TransferStatus::Ready
+    );
+    let progress = state
         .runtime
         .set_mobile_transfer_status(&id, &payload.session_id, TransferStatus::Rejected)
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("手机传输不存在"))
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    if should_cleanup {
+        cleanup_mobile_staging_directory(&record.staged_directory).await;
+    }
+    Ok(Json(progress))
 }
 
 async fn cancel_mobile_transfer(
@@ -882,11 +922,7 @@ async fn cancel_mobile_transfer(
         .cancel_mobile_transfer(&id, &payload.session_id)
         .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
     if should_cleanup {
-        if let Err(error) = fs::remove_dir_all(&record.staged_directory).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!("清理已取消的手机临时目录失败：{error}");
-            }
-        }
+        cleanup_mobile_staging_directory(&record.staged_directory).await;
     }
     Ok(Json(progress))
 }
@@ -911,7 +947,12 @@ async fn fail_mobile_transfer(
         .runtime
         .fail_mobile_transfer(&id, message)
         .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
-    cleanup_mobile_partial_files(&record.staged_directory).await;
+    if matches!(
+        record.progress.status,
+        TransferStatus::Waiting | TransferStatus::Accepted | TransferStatus::Uploading
+    ) {
+        cleanup_mobile_staging_directory(&record.staged_directory).await;
+    }
     Ok(Json(progress))
 }
 
@@ -984,6 +1025,7 @@ async fn upload_mobile_item(
             {
                 return Err(ApiError::not_found("手机会话已过期"));
             }
+            state.runtime.touch_mobile_transfer_activity(&transfer_id);
             let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
             total = total.saturating_add(chunk.len() as u64);
             if total > item.size || total > crate::model::MAX_TRANSFER_BYTES {
@@ -1146,6 +1188,9 @@ async fn download_mobile_item(
                 Some(Ok(chunk)) => {
                     if let Some((runtime, session_id, _, _)) = completion.as_ref() {
                         let _ = runtime.touch_mobile_session(session_id);
+                    }
+                    if let Some((runtime, _, transfer_id, _)) = completion.as_ref() {
+                        let _ = runtime.touch_mobile_transfer_activity(transfer_id);
                     }
                     let sent = sent.saturating_add(chunk.len() as u64);
                     let completion = if sent >= size {
@@ -1576,17 +1621,18 @@ fn has_parent_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_mobile_partial_files, handle_wire_message, has_parent_component, validate_offer,
+        handle_wire_message, has_parent_component, validate_offer, PEER_HANDSHAKE_TIMEOUT,
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, TransferItem,
-        TransferOffer, TransferProgress, TransferStatus, WireMessage, METRICS_SYSTEM_CAPABILITY,
-        PROTOCOL_VERSION,
+        TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_TEXT_LIMIT,
+        METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
     };
     use crate::runtime::NodeRuntime;
     use futures_util::{SinkExt, StreamExt};
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+    use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio_tungstenite::connect_async;
     use uuid::Uuid;
@@ -1661,6 +1707,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_remote_clipboard_text_is_ignored() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-large-clipboard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let event = ClipboardEvent {
+            event_id: "large-text".to_string(),
+            origin_node_id: "peer".to_string(),
+            clock: Hlc {
+                physical_ms: 1,
+                logical: 0,
+                node_id: "peer".to_string(),
+            },
+            text: Some("x".repeat(CLIPBOARD_TEXT_LIMIT + 1)),
+            image_png: None,
+            updated_at_ms: 1,
+        };
+        handle_wire_message(
+            WireMessage::ClipboardUpdate { event },
+            &runtime,
+            Some("peer"),
+        )
+        .await;
+        assert!(runtime.clipboard_snapshot().is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn invalid_hello_does_not_register_a_peer() {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-invalid-hello-{}", Uuid::new_v4()));
@@ -1686,6 +1761,40 @@ mod tests {
         .await;
         assert!(result.is_none());
         assert!(runtime.peers_snapshot().is_empty());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn duplicate_hello_does_not_replace_existing_peer_metadata() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-duplicate-hello-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let hello = |node_name: &str| WireMessage::Hello {
+            node: NodeInfo {
+                node_id: "peer".to_string(),
+                node_name: node_name.to_string(),
+                version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                platform: "test".to_string(),
+                port: 0,
+                addresses: Vec::new(),
+                capabilities: Vec::new(),
+            },
+        };
+        assert_eq!(
+            handle_wire_message(hello("first"), &runtime, None)
+                .await
+                .as_deref(),
+            Some("peer")
+        );
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(runtime.add_peer_channel("peer".to_string(), tx));
+        assert!(handle_wire_message(hello("duplicate"), &runtime, None)
+            .await
+            .is_none());
+        assert_eq!(runtime.peer_name("peer").as_deref(), Some("first"));
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -1748,20 +1857,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_mobile_partial_files_preserves_completed_files() {
-        let directory =
-            std::env::temp_dir().join(format!("meshshare-partial-test-{}", Uuid::new_v4()));
-        let nested = directory.join("nested");
-        std::fs::create_dir_all(&nested).expect("create partial test directory");
-        std::fs::write(directory.join("complete.bin"), b"complete").expect("write complete file");
-        std::fs::write(nested.join("upload.meshshare-id.part"), b"partial")
-            .expect("write partial file");
+    async fn rejecting_mobile_transfer_removes_staged_directory() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-mobile-reject-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        let offer = TransferOffer {
+            transfer_id: "mobile-reject-cleanup".to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "empty.txt".to_string(),
+                relative_path: "empty.txt".to_string(),
+                size: 0,
+                sha256: "0".repeat(64),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        let record = runtime
+            .mobile_transfer("mobile-reject-cleanup")
+            .expect("find mobile transfer");
+        std::fs::create_dir_all(&record.staged_directory).expect("create staging directory");
+        std::fs::write(record.staged_directory.join("stale.part"), b"stale")
+            .expect("write staged file");
 
-        cleanup_mobile_partial_files(&directory).await;
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let response = runtime
+            .http
+            .post(format!(
+                "http://{address}/api/v1/mobile/transfers/mobile-reject-cleanup/reject"
+            ))
+            .json(&serde_json::json!({ "session_id": session.session_id }))
+            .send()
+            .await
+            .expect("reject mobile transfer");
+        assert!(response.status().is_success());
+        assert!(!record.staged_directory.exists());
+        assert_eq!(
+            runtime
+                .mobile_transfer("mobile-reject-cleanup")
+                .expect("find rejected transfer")
+                .progress
+                .status,
+            TransferStatus::Rejected
+        );
 
-        assert!(directory.join("complete.bin").exists());
-        assert!(!nested.join("upload.meshshare-id.part").exists());
-        let _ = std::fs::remove_dir_all(directory);
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[tokio::test]
@@ -2313,6 +2481,44 @@ mod tests {
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         server_task.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn websocket_closes_if_peer_never_sends_hello() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-handshake-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let (mut socket, _) = connect_async(format!("ws://{address}/api/v1/ws"))
+            .await
+            .expect("connect websocket");
+        assert!(socket.next().await.is_some(), "server hello");
+
+        tokio::time::sleep(PEER_HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+        let closed = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("handshake timeout should close socket");
+        assert!(matches!(closed, None | Some(Err(_))));
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
         let _ = std::fs::remove_dir_all(data_dir);
     }
 }

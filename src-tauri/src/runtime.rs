@@ -94,6 +94,7 @@ pub struct MobileTransferRecord {
     pub staged_directory: PathBuf,
     pub staged_items: HashSet<String>,
     pub downloaded_items: HashSet<String>,
+    pub updated_at_ms: i64,
 }
 
 pub struct NodeRuntime {
@@ -160,7 +161,7 @@ fn mobile_reserved_bytes(record: &MobileTransferRecord) -> u64 {
         | TransferStatus::Accepted
         | TransferStatus::Uploading
         | TransferStatus::Ready => record.offer.total_bytes,
-        TransferStatus::Failed => record.progress.completed_bytes,
+        TransferStatus::Failed => 0,
         TransferStatus::Rejected | TransferStatus::Cancelled | TransferStatus::Completed => 0,
     }
 }
@@ -349,6 +350,10 @@ impl NodeRuntime {
         channels.insert(node_id.clone(), channel);
         self.connecting_peers.lock().remove(&node_id);
         true
+    }
+
+    pub fn has_peer_channel(&self, node_id: &str) -> bool {
+        self.peer_channels.lock().contains_key(node_id)
     }
 
     pub fn remove_peer_channel(&self, node_id: &str) {
@@ -707,6 +712,13 @@ impl NodeRuntime {
         source_name: String,
     ) -> Option<ClipboardEvent> {
         if !self.sync_enabled.load(Ordering::SeqCst) {
+            return None;
+        }
+        if source_name.len() > 256
+            || text
+                .as_ref()
+                .is_some_and(|value| value.len() > crate::model::CLIPBOARD_TEXT_LIMIT)
+        {
             return None;
         }
         let image_png = image_png
@@ -1156,6 +1168,7 @@ impl NodeRuntime {
             staged_directory,
             staged_items: HashSet::new(),
             downloaded_items: HashSet::new(),
+            updated_at_ms: now_millis(),
         };
         let view = mobile_view(&record);
         transfers.insert(record.offer.transfer_id.clone(), record);
@@ -1178,6 +1191,39 @@ impl NodeRuntime {
         transfers
     }
 
+    pub fn touch_mobile_session_transfers(&self, session_id: &str) {
+        let now = now_millis();
+        let mut transfers = self.mobile_transfers.write();
+        for record in transfers.values_mut() {
+            if record.session_id == session_id
+                && matches!(
+                    record.progress.status,
+                    TransferStatus::Waiting
+                        | TransferStatus::Accepted
+                        | TransferStatus::Uploading
+                        | TransferStatus::Ready
+                )
+            {
+                record.updated_at_ms = now;
+            }
+        }
+    }
+
+    pub fn touch_mobile_transfer_activity(&self, transfer_id: &str) -> bool {
+        let mut transfers = self.mobile_transfers.write();
+        let Some(record) = transfers.get_mut(transfer_id) else {
+            return false;
+        };
+        if !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading | TransferStatus::Ready
+        ) {
+            return false;
+        }
+        record.updated_at_ms = now_millis();
+        true
+    }
+
     pub fn prune_mobile_transfers(&self) -> Vec<PathBuf> {
         let sessions = self.mobile_sessions.read();
         let mut transfers = self.mobile_transfers.write();
@@ -1191,12 +1237,26 @@ impl NodeRuntime {
                     | TransferStatus::Cancelled
             )
         };
+        let mut cleanup = transfers
+            .values_mut()
+            .filter(|record| {
+                sessions.contains_key(&record.session_id)
+                    && !terminal(&record.progress.status)
+                    && now.saturating_sub(record.updated_at_ms) > TRANSFER_ACTIVITY_TIMEOUT_MS
+            })
+            .map(|record| {
+                record.progress.status = TransferStatus::Failed;
+                record.progress.error = Some("手机传输长时间没有进展，已自动失败".to_string());
+                record.updated_at_ms = now;
+                record.staged_directory.clone()
+            })
+            .collect::<Vec<_>>();
         let mut remove = transfers
             .iter()
             .filter(|(_, record)| {
                 !sessions.contains_key(&record.session_id)
                     || (terminal(&record.progress.status)
-                        && now.saturating_sub(record.offer.created_at_ms) > TRANSFER_RETENTION_MS)
+                        && now.saturating_sub(record.updated_at_ms) > TRANSFER_RETENTION_MS)
             })
             .map(|(transfer_id, record)| (transfer_id.clone(), record.staged_directory.clone()))
             .collect::<Vec<_>>();
@@ -1208,7 +1268,7 @@ impl NodeRuntime {
                     .or_default()
                     .push((
                         transfer_id.clone(),
-                        record.offer.created_at_ms,
+                        record.updated_at_ms,
                         record.staged_directory.clone(),
                     ));
             }
@@ -1230,9 +1290,10 @@ impl NodeRuntime {
         for (transfer_id, _) in &remove {
             transfers.remove(transfer_id);
         }
-        remove
+        cleanup.extend(remove.into_iter().map(|(_, directory)| directory));
+        cleanup
             .into_iter()
-            .filter_map(|(_, directory)| {
+            .filter_map(|directory| {
                 self.is_mobile_staging_directory(&directory)
                     .then_some(directory)
             })
@@ -1261,6 +1322,7 @@ impl NodeRuntime {
             return Some(mobile_view(record));
         }
         record.progress.status = status.clone();
+        record.updated_at_ms = now_millis();
         if status == TransferStatus::Rejected {
             record.progress.error = Some("手机端拒绝了传输".to_string());
         }
@@ -1288,6 +1350,7 @@ impl NodeRuntime {
         }
         record.progress.status = TransferStatus::Cancelled;
         record.progress.error = Some("手机传输已取消".to_string());
+        record.updated_at_ms = now_millis();
         Some(mobile_view(record))
     }
 
@@ -1317,6 +1380,7 @@ impl NodeRuntime {
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
             record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
         }
+        record.updated_at_ms = now_millis();
         record.progress.status = if record.progress.completed_items >= record.progress.total_items {
             TransferStatus::Ready
         } else {
@@ -1335,6 +1399,7 @@ impl NodeRuntime {
             return None;
         }
         record.progress.status = TransferStatus::Uploading;
+        record.updated_at_ms = now_millis();
         Some(mobile_view(record))
     }
 
@@ -1353,6 +1418,7 @@ impl NodeRuntime {
             return None;
         }
         record.downloaded_items.insert(item_id.to_string());
+        record.updated_at_ms = now_millis();
         if record.downloaded_items.len() >= record.progress.total_items {
             record.progress.status = TransferStatus::Completed;
         }
@@ -1378,6 +1444,7 @@ impl NodeRuntime {
         }
         record.progress.status = TransferStatus::Failed;
         record.progress.error = Some(message);
+        record.updated_at_ms = now_millis();
         Some(mobile_view(record))
     }
 
@@ -1565,16 +1632,29 @@ fn network_addresses_for_bound(port: u16, bound: &[Ipv4Addr]) -> Vec<AddressInfo
 }
 
 fn currently_available_bound_addresses(bound: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
-    let Ok(interfaces) = get_if_addrs::get_if_addrs() else {
-        return bound.to_vec();
+    let available = get_if_addrs::get_if_addrs().ok().map(|interfaces| {
+        interfaces
+            .into_iter()
+            .filter_map(|interface| match interface.ip() {
+                IpAddr::V4(address) => Some(address),
+                IpAddr::V6(_) => None,
+            })
+            .collect::<HashSet<_>>()
+    });
+    currently_available_bound_addresses_from(bound, available.as_ref())
+}
+
+fn currently_available_bound_addresses_from(
+    bound: &[Ipv4Addr],
+    available: Option<&HashSet<Ipv4Addr>>,
+) -> Vec<Ipv4Addr> {
+    let Some(available) = available else {
+        // Do not keep advertising an interface whose current state cannot be
+        // verified. The listener may remain alive briefly after an interface
+        // change, but publishing only loopback keeps NodeInfo and mDNS
+        // conservative until the next successful interface scan.
+        return vec![Ipv4Addr::LOCALHOST];
     };
-    let available = interfaces
-        .into_iter()
-        .filter_map(|interface| match interface.ip() {
-            IpAddr::V4(address) => Some(address),
-            IpAddr::V6(_) => None,
-        })
-        .collect::<HashSet<_>>();
     let mut addresses = bound
         .iter()
         .copied()
@@ -1610,8 +1690,8 @@ pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_addresses, load_or_create_config, network_addresses_for_bound, NodeRuntime,
-        UpdateFrequency,
+        bind_addresses, currently_available_bound_addresses_from, load_or_create_config,
+        network_addresses_for_bound, NodeRuntime, UpdateFrequency, TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
@@ -1689,6 +1769,18 @@ mod tests {
                 address
             );
         }
+    }
+
+    #[test]
+    fn address_publication_hides_non_loopback_when_interfaces_cannot_be_read() {
+        let bound = [
+            std::net::Ipv4Addr::LOCALHOST,
+            std::net::Ipv4Addr::new(192, 168, 1, 10),
+        ];
+        assert_eq!(
+            currently_available_bound_addresses_from(&bound, None),
+            vec![std::net::Ipv4Addr::LOCALHOST]
+        );
     }
 
     fn mobile_offer(runtime: &NodeRuntime, transfer_id: &str, total_bytes: u64) -> TransferOffer {
@@ -2175,6 +2267,55 @@ mod tests {
     }
 
     #[test]
+    fn stalled_mobile_transfer_fails_and_releases_staging_quota() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(&runtime, "stalled", MAX_MOBILE_STAGING_BYTES_PER_SESSION),
+            )
+            .expect("create mobile transfer");
+        runtime
+            .set_mobile_transfer_status("stalled", &session.session_id, TransferStatus::Accepted)
+            .expect("accept mobile transfer");
+        let record = runtime.mobile_transfer("stalled").expect("find transfer");
+        std::fs::create_dir_all(&record.staged_directory).expect("create staging directory");
+        runtime
+            .mobile_transfers
+            .write()
+            .get_mut("stalled")
+            .expect("find mutable transfer")
+            .updated_at_ms = crate::clock::now_millis() - TRANSFER_ACTIVITY_TIMEOUT_MS - 1;
+
+        let cleanup = runtime.prune_mobile_transfers();
+        assert!(cleanup.contains(&record.staged_directory));
+        assert_eq!(
+            runtime
+                .mobile_transfer("stalled")
+                .expect("find failed transfer")
+                .progress
+                .status,
+            TransferStatus::Failed
+        );
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(
+                    &runtime,
+                    "after-stalled",
+                    MAX_MOBILE_STAGING_BYTES_PER_SESSION,
+                ),
+            )
+            .expect("failed transfer releases session quota");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn rejected_mobile_transfer_releases_session_quota() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
@@ -2254,7 +2395,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_mobile_transfer_reserves_only_staged_bytes() {
+    fn failed_mobile_transfer_releases_session_quota() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
@@ -2311,7 +2452,39 @@ mod tests {
                 &session.session_id,
                 mobile_offer(&runtime, "quota-after-failure", 1),
             )
-            .expect("failed transfer reserves only staged bytes");
+            .expect("failed transfer releases session quota");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn recently_completed_mobile_transfer_uses_completion_time_for_retention() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        let mut offer = mobile_offer(&runtime, "recent-mobile", 1);
+        offer.created_at_ms = crate::clock::now_millis() - 11 * 60 * 1000;
+        runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        runtime
+            .set_mobile_transfer_status(
+                "recent-mobile",
+                &session.session_id,
+                TransferStatus::Accepted,
+            )
+            .expect("accept mobile transfer");
+        runtime
+            .stage_mobile_item("recent-mobile", "recent-mobile-item", 1)
+            .expect("stage mobile item");
+        runtime
+            .mark_mobile_item_downloaded("recent-mobile", "recent-mobile-item")
+            .expect("download mobile item");
+
+        runtime.prune_mobile_transfers();
+        assert!(runtime.mobile_transfer("recent-mobile").is_some());
         let _ = std::fs::remove_dir_all(path);
     }
 

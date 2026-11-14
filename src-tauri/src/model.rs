@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const CLIPBOARD_TEXT_LIMIT: usize = 16 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_LIMIT: usize = 16 * 1024 * 1024;
 pub const MAX_TRANSFER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const MAX_TRANSFER_ITEMS: usize = 4_096;

@@ -330,8 +330,11 @@ async fn run_peer_session(
     let mut clipboard_resync = tokio::time::interval(Duration::from_secs(1));
     let mut last_pong = tokio::time::Instant::now();
     let mut received_hello = false;
+    let handshake_deadline = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(handshake_deadline);
     loop {
         tokio::select! {
+            _ = &mut handshake_deadline, if !received_hello => break,
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
                 if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                     break;

@@ -12,7 +12,7 @@ use anyhow::Context;
 use model::{HardwareMetrics, MonitorDisplayMode, MonitorPosition, TransferProgress, WireMessage};
 use runtime::{NodeRuntime, UpdateFrequency};
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -531,19 +531,18 @@ async fn start_node(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(37880u16);
-    let bind_addresses = runtime::bind_addresses();
-    let first_address = bind_addresses
-        .first()
-        .copied()
-        .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
-    let first_listener = match tokio::net::TcpListener::bind((first_address, preferred_port)).await
-    {
-        Ok(listener) => listener,
-        Err(_) => tokio::net::TcpListener::bind((first_address, 0)).await?,
-    };
+    let mut bind_addresses = runtime::bind_addresses();
+    if bind_addresses.is_empty() {
+        bind_addresses.push(Ipv4Addr::LOCALHOST);
+    }
+    let first_listener = bind_initial_listener(&bind_addresses, preferred_port).await?;
     let actual_port = first_listener.local_addr()?.port();
+    let first_address = first_listener.local_addr()?.ip();
     let mut listeners = vec![first_listener];
-    for address in bind_addresses.into_iter().skip(1) {
+    for address in bind_addresses {
+        if IpAddr::V4(address) == first_address {
+            continue;
+        }
         if let Ok(listener) = tokio::net::TcpListener::bind((address, actual_port)).await {
             listeners.push(listener);
         }
@@ -604,6 +603,31 @@ async fn start_node(
     metrics::start(runtime.clone());
     discovery::start(runtime.clone());
     Ok(runtime)
+}
+
+async fn bind_initial_listener(
+    addresses: &[Ipv4Addr],
+    preferred_port: u16,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let mut last_error = None;
+    for address in addresses {
+        match tokio::net::TcpListener::bind((*address, preferred_port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    for address in addresses {
+        match tokio::net::TcpListener::bind((*address, 0)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(anyhow::anyhow!(
+        "无法绑定允许的本地地址：{}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "没有可用地址".to_string())
+    ))
 }
 
 fn static_root(app: &AppHandle) -> PathBuf {
@@ -863,9 +887,22 @@ pub fn cleanup_autostart() {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_position_to_work_area;
+    use super::{bind_initial_listener, clamp_position_to_work_area};
     use crate::autostart::launched_from_args;
     use crate::model::MonitorPosition;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test]
+    async fn initial_listener_skips_an_unavailable_address() {
+        let listener =
+            bind_initial_listener(&[Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::LOCALHOST], 0)
+                .await
+                .expect("bind fallback address");
+        assert_eq!(
+            listener.local_addr().expect("fallback address").ip(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        );
+    }
 
     #[test]
     fn monitor_position_is_clamped_inside_work_area() {
