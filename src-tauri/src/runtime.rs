@@ -1,9 +1,10 @@
 use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
-    MobileTransferView, MonitorDisplayMode, NodeInfo, PeerInfo, TransferOffer, TransferProgress,
-    TransferStatus, WireMessage, MAX_MOBILE_SESSIONS, MAX_MOBILE_TRANSFERS_PER_SESSION,
-    MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    MobileTransferView, MonitorDisplayMode, MonitorPosition, NodeInfo, PeerInfo, TransferOffer,
+    TransferProgress, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
+    MAX_MOBILE_TRANSFERS_PER_SESSION, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
+    METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -16,12 +17,16 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedConfig {
     node_id: String,
     node_name: String,
     #[serde(default)]
     monitor_display: MonitorDisplayMode,
+    #[serde(default)]
+    monitor_position: Option<MonitorPosition>,
+    #[serde(default)]
+    monitor_locked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +58,7 @@ pub struct NodeRuntime {
     pub mobile_transfers: RwLock<HashMap<String, MobileTransferRecord>>,
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
     pub monitor_display: RwLock<MonitorDisplayMode>,
+    pub monitor_locked: AtomicBool,
     listening_addresses: RwLock<Option<Vec<Ipv4Addr>>>,
     config: Mutex<PersistedConfig>,
     data_dir: PathBuf,
@@ -156,6 +162,7 @@ impl NodeRuntime {
             mobile_transfers: RwLock::new(HashMap::new()),
             local_metrics: RwLock::new(None),
             monitor_display: RwLock::new(config.monitor_display.clone()),
+            monitor_locked: AtomicBool::new(config.monitor_locked),
             listening_addresses: RwLock::new(Some(vec![Ipv4Addr::LOCALHOST])),
             config: Mutex::new(config),
             data_dir,
@@ -452,10 +459,40 @@ impl NodeRuntime {
     }
 
     pub fn set_monitor_display_mode(&self, mode: MonitorDisplayMode) -> anyhow::Result<()> {
-        *self.monitor_display.write() = mode.clone();
         let mut config = self.config.lock();
-        config.monitor_display = mode;
-        persist_config(&self.data_dir, &config)
+        let mut next = config.clone();
+        next.monitor_display = mode.clone();
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        *self.monitor_display.write() = mode;
+        Ok(())
+    }
+
+    pub fn monitor_locked(&self) -> bool {
+        self.monitor_locked.load(Ordering::SeqCst)
+    }
+
+    pub fn set_monitor_locked(&self, locked: bool) -> anyhow::Result<()> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.monitor_locked = locked;
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        self.monitor_locked.store(locked, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn monitor_position(&self) -> Option<MonitorPosition> {
+        self.config.lock().monitor_position.clone()
+    }
+
+    pub fn set_monitor_position(&self, position: MonitorPosition) -> anyhow::Result<()> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.monitor_position = Some(position);
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        Ok(())
     }
 
     pub fn peers_snapshot(&self) -> Vec<PeerInfo> {
@@ -1264,6 +1301,8 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "MeshShare 节点".to_string()),
         monitor_display: MonitorDisplayMode::default(),
+        monitor_position: None,
+        monitor_locked: false,
     };
     persist_config(data_dir, &config)?;
     Ok(config)
@@ -1509,7 +1548,48 @@ mod tests {
         .expect("write old config");
         let config = load_or_create_config(&path).expect("load config");
         assert_eq!(config.monitor_display.as_str(), "floating");
+        assert_eq!(config.monitor_position, None);
+        assert!(!config.monitor_locked);
         let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn monitor_position_and_lock_are_persisted() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .set_monitor_position(crate::model::MonitorPosition { x: 123, y: 456 })
+            .expect("save monitor position");
+        runtime.set_monitor_locked(true).expect("save monitor lock");
+
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert_eq!(
+            restored.monitor_position(),
+            Some(crate::model::MonitorPosition { x: 123, y: 456 })
+        );
+        assert!(restored.monitor_locked());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn failed_monitor_settings_write_does_not_mutate_runtime_state() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        std::fs::remove_dir_all(&path).expect("remove config directory");
+
+        assert!(runtime
+            .set_monitor_display_mode(crate::model::MonitorDisplayMode::Tray)
+            .is_err());
+        assert_eq!(runtime.monitor_display_mode().as_str(), "floating");
+        assert!(runtime.set_monitor_locked(true).is_err());
+        assert!(!runtime.monitor_locked());
+        assert!(runtime
+            .set_monitor_position(crate::model::MonitorPosition { x: 10, y: 20 })
+            .is_err());
+        assert_eq!(runtime.monitor_position(), None);
     }
 
     #[test]

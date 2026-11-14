@@ -111,6 +111,12 @@ impl MonitorDisplayMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MonitorPosition {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Hlc {
     pub physical_ms: i64,
     pub logical: u64,

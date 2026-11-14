@@ -18,7 +18,7 @@
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; background: #f4f7fb; }
+body { margin: 0; min-width: 320px; background: transparent; }
 button, input, textarea, select { font: inherit; }
 button { border: 0; cursor: pointer; }
 
@@ -138,15 +138,13 @@ button.small { padding: 7px 9px; font-size: 11px; }
 footer { max-width: 1240px; margin: -8px auto 0; padding: 0 26px 26px; display: flex; justify-content: space-between; gap: 12px; color: #8895a8; font-size: 11px; }
 .hidden-input { display: none; }
 
-.monitor-shell { min-height: 0; overflow: hidden; background: #101a2c; }
-.monitor-main { height: 100vh; display: flex; align-items: center; gap: 12px; padding: 8px 12px; color: #fff; background: linear-gradient(135deg, #162640, #0f172a); user-select: none; }
-.monitor-brand { display: flex; align-items: center; gap: 6px; margin-right: 2px; color: #d8e5ff; font-size: 11px; }
-.monitor-dot { width: 7px; height: 7px; border-radius: 50%; background: #54dc9a; box-shadow: 0 0 0 4px #54dc9a22; }
-.monitor-metric { min-width: 52px; display: grid; gap: 2px; }
-.monitor-metric b { color: #8fa7ca; font-size: 9px; letter-spacing: .08em; }
-.monitor-metric span { color: #fff; font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.monitor-close { width: 22px; height: 22px; margin-left: auto; padding: 0; border-radius: 7px; color: #aebbd0; background: transparent; font-size: 18px; line-height: 22px; }
-.monitor-close:hover { color: #fff; background: #ffffff16; transform: none; }
+.monitor-shell { min-height: 0; height: 100vh; overflow: hidden; background: transparent; }
+.monitor-main { height: 100vh; display: flex; align-items: center; gap: 10px; padding: 4px 10px; overflow: hidden; color: #fff; border: 1px solid #b9d0f52e; border-radius: 12px; background: #15243dcc; box-shadow: 0 8px 22px #07122552; backdrop-filter: blur(10px); cursor: move; user-select: none; }
+.monitor-metric { min-width: 0; display: flex; align-items: baseline; gap: 4px; white-space: nowrap; }
+.monitor-metric b { color: #9db4d6; font-size: 9px; font-weight: 700; letter-spacing: .06em; }
+.monitor-metric span { color: #fff; font-size: 11px; font-variant-numeric: tabular-nums; }
+.metrics-heading .heading-actions { align-items: center; }
+.monitor-lock-toggle { white-space: nowrap; }
 
 .mobile-shell { background: #f4f7fb; }
 .mobile-shell .topbar { height: 76px; color: var(--ink); }

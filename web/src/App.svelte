@@ -3,6 +3,7 @@
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { apiUrl, createMobileSession, getClipboard, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, websocketUrl } from './api';
   import { digestFile } from './sha256';
   import type { ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, WireMessage } from './types';
@@ -33,6 +34,7 @@
   let mobileTransfers: MobileTransferView[] = [];
   let mobileSessionId = '';
   let manualAddress = '';
+  let monitorLocked = false;
   const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[] }>();
   const uploading = new Set<string>();
   const watching = new Set<string>();
@@ -66,10 +68,46 @@
     folderInput?.setAttribute('directory', '');
     let timer: number | undefined;
     let stopped = false;
+    let monitorPositionTimer: number | undefined;
+    let pendingMonitorPosition: { x: number; y: number } | null = null;
+    let monitorPositionWriteInFlight = false;
+    let monitorPositionUnlisten: (() => void) | undefined;
+    const flushMonitorPosition = async () => {
+      if (!pendingMonitorPosition || monitorPositionWriteInFlight) return;
+      const position = pendingMonitorPosition;
+      monitorPositionWriteInFlight = true;
+      try {
+        await invoke('set_monitor_position', position);
+        if (pendingMonitorPosition?.x === position.x && pendingMonitorPosition?.y === position.y) {
+          pendingMonitorPosition = null;
+        }
+      } catch (error) {
+        console.error('保存悬浮监控条位置失败', error);
+      } finally {
+        monitorPositionWriteInFlight = false;
+        if (!stopped && pendingMonitorPosition && (pendingMonitorPosition.x !== position.x || pendingMonitorPosition.y !== position.y)) {
+          void flushMonitorPosition();
+        }
+      }
+    };
+    if (isMonitor) {
+      void getCurrentWindow().onMoved(({ payload }) => {
+        pendingMonitorPosition = { x: payload.x, y: payload.y };
+        if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
+        monitorPositionTimer = window.setTimeout(() => {
+          monitorPositionTimer = undefined;
+          void flushMonitorPosition();
+        }, 200);
+      }).then((unlisten) => {
+        if (stopped) unlisten();
+        else monitorPositionUnlisten = unlisten;
+      }).catch((error) => console.error('监听悬浮监控条移动失败', error));
+    }
     const start = async () => {
       if (pageStopped) return;
       try {
         await initApi();
+        if (!isMobile) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
         await refresh();
         syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
         connectWebSocket();
@@ -93,6 +131,9 @@
       pageStopped = true;
       if (timer) window.clearInterval(timer);
       ws?.close();
+      if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
+      monitorPositionUnlisten?.();
+      void flushMonitorPosition();
       if (stopped) window.clearTimeout(timer);
     };
   });
@@ -252,8 +293,14 @@
     selectedMetricsPeer = peer;
   }
 
-  async function hideMonitor() {
-    await invoke('set_monitor_display_mode', { mode: 'tray' }).catch(() => undefined);
+  async function toggleMonitorLock() {
+    try {
+      monitorLocked = await invoke<boolean>('set_monitor_locked', { locked: !monitorLocked });
+      notice = monitorLocked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法更新悬浮监控条状态';
+    }
+    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function publishClipboard() {
@@ -696,15 +743,13 @@
 
 <div class:mobile-shell={isMobile} class:monitor-shell={isMonitor} class="shell">
   {#if isMonitor}
-    <main class="monitor-main" data-tauri-drag-region>
-      <div class="monitor-brand" data-tauri-drag-region><span class="monitor-dot"></span><strong>MeshShare</strong></div>
+    <main class="monitor-main" data-tauri-drag-region="deep">
       <div class="monitor-metric"><b>CPU</b><span>{formatPercent(metrics?.cpu_usage_percent)}</span></div>
       <div class="monitor-metric"><b>GPU</b><span>{gpuSummary(metrics).split(' · ')[0]}</span></div>
       <div class="monitor-metric"><b>显存</b><span>{gpuSummary(metrics).split(' · ')[1] ?? '—'}</span></div>
       <div class="monitor-metric"><b>内存</b><span>{formatPercent(memoryPercent(metrics))}</span></div>
       <div class="monitor-metric"><b>↓</b><span>{formatRate(metrics?.network_down_bytes_per_sec)}</span></div>
       <div class="monitor-metric"><b>↑</b><span>{formatRate(metrics?.network_up_bytes_per_sec)}</span></div>
-      <button class="monitor-close" aria-label="隐藏监控条" on:click={hideMonitor}>×</button>
     </main>
   {:else}
   <header class="topbar">
@@ -788,7 +833,15 @@
       </section>
 
       <section class="panel metrics-panel">
-        <div class="panel-heading"><div><div class="section-kicker">HARDWARE MONITOR</div><h2>{selectedMetricsPeer ? selectedMetricsPeer.node_name + ' 的硬件状态' : '本机硬件状态'}</h2></div><span class="muted">{metricStatus(selectedMetricsPeer, currentMetrics)}</span></div>
+        <div class="panel-heading metrics-heading">
+          <div><div class="section-kicker">HARDWARE MONITOR</div><h2>{selectedMetricsPeer ? selectedMetricsPeer.node_name + ' 的硬件状态' : '本机硬件状态'}</h2></div>
+          <div class="heading-actions">
+            <span class="muted">{metricStatus(selectedMetricsPeer, currentMetrics)}</span>
+            {#if !selectedMetricsPeer}
+              <button class="ghost small monitor-lock-toggle" aria-pressed={monitorLocked} on:click={toggleMonitorLock}>{monitorLocked ? '解锁悬浮条' : '锁定悬浮条'}</button>
+            {/if}
+          </div>
+        </div>
         <div class="metrics-grid">
           <div class="metric-card"><span>CPU</span><strong>{formatPercent(currentMetrics?.cpu_usage_percent)}</strong><small>系统总使用率</small></div>
           <div class="metric-card"><span>内存</span><strong>{formatPercent(memoryPercent(currentMetrics))}</strong><small>{formatMemory(currentMetrics?.memory_used_bytes)} / {formatMemory(currentMetrics?.memory_total_bytes)}</small></div>

@@ -3,5 +3,11 @@
   "identifier": "default",
   "description": "MeshShare desktop permissions",
   "windows": ["main", "monitor"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-internal-toggle-maximize",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-start-dragging",
+    "dialog:default"
+  ]
 }

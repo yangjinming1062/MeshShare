@@ -1,5 +1,3 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 mod clipboard;
 mod clock;
 mod discovery;
@@ -9,7 +7,7 @@ mod runtime;
 mod server;
 
 use anyhow::Context;
-use model::{HardwareMetrics, MonitorDisplayMode, TransferProgress, WireMessage};
+use model::{HardwareMetrics, MonitorDisplayMode, MonitorPosition, TransferProgress, WireMessage};
 use runtime::NodeRuntime;
 use std::fs;
 use std::net::IpAddr;
@@ -17,7 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Manager, PhysicalPosition, State, WindowEvent};
 
 #[derive(Clone)]
 struct ManagedNode {
@@ -116,8 +114,42 @@ fn set_monitor_display_mode(
         .runtime
         .set_monitor_display_mode(mode.clone())
         .map_err(|error| error.to_string())?;
-    apply_monitor_mode(&app, &mode);
+    apply_monitor_mode(&app, &mode, state.runtime.monitor_locked());
     Ok(mode.as_str().to_string())
+}
+
+#[tauri::command]
+fn monitor_locked(state: State<'_, ManagedNode>) -> bool {
+    state.runtime.monitor_locked()
+}
+
+#[tauri::command]
+fn set_monitor_locked(
+    app: AppHandle,
+    state: State<'_, ManagedNode>,
+    locked: bool,
+) -> Result<bool, String> {
+    let previous = state.runtime.monitor_locked();
+    if let Some(window) = app.get_webview_window("monitor") {
+        window
+            .set_ignore_cursor_events(locked)
+            .map_err(|error| format!("无法更新监控条鼠标状态：{error}"))?;
+    }
+    if let Err(error) = state.runtime.set_monitor_locked(locked) {
+        if let Some(window) = app.get_webview_window("monitor") {
+            let _ = window.set_ignore_cursor_events(previous);
+        }
+        return Err(error.to_string());
+    }
+    Ok(locked)
+}
+
+#[tauri::command]
+fn set_monitor_position(state: State<'_, ManagedNode>, x: i32, y: i32) -> Result<(), String> {
+    state
+        .runtime
+        .set_monitor_position(MonitorPosition { x, y })
+        .map_err(|error| error.to_string())
 }
 
 fn parse_monitor_mode(value: &str) -> Option<MonitorDisplayMode> {
@@ -129,16 +161,130 @@ fn parse_monitor_mode(value: &str) -> Option<MonitorDisplayMode> {
     }
 }
 
-fn apply_monitor_mode(app: &AppHandle, mode: &MonitorDisplayMode) {
+fn apply_monitor_mode(app: &AppHandle, mode: &MonitorDisplayMode, locked: bool) {
     let Some(window) = app.get_webview_window("monitor") else {
         return;
     };
+    let _ = window.set_ignore_cursor_events(locked);
     match mode {
         MonitorDisplayMode::Floating => {
             let _ = window.show();
         }
         MonitorDisplayMode::Tray | MonitorDisplayMode::Disabled => {
             let _ = window.hide();
+        }
+    }
+}
+
+const MONITOR_MARGIN_PX: i32 = 16;
+
+fn point_is_in_work_area(position: &MonitorPosition, monitor: &tauri::Monitor) -> bool {
+    let area = monitor.work_area();
+    let left = i64::from(area.position.x);
+    let top = i64::from(area.position.y);
+    let right = left + i64::from(area.size.width);
+    let bottom = top + i64::from(area.size.height);
+    let x = i64::from(position.x);
+    let y = i64::from(position.y);
+    x >= left && x < right && y >= top && y < bottom
+}
+
+fn clamp_monitor_position(
+    position: MonitorPosition,
+    monitor: &tauri::Monitor,
+    window_width: i32,
+    window_height: i32,
+) -> MonitorPosition {
+    let area = monitor.work_area();
+    clamp_position_to_work_area(
+        position,
+        area.position.x,
+        area.position.y,
+        area.size.width,
+        area.size.height,
+        window_width,
+        window_height,
+    )
+}
+
+fn clamp_position_to_work_area(
+    position: MonitorPosition,
+    area_x: i32,
+    area_y: i32,
+    area_width: u32,
+    area_height: u32,
+    window_width: i32,
+    window_height: i32,
+) -> MonitorPosition {
+    let left = i64::from(area_x) + i64::from(MONITOR_MARGIN_PX);
+    let top = i64::from(area_y) + i64::from(MONITOR_MARGIN_PX);
+    let right = i64::from(area_x) + i64::from(area_width)
+        - i64::from(window_width)
+        - i64::from(MONITOR_MARGIN_PX);
+    let bottom = i64::from(area_y) + i64::from(area_height)
+        - i64::from(window_height)
+        - i64::from(MONITOR_MARGIN_PX);
+    MonitorPosition {
+        x: position.x.clamp(left as i32, right.max(left) as i32),
+        y: position.y.clamp(top as i32, bottom.max(top) as i32),
+    }
+}
+
+fn position_monitor_window<R: tauri::Runtime>(
+    window: &tauri::WebviewWindow<R>,
+    runtime: &NodeRuntime,
+) {
+    let Ok(outer_size) = window.outer_size() else {
+        return;
+    };
+    let window_width = i32::try_from(outer_size.width).unwrap_or(i32::MAX);
+    let window_height = i32::try_from(outer_size.height).unwrap_or(i32::MAX);
+    let Ok(monitors) = window.available_monitors() else {
+        return;
+    };
+    if monitors.is_empty() {
+        return;
+    }
+    let saved = runtime.monitor_position();
+    let monitor = saved
+        .filter(|position| {
+            monitors
+                .iter()
+                .any(|item| point_is_in_work_area(position, item))
+        })
+        .and_then(|position| {
+            monitors
+                .iter()
+                .find(|item| point_is_in_work_area(&position, item))
+                .map(|item| (position, item.clone()))
+        });
+    let (position, monitor) = if let Some((position, monitor)) = monitor {
+        (position, monitor)
+    } else {
+        let monitor = window
+            .primary_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| monitors.first().cloned())
+            .unwrap_or_else(|| monitors[0].clone());
+        let area = monitor.work_area();
+        let position = MonitorPosition {
+            x: (i64::from(area.position.x) + i64::from(area.size.width)
+                - i64::from(window_width)
+                - i64::from(MONITOR_MARGIN_PX)) as i32,
+            y: (i64::from(area.position.y) + i64::from(area.size.height)
+                - i64::from(window_height)
+                - i64::from(MONITOR_MARGIN_PX)) as i32,
+        };
+        (position, monitor)
+    };
+    let position = clamp_monitor_position(position, &monitor, window_width, window_height);
+    if window
+        .set_position(PhysicalPosition::new(position.x, position.y))
+        .is_ok()
+    {
+        if let Err(error) = runtime.set_monitor_position(position) {
+            eprintln!("保存监控条位置失败：{error}");
         }
     }
 }
@@ -413,6 +559,9 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         }
         "monitor-show" => {
             if let Some(window) = app.get_webview_window("monitor") {
+                if let Some(state) = app.try_state::<ManagedNode>() {
+                    let _ = window.set_ignore_cursor_events(state.runtime.monitor_locked());
+                }
                 let _ = window.show();
             }
         }
@@ -429,7 +578,8 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
             };
             if let Some(state) = app.try_state::<ManagedNode>() {
                 let _ = state.runtime.set_monitor_display_mode(mode.clone());
-                apply_monitor_mode(app, &mode);
+                let locked = state.runtime.monitor_locked();
+                apply_monitor_mode(app, &mode, locked);
             }
         }
         "toggle-sync" => {
@@ -475,7 +625,14 @@ pub fn run() {
                 runtime: runtime.clone(),
             });
             setup_tray_menu(app.handle(), runtime.clone())?;
-            apply_monitor_mode(app.handle(), &runtime.monitor_display_mode());
+            if let Some(window) = app.get_webview_window("monitor") {
+                position_monitor_window(&window, runtime.as_ref());
+            }
+            apply_monitor_mode(
+                app.handle(),
+                &runtime.monitor_display_mode(),
+                runtime.monitor_locked(),
+            );
             if let Some(window) = app.get_webview_window("main") {
                 let window_for_close = window.clone();
                 window.on_window_event(move |event| {
@@ -504,8 +661,45 @@ pub fn run() {
             register_outgoing_transfer,
             update_transfer_progress,
             monitor_display_mode,
-            set_monitor_display_mode
+            set_monitor_display_mode,
+            monitor_locked,
+            set_monitor_locked,
+            set_monitor_position
         ])
         .run(tauri::generate_context!())
         .expect("error while running MeshShare");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_position_to_work_area;
+    use crate::model::MonitorPosition;
+
+    #[test]
+    fn monitor_position_is_clamped_inside_work_area() {
+        assert_eq!(
+            clamp_position_to_work_area(
+                MonitorPosition { x: -500, y: -500 },
+                0,
+                0,
+                1920,
+                1080,
+                440,
+                42
+            ),
+            MonitorPosition { x: 16, y: 16 }
+        );
+        assert_eq!(
+            clamp_position_to_work_area(
+                MonitorPosition { x: 4000, y: 4000 },
+                0,
+                0,
+                1920,
+                1080,
+                440,
+                42
+            ),
+            MonitorPosition { x: 1464, y: 1022 }
+        );
+    }
 }
