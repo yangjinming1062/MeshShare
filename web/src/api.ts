@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress, TransferStatus } from './types';
+import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress, TransferStatus } from './types';
 
 let baseUrl = '';
 
@@ -57,7 +57,6 @@ async function requestList<T>(path: string): Promise<T[]> {
 export const getInfo = () => request<NodeInfo>('/api/v1/info');
 export const getPeers = () => requestList<PeerInfo>('/api/v1/peers');
 export const getMetrics = () => request<HardwareMetrics | null>('/api/v1/metrics');
-export const getMobileAccess = () => request<MobileAccessInfo>('/api/v1/mobile/access');
 export const getClipboard = () => request<ClipboardSnapshot | null>('/api/v1/clipboard');
 export const getClipboardHistory = () => request<ClipboardHistoryResponse>('/api/v1/clipboard/history');
 export const getClipboardHistoryDetail = (eventId: string) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`);

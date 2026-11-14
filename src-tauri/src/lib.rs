@@ -2,6 +2,7 @@ mod autostart;
 mod clipboard;
 mod clock;
 mod discovery;
+mod listeners;
 mod metrics;
 mod mobile_tls;
 mod model;
@@ -12,14 +13,13 @@ mod updater;
 use anyhow::Context;
 use model::{
     ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, HardwareMetrics,
-    MobileAccessInfo, MonitorDisplayMode, MonitorPosition, ReceiveMode, ReceiveSettings,
-    TransferProgress, WireMessage,
+    MonitorDisplayMode, MonitorPosition, ReceiveMode, ReceiveSettings, TransferProgress,
+    WireMessage,
 };
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use runtime::{validate_receive_directory, NodeRuntime, UpdateFrequency};
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -668,126 +668,7 @@ async fn start_node(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(37880u16);
-    let mut bind_addresses = runtime::bind_addresses();
-    if bind_addresses.is_empty() {
-        bind_addresses.push(Ipv4Addr::LOCALHOST);
-    }
-    let first_listener = bind_initial_listener(&bind_addresses, preferred_port).await?;
-    let actual_port = first_listener.local_addr()?.port();
-    let first_address = first_listener.local_addr()?.ip();
-    let mut listeners = vec![first_listener];
-    for address in bind_addresses {
-        if IpAddr::V4(address) == first_address {
-            continue;
-        }
-        if let Ok(listener) = tokio::net::TcpListener::bind((address, actual_port)).await {
-            listeners.push(listener);
-        }
-    }
-    let listening_addresses = listeners
-        .iter()
-        .map(|listener| listener.local_addr().map(|address| address.ip()))
-        .collect::<std::io::Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|address| match address {
-            IpAddr::V4(address) => Some(address),
-            IpAddr::V6(_) => None,
-        })
-        .collect::<Vec<_>>();
-    let tls_data_dir = data_dir.clone();
-    let runtime = NodeRuntime::new(data_dir, actual_port, version)?;
-    runtime.set_listening_addresses(listening_addresses.clone());
-    let tls_material = mobile_tls::ensure(&tls_data_dir, &listening_addresses)?;
-    let tls_first_listener = bind_initial_tls_listener(&listening_addresses).await?;
-    let tls_port = tls_first_listener.local_addr()?.port();
-    let tls_first_address = tls_first_listener.local_addr()?.ip();
-    let mut tls_listeners = vec![tls_first_listener];
-    for address in &listening_addresses {
-        if IpAddr::V4(*address) == tls_first_address {
-            continue;
-        }
-        if let Ok(listener) = tokio::net::TcpListener::bind((*address, tls_port)).await {
-            tls_listeners.push(listener);
-        }
-    }
-    let secure_urls = tls_listeners
-        .iter()
-        .filter_map(|listener| listener.local_addr().ok())
-        .filter_map(|address| match address.ip() {
-            IpAddr::V4(ip) => Some(model::AddressInfo {
-                address: ip.to_string(),
-                url: format!("https://{ip}:{tls_port}"),
-                label: format!("手机 HTTPS · {ip}"),
-                kind: "mobile_https".to_string(),
-            }),
-            IpAddr::V6(_) => None,
-        })
-        .collect::<Vec<_>>();
-    runtime.set_mobile_access_info(
-        MobileAccessInfo {
-            bootstrap_urls: runtime.node_info().addresses.clone(),
-            secure_urls,
-            ca_url: "/api/v1/mobile/ca".to_string(),
-            ca_fingerprint: tls_material.fingerprint.clone(),
-        },
-        tls_material.ca_certificate_path.clone(),
-    );
-    let app = server::router(runtime.clone(), static_root);
-    for listener in listeners {
-        let app = app.clone();
-        let shutdown_runtime = runtime.clone();
-        tauri::async_runtime::spawn(async move {
-            let shutdown = async move {
-                while !shutdown_runtime
-                    .stopping
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-            };
-            let _ = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown)
-                .await;
-        });
-    }
-    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-        &tls_material.server_certificate_path,
-        &tls_material.server_key_path,
-    )
-    .await?;
-    let tls_app = app.clone();
-    for listener in tls_listeners {
-        let tls_config = tls_config.clone();
-        let shutdown_runtime = runtime.clone();
-        let std_listener = listener.into_std()?;
-        let tls_handle = axum_server::Handle::new();
-        let tls_server =
-            axum_server::from_tcp_rustls(std_listener, tls_config)?.handle(tls_handle.clone());
-        let tls_app = tls_app.clone();
-        tauri::async_runtime::spawn(async move {
-            let shutdown = async move {
-                while !shutdown_runtime
-                    .stopping
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                tls_handle.graceful_shutdown(None);
-            };
-            let server = tls_server.serve(tls_app.into_make_service());
-            tokio::pin!(server);
-            tokio::select! {
-                result = &mut server => {
-                    if let Err(error) = result {
-                        eprintln!("手机 HTTPS 服务停止：{error}");
-                    }
-                }
-                _ = shutdown => {
-                    let _ = server.await;
-                }
-            }
-        });
-    }
+    let runtime = listeners::start(data_dir, static_root, version, preferred_port).await?;
     let cleanup_runtime = runtime.clone();
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -815,49 +696,6 @@ async fn start_node(
     metrics::start(runtime.clone());
     discovery::start(runtime.clone());
     Ok(runtime)
-}
-
-async fn bind_initial_listener(
-    addresses: &[Ipv4Addr],
-    preferred_port: u16,
-) -> anyhow::Result<tokio::net::TcpListener> {
-    let mut last_error = None;
-    for address in addresses {
-        match tokio::net::TcpListener::bind((*address, preferred_port)).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    for address in addresses {
-        match tokio::net::TcpListener::bind((*address, 0)).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "无法绑定允许的本地地址：{}",
-        last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "没有可用地址".to_string())
-    ))
-}
-
-async fn bind_initial_tls_listener(
-    addresses: &[Ipv4Addr],
-) -> anyhow::Result<tokio::net::TcpListener> {
-    let mut last_error = None;
-    for address in addresses {
-        match tokio::net::TcpListener::bind((*address, 0)).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(anyhow::anyhow!(
-        "无法绑定手机 HTTPS 地址：{}",
-        last_error
-            .map(|error| error.to_string())
-            .unwrap_or_else(|| "没有可用地址".to_string())
-    ))
 }
 
 fn static_root(app: &AppHandle) -> PathBuf {
@@ -1126,25 +964,9 @@ pub fn cleanup_autostart() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        bind_initial_listener, clamp_position_to_work_area, monitor_capabilities_for_backend,
-        MonitorBackend,
-    };
+    use super::{clamp_position_to_work_area, monitor_capabilities_for_backend, MonitorBackend};
     use crate::autostart::launched_from_args;
     use crate::model::MonitorPosition;
-    use std::net::{IpAddr, Ipv4Addr};
-
-    #[tokio::test]
-    async fn initial_listener_skips_an_unavailable_address() {
-        let listener =
-            bind_initial_listener(&[Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::LOCALHOST], 0)
-                .await
-                .expect("bind fallback address");
-        assert_eq!(
-            listener.local_addr().expect("fallback address").ip(),
-            IpAddr::V4(Ipv4Addr::LOCALHOST)
-        );
-    }
 
     #[test]
     fn monitor_position_is_clamped_inside_work_area() {

@@ -12,7 +12,7 @@ use crate::model::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -137,6 +137,11 @@ pub struct MobileTransferRecord {
     pub updated_at_ms: i64,
 }
 
+struct MobileCa {
+    path: PathBuf,
+    fingerprint: String,
+}
+
 pub struct NodeRuntime {
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
@@ -151,9 +156,7 @@ pub struct NodeRuntime {
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
     pub monitor_display: RwLock<MonitorDisplayMode>,
     pub monitor_locked: AtomicBool,
-    listening_addresses: RwLock<Option<Vec<Ipv4Addr>>>,
-    mobile_access: RwLock<MobileAccessInfo>,
-    mobile_ca_path: RwLock<Option<PathBuf>>,
+    mobile_ca: RwLock<Option<MobileCa>>,
     config: Mutex<PersistedConfig>,
     data_dir: PathBuf,
     clipboard_update: Mutex<()>,
@@ -251,7 +254,6 @@ impl NodeRuntime {
         if let Some(snapshot) = clipboard.as_ref() {
             clock.observe(&snapshot.clock);
         }
-        let addresses = network_addresses_for_bound(port, &[Ipv4Addr::LOCALHOST]);
         let node = NodeInfo {
             node_id: config.node_id.clone(),
             node_name: config.node_name.clone(),
@@ -259,7 +261,7 @@ impl NodeRuntime {
             protocol_version: crate::model::PROTOCOL_VERSION,
             platform: std::env::consts::OS.to_string(),
             port,
-            addresses,
+            addresses: Vec::new(),
             mobile_addresses: Vec::new(),
             capabilities: vec![
                 "clipboard.text".to_string(),
@@ -286,9 +288,7 @@ impl NodeRuntime {
             local_metrics: RwLock::new(None),
             monitor_display: RwLock::new(config.monitor_display.clone()),
             monitor_locked: AtomicBool::new(config.monitor_locked),
-            listening_addresses: RwLock::new(Some(vec![Ipv4Addr::LOCALHOST])),
-            mobile_access: RwLock::new(MobileAccessInfo::default()),
-            mobile_ca_path: RwLock::new(None),
+            mobile_ca: RwLock::new(None),
             config: Mutex::new(config),
             data_dir,
             clipboard_update: Mutex::new(()),
@@ -365,17 +365,26 @@ impl NodeRuntime {
     }
 
     pub fn mobile_access_info(&self) -> MobileAccessInfo {
-        self.mobile_access.read().clone()
+        let node = self.node.read();
+        let ca = self.mobile_ca.read();
+        MobileAccessInfo {
+            bootstrap_urls: node.addresses.clone(),
+            secure_urls: node.mobile_addresses.clone(),
+            ca_url: ca
+                .as_ref()
+                .map_or_else(String::new, |_| "/api/v1/mobile/ca".to_string()),
+            ca_fingerprint: ca
+                .as_ref()
+                .map_or_else(String::new, |ca| ca.fingerprint.clone()),
+        }
     }
 
-    pub fn set_mobile_access_info(&self, info: MobileAccessInfo, ca_path: PathBuf) {
-        self.node.write().mobile_addresses = info.secure_urls.clone();
-        *self.mobile_access.write() = info;
-        *self.mobile_ca_path.write() = Some(ca_path);
+    pub fn set_mobile_ca(&self, path: PathBuf, fingerprint: String) {
+        *self.mobile_ca.write() = Some(MobileCa { path, fingerprint });
     }
 
     pub fn mobile_ca_path(&self) -> Option<PathBuf> {
-        self.mobile_ca_path.read().clone()
+        self.mobile_ca.read().as_ref().map(|ca| ca.path.clone())
     }
 
     fn mobile_staging_root(&self) -> PathBuf {
@@ -395,29 +404,23 @@ impl NodeRuntime {
         matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
     }
 
-    pub fn update_addresses(&self) {
-        let port = self.node.read().port;
-        let listening_addresses = self.listening_addresses.read().clone();
-        let addresses = network_addresses_for_bound(
-            port,
-            &currently_available_bound_addresses(listening_addresses.as_deref().unwrap_or(&[])),
-        );
-        self.node.write().addresses = addresses;
-    }
-
-    pub fn set_listening_addresses(&self, addresses: Vec<Ipv4Addr>) {
-        let mut addresses = addresses
-            .into_iter()
-            .filter(|address| is_local_network_ipv4(*address))
-            .collect::<Vec<_>>();
-        addresses.sort();
-        addresses.dedup();
-        if addresses.is_empty() {
-            addresses.push(Ipv4Addr::LOCALHOST);
-        }
-        let port = self.node.read().port;
-        *self.listening_addresses.write() = Some(addresses.clone());
-        self.node.write().addresses = network_addresses_for_bound(port, &addresses);
+    pub fn set_listening_addresses(
+        &self,
+        http: &BTreeSet<Ipv4Addr>,
+        https: impl Iterator<Item = Ipv4Addr>,
+        https_port: u16,
+    ) {
+        let mut node = self.node.write();
+        node.addresses = network_addresses_for_bound(node.port, http);
+        node.mobile_addresses = https
+            .filter(|ip| http.contains(ip) && is_network_ipv4(*ip))
+            .map(|ip| AddressInfo {
+                address: ip.to_string(),
+                url: format!("https://{ip}:{https_port}"),
+                label: ip.to_string(),
+                kind: "mobile_https".to_string(),
+            })
+            .collect();
     }
 
     pub fn publish_event(&self, message: WireMessage) {
@@ -2482,150 +2485,70 @@ fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
     (u32::from(address) & 0xffc00000) == 0x64400000
 }
 
-fn is_local_network_ipv4(address: Ipv4Addr) -> bool {
-    address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || is_tailscale_ipv4(address)
+fn is_network_ipv4(address: Ipv4Addr) -> bool {
+    address.is_private() || address.is_link_local() || is_tailscale_ipv4(address)
 }
 
-fn network_addresses_for_bound(port: u16, bound: &[Ipv4Addr]) -> Vec<AddressInfo> {
-    let interface_names = get_if_addrs::get_if_addrs()
-        .map(|interfaces| {
-            interfaces
-                .into_iter()
-                .filter_map(|interface| match interface.ip() {
-                    IpAddr::V4(address) => Some((address, interface.name)),
-                    IpAddr::V6(_) => None,
-                })
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
+fn network_addresses_for_bound(port: u16, bound: &BTreeSet<Ipv4Addr>) -> Vec<AddressInfo> {
     let mut addresses = bound
         .iter()
         .copied()
-        .filter(|address| is_local_network_ipv4(*address))
+        .filter(|address| is_network_ipv4(*address))
         .map(|address| {
-            let address_text = address.to_string();
-            let kind = if address.is_loopback() {
-                "loopback"
-            } else if is_tailscale_ipv4(address) {
+            let kind = if is_tailscale_ipv4(address) {
                 "tailscale"
             } else if address.is_private() {
                 "lan"
             } else {
                 "network"
             };
-            let label = if address.is_loopback() {
-                format!("本机 · {address_text}")
-            } else {
-                format!(
-                    "{} · {address_text}",
-                    interface_names
-                        .get(&address)
-                        .map(String::as_str)
-                        .unwrap_or("network")
-                )
-            };
             AddressInfo {
-                address: address_text.clone(),
-                url: format!("http://{address_text}:{port}"),
-                label,
+                address: address.to_string(),
+                url: format!("http://{address}:{port}"),
+                label: address.to_string(),
                 kind: kind.to_string(),
             }
         })
         .collect::<Vec<_>>();
-    addresses.sort_by(|left, right| {
-        let rank = |kind: &str| match kind {
-            "lan" => 0,
-            "tailscale" => 1,
-            "network" => 2,
-            _ => 3,
-        };
-        rank(&left.kind)
-            .cmp(&rank(&right.kind))
-            .then(left.address.cmp(&right.address))
+    addresses.sort_by_key(|address| match address.kind.as_str() {
+        "lan" => 0,
+        "tailscale" => 1,
+        _ => 2,
     });
-    addresses.dedup_by(|left, right| left.address == right.address);
-    if addresses.is_empty() {
-        addresses.push(AddressInfo {
-            address: Ipv4Addr::LOCALHOST.to_string(),
-            url: format!("http://127.0.0.1:{port}"),
-            label: "本机 · 127.0.0.1".to_string(),
-            kind: "loopback".to_string(),
-        });
-    }
     addresses
 }
 
-fn currently_available_bound_addresses(bound: &[Ipv4Addr]) -> Vec<Ipv4Addr> {
-    let available = get_if_addrs::get_if_addrs().ok().map(|interfaces| {
-        interfaces
-            .into_iter()
-            .filter_map(|interface| match interface.ip() {
-                IpAddr::V4(address) => Some(address),
-                IpAddr::V6(_) => None,
-            })
-            .collect::<HashSet<_>>()
-    });
-    currently_available_bound_addresses_from(bound, available.as_ref())
-}
-
-fn currently_available_bound_addresses_from(
-    bound: &[Ipv4Addr],
-    available: Option<&HashSet<Ipv4Addr>>,
-) -> Vec<Ipv4Addr> {
-    let Some(available) = available else {
-        // Do not keep advertising an interface whose current state cannot be
-        // verified. The listener may remain alive briefly after an interface
-        // change, but publishing only loopback keeps NodeInfo and mDNS
-        // conservative until the next successful interface scan.
-        return vec![Ipv4Addr::LOCALHOST];
-    };
-    let mut addresses = bound
-        .iter()
-        .copied()
-        .filter(|address| address.is_loopback() || available.contains(address))
-        .collect::<Vec<_>>();
-    addresses.sort();
-    addresses.dedup();
-    if addresses.is_empty() {
-        addresses.push(Ipv4Addr::LOCALHOST);
-    }
-    addresses
-}
-
-pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
-    let mut addresses = vec![std::net::Ipv4Addr::LOCALHOST];
-    if let Ok(interfaces) = get_if_addrs::get_if_addrs() {
-        for interface in interfaces {
-            let IpAddr::V4(address) = interface.ip() else {
-                continue;
-            };
-            let value = u32::from(address);
-            let tailscale = (value & 0xffc00000) == 0x64400000;
-            if address.is_private() || address.is_link_local() || tailscale {
-                addresses.push(address);
-            }
+pub fn bind_addresses() -> BTreeSet<Ipv4Addr> {
+    let mut addresses = BTreeSet::from([Ipv4Addr::LOCALHOST]);
+    match get_if_addrs::get_if_addrs() {
+        Ok(interfaces) => {
+            addresses.extend(
+                interfaces
+                    .into_iter()
+                    .filter_map(|interface| match interface.ip() {
+                        IpAddr::V4(address) if is_network_ipv4(address) => Some(address),
+                        _ => None,
+                    }),
+            )
         }
+        Err(error) => eprintln!("读取本机网卡失败：{error}"),
     }
-    addresses.sort();
-    addresses.dedup();
     addresses
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_addresses, currently_available_bound_addresses_from, load_or_create_config,
-        network_addresses_for_bound, NodeRuntime, UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE,
-        MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACTIVITY_TIMEOUT_MS,
+        bind_addresses, load_or_create_config, network_addresses_for_bound, NodeRuntime,
+        UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS,
+        TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
         PeerInfo, ReceiveMode, TransferItem, TransferOffer, TransferStatus, WireMessage,
         MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_SYSTEM_CAPABILITY,
     };
+    use std::net::Ipv4Addr;
     use std::path::PathBuf;
     use tokio::sync::mpsc;
     use uuid::Uuid;
@@ -2655,24 +2578,25 @@ mod tests {
     }
 
     #[test]
-    fn bound_addresses_exclude_public_addresses_and_prefer_lan() {
-        let addresses = network_addresses_for_bound(
-            37880,
-            &[
-                std::net::Ipv4Addr::LOCALHOST,
-                std::net::Ipv4Addr::new(192, 168, 1, 10),
-                std::net::Ipv4Addr::new(100, 64, 0, 2),
-                std::net::Ipv4Addr::new(8, 8, 8, 8),
-            ],
+    fn bound_addresses_publish_only_network_ipv4_in_access_order() {
+        let bound = [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::new(127, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 10),
+            Ipv4Addr::new(100, 64, 0, 2),
+            Ipv4Addr::new(169, 254, 2, 3),
+            Ipv4Addr::new(8, 8, 8, 8),
+        ]
+        .into_iter()
+        .collect();
+        let addresses = network_addresses_for_bound(37880, &bound);
+        assert_eq!(
+            addresses
+                .iter()
+                .map(|address| address.address.as_str())
+                .collect::<Vec<_>>(),
+            ["192.168.1.10", "100.64.0.2", "169.254.2.3"]
         );
-        assert_eq!(addresses[0].address, "192.168.1.10");
-        assert!(addresses.iter().all(|address| address.address != "8.8.8.8"));
-        assert!(addresses
-            .iter()
-            .any(|address| address.address == "127.0.0.1"));
-        assert!(addresses
-            .iter()
-            .any(|address| address.address == "100.64.0.2"));
     }
 
     #[test]
@@ -2698,18 +2622,6 @@ mod tests {
                 address
             );
         }
-    }
-
-    #[test]
-    fn address_publication_hides_non_loopback_when_interfaces_cannot_be_read() {
-        let bound = [
-            std::net::Ipv4Addr::LOCALHOST,
-            std::net::Ipv4Addr::new(192, 168, 1, 10),
-        ];
-        assert_eq!(
-            currently_available_bound_addresses_from(&bound, None),
-            vec![std::net::Ipv4Addr::LOCALHOST]
-        );
     }
 
     fn mobile_offer(runtime: &NodeRuntime, transfer_id: &str, total_bytes: u64) -> TransferOffer {

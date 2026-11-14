@@ -27,21 +27,17 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                 return;
             };
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                let event = match receiver.recv_timeout(Duration::from_secs(1)) {
-                    Ok(event) => event,
-                    Err(_) => {
-                        runtime.update_addresses();
-                        let current_node = runtime.node_info();
-                        let current_address = service_address(&current_node);
-                        if current_address != registered_address {
-                            let fullname = format!("{}{}", current_node.node_id, SERVICE_TYPE);
-                            let _ = daemon.unregister(&fullname);
-                            registered_address = register_service(&daemon, &current_node);
-                        }
-                        continue;
+                let event = receiver.recv_timeout(Duration::from_secs(1));
+                let current_node = runtime.node_info();
+                let current_address = service_address(&current_node);
+                if current_address != registered_address {
+                    if registered_address.is_some() {
+                        let fullname = format!("{}{}", current_node.node_id, SERVICE_TYPE);
+                        let _ = daemon.unregister(&fullname);
                     }
-                };
-                if let ServiceEvent::ServiceResolved(info) = event {
+                    registered_address = register_service(&daemon, &current_node);
+                }
+                if let Ok(ServiceEvent::ServiceResolved(info)) = event {
                     let properties = info.get_properties();
                     let Some(node_id) = properties.iter().find_map(|item| {
                         (item.key() == "node_id").then(|| item.val_str().to_string())
@@ -86,8 +82,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
 
 fn service_address(node: &NodeInfo) -> Option<String> {
     node.addresses
-        .iter()
-        .find(|address| address.kind != "loopback")
+        .first()
         .map(|address| address.address.clone())
 }
 

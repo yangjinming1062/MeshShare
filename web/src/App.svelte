@@ -5,9 +5,9 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileAccess, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
+  import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
@@ -28,8 +28,9 @@
   let clipboardDraft = '';
   let status = '正在连接…';
   let statusKind: 'ok' | 'warn' | 'error' = 'warn';
+  let mobileAddresses: AddressInfo[] = [];
   let selectedAddress = '';
-  let qrData = '';
+  let mobileQr: { url: string; image: string } | null = null;
   let syncEnabled = true;
   let autostartEnabled = true;
   let autostartAvailable = false;
@@ -40,7 +41,6 @@
   let updateBusy = false;
   let receiveSettings: ReceiveSettings = { mode: 'confirm' };
   let receiveSettingsBusy = false;
-  let mobileAccess: MobileAccessInfo | null = null;
   let ws: WebSocket | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
@@ -67,8 +67,10 @@
   let mobileReceiveDirectoryName = '';
   let pageStopped = false;
 
-  $: selectedUrl = selectedAddress || node?.addresses[0]?.url || '';
-  let mobileUrl = '';
+  $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
+  $: mobileUrl = mobileAddress ? `${mobileAddress.url}/mobile` : '';
+  $: secureMobileUrl = node?.mobile_addresses?.find((address) => address.address === mobileAddress?.address)?.url;
+  $: if (!isMobile && !isMonitor) void refreshQr(mobileUrl);
   $: mobileTargets = node ? [{
     node_id: node.node_id,
     node_name: node.node_name,
@@ -151,7 +153,6 @@
           receiveSettings = await invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings);
           clipboardStatus = await invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus);
         }
-        if (!isMonitor) mobileAccess = await getMobileAccess().catch(() => null);
         await refresh();
         if (isDesktopWindow) {
           syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
@@ -254,10 +255,12 @@
       selectedMetricsPeer = peers.find((peer) => peer.node_id === selectedMetricsPeer?.node_id) ?? null;
     }
     if (clipboard && document.activeElement?.id !== 'clipboard-editor') clipboardDraft = clipboard.text ?? '';
-    if (!selectedAddress || !nextNode.addresses.some((address) => address.url === selectedAddress)) selectedAddress = nextNode.addresses[0]?.url ?? '';
+    mobileAddresses = nextNode.addresses.filter((address) => !address.address.startsWith('127.'));
+    if (!mobileAddresses.some((address) => address.url === selectedAddress)) {
+      selectedAddress = mobileAddresses[0]?.url ?? '';
+    }
     status = '节点在线';
     statusKind = 'ok';
-    if (!isMonitor) await refreshQr();
   }
 
   async function ensureMobileSession() {
@@ -347,16 +350,15 @@
     }
   }
 
-  async function refreshQr() {
-    mobileAccess = await getMobileAccess().catch(() => mobileAccess);
-    const addresses = mobileAccess?.bootstrap_urls?.length ? mobileAccess.bootstrap_urls : (node?.addresses ?? []);
-    const address = addresses.find((candidate) => candidate.url === selectedAddress) ?? addresses[0];
-    mobileUrl = address ? `${address.url}/mobile` : '';
-    if (!mobileUrl) {
-      qrData = '';
-      return;
+  async function refreshQr(url: string): Promise<void> {
+    if (!url) return;
+    try {
+      const image = await QRCode.toDataURL(url, { width: 192, margin: 1, color: { dark: '#111827', light: '#ffffff' } });
+      if (url === mobileUrl) mobileQr = { url, image };
+    } catch (error) {
+      console.error('生成手机访问二维码失败', error);
+      if (url === mobileUrl) mobileQr = { url, image: '' };
     }
-    qrData = await QRCode.toDataURL(mobileUrl, { width: 192, margin: 1, color: { dark: '#111827', light: '#ffffff' } });
   }
 
   async function getMobileTransfersWithRecovery(): Promise<MobileTransferView[]> {
@@ -693,22 +695,12 @@
   }
 
   function targetBase(peer: PeerInfo): string | null {
-    if (isMobile && window.location.protocol === 'https:') {
+    if (isMobile) {
       if (peer.node_id === node?.node_id) return window.location.origin;
-      return `${window.location.origin}/api/v1/mobile/peers/${encodeURIComponent(peer.node_id)}`;
+      if (window.location.protocol === 'https:') return `${window.location.origin}/api/v1/mobile/peers/${encodeURIComponent(peer.node_id)}`;
     }
     const url = peer.addresses.find((address) => address.kind === 'lan')?.url ?? peer.addresses[0]?.url;
     return url ?? (peer.endpoint ? peer.endpoint.replace(/\/api\/v1\/ws$/, '') : null);
-  }
-
-  function mobileAccessUrl(value: string) {
-    return /^https?:\/\//i.test(value) ? value : apiUrl(value);
-  }
-
-  function selectedSecureMobileUrl() {
-    const selected = node?.addresses.find((address) => address.url === selectedAddress)?.address;
-    const candidates = mobileAccess?.secure_urls ?? [];
-    return selected ? (candidates.find((address) => address.address === selected)?.url ?? '') : '';
   }
 
   async function createItem(file: File, index: number): Promise<TransferItem> {
@@ -1286,11 +1278,32 @@
           <div class="hero-stats"><div><b>{peers.length}</b><span>在线设备</span></div><div><b>{node?.platform ?? '—'}</b><span>运行平台</span></div><div><b>{node?.port ?? '—'}</b><span>服务端口</span></div></div>
         </div>
         <div class="panel access-panel">
-          <div class="panel-heading"><div><div class="section-kicker">MOBILE ACCESS</div><h2>手机扫码访问</h2></div><span class="muted">无需复制地址</span></div>
-          <div class="access-content">
-            {#if qrData}<img class="qr" src={qrData} alt="手机访问二维码" />{:else}<div class="qr-placeholder">二维码生成中</div>{/if}
-            <div class="access-copy"><label for="address-select">选择访问地址</label><select id="address-select" bind:value={selectedAddress} on:change={refreshQr}>{#each node?.addresses ?? [] as address}<option value={address.url}>{address.label}</option>{/each}</select><code>{mobileUrl || '等待服务启动…'}</code><p>让手机连接同一网络后扫描二维码。</p>{#if selectedSecureMobileUrl()}<p>手机接收文件前请先安装 <a class="ca-link" href={mobileAccessUrl(mobileAccess?.ca_url ?? '')} target="_blank" rel="noreferrer">本节点 CA 证书</a>，再打开 HTTPS 地址。</p><code>{`${selectedSecureMobileUrl()}/mobile`}</code>{/if}</div>
-          </div>
+          <div class="panel-heading"><div><div class="section-kicker">MOBILE ACCESS</div><h2>手机扫码访问</h2></div>{#if mobileAddress}<span class="muted">无需复制地址</span>{/if}</div>
+          {#if mobileAddress}
+            <div class="access-content">
+              {#if mobileQr?.url === mobileUrl && mobileQr.image}
+                <img class="qr" src={mobileQr.image} alt="手机访问二维码" />
+              {:else}
+                <div class="qr-placeholder">{mobileQr?.url === mobileUrl ? '二维码生成失败' : '二维码生成中'}</div>
+              {/if}
+              <div class="access-copy">
+                <label for="address-select">选择访问地址</label>
+                <select id="address-select" value={mobileAddress.url} on:change={(event) => selectedAddress = event.currentTarget.value}>
+                  {#each mobileAddresses as address (address.url)}
+                    <option value={address.url}>{address.address}</option>
+                  {/each}
+                </select>
+                <code>{mobileUrl}</code>
+                <p>让手机连接同一网络后扫描二维码。</p>
+                {#if secureMobileUrl}
+                  <p>手机接收文件前请先安装 <a class="ca-link" href={apiUrl('/api/v1/mobile/ca', mobileAddress.url)} target="_blank" rel="noreferrer">本节点 CA 证书</a>，再打开 HTTPS 地址。</p>
+                  <code>{`${secureMobileUrl}/mobile`}</code>
+                {/if}
+              </div>
+            </div>
+          {:else}
+            <div class="empty-state compact" role="status">{node ? '暂无可用的网络地址。连接局域网或 Tailscale 后会自动更新。' : '正在读取网络地址…'}</div>
+          {/if}
         </div>
       </section>
 

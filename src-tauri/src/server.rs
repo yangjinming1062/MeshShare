@@ -247,7 +247,6 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
 }
 
 async fn info(State(state): State<AppState>) -> Json<NodeInfo> {
-    state.runtime.update_addresses();
     Json(state.runtime.node_info())
 }
 

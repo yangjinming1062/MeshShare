@@ -183,13 +183,6 @@ export type MobileTransferView = {
   downloaded_item_ids?: string[];
 };
 
-export type MobileAccessInfo = {
-  bootstrap_urls: AddressInfo[];
-  secure_urls: AddressInfo[];
-  ca_url: string;
-  ca_fingerprint: string;
-};
-
 export type WireMessage =
   | { type: 'Hello'; payload: { node: NodeInfo } }
   | { type: 'Ping'; payload: { at_ms: number } }
