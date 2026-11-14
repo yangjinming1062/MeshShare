@@ -83,12 +83,12 @@ fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilit
 fn monitor_backend<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> MonitorBackend {
     #[cfg(target_os = "linux")]
     {
-        return match window.display_handle().ok().map(|handle| handle.as_raw()) {
+        match window.display_handle().ok().map(|handle| handle.as_raw()) {
             Some(RawDisplayHandle::Wayland(_)) => MonitorBackend::Wayland,
             Some(RawDisplayHandle::Xlib(_)) | Some(RawDisplayHandle::Xcb(_)) => MonitorBackend::X11,
             Some(_) => MonitorBackend::Other,
             None => MonitorBackend::Unknown,
-        };
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
