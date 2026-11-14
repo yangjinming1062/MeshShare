@@ -896,11 +896,20 @@ async fn cleanup_mobile_staging_directory(directory: &Path) {
     }
 }
 
-async fn remove_file_with_diagnostics(path: &Path) {
-    if let Err(error) = fs::remove_file(path).await {
-        if error.kind() != std::io::ErrorKind::NotFound {
+async fn remove_file_with_diagnostics(path: &Path) -> bool {
+    match fs::remove_file(path).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
             eprintln!("清理临时文件失败 {}：{error}", path.display());
+            false
         }
+    }
+}
+
+async fn remove_tracked_temp_file(runtime: &Arc<NodeRuntime>, path: &Path) {
+    if remove_file_with_diagnostics(path).await {
+        runtime.unregister_desktop_temp_file(path);
     }
 }
 
@@ -1077,12 +1086,22 @@ async fn upload_mobile_item(
         .begin_mobile_upload(&transfer_id)
         .ok_or_else(|| ApiError::conflict("手机传输已结束"))?;
     let temp = target.with_extension(format!("meshshare-{}.part", uuid::Uuid::new_v4()));
-    let mut file = fs::OpenOptions::new()
+    let mut file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let message = format!("无法创建手机临时文件：{error}");
+            let _ = state
+                .runtime
+                .fail_mobile_transfer(&transfer_id, message.clone());
+            cleanup_mobile_staging_directory(&record.staged_directory).await;
+            return Err(ApiError::internal(message));
+        }
+    };
     let mut stream = body.into_data_stream();
     let mut hasher = Sha256::new();
     let mut total = 0u64;
@@ -1418,12 +1437,41 @@ async fn upload_item(
         .runtime
         .publish_event(WireMessage::TransferProgress { progress });
     let temp = target.with_extension(format!("meshshare-{}.part", uuid::Uuid::new_v4()));
-    let mut file = fs::OpenOptions::new()
+    if let Err(error) = state.runtime.register_desktop_temp_file(&temp) {
+        let message = format!("无法登记桌面临时文件：{error}");
+        if let Some(progress) =
+            state
+                .runtime
+                .fail_transfer(&transfer_id, message.clone(), TransferStatus::Failed)
+        {
+            state
+                .runtime
+                .publish_event(WireMessage::TransferProgress { progress });
+        }
+        return Err(ApiError::internal(message));
+    }
+    let mut file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    {
+        Ok(file) => file,
+        Err(error) => {
+            state.runtime.unregister_desktop_temp_file(&temp);
+            let message = format!("无法创建桌面临时文件：{error}");
+            if let Some(progress) =
+                state
+                    .runtime
+                    .fail_transfer(&transfer_id, message.clone(), TransferStatus::Failed)
+            {
+                state
+                    .runtime
+                    .publish_event(WireMessage::TransferProgress { progress });
+            }
+            return Err(ApiError::internal(message));
+        }
+    };
     let mut stream = body.into_data_stream();
     let mut hasher = Sha256::new();
     let mut total = 0u64;
@@ -1456,12 +1504,12 @@ async fn upload_item(
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
-            remove_file_with_diagnostics(&temp).await;
+            remove_tracked_temp_file(&state.runtime, &temp).await;
             return Err(error);
         }
     };
     if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
-        remove_file_with_diagnostics(&temp).await;
+        remove_tracked_temp_file(&state.runtime, &temp).await;
         let message = "文件校验失败".to_string();
         let progress = state
             .runtime
@@ -1475,16 +1523,16 @@ async fn upload_item(
     let target = match prepare_target(&destination, &item.relative_path).await {
         Ok(target) => target,
         Err(error) => {
-            remove_file_with_diagnostics(&temp).await;
+            remove_tracked_temp_file(&state.runtime, &temp).await;
             return Err(error);
         }
     };
     if !state.runtime.transfer_upload_active(&transfer_id) {
-        remove_file_with_diagnostics(&temp).await;
+        remove_tracked_temp_file(&state.runtime, &temp).await;
         return Err(ApiError::conflict("传输已取消"));
     }
     if let Err(error) = fs::hard_link(&temp, &target).await {
-        remove_file_with_diagnostics(&temp).await;
+        remove_tracked_temp_file(&state.runtime, &temp).await;
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             return Err(ApiError::conflict(format!(
                 "目标已存在：{}",
@@ -1493,7 +1541,7 @@ async fn upload_item(
         }
         return Err(ApiError::internal(error.to_string()));
     }
-    remove_file_with_diagnostics(&temp).await;
+    remove_tracked_temp_file(&state.runtime, &temp).await;
     let Some(progress) = state
         .runtime
         .mark_item_received(&transfer_id, &item_id, total)
@@ -2296,6 +2344,12 @@ mod tests {
                 .next()
                 .is_none(),
             "checksum failure must remove partial files"
+        );
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("desktop-transfer-temp-files.json"))
+                .expect("read desktop temp registry")
+                .trim(),
+            "[]"
         );
         runtime
             .stopping

@@ -118,6 +118,7 @@ pub struct NodeRuntime {
     pending_clipboard_resync: Mutex<HashSet<String>>,
     connecting_peers: Mutex<HashSet<String>>,
     transfer_locks: Mutex<HashSet<(String, String)>>,
+    desktop_temp_files: Mutex<HashSet<PathBuf>>,
     pub events: broadcast::Sender<WireMessage>,
     pub sync_enabled: AtomicBool,
     pub stopping: AtomicBool,
@@ -147,6 +148,8 @@ const TRANSFER_ACTIVITY_TIMEOUT_MS: i64 = 5 * 60 * 1000;
 const MAX_TERMINAL_TRANSFERS: usize = 256;
 const MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION: usize = 128;
 const MAX_SEEN_CLIPBOARD_EVENTS: usize = 4_096;
+const DESKTOP_TEMP_REGISTRY_FILE: &str = "desktop-transfer-temp-files.json";
+const MAX_DESKTOP_TEMP_FILES: usize = 512;
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     MobileTransferView {
@@ -182,6 +185,7 @@ impl NodeRuntime {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
+        let desktop_temp_files = load_and_cleanup_desktop_temp_files(&data_dir)?;
         let config = load_or_create_config(&data_dir)?;
         let addresses = network_addresses_for_bound(port, &[Ipv4Addr::LOCALHOST]);
         let node = NodeInfo {
@@ -224,6 +228,7 @@ impl NodeRuntime {
             pending_clipboard_resync: Mutex::new(HashSet::new()),
             connecting_peers: Mutex::new(HashSet::new()),
             transfer_locks: Mutex::new(HashSet::new()),
+            desktop_temp_files: Mutex::new(desktop_temp_files),
             events,
             sync_enabled: AtomicBool::new(true),
             stopping: AtomicBool::new(false),
@@ -1030,6 +1035,34 @@ impl NodeRuntime {
             .remove(&(transfer_id.to_string(), item_id.to_string()));
     }
 
+    pub fn register_desktop_temp_file(&self, path: &Path) -> anyhow::Result<()> {
+        if !is_desktop_temp_file_path(path) {
+            return Err(anyhow::anyhow!("桌面临时文件路径无效"));
+        }
+        let mut files = self.desktop_temp_files.lock();
+        if files.contains(path) {
+            return Ok(());
+        }
+        if files.len() >= MAX_DESKTOP_TEMP_FILES {
+            return Err(anyhow::anyhow!("桌面临时文件登记数量已达到上限"));
+        }
+        let mut next = files.clone();
+        next.insert(path.to_path_buf());
+        persist_desktop_temp_files(&self.data_dir, &next)?;
+        *files = next;
+        Ok(())
+    }
+
+    pub fn unregister_desktop_temp_file(&self, path: &Path) {
+        let mut files = self.desktop_temp_files.lock();
+        if !files.remove(path) {
+            return;
+        }
+        if let Err(error) = persist_desktop_temp_files(&self.data_dir, &files) {
+            eprintln!("保存桌面临时文件登记失败：{error}");
+        }
+    }
+
     pub fn transfer_upload_active(&self, transfer_id: &str) -> bool {
         self.transfers
             .read()
@@ -1528,6 +1561,103 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
     Ok(config)
 }
 
+fn desktop_temp_registry_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(DESKTOP_TEMP_REGISTRY_FILE)
+}
+
+fn is_desktop_temp_file_path(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    name.contains(".meshshare-") && name.ends_with(".part")
+}
+
+fn load_and_cleanup_desktop_temp_files(data_dir: &Path) -> anyhow::Result<HashSet<PathBuf>> {
+    let registry_path = desktop_temp_registry_path(data_dir);
+    let contents = match std::fs::read(&registry_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let registered = if contents.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_slice::<Vec<PathBuf>>(&contents)
+            .map_err(|error| anyhow::anyhow!("桌面临时文件登记损坏：{error}"))?
+    };
+    if registered.len() > MAX_DESKTOP_TEMP_FILES {
+        return Err(anyhow::anyhow!("桌面临时文件登记超过数量上限"));
+    }
+    let mut remaining = HashSet::new();
+    for path in registered {
+        if !is_desktop_temp_file_path(&path) {
+            eprintln!("忽略无效的桌面临时文件登记：{}", path.display());
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!("读取桌面临时文件失败 {}：{error}", path.display());
+                remaining.insert(path);
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            eprintln!("跳过非普通桌面临时文件：{}", path.display());
+            remaining.insert(path);
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) => {
+                eprintln!("清理桌面临时文件失败 {}：{error}", path.display());
+                remaining.insert(path);
+            }
+        }
+    }
+    persist_desktop_temp_files(data_dir, &remaining)?;
+    Ok(remaining)
+}
+
+fn persist_desktop_temp_files(data_dir: &Path, files: &HashSet<PathBuf>) -> anyhow::Result<()> {
+    let path = desktop_temp_registry_path(data_dir);
+    let temporary = data_dir.join(format!(
+        "{DESKTOP_TEMP_REGISTRY_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    let mut entries = files.iter().cloned().collect::<Vec<_>>();
+    entries.sort();
+    std::fs::write(&temporary, serde_json::to_vec_pretty(&entries)?)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                std::fs::rename(&temporary, &path)?;
+            } else {
+                return Err(error.into());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            if let Err(cleanup_error) = std::fs::remove_file(&temporary) {
+                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "清理桌面临时文件登记临时文件失败 {}：{cleanup_error}",
+                        temporary.display()
+                    );
+                }
+            }
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
 fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<()> {
     let path = data_dir.join("node.json");
     let temporary = data_dir.join(format!("node.json.tmp-{}", std::process::id()));
@@ -1698,7 +1828,8 @@ pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
 mod tests {
     use super::{
         bind_addresses, currently_available_bound_addresses_from, load_or_create_config,
-        network_addresses_for_bound, NodeRuntime, UpdateFrequency, TRANSFER_ACTIVITY_TIMEOUT_MS,
+        network_addresses_for_bound, NodeRuntime, UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE,
+        TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
@@ -2233,6 +2364,29 @@ mod tests {
         let _runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
         assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn startup_removes_registered_desktop_temp_files() {
+        let path = temp_data_dir();
+        let received = path.join("received");
+        std::fs::create_dir_all(&received).expect("create received directory");
+        let temp = received.join("payload.meshshare-test.part");
+        std::fs::write(&temp, b"stale").expect("write desktop temp file");
+        {
+            let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+                .expect("create runtime");
+            runtime
+                .register_desktop_temp_file(&temp)
+                .expect("register desktop temp file");
+        }
+        let _restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert!(!temp.exists());
+        let registry = std::fs::read_to_string(path.join(DESKTOP_TEMP_REGISTRY_FILE))
+            .expect("read desktop temp registry");
+        assert_eq!(registry.trim(), "[]");
         let _ = std::fs::remove_dir_all(path);
     }
 
