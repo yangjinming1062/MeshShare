@@ -49,6 +49,8 @@ npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-updater.key
 ```
 
+将私钥文件中的完整单行 base64 值原样保存到 `TAURI_SIGNING_PRIVATE_KEY`，不要填写文件路径、密码、URL 编码值（例如 `%2B` 或 `%0A`）、引号或命令输出；密码单独保存到 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会在跨平台构建前检查该值的 base64 和 Tauri/minisign 私钥格式。若私钥丢失，必须重新生成密钥并同步更新 `src-tauri/tauri.conf.json` 中的公钥，已发布版本不会接受新公钥。
+
 Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 合并成 `latest.json`。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在清单、签名和所有安装包都上传后才解除 Release 草稿状态。
 
 开发构建不会执行 GitHub 更新检查。

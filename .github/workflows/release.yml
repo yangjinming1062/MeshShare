@@ -71,6 +71,14 @@ jobs:
             exit 1
           fi
           printf '{"version":"%s"}\n' "${GITHUB_REF_NAME#v}" > release-version.json
+      - name: Validate updater signing key
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            python .github/scripts/validate_updater_key.py
+          else
+            python3 .github/scripts/validate_updater_key.py
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
@@ -86,13 +94,6 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-features --locked
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version '2.12.4' --locked
-      - name: Require updater signing key
-        shell: bash
-        run: |
-          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not configured"
-            exit 1
-          fi
       - name: Build application
         run: cargo tauri build --config release-version.json -- --locked
       - name: Name macOS updater artifacts by architecture
