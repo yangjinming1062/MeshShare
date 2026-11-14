@@ -39,7 +39,7 @@ npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 
 开发模式和调试构建不会自动写入系统登录启动项，避免把调试可执行文件注册为正式启动入口；调试界面也不显示不可用的自启动开关。开机自启动需要在正式桌面安装包中验证：首次启动应默认注册，登录后主窗口保持隐藏并可从托盘打开，重复打开应用只激活已有窗口。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
 
-推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包，核对 GitHub Release 的附件完整后自动发布。普通分支推送和 Pull Request 的检查在本地运行。
+推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包，核对 GitHub Release 的附件完整后发布为 prerelease。普通分支推送和 Pull Request 的检查在本地运行。
 
 ### 自动更新发布
 
@@ -51,7 +51,7 @@ npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-upda
 
 将私钥文件中的完整单行 base64 值原样保存到 `TAURI_SIGNING_PRIVATE_KEY`，不要填写文件路径、密码、URL 编码值（例如 `%2B` 或 `%0A`）、引号或命令输出；密码单独保存到 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会在跨平台构建前检查该值的 base64 和 Tauri/minisign 私钥格式。若私钥丢失，必须重新生成密钥并同步更新 `src-tauri/tauri.conf.json` 中的公钥，已发布版本不会接受新公钥。
 
-Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 合并成 `latest.json`。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在清单、签名和所有安装包都上传后才解除 Release 草稿状态。
+Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 合并成 `latest.json`。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在清单、签名和所有安装包都上传后才解除 Release 草稿状态，并保持 prerelease 标记；人工验证安装包后，在 GitHub Release 页面取消 prerelease 标记，版本才会进入 `releases/latest` 并允许客户端自动更新。已人工晋级为稳定版的 Release 不会被工作流重跑覆盖。
 
 开发构建不会执行 GitHub 更新检查。
 

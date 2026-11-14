@@ -142,7 +142,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: release-notes
-      - name: Publish verified installers
+      - name: Publish verified prerelease installers
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -189,20 +189,22 @@ jobs:
             --json tagName,isDraft,isPrerelease \
             --jq ".[] | select(.tagName == \"$GITHUB_REF_NAME\") | [.tagName, .isDraft, .isPrerelease] | @tsv")
           if (( ${#matching_releases[@]} > 1 )); then
-            echo "::error::Multiple releases for $GITHUB_REF_NAME. Resolve the duplicate drafts before retrying."
+            echo "::error::Multiple releases for $GITHUB_REF_NAME. Resolve the duplicate releases before retrying."
             printf '%s\n' "${matching_releases[@]}"
             exit 1
           fi
           if (( ${#matching_releases[@]} == 1 )); then
             release_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json databaseId --jq '.databaseId')
+            release_state=$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json isDraft,isPrerelease --jq '[.isDraft, .isPrerelease] | @tsv')
+            IFS=$'\t' read -r is_draft is_prerelease <<< "$release_state"
+            if [[ "$is_draft" != "true" && "$is_prerelease" != "true" ]]; then
+              echo "::error::Release $GITHUB_REF_NAME is already stable; refusing to overwrite its manual promotion"
+              exit 1
+            fi
           else
-            gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft --prerelease \
               --repo "$GH_REPO" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
             release_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json databaseId --jq '.databaseId')
-          fi
-          if [[ "$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')" == "true" ]]; then
-            echo "::error::Updater releases must be stable releases, not prereleases"
-            exit 1
           fi
 
           assets_url="repos/$GH_REPO/releases/$release_id/assets?per_page=100"
@@ -237,4 +239,5 @@ jobs:
             echo "::error::Release assets do not match the installers and updater manifest for $GITHUB_REF_NAME"
             exit 1
           fi
-          gh release edit "$GITHUB_REF_NAME" --repo "$GH_REPO" --notes-file release-notes.md --draft=false
+          gh release edit "$GITHUB_REF_NAME" --repo "$GH_REPO" --notes-file release-notes.md --draft=false --prerelease
+          echo "Published $GITHUB_REF_NAME as a prerelease; promote it manually after validation."
