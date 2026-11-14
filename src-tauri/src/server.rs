@@ -740,7 +740,7 @@ fn validate_node_info(node: &NodeInfo) -> bool {
 }
 
 fn is_valid_png(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x89PNG\r\n\x1a\n") && image::load_from_memory(bytes).is_ok()
+    clipboard::is_valid_png(bytes)
 }
 
 fn is_allowed_advertised_address(address: &AddressInfo) -> bool {

@@ -2,13 +2,16 @@ use crate::model::ClipboardSnapshot;
 use crate::runtime::NodeRuntime;
 use arboard::{Clipboard, ImageData};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use image::{DynamicImage, ImageFormat};
+use image::{DynamicImage, ImageFormat, ImageReader, Limits};
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+const MAX_CLIPBOARD_IMAGE_DIMENSION: u32 = 8_192;
+const MAX_CLIPBOARD_IMAGE_ALLOCATION: u64 = 128 * 1024 * 1024;
 
 pub fn start_monitor(runtime: Arc<NodeRuntime>) {
     thread::Builder::new()
@@ -85,6 +88,20 @@ fn encode_image(image: &ImageData<'_>) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+pub(crate) fn decode_png(bytes: &[u8]) -> Result<DynamicImage, String> {
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), ImageFormat::Png);
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_CLIPBOARD_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_CLIPBOARD_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_CLIPBOARD_IMAGE_ALLOCATION);
+    reader.limits(limits);
+    reader.decode().map_err(|error| error.to_string())
+}
+
+pub(crate) fn is_valid_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n") && decode_png(bytes).is_ok()
+}
+
 pub fn payload_hash(text: Option<&str>, image_png: Option<&[u8]>) -> String {
     let mut hasher = Sha256::new();
     if let Some(text) = text {
@@ -109,9 +126,7 @@ pub fn apply_snapshot(snapshot: &ClipboardSnapshot, runtime: &NodeRuntime) -> Re
     runtime.set_clipboard_suppression(hash);
     let mut clipboard = Clipboard::new().map_err(|error| error.to_string())?;
     if let Some(image_png) = image {
-        let decoded = image::load_from_memory(&image_png)
-            .map_err(|error| error.to_string())?
-            .to_rgba8();
+        let decoded = decode_png(&image_png)?.to_rgba8();
         let image = ImageData {
             width: decoded.width() as usize,
             height: decoded.height() as usize,
@@ -130,7 +145,9 @@ pub fn apply_snapshot(snapshot: &ClipboardSnapshot, runtime: &NodeRuntime) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::payload_hash;
+    use super::{is_valid_png, payload_hash};
+    use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+    use std::io::Cursor;
 
     #[test]
     fn payload_hash_changes_when_text_or_image_changes() {
@@ -138,5 +155,15 @@ mod tests {
         assert_ne!(text_hash, payload_hash(Some("world"), None));
         assert_ne!(text_hash, payload_hash(Some("hello"), Some(&[1, 2, 3])));
         assert_eq!(text_hash, payload_hash(Some("hello"), None));
+    }
+
+    #[test]
+    fn png_validation_rejects_excessive_dimensions() {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(8_193, 1, Rgba([0, 0, 0, 255])));
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .expect("encode png");
+        assert!(!is_valid_png(&bytes));
     }
 }
