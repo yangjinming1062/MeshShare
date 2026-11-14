@@ -11,6 +11,22 @@ use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Networks, RefreshKind, System};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+// 安装版进程没有控制台，外部命令会各自新建控制台窗口，表现为反复闪出终端。
+fn hidden_command(program: &str) -> Command {
+    let command = Command::new(program);
+    #[cfg(target_os = "windows")]
+    let command = {
+        use std::os::windows::process::CommandExt;
+        let mut command = command;
+        command.creation_flags(CREATE_NO_WINDOW);
+        command
+    };
+    command
+}
+
 pub fn start(runtime: Arc<NodeRuntime>) {
     thread::Builder::new()
         .name("meshshare-metrics".to_string())
@@ -178,7 +194,7 @@ fn merge_gpu_metadata(gpus: &mut [GpuMetrics], metadata: &[GpuMetrics]) {
 }
 
 fn probe_nvidia_smi() -> Vec<GpuMetrics> {
-    let output = Command::new("nvidia-smi")
+    let output = hidden_command("nvidia-smi")
         .args([
             "--query-gpu=name,utilization.gpu,memory.used,memory.total",
             "--format=csv,noheader,nounits",
@@ -276,7 +292,7 @@ Write-Output ($fields -join ';')
 // 性能计数器只有适配器 LUID 维度、没有每卡容量，Windows 因此聚合为一条记录。
 #[cfg(target_os = "windows")]
 fn probe_windows_gpus() -> Vec<GpuMetrics> {
-    let output = Command::new("powershell.exe")
+    let output = hidden_command("powershell.exe")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -463,7 +479,7 @@ fn read_text(path: &Path) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn probe_macos_gpus() -> Vec<GpuMetrics> {
-    let output = Command::new("system_profiler")
+    let output = hidden_command("system_profiler")
         .args(["SPDisplaysDataType", "-json"])
         .output();
     let Ok(output) = output else {
