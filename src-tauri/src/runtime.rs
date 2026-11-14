@@ -3,11 +3,11 @@ use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryItem,
     ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSession,
     ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession,
-    MobileTransferView, MonitorDisplayMode, MonitorPosition, NodeInfo, PeerInfo, ReceiveMode,
-    ReceiveSettings, TransferOffer, TransferProgress, TransferStatus, WireMessage,
-    CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, DEFAULT_CLIPBOARD_HISTORY_COUNT,
-    DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS,
-    MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    MobileTransferView, MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings,
+    TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT,
+    CLIPBOARD_TEXT_LIMIT, DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS,
+    MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS, MAX_MOBILE_SESSIONS,
+    MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -21,6 +21,10 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 fn default_autostart_enabled() -> bool {
+    true
+}
+
+fn default_monitor_visible() -> bool {
     true
 }
 
@@ -76,8 +80,8 @@ impl UpdateFrequency {
 struct PersistedConfig {
     node_id: String,
     node_name: String,
-    #[serde(default)]
-    monitor_display: MonitorDisplayMode,
+    #[serde(default = "default_monitor_visible")]
+    monitor_visible: bool,
     #[serde(default)]
     monitor_position: Option<MonitorPosition>,
     #[serde(default)]
@@ -154,7 +158,7 @@ pub struct NodeRuntime {
     pub mobile_transfers: RwLock<HashMap<String, MobileTransferRecord>>,
     mobile_manifest_bytes: AtomicU64,
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
-    pub monitor_display: RwLock<MonitorDisplayMode>,
+    pub monitor_visible: AtomicBool,
     pub monitor_locked: AtomicBool,
     mobile_ca: RwLock<Option<MobileCa>>,
     config: Mutex<PersistedConfig>,
@@ -286,7 +290,7 @@ impl NodeRuntime {
             mobile_transfers: RwLock::new(HashMap::new()),
             mobile_manifest_bytes: AtomicU64::new(0),
             local_metrics: RwLock::new(None),
-            monitor_display: RwLock::new(config.monitor_display.clone()),
+            monitor_visible: AtomicBool::new(config.monitor_visible),
             monitor_locked: AtomicBool::new(config.monitor_locked),
             mobile_ca: RwLock::new(None),
             config: Mutex::new(config),
@@ -657,17 +661,17 @@ impl NodeRuntime {
         *self.local_metrics.write() = Some(metrics);
     }
 
-    pub fn monitor_display_mode(&self) -> MonitorDisplayMode {
-        self.monitor_display.read().clone()
+    pub fn monitor_visible(&self) -> bool {
+        self.monitor_visible.load(Ordering::SeqCst)
     }
 
-    pub fn set_monitor_display_mode(&self, mode: MonitorDisplayMode) -> anyhow::Result<()> {
+    pub fn set_monitor_visible(&self, visible: bool) -> anyhow::Result<()> {
         let mut config = self.config.lock();
         let mut next = config.clone();
-        next.monitor_display = mode.clone();
+        next.monitor_visible = visible;
         persist_config(&self.data_dir, &next)?;
         *config = next;
-        *self.monitor_display.write() = mode;
+        self.monitor_visible.store(visible, Ordering::SeqCst);
         Ok(())
     }
 
@@ -1931,8 +1935,16 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
     let path = data_dir.join("node.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            let mut config = serde_json::from_str::<PersistedConfig>(&contents)
+            let value: serde_json::Value = serde_json::from_str(&contents)
                 .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
+            let mut config: PersistedConfig = serde_json::from_value(value.clone())
+                .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
+            if value.get("monitor_visible").is_none() {
+                config.monitor_visible = !matches!(
+                    value.get("monitor_display").and_then(|item| item.as_str()),
+                    Some("tray" | "disabled")
+                );
+            }
             config.clipboard_history_count = config
                 .clipboard_history_count
                 .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
@@ -1951,7 +1963,7 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
             .and_then(|value| value.into_string().ok())
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "MeshShare 节点".to_string()),
-        monitor_display: MonitorDisplayMode::default(),
+        monitor_visible: true,
         monitor_position: None,
         monitor_locked: false,
         autostart_enabled: default_autostart_enabled(),
@@ -2645,7 +2657,7 @@ mod tests {
     }
 
     #[test]
-    fn old_config_uses_floating_monitor_default() {
+    fn old_config_shows_monitor_by_default() {
         let path = temp_data_dir();
         std::fs::write(
             path.join("node.json"),
@@ -2653,7 +2665,7 @@ mod tests {
         )
         .expect("write old config");
         let config = load_or_create_config(&path).expect("load config");
-        assert_eq!(config.monitor_display.as_str(), "floating");
+        assert!(config.monitor_visible);
         assert_eq!(config.monitor_position, None);
         assert!(!config.monitor_locked);
         assert!(config.autostart_enabled);
@@ -2674,6 +2686,34 @@ mod tests {
         );
         assert_eq!(config.receive_mode, ReceiveMode::Confirm);
         assert_eq!(config.receive_directory, None);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn legacy_monitor_display_maps_to_visibility() {
+        let path = temp_data_dir();
+        for (legacy, expected) in [
+            (
+                r#"{"node_id":"node-a","node_name":"test","monitor_display":"tray"}"#,
+                false,
+            ),
+            (
+                r#"{"node_id":"node-a","node_name":"test","monitor_display":"disabled"}"#,
+                false,
+            ),
+            (
+                r#"{"node_id":"node-a","node_name":"test","monitor_display":"floating"}"#,
+                true,
+            ),
+            (
+                r#"{"node_id":"node-a","node_name":"test","monitor_visible":true,"monitor_display":"tray"}"#,
+                true,
+            ),
+        ] {
+            std::fs::write(path.join("node.json"), legacy).expect("write legacy config");
+            let config = load_or_create_config(&path).expect("load legacy config");
+            assert_eq!(config.monitor_visible, expected, "legacy: {legacy}");
+        }
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -2835,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_position_and_lock_are_persisted() {
+    fn monitor_position_lock_and_visibility_are_persisted() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
@@ -2843,6 +2883,9 @@ mod tests {
             .set_monitor_position(crate::model::MonitorPosition { x: 123, y: 456 })
             .expect("save monitor position");
         runtime.set_monitor_locked(true).expect("save monitor lock");
+        runtime
+            .set_monitor_visible(false)
+            .expect("save monitor visibility");
 
         let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("restore runtime");
@@ -2851,6 +2894,7 @@ mod tests {
             Some(crate::model::MonitorPosition { x: 123, y: 456 })
         );
         assert!(restored.monitor_locked());
+        assert!(!restored.monitor_visible());
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -2861,10 +2905,8 @@ mod tests {
             .expect("create runtime");
         std::fs::remove_dir_all(&path).expect("remove config directory");
 
-        assert!(runtime
-            .set_monitor_display_mode(crate::model::MonitorDisplayMode::Tray)
-            .is_err());
-        assert_eq!(runtime.monitor_display_mode().as_str(), "floating");
+        assert!(runtime.set_monitor_visible(false).is_err());
+        assert!(runtime.monitor_visible());
         assert!(runtime.set_monitor_locked(true).is_err());
         assert!(!runtime.monitor_locked());
         assert!(runtime

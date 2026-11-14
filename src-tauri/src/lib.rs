@@ -13,8 +13,7 @@ mod updater;
 use anyhow::Context;
 use model::{
     ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, HardwareMetrics,
-    MonitorDisplayMode, MonitorPosition, ReceiveMode, ReceiveSettings, TransferProgress,
-    WireMessage,
+    MonitorPosition, ReceiveMode, ReceiveSettings, TransferProgress, WireMessage,
 };
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
@@ -32,6 +31,13 @@ use updater::{UpdateCoordinator, UpdateStatus};
 #[derive(Clone)]
 struct ManagedNode {
     runtime: Arc<NodeRuntime>,
+}
+
+struct TrayHandles {
+    window_toggle: MenuItem<tauri::Wry>,
+    monitor_toggle: MenuItem<tauri::Wry>,
+    lock_toggle: MenuItem<tauri::Wry>,
+    sync_toggle: MenuItem<tauri::Wry>,
 }
 
 #[derive(Clone)]
@@ -113,7 +119,7 @@ fn node_base_url(state: State<'_, ManagedNode>) -> String {
 }
 
 #[tauri::command]
-fn toggle_clipboard_sync(state: State<'_, ManagedNode>) -> bool {
+fn toggle_clipboard_sync(app: AppHandle, state: State<'_, ManagedNode>) -> bool {
     let enabled = !state
         .runtime
         .sync_enabled
@@ -122,6 +128,7 @@ fn toggle_clipboard_sync(state: State<'_, ManagedNode>) -> bool {
         .runtime
         .sync_enabled
         .store(enabled, std::sync::atomic::Ordering::SeqCst);
+    sync_tray_labels(&app);
     enabled
 }
 
@@ -310,30 +317,6 @@ fn update_transfer_progress(state: State<'_, ManagedNode>, progress: TransferPro
 }
 
 #[tauri::command]
-fn monitor_display_mode(state: State<'_, ManagedNode>) -> String {
-    state.runtime.monitor_display_mode().as_str().to_string()
-}
-
-#[tauri::command]
-fn set_monitor_display_mode(
-    app: AppHandle,
-    state: State<'_, ManagedNode>,
-    mode: String,
-) -> Result<String, String> {
-    let mode = parse_monitor_mode(&mode).ok_or_else(|| "监控显示模式无效".to_string())?;
-    state
-        .runtime
-        .set_monitor_display_mode(mode.clone())
-        .map_err(|error| error.to_string())?;
-    apply_monitor_mode(
-        &app,
-        &mode,
-        effective_monitor_locked(&app, state.runtime.as_ref()),
-    );
-    Ok(mode.as_str().to_string())
-}
-
-#[tauri::command]
 fn monitor_capabilities(app: AppHandle) -> MonitorCapabilities {
     current_monitor_capabilities(&app)
 }
@@ -350,9 +333,7 @@ fn apply_monitor_locked(
 ) -> Result<bool, String> {
     let capabilities = current_monitor_capabilities(app);
     if locked && !capabilities.can_click_through {
-        return Err(
-            "当前 Wayland 会话不支持悬浮条点击穿透，请从托盘隐藏悬浮条或切换为托盘模式".to_string(),
-        );
+        return Err("当前 Wayland 会话不支持悬浮条点击穿透，请从托盘隐藏悬浮条".to_string());
     }
     let previous = runtime.monitor_locked();
     if let Some(window) = app.get_webview_window("monitor") {
@@ -366,6 +347,7 @@ fn apply_monitor_locked(
         }
         return Err(error.to_string());
     }
+    sync_tray_labels(app);
     Ok(locked)
 }
 
@@ -415,29 +397,107 @@ fn set_monitor_position(
         .map_err(|error| error.to_string())
 }
 
-fn parse_monitor_mode(value: &str) -> Option<MonitorDisplayMode> {
-    match value {
-        "floating" => Some(MonitorDisplayMode::Floating),
-        "tray" => Some(MonitorDisplayMode::Tray),
-        "disabled" => Some(MonitorDisplayMode::Disabled),
-        _ => None,
+fn window_toggle_label(visible: bool) -> &'static str {
+    if visible {
+        "隐藏窗口"
+    } else {
+        "显示窗口"
     }
 }
 
-fn apply_monitor_mode(app: &AppHandle, mode: &MonitorDisplayMode, locked: bool) {
-    let Some(window) = app.get_webview_window("monitor") else {
+fn monitor_toggle_label(visible: bool) -> &'static str {
+    if visible {
+        "隐藏悬浮监控条"
+    } else {
+        "显示悬浮监控条"
+    }
+}
+
+fn monitor_lock_toggle_label(locked: bool) -> &'static str {
+    if locked {
+        "解锁悬浮条"
+    } else {
+        "锁定悬浮条"
+    }
+}
+
+fn tray_monitor_locked(app: &AppHandle) -> bool {
+    app.try_state::<ManagedNode>()
+        .is_some_and(|state| effective_monitor_locked(app, state.runtime.as_ref()))
+}
+
+fn clipboard_sync_toggle_label(enabled: bool) -> &'static str {
+    if enabled {
+        "暂停剪贴板同步"
+    } else {
+        "恢复剪贴板同步"
+    }
+}
+
+fn tray_sync_enabled(app: &AppHandle) -> bool {
+    app.try_state::<ManagedNode>().is_some_and(|state| {
+        state
+            .runtime
+            .sync_enabled
+            .load(std::sync::atomic::Ordering::SeqCst)
+    })
+}
+
+fn main_window_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
+fn monitor_window_visible(app: &AppHandle) -> bool {
+    app.get_webview_window("monitor")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false)
+}
+
+fn sync_tray_labels(app: &AppHandle) {
+    let Some(tray) = app.try_state::<TrayHandles>() else {
         return;
     };
-    let locked = locked && current_monitor_capabilities(app).can_click_through;
-    let _ = window.set_ignore_cursor_events(locked);
-    match mode {
-        MonitorDisplayMode::Floating => {
+    let _ = tray
+        .window_toggle
+        .set_text(window_toggle_label(main_window_visible(app)));
+    let _ = tray
+        .monitor_toggle
+        .set_text(monitor_toggle_label(monitor_window_visible(app)));
+    let _ = tray
+        .lock_toggle
+        .set_text(monitor_lock_toggle_label(tray_monitor_locked(app)));
+    let _ = tray
+        .sync_toggle
+        .set_text(clipboard_sync_toggle_label(tray_sync_enabled(app)));
+}
+
+fn set_main_window_visible(app: &AppHandle, visible: bool) {
+    if let Some(window) = app.get_webview_window("main") {
+        if visible {
             let _ = window.show();
-        }
-        MonitorDisplayMode::Tray | MonitorDisplayMode::Disabled => {
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        } else {
             let _ = window.hide();
         }
     }
+    sync_tray_labels(app);
+}
+
+fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked: bool) {
+    let Some(window) = app.get_webview_window("monitor") else {
+        return;
+    };
+    let locked = visible && locked && current_monitor_capabilities(app).can_click_through;
+    let _ = window.set_ignore_cursor_events(locked);
+    if visible {
+        let _ = window.show();
+    } else {
+        let _ = window.hide();
+    }
+    sync_tray_labels(app);
 }
 
 fn apply_autostart_registration(
@@ -491,11 +551,7 @@ fn is_autostart_launch() -> bool {
 }
 
 fn show_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.unminimize();
-        let _ = window.set_focus();
-    }
+    set_main_window_visible(app, true);
 }
 
 const MONITOR_MARGIN_PX: i32 = 16;
@@ -750,8 +806,13 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
     let tray = app
         .tray_by_id("meshshare")
         .context("MeshShare tray icon is missing")?;
-    let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-    let hide = MenuItem::with_id(app, "hide", "隐藏窗口", true, None::<&str>)?;
+    let window_toggle = MenuItem::with_id(
+        app,
+        "toggle-window",
+        window_toggle_label(main_window_visible(app)),
+        true,
+        None::<&str>,
+    )?;
     let metrics_summary = MenuItem::with_id(
         app,
         "metrics-summary",
@@ -759,32 +820,24 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         false,
         None::<&str>,
     )?;
-    let monitor_show =
-        MenuItem::with_id(app, "monitor-show", "显示悬浮监控条", true, None::<&str>)?;
-    let monitor_hide =
-        MenuItem::with_id(app, "monitor-hide", "隐藏悬浮监控条", true, None::<&str>)?;
-    let monitor_lock_toggle = MenuItem::with_id(
+    let monitor_toggle = MenuItem::with_id(
+        app,
+        "toggle-monitor",
+        monitor_toggle_label(monitor_window_visible(app)),
+        true,
+        None::<&str>,
+    )?;
+    let lock_toggle = MenuItem::with_id(
         app,
         "monitor-lock-toggle",
-        "锁定/解锁悬浮条",
+        monitor_lock_toggle_label(tray_monitor_locked(app)),
         true,
         None::<&str>,
     )?;
-    let monitor_floating = MenuItem::with_id(
-        app,
-        "monitor-floating",
-        "监控模式：悬浮条",
-        true,
-        None::<&str>,
-    )?;
-    let monitor_tray =
-        MenuItem::with_id(app, "monitor-tray", "监控模式：仅托盘", true, None::<&str>)?;
-    let monitor_disabled =
-        MenuItem::with_id(app, "monitor-disabled", "关闭硬件监控", true, None::<&str>)?;
-    let toggle = MenuItem::with_id(
+    let sync_toggle = MenuItem::with_id(
         app,
         "toggle-sync",
-        "暂停/恢复剪贴板同步",
+        clipboard_sync_toggle_label(tray_sync_enabled(app)),
         true,
         None::<&str>,
     )?;
@@ -793,19 +846,21 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         app,
         &[
             &metrics_summary,
-            &monitor_show,
-            &monitor_hide,
-            &monitor_lock_toggle,
-            &monitor_floating,
-            &monitor_tray,
-            &monitor_disabled,
-            &show,
-            &hide,
-            &toggle,
+            &monitor_toggle,
+            &lock_toggle,
+            &window_toggle,
+            &sync_toggle,
             &exit,
         ],
     )?;
     tray.set_menu(Some(menu))?;
+    app.manage(TrayHandles {
+        window_toggle,
+        monitor_toggle,
+        lock_toggle,
+        sync_toggle,
+    });
+    sync_tray_labels(app);
     let mut events = runtime.subscribe();
     let metrics_summary_for_task = metrics_summary.clone();
     let tray_runtime = runtime.clone();
@@ -833,48 +888,28 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         }
     });
     tray.on_menu_event(|app, event| match event.id().as_ref() {
-        "show" => {
-            show_main_window(app);
+        "toggle-window" => {
+            set_main_window_visible(app, !main_window_visible(app));
         }
-        "hide" => {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.hide();
-            }
-        }
-        "monitor-show" => {
-            if let Some(window) = app.get_webview_window("monitor") {
-                if let Some(state) = app.try_state::<ManagedNode>() {
-                    let _ = window.set_ignore_cursor_events(effective_monitor_locked(
+        "toggle-monitor" => {
+            if let Some(state) = app.try_state::<ManagedNode>() {
+                let visible = !monitor_window_visible(app);
+                match state.runtime.set_monitor_visible(visible) {
+                    Ok(()) => set_monitor_window_visible(
                         app,
-                        state.runtime.as_ref(),
-                    ));
+                        visible,
+                        effective_monitor_locked(app, state.runtime.as_ref()),
+                    ),
+                    Err(error) => eprintln!("保存悬浮监控条可见性失败：{error}"),
                 }
-                let _ = window.show();
-            }
-        }
-        "monitor-hide" => {
-            if let Some(window) = app.get_webview_window("monitor") {
-                let _ = window.hide();
             }
         }
         "monitor-lock-toggle" => {
             if let Some(state) = app.try_state::<ManagedNode>() {
-                let locked = !state.runtime.monitor_locked();
+                let locked = !effective_monitor_locked(app, state.runtime.as_ref());
                 if let Err(error) = apply_monitor_locked(app, state.runtime.as_ref(), locked) {
                     eprintln!("{error}");
                 }
-            }
-        }
-        "monitor-floating" | "monitor-tray" | "monitor-disabled" => {
-            let mode = match event.id().as_ref() {
-                "monitor-floating" => MonitorDisplayMode::Floating,
-                "monitor-tray" => MonitorDisplayMode::Tray,
-                _ => MonitorDisplayMode::Disabled,
-            };
-            if let Some(state) = app.try_state::<ManagedNode>() {
-                let _ = state.runtime.set_monitor_display_mode(mode.clone());
-                let locked = effective_monitor_locked(app, state.runtime.as_ref());
-                apply_monitor_mode(app, &mode, locked);
             }
         }
         "toggle-sync" => {
@@ -888,6 +923,7 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
                     .sync_enabled
                     .store(enabled, std::sync::atomic::Ordering::SeqCst);
             }
+            sync_tray_labels(app);
         }
         "exit" => {
             if let Some(state) = app.try_state::<ManagedNode>() {
@@ -934,9 +970,9 @@ pub fn run() {
             if let Some(window) = app.get_webview_window("monitor") {
                 position_monitor_window(&window, runtime.as_ref());
             }
-            apply_monitor_mode(
+            set_monitor_window_visible(
                 app.handle(),
-                &runtime.monitor_display_mode(),
+                runtime.monitor_visible(),
                 effective_monitor_locked(app.handle(), runtime.as_ref()),
             );
             if let Some(window) = app.get_webview_window("monitor") {
@@ -952,9 +988,7 @@ pub fn run() {
                         }
                     }
                     "monitor-hide-now" => {
-                        if let Some(window) = app_for_menu.get_webview_window("monitor") {
-                            let _ = window.hide();
-                        }
+                        set_monitor_window_visible(&app_for_menu, false, false);
                     }
                     _ => {}
                 });
@@ -963,20 +997,20 @@ pub fn run() {
                 if !autostart_launch {
                     show_main_window(app.handle());
                 }
-                let window_for_close = window.clone();
+                let app_for_close = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        let _ = window_for_close.hide();
+                        set_main_window_visible(&app_for_close, false);
                     }
                 });
             }
             if let Some(window) = app.get_webview_window("monitor") {
-                let window_for_close = window.clone();
+                let app_for_close = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        let _ = window_for_close.hide();
+                        set_monitor_window_visible(&app_for_close, false, false);
                     }
                 });
             }
@@ -1000,8 +1034,6 @@ pub fn run() {
             accept_transfer,
             register_outgoing_transfer,
             update_transfer_progress,
-            monitor_display_mode,
-            set_monitor_display_mode,
             monitor_capabilities,
             monitor_locked,
             set_monitor_locked,
@@ -1030,7 +1062,10 @@ pub fn cleanup_autostart() {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_position_to_work_area, monitor_capabilities_for_backend, MonitorBackend};
+    use super::{
+        clamp_position_to_work_area, clipboard_sync_toggle_label, monitor_capabilities_for_backend,
+        monitor_lock_toggle_label, monitor_toggle_label, window_toggle_label, MonitorBackend,
+    };
     use crate::autostart::launched_from_args;
     use crate::model::MonitorPosition;
 
@@ -1074,5 +1109,16 @@ mod tests {
     fn autostart_argument_is_detected_without_matching_similar_flags() {
         assert!(launched_from_args(["meshshare", "--meshshare-autostart"]));
         assert!(!launched_from_args(["meshshare", "--autostart"]));
+    }
+    #[test]
+    fn tray_toggle_labels_follow_state() {
+        assert_eq!(window_toggle_label(true), "隐藏窗口");
+        assert_eq!(window_toggle_label(false), "显示窗口");
+        assert_eq!(monitor_toggle_label(true), "隐藏悬浮监控条");
+        assert_eq!(monitor_toggle_label(false), "显示悬浮监控条");
+        assert_eq!(clipboard_sync_toggle_label(true), "暂停剪贴板同步");
+        assert_eq!(clipboard_sync_toggle_label(false), "恢复剪贴板同步");
+        assert_eq!(monitor_lock_toggle_label(true), "解锁悬浮条");
+        assert_eq!(monitor_lock_toggle_label(false), "锁定悬浮条");
     }
 }

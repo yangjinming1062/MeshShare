@@ -104,25 +104,6 @@ pub struct HardwareMetrics {
     pub gpus: Vec<GpuMetrics>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum MonitorDisplayMode {
-    #[default]
-    Floating,
-    Tray,
-    Disabled,
-}
-
-impl MonitorDisplayMode {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Floating => "floating",
-            Self::Tray => "tray",
-            Self::Disabled => "disabled",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MonitorPosition {
     pub x: i32,
