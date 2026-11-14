@@ -3,10 +3,11 @@
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { apiUrl, createMobileSession, getClipboard, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, websocketUrl } from './api';
   import { digestFile } from './sha256';
-  import type { ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, WireMessage } from './types';
+  import type { ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
@@ -25,6 +26,9 @@
   let autostartEnabled = true;
   let autostartAvailable = true;
   let autostartBusy = false;
+  let updateFrequency: UpdateFrequency = 'weekly';
+  let updateStatus: UpdateStatus | null = null;
+  let updateBusy = false;
   let ws: WebSocket | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
@@ -75,6 +79,15 @@
     let pendingMonitorPosition: { x: number; y: number } | null = null;
     let monitorPositionWriteInFlight = false;
     let monitorPositionUnlisten: (() => void) | undefined;
+    let updateStatusUnlisten: (() => void) | undefined;
+    if (!isMobile && !isMonitor) {
+      void listen<UpdateStatus>('update-status', ({ payload }) => {
+        updateStatus = payload;
+      }).then((unlisten) => {
+        if (stopped) unlisten();
+        else updateStatusUnlisten = unlisten;
+      }).catch((error) => console.error('监听更新状态失败', error));
+    }
     const flushMonitorPosition = async () => {
       if (!pendingMonitorPosition || monitorPositionWriteInFlight) return;
       const position = pendingMonitorPosition;
@@ -111,6 +124,10 @@
       try {
         await initApi();
         if (!isMobile) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
+        if (!isMobile && !isMonitor) {
+          updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
+          updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
+        }
         await refresh();
         syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
         if (!isMobile && !isMonitor) {
@@ -149,6 +166,7 @@
       ws?.close();
       if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
       monitorPositionUnlisten?.();
+      updateStatusUnlisten?.();
       void flushMonitorPosition();
       if (stopped) window.clearTimeout(timer);
     };
@@ -318,6 +336,56 @@
       autostartBusy = false;
     }
     window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function setUpdateFrequency(event: Event) {
+    const next = (event.currentTarget as HTMLSelectElement).value as UpdateFrequency;
+    const previous = updateFrequency;
+    try {
+      updateFrequency = await invoke<UpdateFrequency>('set_update_frequency', { frequency: next });
+      updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
+      notice = next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`;
+    } catch (error) {
+      updateFrequency = previous;
+      notice = error instanceof Error ? error.message : '无法更新自动更新设置';
+    }
+    window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function checkForUpdates() {
+    if (updateBusy) return;
+    updateBusy = true;
+    try {
+      await invoke('check_for_updates');
+      updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
+      notice = '已发起更新检查';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法检查更新';
+    } finally {
+      updateBusy = false;
+    }
+    window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  function updateFrequencyLabel(value: UpdateFrequency) {
+    return value === 'daily' ? '每天' : value === 'weekly' ? '每周' : '关闭';
+  }
+
+  function updateStatusLabel(value: UpdateStatus | null) {
+    if (!value) return '更新状态读取中';
+    if (value.state === 'unavailable') return '开发构建不执行自动更新';
+    if (value.state === 'disabled') return '自动更新已关闭';
+    if (value.state === 'idle') return '等待下次检查';
+    if (value.state === 'checking') return '正在检查 GitHub Release…';
+    if (value.state === 'available') return `发现 v${value.available_version ?? '新版本'}`;
+    if (value.state === 'deferred') return `发现 v${value.available_version ?? '新版本'}，等待传输完成`;
+    if (value.state === 'downloading') {
+      if (!value.content_length) return '正在下载更新…';
+      return `正在下载更新 ${formatSize(value.downloaded_bytes)} / ${formatSize(value.content_length)}`;
+    }
+    if (value.state === 'installing') return value.error ?? '正在安装更新，应用即将重启';
+    if (value.state === 'up_to_date') return '已是最新版本';
+    return value.error ? `更新失败：${value.error}` : '更新失败';
   }
 
   function selectMetricsPeer(peer: PeerInfo) {
@@ -852,6 +920,28 @@
             <div class="access-copy"><label for="address-select">选择访问地址</label><select id="address-select" bind:value={selectedAddress} on:change={refreshQr}>{#each node?.addresses ?? [] as address}<option value={address.url}>{address.label}</option>{/each}</select><code>{mobileUrl || '等待服务启动…'}</code><p>让手机连接同一网络后扫描二维码。</p></div>
           </div>
         </div>
+      </section>
+
+      <section class="panel update-panel">
+        <div class="panel-heading">
+          <div><div class="section-kicker">APPLICATION UPDATE</div><h2>客户端自动更新</h2></div>
+          <span class="muted">当前版本 v{node?.version ?? '—'}</span>
+        </div>
+        <div class="update-settings">
+          <div class="update-setting-copy">
+            <strong>检查频率</strong>
+            <span>只获取 GitHub 稳定版 Release；安装会等待当前文件传输完成。</span>
+          </div>
+          <div class="update-setting-actions">
+            <select id="update-frequency" value={updateFrequency} on:change={setUpdateFrequency} disabled={['downloading', 'installing'].includes(updateStatus?.state ?? '')}>
+              <option value="daily">每天</option>
+              <option value="weekly">每周</option>
+              <option value="disabled">关闭</option>
+            </select>
+            <button class="ghost small" on:click={checkForUpdates} disabled={updateBusy || ['checking', 'downloading', 'installing'].includes(updateStatus?.state ?? '')}>立即检查</button>
+          </div>
+        </div>
+        <div class="update-status" data-state={updateStatus?.state ?? 'idle'}>{updateStatusLabel(updateStatus)}</div>
       </section>
 
       <section class="panel clipboard-panel">

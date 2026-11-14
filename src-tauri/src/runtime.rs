@@ -21,6 +21,42 @@ fn default_autostart_enabled() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateFrequency {
+    Daily,
+    #[default]
+    Weekly,
+    Disabled,
+}
+
+impl UpdateFrequency {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "daily" => Some(Self::Daily),
+            "weekly" => Some(Self::Weekly),
+            "disabled" => Some(Self::Disabled),
+            _ => None,
+        }
+    }
+
+    pub fn period_ms(self) -> Option<i64> {
+        match self {
+            Self::Daily => Some(24 * 60 * 60 * 1000),
+            Self::Weekly => Some(7 * 24 * 60 * 60 * 1000),
+            Self::Disabled => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedConfig {
     node_id: String,
@@ -33,6 +69,12 @@ struct PersistedConfig {
     monitor_locked: bool,
     #[serde(default = "default_autostart_enabled")]
     autostart_enabled: bool,
+    #[serde(default)]
+    update_frequency: UpdateFrequency,
+    #[serde(default)]
+    update_last_checked_at_ms: Option<i64>,
+    #[serde(default)]
+    pending_update_version: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,7 +120,9 @@ pub struct NodeRuntime {
     pub events: broadcast::Sender<WireMessage>,
     pub sync_enabled: AtomicBool,
     pub stopping: AtomicBool,
+    update_installing: AtomicBool,
     pub http: reqwest::Client,
+    transfer_update_gate: Mutex<()>,
 }
 
 fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress {
@@ -182,11 +226,13 @@ impl NodeRuntime {
             events,
             sync_enabled: AtomicBool::new(true),
             stopping: AtomicBool::new(false),
+            update_installing: AtomicBool::new(false),
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
+            transfer_update_gate: Mutex::new(()),
         }))
     }
 
@@ -514,6 +560,73 @@ impl NodeRuntime {
         Ok(())
     }
 
+    pub fn update_settings(&self) -> (UpdateFrequency, Option<i64>, Option<String>) {
+        let config = self.config.lock();
+        (
+            config.update_frequency,
+            config.update_last_checked_at_ms,
+            config.pending_update_version.clone(),
+        )
+    }
+
+    pub fn set_update_frequency(&self, frequency: UpdateFrequency) -> anyhow::Result<()> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.update_frequency = frequency;
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        Ok(())
+    }
+
+    pub fn set_update_check_state(
+        &self,
+        checked_at_ms: Option<i64>,
+        pending_version: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.update_last_checked_at_ms = checked_at_ms;
+        next.pending_update_version = pending_version;
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        Ok(())
+    }
+
+    pub fn has_active_transfers(&self) -> bool {
+        let active = |status: &TransferStatus| {
+            matches!(
+                status,
+                TransferStatus::Waiting
+                    | TransferStatus::Accepted
+                    | TransferStatus::Uploading
+                    | TransferStatus::Ready
+            )
+        };
+        self.transfers
+            .read()
+            .values()
+            .any(|record| active(&record.progress.status))
+            || self
+                .mobile_transfers
+                .read()
+                .values()
+                .any(|record| active(&record.progress.status))
+    }
+
+    pub fn begin_update_install(&self) -> bool {
+        let _update_gate = self.transfer_update_gate.lock();
+        if self.update_installing.load(Ordering::SeqCst) || self.has_active_transfers() {
+            return false;
+        }
+        self.update_installing.store(true, Ordering::SeqCst);
+        true
+    }
+
+    pub fn end_update_install(&self) {
+        let _update_gate = self.transfer_update_gate.lock();
+        self.update_installing.store(false, Ordering::SeqCst);
+    }
+
     pub fn peers_snapshot(&self) -> Vec<PeerInfo> {
         let now = now_millis();
         let mut peers = self
@@ -635,14 +748,18 @@ impl NodeRuntime {
         false
     }
 
-    pub fn add_transfer(&self, offer: TransferOffer) {
+    pub fn add_transfer(&self, offer: TransferOffer) -> bool {
+        let _update_gate = self.transfer_update_gate.lock();
+        if self.update_installing.load(Ordering::SeqCst) {
+            return false;
+        }
         let progress = transfer_progress(&offer, "receive");
         let mut transfers = self.transfers.write();
         if transfers.contains_key(&offer.transfer_id) {
-            return;
+            return false;
         }
         if !evict_terminal_transfer_if_needed(&mut transfers) {
-            return;
+            return false;
         }
         transfers.insert(
             offer.transfer_id.clone(),
@@ -657,9 +774,17 @@ impl NodeRuntime {
         drop(transfers);
         self.publish_event(WireMessage::TransferOffer { offer });
         self.publish_event(WireMessage::TransferProgress { progress });
+        true
     }
 
     pub fn add_outgoing_transfer(&self, offer: TransferOffer) -> TransferProgress {
+        let _update_gate = self.transfer_update_gate.lock();
+        if self.update_installing.load(Ordering::SeqCst) {
+            let mut failed = transfer_progress(&offer, "send");
+            failed.status = TransferStatus::Failed;
+            failed.error = Some("应用正在安装更新，请稍后重试".to_string());
+            return failed;
+        }
         let mut transfers = self.transfers.write();
         if let Some(record) = transfers.get(&offer.transfer_id) {
             return record.progress.clone();
@@ -982,6 +1107,10 @@ impl NodeRuntime {
     ) -> Result<MobileTransferView, String> {
         if self.touch_mobile_session(session_id).is_none() {
             return Err("手机会话已过期".to_string());
+        }
+        let _update_gate = self.transfer_update_gate.lock();
+        if self.update_installing.load(Ordering::SeqCst) {
+            return Err("应用正在安装更新，请稍后重试".to_string());
         }
         if offer.total_bytes > crate::model::MAX_MOBILE_STAGING_BYTES_PER_SESSION {
             return Err("手机临时文件超过会话配额".to_string());
@@ -1324,6 +1453,9 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
         monitor_position: None,
         monitor_locked: false,
         autostart_enabled: default_autostart_enabled(),
+        update_frequency: UpdateFrequency::default(),
+        update_last_checked_at_ms: None,
+        pending_update_version: None,
     };
     persist_config(data_dir, &config)?;
     Ok(config)
@@ -1477,7 +1609,10 @@ pub fn bind_addresses() -> Vec<std::net::Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_addresses, load_or_create_config, network_addresses_for_bound, NodeRuntime};
+    use super::{
+        bind_addresses, load_or_create_config, network_addresses_for_bound, NodeRuntime,
+        UpdateFrequency,
+    };
     use crate::model::{
         ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
         TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
@@ -1589,6 +1724,9 @@ mod tests {
         assert_eq!(config.monitor_position, None);
         assert!(!config.monitor_locked);
         assert!(config.autostart_enabled);
+        assert_eq!(config.update_frequency, UpdateFrequency::Weekly);
+        assert_eq!(config.update_last_checked_at_ms, None);
+        assert_eq!(config.pending_update_version, None);
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -1619,6 +1757,89 @@ mod tests {
         let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("restore runtime");
         assert!(!restored.autostart_enabled());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn update_preference_and_pending_state_are_persisted() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .set_update_frequency(UpdateFrequency::Daily)
+            .expect("save update frequency");
+        runtime
+            .set_update_check_state(Some(123), Some("1.2.3".to_string()))
+            .expect("save update state");
+
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert_eq!(
+            restored.update_settings(),
+            (UpdateFrequency::Daily, Some(123), Some("1.2.3".to_string()))
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn update_frequency_parser_rejects_unknown_values() {
+        assert_eq!(
+            UpdateFrequency::parse("daily"),
+            Some(UpdateFrequency::Daily)
+        );
+        assert_eq!(
+            UpdateFrequency::parse("weekly"),
+            Some(UpdateFrequency::Weekly)
+        );
+        assert_eq!(
+            UpdateFrequency::parse("disabled"),
+            Some(UpdateFrequency::Disabled)
+        );
+        assert_eq!(UpdateFrequency::parse("monthly"), None);
+    }
+
+    #[test]
+    fn active_transfers_block_update_installation() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert!(!runtime.has_active_transfers());
+        let offer = mobile_offer(&runtime, "active", 1);
+        runtime.add_outgoing_transfer(offer);
+        assert!(runtime.has_active_transfers());
+        runtime
+            .fail_transfer(
+                "active",
+                "test complete".to_string(),
+                TransferStatus::Completed,
+            )
+            .expect("finish transfer");
+        assert!(!runtime.has_active_transfers());
+
+        let session = runtime
+            .create_mobile_session("phone".to_string())
+            .expect("create mobile session");
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(&runtime, "mobile-active", 1),
+            )
+            .expect("create mobile transfer");
+        assert!(runtime.has_active_transfers());
+        runtime
+            .fail_mobile_transfer("mobile-active", "test complete".to_string())
+            .expect("finish mobile transfer");
+        assert!(!runtime.has_active_transfers());
+        assert!(runtime.begin_update_install());
+        let blocked = runtime.add_outgoing_transfer(mobile_offer(&runtime, "blocked", 1));
+        assert_eq!(blocked.status, TransferStatus::Failed);
+        assert!(runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(&runtime, "blocked-mobile", 1)
+            )
+            .is_err());
+        runtime.end_update_install();
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -1661,6 +1882,15 @@ mod tests {
         assert_eq!(runtime.monitor_position(), None);
         assert!(runtime.set_autostart_enabled(false).is_err());
         assert!(runtime.autostart_enabled());
+        assert!(runtime
+            .set_update_frequency(UpdateFrequency::Daily)
+            .is_err());
+        assert_eq!(runtime.update_settings().0, UpdateFrequency::Weekly);
+        assert!(runtime
+            .set_update_check_state(Some(42), Some("1.2.3".to_string()))
+            .is_err());
+        assert_eq!(runtime.update_settings().1, None);
+        assert_eq!(runtime.update_settings().2, None);
     }
 
     #[test]

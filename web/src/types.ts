@@ -16,6 +16,19 @@ export type NodeInfo = {
   capabilities: string[];
 };
 
+export type UpdateFrequency = 'daily' | 'weekly' | 'disabled';
+
+export type UpdateState = 'unavailable' | 'disabled' | 'idle' | 'checking' | 'available' | 'deferred' | 'downloading' | 'installing' | 'up_to_date' | 'error';
+
+export type UpdateStatus = {
+  state: UpdateState;
+  current_version: string;
+  available_version: string | null;
+  downloaded_bytes: number;
+  content_length: number | null;
+  error: string | null;
+};
+
 export type MobileSession = {
   session_id: string;
   node_id: string;

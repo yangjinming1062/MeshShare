@@ -6,10 +6,11 @@ mod metrics;
 mod model;
 mod runtime;
 mod server;
+mod updater;
 
 use anyhow::Context;
 use model::{HardwareMetrics, MonitorDisplayMode, MonitorPosition, TransferProgress, WireMessage};
-use runtime::NodeRuntime;
+use runtime::{NodeRuntime, UpdateFrequency};
 use std::fs;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -17,10 +18,16 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 use tauri::{AppHandle, Manager, PhysicalPosition, RunEvent, State, WindowEvent};
+use updater::{UpdateCoordinator, UpdateStatus};
 
 #[derive(Clone)]
 struct ManagedNode {
     runtime: Arc<NodeRuntime>,
+}
+
+#[derive(Clone)]
+struct ManagedUpdater {
+    coordinator: Arc<UpdateCoordinator>,
 }
 
 #[tauri::command]
@@ -47,6 +54,31 @@ fn clipboard_sync_enabled(state: State<'_, ManagedNode>) -> bool {
         .runtime
         .sync_enabled
         .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn update_frequency(state: State<'_, ManagedUpdater>) -> String {
+    state.coordinator.frequency().as_str().to_string()
+}
+
+#[tauri::command]
+fn set_update_frequency(
+    state: State<'_, ManagedUpdater>,
+    frequency: String,
+) -> Result<String, String> {
+    let frequency =
+        UpdateFrequency::parse(&frequency).ok_or_else(|| "自动更新频率无效".to_string())?;
+    state.coordinator.set_frequency(frequency)
+}
+
+#[tauri::command]
+fn check_for_updates(state: State<'_, ManagedUpdater>) -> Result<(), String> {
+    state.coordinator.request_manual_check()
+}
+
+#[tauri::command]
+fn update_status(state: State<'_, ManagedUpdater>) -> UpdateStatus {
+    state.coordinator.status()
 }
 
 #[tauri::command]
@@ -735,6 +767,7 @@ pub fn run() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let autostart_launch = is_autostart_launch();
             let data_dir = app
@@ -749,6 +782,11 @@ pub fn run() {
             app.manage(ManagedNode {
                 runtime: runtime.clone(),
             });
+            let updater = UpdateCoordinator::new(app.handle().clone(), runtime.clone());
+            app.manage(ManagedUpdater {
+                coordinator: updater.clone(),
+            });
+            updater.start();
             sync_autostart_registration(runtime.as_ref());
             setup_tray_menu(app.handle(), runtime.clone())?;
             if let Some(window) = app.get_webview_window("monitor") {
@@ -786,6 +824,10 @@ pub fn run() {
             node_base_url,
             toggle_clipboard_sync,
             clipboard_sync_enabled,
+            update_frequency,
+            set_update_frequency,
+            check_for_updates,
+            update_status,
             autostart_enabled,
             set_autostart_enabled,
             accept_transfer,

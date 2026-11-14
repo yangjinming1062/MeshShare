@@ -167,7 +167,7 @@ mod platform {
     use anyhow::{Context, Result};
     use std::path::{Path, PathBuf};
 
-    const BUNDLE_IDENTIFIER: &str = "com.meshshare.app";
+    const BUNDLE_IDENTIFIER: &str = "com.meshshare.desktop";
 
     fn launch_agent_file() -> Result<PathBuf> {
         Ok(home_directory()?

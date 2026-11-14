@@ -33,6 +33,7 @@ sysinfo = { version = "0.31", default-features = false, features = ["network", "
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-single-instance = "2.5"
+tauri-plugin-updater = "=2.14.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }

@@ -39,21 +39,28 @@ jobs:
           - os: windows-latest
             name: windows-x64
             bundles: |
-              src-tauri/target/release/bundle/nsis/*-setup.exe
-              src-tauri/target/release/bundle/msi/*.msi
+              src-tauri/target/release/bundle/nsis/*-setup.exe*
+              src-tauri/target/release/bundle/msi/*.msi*
           - os: macos-15-intel
             name: macos-x64
-            bundles: src-tauri/target/release/bundle/dmg/*.dmg
+            bundles: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+              src-tauri/target/release/bundle/macos/*.app.tar.gz*
           - os: macos-15
             name: macos-arm64
-            bundles: src-tauri/target/release/bundle/dmg/*.dmg
+            bundles: |
+              src-tauri/target/release/bundle/dmg/*.dmg
+              src-tauri/target/release/bundle/macos/*.app.tar.gz*
           - os: ubuntu-24.04
             name: linux-x64
             bundles: |
-              src-tauri/target/release/bundle/appimage/*.AppImage
-              src-tauri/target/release/bundle/deb/*.deb
-              src-tauri/target/release/bundle/rpm/*.rpm
+              src-tauri/target/release/bundle/appimage/*.AppImage*
+              src-tauri/target/release/bundle/deb/*.deb*
+              src-tauri/target/release/bundle/rpm/*.rpm*
     runs-on: ${{ matrix.os }}
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - name: Set application version from tag
@@ -78,9 +85,43 @@ jobs:
       - name: Run Rust regression tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --all-features --locked
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version '^2' --locked
+        run: cargo install tauri-cli --version '2.12.4' --locked
+      - name: Require updater signing key
+        shell: bash
+        run: |
+          if [[ -z "$TAURI_SIGNING_PRIVATE_KEY" ]]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not configured"
+            exit 1
+          fi
       - name: Build application
         run: cargo tauri build --config release-version.json -- --locked
+      - name: Name macOS updater artifacts by architecture
+        if: startsWith(matrix.name, 'macos-')
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "${{ matrix.name }}" == "macos-x64" ]]; then
+            arch="x64"
+          else
+            arch="aarch64"
+          fi
+          shopt -s nullglob
+          archives=(src-tauri/target/release/bundle/macos/*.app.tar.gz)
+          if (( ${#archives[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS updater archive"
+            printf '%s\n' "${archives[@]}"
+            exit 1
+          fi
+          source="${archives[0]}"
+          target="src-tauri/target/release/bundle/macos/MeshShare_${version}_${arch}.app.tar.gz"
+          if [[ ! -s "$source" || ! -s "$source.sig" ]]; then
+            echo "::error::macOS updater archive or signature is missing"
+            exit 1
+          fi
+          if [[ "$source" != "$target" ]]; then
+            mv "$source" "$target"
+            mv "$source.sig" "$target.sig"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: MeshShare-${{ matrix.name }}
@@ -114,13 +155,25 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           expected=(
             "MeshShare_${version}_x64-setup.exe"
+            "MeshShare_${version}_x64-setup.exe.sig"
             "MeshShare_${version}_x64_en-US.msi"
+            "MeshShare_${version}_x64_en-US.msi.sig"
             "MeshShare_${version}_x64.dmg"
             "MeshShare_${version}_aarch64.dmg"
             "MeshShare_${version}_amd64.AppImage"
+            "MeshShare_${version}_amd64.AppImage.sig"
             "MeshShare_${version}_amd64.deb"
+            "MeshShare_${version}_amd64.deb.sig"
             "MeshShare-${version}-1.x86_64.rpm"
+            "MeshShare-${version}-1.x86_64.rpm.sig"
           )
+          mapfile -t mac_updater_assets < <(find release-assets -type f -name '*.app.tar.gz*' -printf '%f\n' | sort -u)
+          if (( ${#mac_updater_assets[@]} != 4 )); then
+            echo "::error::Expected two macOS updater bundles and two signatures"
+            printf '%s\n' "${mac_updater_assets[@]}"
+            exit 1
+          fi
+          expected+=("${mac_updater_assets[@]}")
           installers=()
           for name in "${expected[@]}"; do
             matches=(release-assets/MeshShare-*/**/"$name")
@@ -131,23 +184,30 @@ jobs:
             installers+=("${matches[0]}")
           done
 
-          # The release-by-tag endpoint only returns published releases.
-          release_id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
-            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id")
-          if [[ "$release_id" == *$'\n'* ]]; then
+          mapfile -t matching_releases < <(gh release list --repo "$GH_REPO" --limit 100 \
+            --json tagName,isDraft,isPrerelease \
+            --jq ".[] | select(.tagName == \"$GITHUB_REF_NAME\") | [.tagName, .isDraft, .isPrerelease] | @tsv")
+          if (( ${#matching_releases[@]} > 1 )); then
             echo "::error::Multiple releases for $GITHUB_REF_NAME. Resolve the duplicate drafts before retrying."
+            printf '%s\n' "${matching_releases[@]}"
             exit 1
           fi
-          if [[ -z "$release_id" ]]; then
+          if (( ${#matching_releases[@]} == 1 )); then
+            release_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json databaseId --jq '.databaseId')
+          else
             gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
-              --title "$GITHUB_REF_NAME" --notes-file release-notes.md
-            release_id=$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq '.databaseId')
+              --repo "$GH_REPO" --title "$GITHUB_REF_NAME" --notes-file release-notes.md
+            release_id=$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json databaseId --jq '.databaseId')
+          fi
+          if [[ "$(gh release view "$GITHUB_REF_NAME" --repo "$GH_REPO" --json isPrerelease --jq '.isPrerelease')" == "true" ]]; then
+            echo "::error::Updater releases must be stable releases, not prereleases"
+            exit 1
           fi
 
           assets_url="repos/$GH_REPO/releases/$release_id/assets?per_page=100"
           existing=$(gh api --paginate "$assets_url" --jq '.[].name')
           if [[ -n "$existing" ]]; then
-            for name in "${expected[@]}"; do
+            for name in "${expected[@]}" latest.json; do
               existing=$(awk -v name="$name" '$0 != name' <<< "$existing")
             done
             if [[ -n "$existing" ]]; then
@@ -158,13 +218,22 @@ jobs:
           fi
 
           for installer in "${installers[@]}"; do
-            gh release upload "$GITHUB_REF_NAME" --clobber "$installer"
+            gh release upload "$GITHUB_REF_NAME" --repo "$GH_REPO" --clobber "$installer"
           done
 
+          python3 .github/scripts/generate_updater_manifest.py \
+            --assets-root release-assets \
+            --version "$version" \
+            --tag "$GITHUB_REF_NAME" \
+            --notes-file release-notes.md \
+            --output latest.json
+          python3 -m json.tool latest.json >/dev/null
+          gh release upload "$GITHUB_REF_NAME" --repo "$GH_REPO" --clobber latest.json
+
           uploaded=$(gh api --paginate "$assets_url" --jq '.[] | if .state == "uploaded" and .size > 0 then .name else "Incomplete upload: " + .name end')
-          expected_names=$(printf '%s\n' "${expected[@]}" | sort)
-          if [[ "$(sort <<< "$uploaded")" != "$expected_names" ]]; then
-            echo "::error::Release assets do not match the seven installers for $GITHUB_REF_NAME"
+          expected_names=$(printf '%s\n' "${expected[@]}" latest.json | sort)
+          if [[ "$(sort <<< "$uploaded")" != "$(sort <<< "$expected_names")" ]]; then
+            echo "::error::Release assets do not match the installers and updater manifest for $GITHUB_REF_NAME"
             exit 1
           fi
-          gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md --draft=false
+          gh release edit "$GITHUB_REF_NAME" --repo "$GH_REPO" --notes-file release-notes.md --draft=false
