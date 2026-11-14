@@ -8,8 +8,12 @@
 | `GET` | `/api/v1/peers` | 当前在线设备 |
 | `GET` | `/api/v1/metrics` | 本机最新硬件指标快照 |
 | `POST` | `/api/v1/peers/connect` | 通过手动地址加入节点 |
-| `GET` | `/api/v1/clipboard` | 当前内存中的剪贴板快照 |
+| `GET` | `/api/v1/clipboard` | 当前共享剪贴板快照 |
 | `POST` | `/api/v1/clipboard` | 主动发布剪贴板文字或 PNG，移动网页发送文字 |
+| `GET` | `/api/v1/clipboard/history` | 查询本机剪贴板历史元数据和当前保留设置 |
+| `GET` | `/api/v1/clipboard/history/{event_id}` | 查询单条历史记录的完整文字/PNG 内容 |
+| `POST` | `/api/v1/clipboard/history/{event_id}/restore` | 恢复单条本机历史并发布新的剪贴板事件 |
+| `DELETE` | `/api/v1/clipboard/history` | 清空本机历史，保留当前共享快照 |
 | `POST` | `/api/v1/transfers` | 创建文件清单和接收确认任务 |
 | `GET` | `/api/v1/transfers` | 查询本节点的传输任务，可用 `status=waiting` 过滤 |
 | `POST` | `/api/v1/transfers/{id}/reject` | 拒绝任务 |
@@ -27,7 +31,7 @@
 | `PUT` | `/api/v1/mobile/transfers/{id}/items/{item_id}` | 桌面端把文件流写入手机临时文件区 |
 | `GET` | `/api/v1/mobile/transfers/{id}/items/{item_id}/download?session_id=...` | 手机按流下载已准备好的文件 |
 
-接口业务错误使用 `{ "error": "..." }`。剪贴板查询返回最新快照，文件接口按传输任务查询状态。接收端目录只能由本机 Tauri `accept_transfer` 命令选择并确认。
+接口业务错误使用 `{ "error": "..." }`。`GET /api/v1/clipboard` 查询返回最新快照；历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容，避免一次加载全部历史图片或大文本。历史接口只访问扫码节点本机保存的记录，不修改节点间 WebSocket 的最新快照交换。文件接口按传输任务查询状态。接收端目录只能由本机 Tauri `accept_transfer` 命令选择并确认。
 
 ## WebSocket 消息
 
@@ -45,7 +49,7 @@
 
 接收端只接受与当前清单总量一致且进度不回退的 `TransferProgress`；终态不会被旧消息覆盖。
 
-剪贴板事件 ID 在节点内存中去重十分钟。节点重启后从空快照开始。
+剪贴板事件 ID 仍在节点内存中去重十分钟；历史同时按内容哈希去重并持久化。节点重启后从本机历史和当前快照文件恢复，不会从其他节点批量拉取历史。
 
 ## 硬件指标
 
@@ -57,7 +61,7 @@
 
 节点每秒生成一次内存快照。
 
-剪贴板文字和 PNG 图片单项均不超过 16 MiB，图片解码还限制为不超过 8192×8192 像素和 128 MiB 解码分配；事件 ID、来源节点 ID 和来源名称也有长度上限，接收端会在写入快照或去重表前校验这些边界。
+剪贴板文字和 PNG 图片单项均不超过 16 MiB，图片解码还限制为不超过 8192×8192 像素和 128 MiB 解码分配；历史默认最多保留 50 条或 30 天，桌面端可分别配置到 1–500 条或 1–365 天，当前版本不设置额外总容量上限。事件 ID、来源节点 ID 和来源名称也有长度上限，接收端会在写入当前快照、历史索引或去重表前校验这些边界。
 
 传输进度的错误和目标字段、节点地址元数据以及硬件指标中的 GPU 名称和不可用原因均有长度或数量上限；超出边界的远端消息会被忽略。
 

@@ -9,7 +9,10 @@ mod server;
 mod updater;
 
 use anyhow::Context;
-use model::{HardwareMetrics, MonitorDisplayMode, MonitorPosition, TransferProgress, WireMessage};
+use model::{
+    ClipboardHistoryMode, ClipboardHistorySettings, HardwareMetrics, MonitorDisplayMode,
+    MonitorPosition, TransferProgress, WireMessage,
+};
 use runtime::{NodeRuntime, UpdateFrequency};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
@@ -56,6 +59,25 @@ fn clipboard_sync_enabled(state: State<'_, ManagedNode>) -> bool {
         .runtime
         .sync_enabled
         .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[tauri::command]
+fn clipboard_history_settings(state: State<'_, ManagedNode>) -> ClipboardHistorySettings {
+    state.runtime.clipboard_history_settings()
+}
+
+#[tauri::command]
+fn set_clipboard_history_settings(
+    state: State<'_, ManagedNode>,
+    mode: String,
+    value: u64,
+) -> Result<ClipboardHistorySettings, String> {
+    let mode =
+        ClipboardHistoryMode::parse(&mode).ok_or_else(|| "剪贴板历史模式无效".to_string())?;
+    state
+        .runtime
+        .set_clipboard_history_settings(mode, value)
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -597,6 +619,7 @@ async fn start_node(
                 }
             }
             cleanup_runtime.prune_transfers();
+            cleanup_runtime.prune_clipboard_history();
         }
     });
     clipboard::start_monitor(runtime.clone());
@@ -850,6 +873,8 @@ pub fn run() {
             node_base_url,
             toggle_clipboard_sync,
             clipboard_sync_enabled,
+            clipboard_history_settings,
+            set_clipboard_history_settings,
             update_frequency,
             set_update_frequency,
             check_for_updates,

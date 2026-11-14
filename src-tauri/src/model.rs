@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const CLIPBOARD_TEXT_LIMIT: usize = 16 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_LIMIT: usize = 16 * 1024 * 1024;
+pub const DEFAULT_CLIPBOARD_HISTORY_COUNT: usize = 50;
+pub const DEFAULT_CLIPBOARD_HISTORY_DAYS: u32 = 30;
+pub const MAX_CLIPBOARD_HISTORY_COUNT: usize = 500;
+pub const MAX_CLIPBOARD_HISTORY_DAYS: u32 = 365;
 pub const MAX_TRANSFER_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const MAX_TRANSFER_ITEMS: usize = 4_096;
 pub const MAX_TRANSFER_RECORDS: usize = 512;
@@ -153,6 +157,56 @@ pub struct ClipboardSnapshot {
     pub text: Option<String>,
     pub image_png: Option<String>,
     pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardHistoryMode {
+    #[default]
+    Count,
+    Days,
+}
+
+impl ClipboardHistoryMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "count" => Some(Self::Count),
+            "days" => Some(Self::Days),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardHistorySettings {
+    pub mode: ClipboardHistoryMode,
+    pub count: usize,
+    pub days: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardHistoryItem {
+    pub event_id: String,
+    pub source_node_id: String,
+    pub source_name: String,
+    pub updated_at_ms: i64,
+    pub recorded_at_ms: i64,
+    pub has_text: bool,
+    pub has_image: bool,
+    pub text_preview: Option<String>,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClipboardHistoryList {
+    pub settings: ClipboardHistorySettings,
+    pub items: Vec<ClipboardHistoryItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardHistoryDetail {
+    pub item: ClipboardHistoryItem,
+    pub snapshot: ClipboardSnapshot,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

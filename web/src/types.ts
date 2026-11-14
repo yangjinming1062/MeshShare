@@ -85,6 +85,36 @@ export type ClipboardSnapshot = {
   updated_at_ms: number;
 };
 
+export type ClipboardHistoryMode = 'count' | 'days';
+
+export type ClipboardHistorySettings = {
+  mode: ClipboardHistoryMode;
+  count: number;
+  days: number;
+};
+
+export type ClipboardHistoryItem = {
+  event_id: string;
+  source_node_id: string;
+  source_name: string;
+  updated_at_ms: number;
+  recorded_at_ms: number;
+  has_text: boolean;
+  has_image: boolean;
+  text_preview?: string;
+  size_bytes: number;
+};
+
+export type ClipboardHistoryResponse = {
+  settings: ClipboardHistorySettings;
+  items: ClipboardHistoryItem[];
+};
+
+export type ClipboardHistoryDetail = {
+  item: ClipboardHistoryItem;
+  snapshot: ClipboardSnapshot;
+};
+
 export type TransferItem = {
   item_id: string;
   name: string;

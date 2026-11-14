@@ -1,10 +1,13 @@
 use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
-    AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
-    MobileTransferView, MonitorDisplayMode, MonitorPosition, NodeInfo, PeerInfo, TransferOffer,
-    TransferProgress, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
-    MAX_MOBILE_TRANSFERS_PER_SESSION, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
-    METRICS_SYSTEM_CAPABILITY,
+    AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryItem,
+    ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot,
+    HardwareMetrics, MobileSession, MobileTransferView, MonitorDisplayMode, MonitorPosition,
+    NodeInfo, PeerInfo, TransferOffer, TransferProgress, TransferStatus, WireMessage,
+    CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, DEFAULT_CLIPBOARD_HISTORY_COUNT,
+    DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS,
+    MAX_MOBILE_SESSIONS, MAX_MOBILE_TRANSFERS_PER_SESSION, MAX_TRANSFER_RECORDS,
+    METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -19,6 +22,14 @@ use uuid::Uuid;
 
 fn default_autostart_enabled() -> bool {
     true
+}
+
+fn default_clipboard_history_count() -> usize {
+    DEFAULT_CLIPBOARD_HISTORY_COUNT
+}
+
+fn default_clipboard_history_days() -> u32 {
+    DEFAULT_CLIPBOARD_HISTORY_DAYS
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +86,27 @@ struct PersistedConfig {
     update_last_checked_at_ms: Option<i64>,
     #[serde(default)]
     pending_update_version: Option<String>,
+    #[serde(default)]
+    clipboard_history_mode: ClipboardHistoryMode,
+    #[serde(default = "default_clipboard_history_count")]
+    clipboard_history_count: usize,
+    #[serde(default = "default_clipboard_history_days")]
+    clipboard_history_days: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClipboardHistoryRecord {
+    event_id: String,
+    source_node_id: String,
+    source_name: String,
+    clock: crate::model::Hlc,
+    updated_at_ms: i64,
+    recorded_at_ms: i64,
+    content_hash: String,
+    text_path: Option<String>,
+    image_path: Option<String>,
+    text_len: usize,
+    image_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +133,7 @@ pub struct NodeRuntime {
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
     pub clipboard: RwLock<Option<ClipboardSnapshot>>,
+    clipboard_history: Mutex<Vec<ClipboardHistoryRecord>>,
     pub peers: RwLock<HashMap<String, PeerInfo>>,
     pub transfers: RwLock<HashMap<String, TransferRecord>>,
     pub mobile_sessions: RwLock<HashMap<String, MobileSession>>,
@@ -150,6 +183,11 @@ const MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION: usize = 128;
 const MAX_SEEN_CLIPBOARD_EVENTS: usize = 4_096;
 const DESKTOP_TEMP_REGISTRY_FILE: &str = "desktop-transfer-temp-files.json";
 const MAX_DESKTOP_TEMP_FILES: usize = 512;
+const CLIPBOARD_HISTORY_FILE: &str = "clipboard-history.json";
+const CLIPBOARD_CURRENT_FILE: &str = "clipboard-current.json";
+const CLIPBOARD_PAYLOAD_DIR: &str = "clipboard-history-payloads";
+const CLIPBOARD_HISTORY_PREVIEW_BYTES: usize = 256;
+const CLIPBOARD_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     MobileTransferView {
@@ -186,7 +224,20 @@ impl NodeRuntime {
             Err(error) => return Err(error.into()),
         }
         let desktop_temp_files = load_and_cleanup_desktop_temp_files(&data_dir)?;
+        cleanup_clipboard_temp_files(&data_dir)?;
         let config = load_or_create_config(&data_dir)?;
+        let mut clipboard_history = load_clipboard_history(&data_dir)?;
+        prune_clipboard_history_records(&mut clipboard_history, &config, now_millis());
+        persist_clipboard_history(&data_dir, &clipboard_history)?;
+        let clipboard = load_clipboard_current(&data_dir).or_else(|| {
+            clipboard_history
+                .first()
+                .and_then(|record| load_history_snapshot(&data_dir, record).ok())
+        });
+        let clock = LogicalClock::new(config.node_id.clone());
+        if let Some(snapshot) = clipboard.as_ref() {
+            clock.observe(&snapshot.clock);
+        }
         let addresses = network_addresses_for_bound(port, &[Ipv4Addr::LOCALHOST]);
         let node = NodeInfo {
             node_id: config.node_id.clone(),
@@ -208,9 +259,10 @@ impl NodeRuntime {
         };
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
-            clock: LogicalClock::new(config.node_id.clone()),
+            clock,
             node: RwLock::new(node),
-            clipboard: RwLock::new(None),
+            clipboard: RwLock::new(clipboard),
+            clipboard_history: Mutex::new(clipboard_history),
             peers: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
             mobile_sessions: RwLock::new(HashMap::new()),
@@ -602,6 +654,160 @@ impl NodeRuntime {
         Ok(())
     }
 
+    pub fn clipboard_history_settings(&self) -> ClipboardHistorySettings {
+        let config = self.config.lock();
+        ClipboardHistorySettings {
+            mode: config.clipboard_history_mode,
+            count: config
+                .clipboard_history_count
+                .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT),
+            days: config
+                .clipboard_history_days
+                .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS),
+        }
+    }
+
+    pub fn set_clipboard_history_settings(
+        &self,
+        mode: ClipboardHistoryMode,
+        value: u64,
+    ) -> anyhow::Result<ClipboardHistorySettings> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        match mode {
+            ClipboardHistoryMode::Count => {
+                let count = usize::try_from(value)
+                    .ok()
+                    .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_COUNT).contains(value))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "剪贴板历史条数必须在 1 到 {MAX_CLIPBOARD_HISTORY_COUNT} 之间"
+                        )
+                    })?;
+                next.clipboard_history_count = count;
+            }
+            ClipboardHistoryMode::Days => {
+                let days = u32::try_from(value)
+                    .ok()
+                    .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_DAYS).contains(value))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "剪贴板历史天数必须在 1 到 {MAX_CLIPBOARD_HISTORY_DAYS} 之间"
+                        )
+                    })?;
+                next.clipboard_history_days = days;
+            }
+        }
+        next.clipboard_history_count = next
+            .clipboard_history_count
+            .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
+        next.clipboard_history_days = next
+            .clipboard_history_days
+            .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
+        next.clipboard_history_mode = mode;
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        drop(config);
+        self.prune_clipboard_history();
+        Ok(self.clipboard_history_settings())
+    }
+
+    pub fn prune_clipboard_history(&self) -> usize {
+        let _update_guard = self.clipboard_update.lock();
+        let mut history = self.clipboard_history.lock();
+        let before = history.len();
+        let previous = history.clone();
+        let config = self.config.lock().clone();
+        prune_clipboard_history_records(&mut history, &config, now_millis());
+        if history.len() != before {
+            if let Err(error) = persist_clipboard_history(&self.data_dir, &history) {
+                *history = previous;
+                eprintln!("保存剪贴板历史清理结果失败：{error}");
+                return 0;
+            }
+        }
+        before.saturating_sub(history.len())
+    }
+
+    pub fn clipboard_history_list(&self) -> ClipboardHistoryList {
+        let _update_guard = self.clipboard_update.lock();
+        let mut history = self.clipboard_history.lock();
+        let config = self.config.lock().clone();
+        let before = history.len();
+        let previous = history.clone();
+        prune_clipboard_history_records(&mut history, &config, now_millis());
+        if history.len() != before {
+            if let Err(error) = persist_clipboard_history(&self.data_dir, &history) {
+                *history = previous;
+                eprintln!("保存剪贴板历史清理结果失败：{error}");
+            }
+        }
+        ClipboardHistoryList {
+            settings: ClipboardHistorySettings {
+                mode: config.clipboard_history_mode,
+                count: config
+                    .clipboard_history_count
+                    .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT),
+                days: config
+                    .clipboard_history_days
+                    .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS),
+            },
+            items: history
+                .iter()
+                .map(|record| self.history_item(record))
+                .collect(),
+        }
+    }
+
+    pub fn clipboard_history_detail(&self, event_id: &str) -> Option<ClipboardHistoryDetail> {
+        let _update_guard = self.clipboard_update.lock();
+        let history = self.clipboard_history.lock();
+        history
+            .iter()
+            .find(|record| record.event_id == event_id)
+            .and_then(|record| {
+                load_history_snapshot(&self.data_dir, record)
+                    .ok()
+                    .map(|snapshot| ClipboardHistoryDetail {
+                        item: self.history_item(record),
+                        snapshot,
+                    })
+            })
+    }
+
+    fn history_item(&self, record: &ClipboardHistoryRecord) -> ClipboardHistoryItem {
+        let text_preview = record.text_path.as_ref().and_then(|path| {
+            let path = self.data_dir.join(CLIPBOARD_PAYLOAD_DIR).join(path);
+            let bytes = std::fs::read(path).ok()?;
+            let bytes = &bytes[..bytes.len().min(CLIPBOARD_HISTORY_PREVIEW_BYTES)];
+            Some(String::from_utf8_lossy(bytes).into_owned())
+        });
+        ClipboardHistoryItem {
+            event_id: record.event_id.clone(),
+            source_node_id: record.source_node_id.clone(),
+            source_name: record.source_name.clone(),
+            updated_at_ms: record.updated_at_ms,
+            recorded_at_ms: record.recorded_at_ms,
+            has_text: record.text_path.is_some(),
+            has_image: record.image_path.is_some(),
+            text_preview,
+            size_bytes: (record.text_len as u64).saturating_add(record.image_len as u64),
+        }
+    }
+
+    pub fn clear_clipboard_history(&self) -> anyhow::Result<usize> {
+        let _update_guard = self.clipboard_update.lock();
+        let mut history = self.clipboard_history.lock();
+        let count = history.len();
+        let previous = history.clone();
+        history.clear();
+        if let Err(error) = persist_clipboard_history(&self.data_dir, &history) {
+            *history = previous;
+            return Err(error);
+        }
+        Ok(count)
+    }
+
     pub fn has_active_transfers(&self) -> bool {
         let active = |status: &TransferStatus| {
             matches!(
@@ -678,16 +884,6 @@ impl NodeRuntime {
             };
             seen.remove(&oldest);
         }
-        let newer = self
-            .clipboard
-            .read()
-            .as_ref()
-            .map(|current| event.clock.compare(&current.clock).is_gt())
-            .unwrap_or(true);
-        if !newer {
-            return false;
-        }
-        self.clock.observe(&event.clock);
         let snapshot = ClipboardSnapshot {
             event_id: event.event_id,
             source_node_id: event.origin_node_id,
@@ -697,8 +893,54 @@ impl NodeRuntime {
             image_png: event.image_png,
             updated_at_ms: event.updated_at_ms,
         };
+        if let Err(error) = clipboard_snapshot_hash(&snapshot) {
+            eprintln!("忽略无效剪贴板内容：{error}");
+            return false;
+        }
+        let current = self.clipboard.read().clone();
+        let replayed_current = current
+            .as_ref()
+            .is_some_and(|current| current.event_id == snapshot.event_id);
+        if !replayed_current {
+            if let Err(error) = self.upsert_clipboard_history_locked(&snapshot, now) {
+                eprintln!("保存剪贴板历史失败：{error}");
+            }
+        }
+        let newer = current
+            .as_ref()
+            .map(|current| snapshot.clock.compare(&current.clock).is_gt())
+            .unwrap_or(true);
+        if !newer {
+            return false;
+        }
+        self.clock.observe(&snapshot.clock);
+        if let Err(error) = persist_clipboard_current(&self.data_dir, &snapshot) {
+            eprintln!("保存当前剪贴板失败：{error}");
+        }
         *self.clipboard.write() = Some(snapshot);
         true
+    }
+
+    fn upsert_clipboard_history_locked(
+        &self,
+        snapshot: &ClipboardSnapshot,
+        recorded_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let content_hash = clipboard_snapshot_hash(snapshot)?;
+        let mut history = self.clipboard_history.lock();
+        if let Some(index) = history.iter().position(|record| {
+            record.event_id == snapshot.event_id || record.content_hash == content_hash
+        }) {
+            let old = history.remove(index);
+            remove_clipboard_record_payloads(&self.data_dir, &old);
+        }
+        let record =
+            write_clipboard_history_record(&self.data_dir, snapshot, recorded_at_ms, content_hash)?;
+        history.insert(0, record);
+        let config = self.config.lock().clone();
+        prune_clipboard_history_records(&mut history, &config, recorded_at_ms);
+        persist_clipboard_history(&self.data_dir, &history)?;
+        Ok(())
     }
 
     pub fn create_local_clipboard(
@@ -741,8 +983,22 @@ impl NodeRuntime {
             image_png,
             updated_at_ms: now_millis(),
         };
-        let _ = self.accept_clipboard(event.clone(), source_name);
-        Some(event)
+        self.accept_clipboard(event.clone(), source_name)
+            .then_some(event)
+    }
+
+    pub fn restore_clipboard_history(&self, event_id: &str) -> Option<ClipboardEvent> {
+        let detail = self.clipboard_history_detail(event_id)?;
+        let image = detail
+            .snapshot
+            .image_png
+            .as_deref()
+            .and_then(|value| BASE64.decode(value).ok());
+        self.create_local_clipboard_named(
+            detail.snapshot.text,
+            image,
+            self.node.read().node_name.clone(),
+        )
     }
 
     pub fn clipboard_snapshot(&self) -> Option<ClipboardSnapshot> {
@@ -1536,8 +1792,15 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
     let path = data_dir.join("node.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            return serde_json::from_str::<PersistedConfig>(&contents)
-                .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"));
+            let mut config = serde_json::from_str::<PersistedConfig>(&contents)
+                .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
+            config.clipboard_history_count = config
+                .clipboard_history_count
+                .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
+            config.clipboard_history_days = config
+                .clipboard_history_days
+                .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
+            return Ok(config);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -1556,6 +1819,9 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
         update_frequency: UpdateFrequency::default(),
         update_last_checked_at_ms: None,
         pending_update_version: None,
+        clipboard_history_mode: ClipboardHistoryMode::default(),
+        clipboard_history_count: default_clipboard_history_count(),
+        clipboard_history_days: default_clipboard_history_days(),
     };
     persist_config(data_dir, &config)?;
     Ok(config)
@@ -1639,6 +1905,7 @@ fn persist_desktop_temp_files(data_dir: &Path, files: &HashSet<PathBuf>) -> anyh
                 std::fs::remove_file(&path)?;
                 std::fs::rename(&temporary, &path)?;
             } else {
+                let _ = std::fs::remove_file(&temporary);
                 return Err(error.into());
             }
         }
@@ -1669,6 +1936,7 @@ fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<(
                 std::fs::remove_file(&path)?;
                 std::fs::rename(&temporary, &path)?;
             } else {
+                let _ = std::fs::remove_file(&temporary);
                 return Err(error.into());
             }
         }
@@ -1686,6 +1954,379 @@ fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+fn clipboard_payload_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join(CLIPBOARD_PAYLOAD_DIR)
+}
+
+fn is_clipboard_index_temp_name(name: &str, base: &str) -> bool {
+    name.strip_prefix(base)
+        .is_some_and(|suffix| suffix.starts_with(".tmp-"))
+}
+
+fn remove_clipboard_temp_file(path: &Path) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !(metadata.is_file() || metadata.file_type().is_symlink()) {
+        return;
+    }
+    if let Err(error) = std::fs::remove_file(path) {
+        eprintln!("清理剪贴板临时文件失败 {}：{error}", path.display());
+    }
+}
+
+fn cleanup_clipboard_temp_files(data_dir: &Path) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(data_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_clipboard_index_temp_name(name, CLIPBOARD_HISTORY_FILE)
+            || is_clipboard_index_temp_name(name, CLIPBOARD_CURRENT_FILE)
+        {
+            remove_clipboard_temp_file(&entry.path());
+        }
+    }
+    let payload_dir = clipboard_payload_dir(data_dir);
+    let entries = match std::fs::read_dir(&payload_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_str().is_some_and(|name| name.contains(".tmp-")) {
+            remove_clipboard_temp_file(&entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn safe_clipboard_payload_name(name: &str, extension: &str) -> bool {
+    let path = Path::new(name);
+    path.components().count() == 1
+        && path.file_name().and_then(|value| value.to_str()) == Some(name)
+        && path.extension().and_then(|value| value.to_str()) == Some(extension)
+        && name.len() <= 128
+}
+
+fn clipboard_history_record_valid(data_dir: &Path, record: &ClipboardHistoryRecord) -> bool {
+    if record.event_id.is_empty()
+        || record.event_id.len() > 256
+        || record.source_node_id.is_empty()
+        || record.source_node_id.len() > 256
+        || record.source_name.len() > 256
+        || record.content_hash.len() != 64
+        || (record.text_path.is_none() && record.image_path.is_none())
+    {
+        return false;
+    }
+    let payload_dir = clipboard_payload_dir(data_dir);
+    if let Some(path) = record.text_path.as_deref() {
+        let full = payload_dir.join(path);
+        if !safe_clipboard_payload_name(path, "txt")
+            || std::fs::symlink_metadata(&full)
+                .map(|metadata| {
+                    !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || metadata.len() as usize != record.text_len
+                })
+                .unwrap_or(true)
+            || record.text_len > CLIPBOARD_TEXT_LIMIT
+        {
+            return false;
+        }
+    }
+    if let Some(path) = record.image_path.as_deref() {
+        let full = payload_dir.join(path);
+        let valid_png = std::fs::read(&full)
+            .ok()
+            .is_some_and(|bytes| crate::clipboard::is_valid_png(&bytes));
+        if !safe_clipboard_payload_name(path, "png")
+            || std::fs::symlink_metadata(&full)
+                .map(|metadata| {
+                    !metadata.is_file()
+                        || metadata.file_type().is_symlink()
+                        || metadata.len() as usize != record.image_len
+                })
+                .unwrap_or(true)
+            || record.image_len > CLIPBOARD_IMAGE_LIMIT
+            || !valid_png
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn load_clipboard_history(data_dir: &Path) -> anyhow::Result<Vec<ClipboardHistoryRecord>> {
+    let path = data_dir.join(CLIPBOARD_HISTORY_FILE);
+    let contents = match std::fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let records = match serde_json::from_slice::<Vec<ClipboardHistoryRecord>>(&contents) {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!("剪贴板历史索引损坏，已忽略：{error}");
+            return Ok(Vec::new());
+        }
+    };
+    Ok(records
+        .into_iter()
+        .take(MAX_CLIPBOARD_HISTORY_COUNT)
+        .filter(|record| clipboard_history_record_valid(data_dir, record))
+        .collect())
+}
+
+fn persist_clipboard_history(
+    data_dir: &Path,
+    history: &[ClipboardHistoryRecord],
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(clipboard_payload_dir(data_dir))?;
+    let path = data_dir.join(CLIPBOARD_HISTORY_FILE);
+    let temporary = data_dir.join(format!(
+        "{CLIPBOARD_HISTORY_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    std::fs::write(&temporary, serde_json::to_vec_pretty(history)?)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                std::fs::rename(&temporary, &path)?;
+            } else {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
+    let referenced = history
+        .iter()
+        .flat_map(|record| [record.text_path.as_deref(), record.image_path.as_deref()])
+        .flatten()
+        .collect::<HashSet<_>>();
+    for entry in std::fs::read_dir(clipboard_payload_dir(data_dir))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.contains(".tmp-") {
+            remove_clipboard_temp_file(&entry.path());
+        } else if !referenced.contains(name) {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn persist_clipboard_current(data_dir: &Path, snapshot: &ClipboardSnapshot) -> anyhow::Result<()> {
+    let path = data_dir.join(CLIPBOARD_CURRENT_FILE);
+    let temporary = data_dir.join(format!(
+        "{CLIPBOARD_CURRENT_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    std::fs::write(&temporary, serde_json::to_vec(snapshot)?)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        #[cfg(windows)]
+        {
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+                std::fs::rename(&temporary, &path)?;
+            } else {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error.into());
+        }
+    }
+    Ok(())
+}
+
+fn load_clipboard_current(data_dir: &Path) -> Option<ClipboardSnapshot> {
+    let contents = std::fs::read(data_dir.join(CLIPBOARD_CURRENT_FILE)).ok()?;
+    let snapshot = serde_json::from_slice::<ClipboardSnapshot>(&contents).ok()?;
+    clipboard_snapshot_hash(&snapshot).ok().map(|_| snapshot)
+}
+
+fn write_clipboard_payload(
+    data_dir: &Path,
+    storage_id: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> anyhow::Result<String> {
+    let directory = clipboard_payload_dir(data_dir);
+    std::fs::create_dir_all(&directory)?;
+    let name = format!("{storage_id}.{extension}");
+    let path = directory.join(&name);
+    let temporary = directory.join(format!("{name}.tmp-{}", std::process::id()));
+    std::fs::write(&temporary, bytes)?;
+    match std::fs::rename(&temporary, &path) {
+        Ok(()) => {}
+        Err(error) => {
+            #[cfg(windows)]
+            {
+                if path.exists() {
+                    std::fs::remove_file(&path)?;
+                    std::fs::rename(&temporary, &path)?;
+                } else {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(error.into());
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(name)
+}
+
+fn write_clipboard_history_record(
+    data_dir: &Path,
+    snapshot: &ClipboardSnapshot,
+    recorded_at_ms: i64,
+    content_hash: String,
+) -> anyhow::Result<ClipboardHistoryRecord> {
+    let storage_id = Uuid::new_v4().to_string();
+    let text_path = snapshot
+        .text
+        .as_ref()
+        .map(|text| write_clipboard_payload(data_dir, &storage_id, "txt", text.as_bytes()))
+        .transpose()?;
+    let image_bytes = snapshot
+        .image_png
+        .as_deref()
+        .map(|value| BASE64.decode(value))
+        .transpose()?;
+    let image_path = image_bytes
+        .as_deref()
+        .map(|bytes| write_clipboard_payload(data_dir, &storage_id, "png", bytes))
+        .transpose()?;
+    Ok(ClipboardHistoryRecord {
+        event_id: snapshot.event_id.clone(),
+        source_node_id: snapshot.source_node_id.clone(),
+        source_name: snapshot.source_name.clone(),
+        clock: snapshot.clock.clone(),
+        updated_at_ms: snapshot.updated_at_ms,
+        recorded_at_ms,
+        content_hash,
+        text_path,
+        image_path,
+        text_len: snapshot.text.as_ref().map_or(0, String::len),
+        image_len: image_bytes.map_or(0, |bytes| bytes.len()),
+    })
+}
+
+fn load_history_snapshot(
+    data_dir: &Path,
+    record: &ClipboardHistoryRecord,
+) -> anyhow::Result<ClipboardSnapshot> {
+    let directory = clipboard_payload_dir(data_dir);
+    let text = record
+        .text_path
+        .as_deref()
+        .map(|path| std::fs::read(directory.join(path)))
+        .transpose()?
+        .map(|bytes| String::from_utf8(bytes).map_err(anyhow::Error::from))
+        .transpose()?;
+    let image_png = record
+        .image_path
+        .as_deref()
+        .map(|path| {
+            std::fs::read(directory.join(path))
+                .map(|bytes| BASE64.encode(bytes))
+                .map_err(anyhow::Error::from)
+        })
+        .transpose()?;
+    Ok(ClipboardSnapshot {
+        event_id: record.event_id.clone(),
+        source_node_id: record.source_node_id.clone(),
+        source_name: record.source_name.clone(),
+        clock: record.clock.clone(),
+        text,
+        image_png,
+        updated_at_ms: record.updated_at_ms,
+    })
+}
+
+fn remove_clipboard_record_payloads(data_dir: &Path, record: &ClipboardHistoryRecord) {
+    let directory = clipboard_payload_dir(data_dir);
+    for path in [record.text_path.as_deref(), record.image_path.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = std::fs::remove_file(directory.join(path));
+    }
+}
+
+fn clipboard_snapshot_hash(snapshot: &ClipboardSnapshot) -> anyhow::Result<String> {
+    let image = snapshot
+        .image_png
+        .as_deref()
+        .map(|value| BASE64.decode(value))
+        .transpose()?;
+    if snapshot
+        .text
+        .as_ref()
+        .is_some_and(|value| value.len() > CLIPBOARD_TEXT_LIMIT)
+        || image
+            .as_ref()
+            .is_some_and(|value| value.len() > CLIPBOARD_IMAGE_LIMIT)
+    {
+        return Err(anyhow::anyhow!("剪贴板内容超过大小限制"));
+    }
+    if image
+        .as_deref()
+        .is_some_and(|bytes| !crate::clipboard::is_valid_png(bytes))
+    {
+        return Err(anyhow::anyhow!("剪贴板图片不是有效的 PNG"));
+    }
+    Ok(crate::clipboard::payload_hash(
+        snapshot.text.as_deref(),
+        image.as_deref(),
+    ))
+}
+
+fn prune_clipboard_history_records(
+    history: &mut Vec<ClipboardHistoryRecord>,
+    config: &PersistedConfig,
+    now: i64,
+) {
+    match config.clipboard_history_mode {
+        ClipboardHistoryMode::Count => history.truncate(
+            config
+                .clipboard_history_count
+                .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT),
+        ),
+        ClipboardHistoryMode::Days => {
+            let age = i64::from(
+                config
+                    .clipboard_history_days
+                    .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS),
+            )
+            .saturating_mul(CLIPBOARD_DAY_MS);
+            let threshold = now.saturating_sub(age);
+            history.retain(|record| record.recorded_at_ms >= threshold);
+            history.truncate(MAX_CLIPBOARD_HISTORY_COUNT);
+        }
+    }
 }
 
 fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
@@ -1832,8 +2473,8 @@ mod tests {
         TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
-        ClipboardEvent, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, PeerInfo, TransferItem,
-        TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
+        ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
+        PeerInfo, TransferItem, TransferOffer, TransferStatus, WireMessage, MAX_MOBILE_SESSIONS,
         MAX_MOBILE_STAGING_BYTES_PER_SESSION, MAX_TRANSFER_RECORDS, METRICS_SYSTEM_CAPABILITY,
     };
     use std::path::PathBuf;
@@ -1957,6 +2598,18 @@ mod tests {
         assert_eq!(config.update_frequency, UpdateFrequency::Weekly);
         assert_eq!(config.update_last_checked_at_ms, None);
         assert_eq!(config.pending_update_version, None);
+        assert_eq!(
+            config.clipboard_history_mode,
+            crate::model::ClipboardHistoryMode::Count
+        );
+        assert_eq!(
+            config.clipboard_history_count,
+            crate::model::DEFAULT_CLIPBOARD_HISTORY_COUNT
+        );
+        assert_eq!(
+            config.clipboard_history_days,
+            crate::model::DEFAULT_CLIPBOARD_HISTORY_DAYS
+        );
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -2801,6 +3454,211 @@ mod tests {
             .expect("clipboard snapshot")
             .image_png
             .is_some());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn persisted_current_snapshot_advances_clock_after_restart() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let future_clock = Hlc {
+            physical_ms: crate::clock::now_millis() + 60_000,
+            logical: 7,
+            node_id: "peer".to_string(),
+        };
+        assert!(runtime.accept_clipboard(
+            ClipboardEvent {
+                event_id: "future-event".to_string(),
+                origin_node_id: "peer".to_string(),
+                clock: future_clock,
+                text: Some("future".to_string()),
+                image_png: None,
+                updated_at_ms: crate::clock::now_millis(),
+            },
+            "peer".to_string(),
+        ));
+        let current = runtime.clipboard_snapshot().expect("current snapshot");
+        drop(runtime);
+
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        let next = restored.clock.tick();
+        assert!(next.compare(&current.clock).is_gt());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn startup_removes_clipboard_history_temporary_files() {
+        let path = temp_data_dir();
+        let payload_dir = path.join("clipboard-history-payloads");
+        std::fs::create_dir_all(&payload_dir).expect("create payload directory");
+        for file in [
+            path.join("clipboard-history.json.tmp-123"),
+            path.join("clipboard-current.json.tmp-123"),
+            payload_dir.join("payload.txt.tmp-123"),
+            payload_dir.join("payload.png.tmp-123"),
+        ] {
+            std::fs::write(file, b"stale").expect("write stale clipboard file");
+        }
+        let _runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert!(!path.join("clipboard-history.json.tmp-123").exists());
+        assert!(!path.join("clipboard-current.json.tmp-123").exists());
+        assert!(!payload_dir.join("payload.txt.tmp-123").exists());
+        assert!(!payload_dir.join("payload.png.tmp-123").exists());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn replaying_current_snapshot_does_not_recreate_cleared_history() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .create_local_clipboard_named(Some("current".to_string()), None, "local".to_string())
+            .expect("create clipboard event");
+        let current = runtime.clipboard_snapshot().expect("current snapshot");
+        drop(runtime);
+
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        restored
+            .clear_clipboard_history()
+            .expect("clear clipboard history");
+        assert!(!restored.accept_clipboard(
+            ClipboardEvent {
+                event_id: current.event_id.clone(),
+                origin_node_id: current.source_node_id.clone(),
+                clock: current.clock.clone(),
+                text: current.text.clone(),
+                image_png: current.image_png.clone(),
+                updated_at_ms: current.updated_at_ms,
+            },
+            current.source_name.clone(),
+        ));
+        assert!(restored.clipboard_history_list().items.is_empty());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_history_persists_deduplicates_and_restores_current() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .create_local_clipboard_named(Some("one".to_string()), None, "local".to_string())
+            .expect("first clipboard event");
+        runtime
+            .create_local_clipboard_named(Some("two".to_string()), None, "local".to_string())
+            .expect("second clipboard event");
+        runtime
+            .create_local_clipboard_named(Some("one".to_string()), None, "local".to_string())
+            .expect("duplicate clipboard event");
+        let history = runtime.clipboard_history_list();
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].text_preview.as_deref(), Some("one"));
+
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert_eq!(
+            restored
+                .clipboard_snapshot()
+                .expect("current snapshot")
+                .text
+                .as_deref(),
+            Some("one")
+        );
+        let restored_history = restored.clipboard_history_list();
+        assert_eq!(restored_history.items.len(), 2);
+        let cleared = restored
+            .clear_clipboard_history()
+            .expect("clear clipboard history");
+        assert_eq!(cleared, 2);
+        assert!(restored.clipboard_history_list().items.is_empty());
+        assert!(restored.clipboard_snapshot().is_some());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_history_count_setting_prunes_immediately() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .set_clipboard_history_settings(ClipboardHistoryMode::Count, 2)
+            .expect("set history count");
+        for value in ["one", "two", "three"] {
+            runtime
+                .create_local_clipboard_named(Some(value.to_string()), None, "local".to_string())
+                .expect("create clipboard event");
+        }
+        let history = runtime.clipboard_history_list();
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].text_preview.as_deref(), Some("three"));
+        assert_eq!(history.items[1].text_preview.as_deref(), Some("two"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_history_days_prune_uses_local_recorded_time() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .create_local_clipboard_named(Some("old".to_string()), None, "local".to_string())
+            .expect("create clipboard event");
+        runtime.clipboard_history.lock()[0].recorded_at_ms =
+            crate::clock::now_millis() - 2 * 24 * 60 * 60 * 1000;
+        runtime
+            .create_local_clipboard_named(Some("new".to_string()), None, "local".to_string())
+            .expect("create clipboard event");
+        runtime
+            .set_clipboard_history_settings(ClipboardHistoryMode::Days, 1)
+            .expect("set history days");
+        let history = runtime.clipboard_history_list();
+        assert_eq!(history.items.len(), 1);
+        assert_eq!(history.items[0].text_preview.as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn older_hlc_event_is_kept_in_history_without_replacing_current() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .create_local_clipboard_named(Some("new".to_string()), None, "local".to_string())
+            .expect("create clipboard event");
+        let accepted_as_current = runtime.accept_clipboard(
+            ClipboardEvent {
+                event_id: "older-event".to_string(),
+                origin_node_id: "peer".to_string(),
+                clock: Hlc {
+                    physical_ms: 1,
+                    logical: 0,
+                    node_id: "peer".to_string(),
+                },
+                text: Some("old".to_string()),
+                image_png: None,
+                updated_at_ms: 1,
+            },
+            "peer".to_string(),
+        );
+        assert!(!accepted_as_current);
+        assert_eq!(
+            runtime
+                .clipboard_snapshot()
+                .expect("current snapshot")
+                .text
+                .as_deref(),
+            Some("new")
+        );
+        assert!(runtime
+            .clipboard_history_list()
+            .items
+            .iter()
+            .any(|item| item.text_preview.as_deref() == Some("old")));
         let _ = std::fs::remove_dir_all(path);
     }
 }

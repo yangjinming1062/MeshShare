@@ -5,15 +5,20 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { apiUrl, createMobileSession, getClipboard, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, websocketUrl } from './api';
+  import { apiUrl, clearClipboardHistory, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
   import { digestFile } from './sha256';
-  import type { ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistoryResponse, ClipboardHistorySettings, ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
   let node: NodeInfo | null = null;
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
+  let clipboardHistory: ClipboardHistoryItem[] = [];
+  let clipboardHistorySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
+  let selectedClipboardHistory: ClipboardHistoryDetail | null = null;
+  let clipboardHistoryBusy = false;
+  let clipboardHistorySettingsBusy = false;
   let metrics: HardwareMetrics | null = null;
   let selectedMetricsPeer: PeerInfo | null = null;
   $: currentMetrics = selectedMetricsPeer?.metrics ?? metrics;
@@ -127,6 +132,7 @@
         if (!isMobile && !isMonitor) {
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
           updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
+          clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
         }
         await refresh();
         syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
@@ -174,7 +180,7 @@
 
   async function refresh() {
     if (isMobile && !mobileSessionId) await ensureMobileSession();
-    const [nextNode, nextPeers, nextClipboard, nextMetrics] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics()]);
+    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory] = await Promise.all([getInfo(), getPeers(), getClipboard(), getMetrics(), getClipboardHistory()]);
     const nextTransfers = isMobile ? [] : await getTransfers();
     if (isMobile) {
       mobileTransfers = await getMobileTransfersWithRecovery();
@@ -191,6 +197,11 @@
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
+    clipboardHistory = nextHistory.items;
+    if (isMobile || isMonitor) clipboardHistorySettings = nextHistory.settings;
+    if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
+      selectedClipboardHistory = null;
+    }
     metrics = nextMetrics;
     transfers = [...nextTransfers, ...transfers.filter((item) => !nextTransfers.some((next) => next.transfer_id === item.transfer_id))];
     for (const transfer of nextTransfers) {
@@ -352,6 +363,48 @@
     window.setTimeout(() => (notice = ''), 2400);
   }
 
+  async function setClipboardHistoryMode(event: Event) {
+    const mode = (event.currentTarget as HTMLSelectElement).value as ClipboardHistoryMode;
+    await saveClipboardHistorySettings(mode, historyValue(mode));
+  }
+
+  async function setClipboardHistoryValue(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    const value = Number.parseInt(input.value, 10);
+    if (!Number.isFinite(value)) return;
+    await saveClipboardHistorySettings(clipboardHistorySettings.mode, value);
+  }
+
+  function historyValue(mode: ClipboardHistoryMode) {
+    return mode === 'count' ? clipboardHistorySettings.count : clipboardHistorySettings.days;
+  }
+
+  async function saveClipboardHistorySettings(mode: ClipboardHistoryMode, value: number) {
+    if (clipboardHistorySettingsBusy) return;
+    clipboardHistorySettingsBusy = true;
+    try {
+      clipboardHistorySettings = await invoke<ClipboardHistorySettings>('set_clipboard_history_settings', { mode, value });
+      await refreshClipboardHistory();
+      notice = mode === 'count'
+        ? `已保留最近 ${clipboardHistorySettings.count} 条剪贴板内容`
+        : `已保留最近 ${clipboardHistorySettings.days} 天剪贴板内容`;
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法更新剪贴板历史设置';
+    } finally {
+      clipboardHistorySettingsBusy = false;
+    }
+    window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function refreshClipboardHistory() {
+    const response = await getClipboardHistory();
+    clipboardHistorySettings = response.settings;
+    clipboardHistory = response.items;
+    if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
+      selectedClipboardHistory = null;
+    }
+  }
+
   async function checkForUpdates() {
     if (updateBusy) return;
     updateBusy = true;
@@ -412,6 +465,50 @@
       notice = '已同步到在线设备';
     } catch (error) {
       notice = error instanceof Error ? error.message : '剪贴板同步失败';
+    }
+    window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function openClipboardHistory(item: ClipboardHistoryItem) {
+    try {
+      selectedClipboardHistory = await getClipboardHistoryDetail(item.event_id);
+      clipboardDraft = selectedClipboardHistory.snapshot.text ?? '';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法读取历史剪贴板内容';
+      window.setTimeout(() => (notice = ''), 2400);
+    }
+  }
+
+  async function restoreClipboardHistoryItem() {
+    const eventId = selectedClipboardHistory?.item.event_id;
+    if (!eventId || clipboardHistoryBusy) return;
+    clipboardHistoryBusy = true;
+    try {
+      clipboard = await restoreClipboardHistory(eventId);
+      clipboardDraft = clipboard.text ?? '';
+      await refreshClipboardHistory();
+      notice = '已恢复并同步剪贴板内容';
+      selectedClipboardHistory = null;
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法恢复剪贴板历史';
+    } finally {
+      clipboardHistoryBusy = false;
+    }
+    window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function clearClipboardHistoryItems() {
+    if (clipboardHistoryBusy || !clipboardHistory.length) return;
+    clipboardHistoryBusy = true;
+    try {
+      await clearClipboardHistory();
+      clipboardHistory = [];
+      selectedClipboardHistory = null;
+      notice = '已清空本机剪贴板历史';
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法清空剪贴板历史';
+    } finally {
+      clipboardHistoryBusy = false;
     }
     window.setTimeout(() => (notice = ''), 2400);
   }
@@ -834,6 +931,21 @@
   function formatTime(value: number | undefined) {
     return value ? new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
   }
+
+  function clipboardHistoryPreview(item: ClipboardHistoryItem) {
+    if (item.text_preview) return item.text_preview;
+    return item.has_image ? 'PNG 图片' : '空内容';
+  }
+
+  function clipboardHistoryKind(item: ClipboardHistoryItem) {
+    if (item.has_text && item.has_image) return '文字 + 图片';
+    if (item.has_image) return 'PNG 图片';
+    return '文字';
+  }
+
+  function clipboardHistoryRetentionLabel(settings: ClipboardHistorySettings) {
+    return settings.mode === 'count' ? `最近 ${settings.count} 条` : `最近 ${settings.days} 天`;
+  }
 </script>
 
 <svelte:head>
@@ -875,6 +987,28 @@
         <div class="panel-heading"><div><div class="section-kicker">CLIPBOARD</div><h2>共享剪贴板</h2></div><span class="muted">{clipboard ? formatTime(clipboard.updated_at_ms) : '暂无内容'}</span></div>
         <textarea id="clipboard-editor" bind:value={clipboardDraft} placeholder="粘贴或输入需要同步的文字"></textarea>
         <div class="button-row"><button class="primary" on:click={publishClipboard}>同步到设备</button><button on:click={readMobileClipboard}>读取手机剪贴板</button><button on:click={writeMobileClipboard}>写入手机剪贴板</button></div>
+      </section>
+      <section class="panel clipboard-history-panel">
+        <div class="panel-heading"><div><div class="section-kicker">CLIPBOARD HISTORY</div><h2>剪贴板历史</h2></div><span class="count-badge">{clipboardHistory.length}</span></div>
+        {#if selectedClipboardHistory}
+          <div class="clipboard-history-detail">
+            <div class="history-detail-meta"><strong>{selectedClipboardHistory.item.source_name}</strong><span>{clipboardHistoryKind(selectedClipboardHistory.item)} · {formatTime(selectedClipboardHistory.item.updated_at_ms)}</span></div>
+            <div class="history-detail-preview">
+              <textarea readonly value={selectedClipboardHistory.snapshot.text ?? ''} placeholder="图片内容"></textarea>
+              {#if selectedClipboardHistory.snapshot.image_png}<img class="clipboard-image" src={`data:image/png;base64,${selectedClipboardHistory.snapshot.image_png}`} alt="历史共享图片" />{/if}
+            </div>
+            <div class="button-row"><button class="primary" on:click={restoreClipboardHistoryItem} disabled={clipboardHistoryBusy}>恢复并同步</button><button class="ghost" on:click={() => (selectedClipboardHistory = null)}>返回历史列表</button></div>
+          </div>
+        {:else}
+          <div class="clipboard-history-list">
+            {#each clipboardHistory as item}
+              <button class="clipboard-history-row" on:click={() => openClipboardHistory(item)}>
+                <span class="history-kind">{item.has_image ? '▣' : 'T'}</span>
+                <span class="history-copy"><strong>{clipboardHistoryPreview(item)}</strong><small>{item.source_name} · {formatTime(item.updated_at_ms)} · {clipboardHistoryKind(item)}</small></span>
+              </button>
+            {:else}<div class="empty-state compact">还没有保存的剪贴板历史。</div>{/each}
+          </div>
+        {/if}
       </section>
       <section class="panel">
         <div class="panel-heading"><div><div class="section-kicker">DEVICES</div><h2>在线设备</h2></div><span class="count-badge">{mobileTargets.length}</span></div>
@@ -944,6 +1078,21 @@
         <div class="update-status" data-state={updateStatus?.state ?? 'idle'}>{updateStatusLabel(updateStatus)}</div>
       </section>
 
+      <section class="panel update-panel clipboard-history-settings-panel">
+        <div class="panel-heading"><div><div class="section-kicker">CLIPBOARD RETENTION</div><h2>剪贴板历史保留</h2></div><span class="muted">{clipboardHistoryRetentionLabel(clipboardHistorySettings)}</span></div>
+        <div class="update-settings">
+          <div class="update-setting-copy"><strong>本机历史</strong><span>每台机器独立保存文字和 PNG；手机只能查看和恢复。</span></div>
+          <div class="update-setting-actions">
+            <select aria-label="剪贴板历史保留模式" value={clipboardHistorySettings.mode} on:change={setClipboardHistoryMode} disabled={clipboardHistorySettingsBusy}>
+              <option value="count">按条数</option>
+              <option value="days">按天数</option>
+            </select>
+            <input class="history-limit-input" aria-label="剪贴板历史保留数量" type="number" min="1" max={clipboardHistorySettings.mode === 'count' ? 500 : 365} value={historyValue(clipboardHistorySettings.mode)} on:change={setClipboardHistoryValue} disabled={clipboardHistorySettingsBusy} />
+            <span class="muted">{clipboardHistorySettings.mode === 'count' ? '条' : '天'}</span>
+          </div>
+        </div>
+      </section>
+
       <section class="panel clipboard-panel">
         <div class="panel-heading"><div><div class="section-kicker">LIVE CLIPBOARD</div><h2>共享剪贴板</h2></div><span class="muted">{clipboard ? `${clipboard.source_name} · ${formatTime(clipboard.updated_at_ms)}` : '复制后自动同步'}</span></div>
         <div class="clipboard-preview">
@@ -951,6 +1100,29 @@
           {#if clipboard?.image_png}<img class="clipboard-image" src={`data:image/png;base64,${clipboard.image_png}`} alt="共享图片" />{/if}
         </div>
         <div class="button-row"><button class="primary" on:click={publishClipboard}>立即同步当前文字</button><span class="hint">桌面端复制文字或图片后会自动推送到在线设备的系统剪贴板。</span></div>
+      </section>
+
+      <section class="panel clipboard-history-panel">
+        <div class="panel-heading"><div><div class="section-kicker">CLIPBOARD HISTORY</div><h2>剪贴板历史</h2></div><div class="heading-actions"><span class="count-badge">{clipboardHistory.length}</span><button class="ghost small" on:click={clearClipboardHistoryItems} disabled={clipboardHistoryBusy || !clipboardHistory.length}>清空历史</button></div></div>
+        {#if selectedClipboardHistory}
+          <div class="clipboard-history-detail">
+            <div class="history-detail-meta"><strong>{selectedClipboardHistory.item.source_name}</strong><span>{clipboardHistoryKind(selectedClipboardHistory.item)} · {formatTime(selectedClipboardHistory.item.updated_at_ms)}</span></div>
+            <div class="history-detail-preview">
+              <textarea readonly value={selectedClipboardHistory.snapshot.text ?? ''} placeholder="图片内容"></textarea>
+              {#if selectedClipboardHistory.snapshot.image_png}<img class="clipboard-image" src={`data:image/png;base64,${selectedClipboardHistory.snapshot.image_png}`} alt="历史共享图片" />{/if}
+            </div>
+            <div class="button-row"><button class="primary" on:click={restoreClipboardHistoryItem} disabled={clipboardHistoryBusy}>恢复并同步</button><button class="ghost" on:click={() => (selectedClipboardHistory = null)}>返回历史列表</button></div>
+          </div>
+        {:else}
+          <div class="clipboard-history-list">
+            {#each clipboardHistory as item}
+              <button class="clipboard-history-row" on:click={() => openClipboardHistory(item)}>
+                <span class="history-kind">{item.has_image ? '▣' : 'T'}</span>
+                <span class="history-copy"><strong>{clipboardHistoryPreview(item)}</strong><small>{item.source_name} · {formatTime(item.updated_at_ms)} · {clipboardHistoryKind(item)}</small></span>
+              </button>
+            {:else}<div class="empty-state compact">还没有保存的剪贴板历史。</div>{/each}
+          </div>
+        {/if}
       </section>
 
       <section class="panel metrics-panel">

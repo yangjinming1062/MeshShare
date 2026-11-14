@@ -1,10 +1,10 @@
 use crate::clipboard;
 use crate::discovery;
 use crate::model::{
-    AddressInfo, ClipboardEvent, ClipboardSnapshot, HardwareMetrics, MobileSession,
-    MobileTransferView, NodeInfo, PeerInfo, TransferOffer, TransferProgress, TransferStatus,
-    WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, MAX_TRANSFER_ITEMS,
-    METRICS_SYSTEM_CAPABILITY,
+    AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot,
+    HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferOffer,
+    TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
+    MAX_TRANSFER_ITEMS, METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
@@ -89,6 +89,11 @@ struct ErrorBody {
     error: String,
 }
 
+#[derive(Debug, Serialize)]
+struct ClipboardHistoryCleared {
+    cleared: usize,
+}
+
 pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
     let index = static_root.join("index.html");
     let state = AppState {
@@ -103,6 +108,18 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
         .route(
             "/api/v1/clipboard",
             get(clipboard_state).post(post_clipboard),
+        )
+        .route(
+            "/api/v1/clipboard/history",
+            get(clipboard_history).delete(clear_clipboard_history),
+        )
+        .route(
+            "/api/v1/clipboard/history/:id",
+            get(clipboard_history_detail),
+        )
+        .route(
+            "/api/v1/clipboard/history/:id/restore",
+            post(restore_clipboard_history),
         )
         .route("/api/v1/ws", get(websocket))
         .route(
@@ -186,6 +203,59 @@ async fn connect_peer(
 
 async fn clipboard_state(State(state): State<AppState>) -> Json<Option<ClipboardSnapshot>> {
     Json(state.runtime.clipboard_snapshot())
+}
+
+async fn clipboard_history(State(state): State<AppState>) -> Json<ClipboardHistoryList> {
+    Json(state.runtime.clipboard_history_list())
+}
+
+async fn clipboard_history_detail(
+    State(state): State<AppState>,
+    AxumPath(event_id): AxumPath<String>,
+) -> Result<Json<ClipboardHistoryDetail>, ApiError> {
+    if event_id.is_empty() || event_id.len() > 256 {
+        return Err(ApiError::bad_request("剪贴板历史 ID 无效"));
+    }
+    state
+        .runtime
+        .clipboard_history_detail(&event_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("剪贴板历史不存在"))
+}
+
+async fn restore_clipboard_history(
+    State(state): State<AppState>,
+    AxumPath(event_id): AxumPath<String>,
+) -> Result<Json<ClipboardSnapshot>, ApiError> {
+    if event_id.is_empty() || event_id.len() > 256 {
+        return Err(ApiError::bad_request("剪贴板历史 ID 无效"));
+    }
+    let event = state
+        .runtime
+        .restore_clipboard_history(&event_id)
+        .ok_or_else(|| ApiError::not_found("剪贴板历史不存在或内容无效"))?;
+    let snapshot = state
+        .runtime
+        .clipboard_snapshot()
+        .ok_or_else(|| ApiError::internal("剪贴板状态不可用"))?;
+    clipboard::apply_snapshot(&snapshot, &state.runtime).map_err(ApiError::internal)?;
+    state.runtime.publish_event(WireMessage::ClipboardUpdate {
+        event: event.clone(),
+    });
+    state
+        .runtime
+        .send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
+    Ok(Json(snapshot))
+}
+
+async fn clear_clipboard_history(
+    State(state): State<AppState>,
+) -> Result<Json<ClipboardHistoryCleared>, ApiError> {
+    state
+        .runtime
+        .clear_clipboard_history()
+        .map(|cleared| Json(ClipboardHistoryCleared { cleared }))
+        .map_err(|error| ApiError::internal(error.to_string()))
 }
 
 async fn api_not_found() -> ApiError {
