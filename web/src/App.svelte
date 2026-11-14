@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { invoke } from '@tauri-apps/api/core';
+  import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileAccess, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
@@ -11,6 +11,8 @@
 
   const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
+  const inTauri = isTauri();
+  const isDesktopWindow = inTauri && !isMobile && !isMonitor;
   let node: NodeInfo | null = null;
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
@@ -30,7 +32,7 @@
   let qrData = '';
   let syncEnabled = true;
   let autostartEnabled = true;
-  let autostartAvailable = true;
+  let autostartAvailable = false;
   let autostartBusy = false;
   let updateFrequency: UpdateFrequency = 'weekly';
   let updateStatus: UpdateStatus | null = null;
@@ -94,7 +96,7 @@
     let monitorPositionWriteInFlight = false;
     let monitorPositionUnlisten: (() => void) | undefined;
     let updateStatusUnlisten: (() => void) | undefined;
-    if (!isMobile && !isMonitor) {
+    if (isDesktopWindow) {
       void listen<UpdateStatus>('update-status', ({ payload }) => {
         updateStatus = payload;
       }).then((unlisten) => {
@@ -120,7 +122,7 @@
         }
       }
     };
-    if (isMonitor) {
+    if (inTauri && isMonitor) {
       void getCurrentWindow().onMoved(({ payload }) => {
         if (!monitorCapabilities.can_persist_position) return;
         pendingMonitorPosition = { x: payload.x, y: payload.y };
@@ -138,11 +140,11 @@
       if (pageStopped) return;
       try {
         await initApi();
-        if (!isMobile) {
+        if (inTauri && !isMobile) {
           monitorCapabilities = await invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities);
           monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
         }
-        if (!isMobile && !isMonitor) {
+        if (isDesktopWindow) {
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
           updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
           clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
@@ -151,13 +153,14 @@
         }
         if (!isMonitor) mobileAccess = await getMobileAccess().catch(() => null);
         await refresh();
-        if (!isMobile && !isMonitor) syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
-        if (!isMobile && !isMonitor) {
+        if (isDesktopWindow) {
+          syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
           try {
             autostartEnabled = await invoke<boolean>('autostart_enabled');
+            autostartAvailable = true;
           } catch (error) {
             autostartEnabled = true;
-            const message = error instanceof Error ? error.message : '无法读取开机自启动状态';
+            const message = typeof error === 'string' ? error : error instanceof Error ? error.message : '无法读取开机自启动状态';
             autostartAvailable = !message.includes('开发构建');
             if (autostartAvailable) {
               notice = message;
@@ -210,7 +213,7 @@
       getClipboard(),
       getMetrics(),
       getClipboardHistory(),
-      !isMobile && !isMonitor ? invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus) : Promise.resolve(clipboardStatus),
+      isDesktopWindow ? invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus) : Promise.resolve(clipboardStatus),
     ]);
     const nextTransfers = isMobile ? [] : await getTransfers();
     if (isMobile) {
@@ -376,14 +379,14 @@
   }
 
   async function toggleAutostart() {
-    if (autostartBusy) return;
+    if (!autostartAvailable || autostartBusy) return;
     const next = !autostartEnabled;
     autostartBusy = true;
     try {
       autostartEnabled = await invoke<boolean>('set_autostart_enabled', { enabled: next });
       notice = autostartEnabled ? '开机自启动已开启' : '开机自启动已关闭';
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法更新开机自启动设置';
+      notice = typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新开机自启动设置';
     } finally {
       autostartBusy = false;
     }
@@ -1200,7 +1203,7 @@
 
   {#if notice}<div class="notice" role="status">{notice}</div>{/if}
 
-  {#if !isMobile && !isMonitor && !clipboardStatus.available}
+  {#if isDesktopWindow && node && !clipboardStatus.available}
     <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
   {/if}
 
