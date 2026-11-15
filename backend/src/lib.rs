@@ -28,6 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(target_os = "android"))]
 use tauri::menu::{Menu, MenuItem};
+#[cfg(not(target_os = "android"))]
+use tauri::tray::{MouseButton, TrayIconEvent};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
 use tauri::{AppHandle, Manager, State};
@@ -460,6 +462,23 @@ fn set_main_window_visible(app: &AppHandle, visible: bool) {
 }
 
 #[cfg(not(target_os = "android"))]
+fn handle_tray_icon_event(app: &AppHandle, event: TrayIconEvent) {
+    if event.id().as_ref() != "meshshare"
+        || !matches!(
+            event,
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            }
+        )
+    {
+        return;
+    }
+
+    set_main_window_visible(app, !main_window_visible(app));
+}
+
+#[cfg(not(target_os = "android"))]
 pub(crate) fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked: bool) {
     let Some(window) = app.get_webview_window("monitor") else {
         return;
@@ -768,6 +787,7 @@ fn setup_tray_menu(app: &AppHandle) -> anyhow::Result<()> {
         sync_toggle,
     });
     sync_tray_labels(app);
+    app.on_tray_icon_event(handle_tray_icon_event);
     tray.on_menu_event(|app, event| match event.id().as_ref() {
         "toggle-window" => {
             set_main_window_visible(app, !main_window_visible(app));

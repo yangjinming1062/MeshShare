@@ -60,7 +60,7 @@ Android App 的本机 Rust 节点能力是文件传输和网络指标；它不�
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 ```
 
-开发模式和调试构建不会自动写入系统登录启动项，避免把调试可执行文件注册为正式启动入口；调试界面仍显示自启动开关，切换时会提示开发构建不写入登录启动项。开机自启动需要在正式桌面安装包中验证：首次启动应默认注册，登录后主窗口保持隐藏并可从托盘打开，重复打开应用只激活已有窗口。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
+开发模式和调试构建不会自动写入系统登录启动项，避免把调试可执行文件注册为正式启动入口；调试界面仍显示自启动开关，切换时会提示开发构建不写入登录启动项。开机自启动需要在正式桌面安装包中验证：首次启动应默认注册，登录后主窗口保持隐藏并可从托盘打开，重复打开应用只激活已有窗口。Windows 桌面还应验证左键双击系统托盘图标可以在显示和隐藏主窗口之间切换，单击不切换且右键菜单仍可用。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
 
 推送到 `main` 时，[GitHub Actions 检查工作流](../.github/workflows/ci.yml) 会运行前端检查、构建、Rust 格式与 lint，并在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行 Rust 回归测试。Pull Request 不触发该工作流，仍可按本页检查命令本地验证。
 
