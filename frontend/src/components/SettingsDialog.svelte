@@ -77,7 +77,7 @@
     <div class="setting">
       <div class="setting-copy">
         <strong>剪贴板历史保留</strong>
-        <span>每台机器独立保存文字和 PNG；手机只能查看和恢复。</span>
+        <span>每台机器独立保存文字和 PNG；网页端只能查看和恢复。</span>
       </div>
       <div class="setting-actions">
         <div class="segmented" role="radiogroup" aria-label="剪贴板历史保留模式">

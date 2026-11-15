@@ -11,7 +11,7 @@ npm --prefix frontend ci
 npm --prefix frontend run build
 ```
 
-手机扫码访问的页面由桌面节点从 `frontend/dist` 构建产物提供。改动移动网页后，重新构建前端并重启桌面程序，再刷新手机页面。
+浏览器临时加入的网页由桌面节点从 `frontend/dist` 构建产物提供。改动网页端后，重新构建前端并重启桌面程序，再刷新浏览器页面。
 
 ## 更新项目图标
 

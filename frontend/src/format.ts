@@ -106,6 +106,16 @@ export function platformLabel(platform: string | undefined): string {
   return platform;
 }
 
+export function webSessionLabel(userAgent: string): string {
+  if (/iPhone|iPod/.test(userAgent)) return 'iPhone 浏览器';
+  if (/iPad/.test(userAgent)) return 'iPad 浏览器';
+  if (/Android/.test(userAgent)) return 'Android 浏览器';
+  if (/Windows/.test(userAgent)) return 'Windows 浏览器';
+  if (/Macintosh|Mac OS X/.test(userAgent)) return 'macOS 浏览器';
+  if (/Linux/.test(userAgent)) return 'Linux 浏览器';
+  return '网页设备';
+}
+
 export function updateFrequencyLabel(value: UpdateFrequency): string {
   return value === 'daily' ? '每天' : value === 'weekly' ? '每周' : '关闭';
 }

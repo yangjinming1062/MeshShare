@@ -36,7 +36,7 @@
       </button>
       <button type="button" class="btn btn-sm" on:click={onMobileAccess}>
         <Icon name="phone" size={14} />
-        手机访问
+        浏览器访问
       </button>
     </div>
   </div>
@@ -81,7 +81,7 @@
         />
       {/each}
       {#if !total}
-        <li class="empty">没有其他在线设备。启动另一台 MeshShare，或用「手机访问」扫码加入。</li>
+        <li class="empty">没有其他在线设备。启动另一台 MeshShare，或让其他设备通过「浏览器访问」临时加入。</li>
       {/if}
     </ul>
   </div>

@@ -16,9 +16,9 @@
   export let onDragLeave: () => void = () => {};
   export let onDropFile: (event: DragEvent) => void = () => {};
 
-  $: name = kind === 'mobile' ? (session?.label ?? '手机') : (peer?.node_name ?? '设备');
+  $: name = kind === 'mobile' ? (session?.label ?? '网页设备') : (peer?.node_name ?? '设备');
   $: meta = kind === 'mobile'
-    ? (session ? session.node_name + ' · 扫码连接' : '扫码连接')
+    ? (session ? session.node_name + ' · 网页加入' : '网页加入')
     : (peer ? platformLabel(peer.platform) + ' · ' + (peer.addresses[0]?.address ?? '在线') : '');
   $: metrics = kind === 'mobile' ? null : (peer?.metrics ?? null);
   $: stale = kind === 'peer' && !!peer?.metrics_stale;

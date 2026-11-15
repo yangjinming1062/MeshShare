@@ -8,7 +8,7 @@
   import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { clipboardHistoryKind, clipboardHistoryPreview, formatPercent, formatRate, formatTime, gpuMemoryPercent, gpuUtilization, memoryPercent, updateFrequencyLabel } from './format';
+  import { clipboardHistoryKind, clipboardHistoryPreview, formatPercent, formatRate, formatTime, gpuMemoryPercent, gpuUtilization, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
   import Icon from './components/Icon.svelte';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
@@ -22,11 +22,12 @@
   import MetricsDetailDialog from './components/MetricsDetailDialog.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
 
-  const isMobile = window.location.pathname.startsWith('/mobile');
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
   if (isMonitor) document.documentElement.dataset.window = 'monitor';
   const inTauri = isTauri();
-  const isDesktopWindow = inTauri && !isMobile && !isMonitor;
+  // 浏览器访问（根地址或 /mobile）一律渲染网页临时加入界面，Tauri 窗口按窗口类型区分
+  const isWeb = !inTauri && !isMonitor;
+  const isDesktopWindow = inTauri && !isMonitor;
   let node: NodeInfo | null = null;
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
@@ -86,9 +87,9 @@
   let pageStopped = false;
 
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
-  $: mobileUrl = mobileAddress ? `${mobileAddress.url}/mobile` : '';
+  $: mobileUrl = mobileAddress ? mobileAddress.url : '';
   $: secureMobileUrl = node?.mobile_addresses?.find((address) => address.address === mobileAddress?.address)?.url;
-  $: if (!isMobile && !isMonitor) void refreshQr(mobileUrl);
+  $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
   $: mobileTargets = node ? [{
     node_id: node.node_id,
     node_name: node.node_name,
@@ -160,7 +161,7 @@
       if (pageStopped) return;
       try {
         await initApi();
-        if (inTauri && !isMobile) {
+        if (inTauri && !isWeb) {
           monitorCapabilities = await invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities);
           monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
         }
@@ -206,7 +207,7 @@
   });
 
   async function refresh() {
-    if (inTauri && !isMobile) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
+    if (inTauri && !isWeb) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
       node = nextNode;
@@ -215,7 +216,7 @@
       statusKind = 'ok';
       return;
     }
-    if (isMobile && !mobileSessionId) await ensureMobileSession();
+    if (isWeb && !mobileSessionId) await ensureMobileSession();
     const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory, nextClipboardStatus] = await Promise.all([
       getInfo(),
       getPeers(),
@@ -224,8 +225,8 @@
       getClipboardHistory(),
       isDesktopWindow ? invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus) : Promise.resolve(clipboardStatus),
     ]);
-    const nextTransfers = isMobile ? [] : await getTransfers();
-    if (isMobile) {
+    const nextTransfers = isWeb ? [] : await getTransfers();
+    if (isWeb) {
       mobileTransfers = await getMobileTransfersWithRecovery();
       for (const view of mobileTransfers) {
         if (view.progress.status === 'ready' && mobileReceiveDirectory && !mobileDownloading.has(view.progress.transfer_id)) {
@@ -247,7 +248,7 @@
     clipboard = nextClipboard;
     clipboardStatus = nextClipboardStatus;
     clipboardHistory = nextHistory.items;
-    if (isMobile || isMonitor) clipboardHistorySettings = nextHistory.settings;
+    if (isWeb || isMonitor) clipboardHistorySettings = nextHistory.settings;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
       selectedClipboardHistory = null;
     }
@@ -273,7 +274,7 @@
   }
 
   async function ensureMobileSession() {
-    if (!isMobile || mobileSessionId) return;
+    if (!isWeb || mobileSessionId) return;
     const stored = window.sessionStorage.getItem('meshshare-mobile-session');
     if (stored) {
       try {
@@ -284,7 +285,7 @@
         window.sessionStorage.removeItem('meshshare-mobile-session');
       }
     }
-    const session = await createMobileSession(navigator.userAgent.slice(0, 48));
+    const session = await createMobileSession(webSessionLabel(navigator.userAgent));
     mobileSessionId = session.session_id;
     window.sessionStorage.setItem('meshshare-mobile-session', mobileSessionId);
   }
@@ -365,7 +366,7 @@
       const image = await QRCode.toDataURL(url, { width: 192, margin: 1, color: { dark: '#111827', light: '#ffffff' } });
       if (url === mobileUrl) mobileQr = { url, image };
     } catch (error) {
-      console.error('生成手机访问二维码失败', error);
+      console.error('生成浏览器访问二维码失败', error);
       if (url === mobileUrl) mobileQr = { url, image: '' };
     }
   }
@@ -628,7 +629,7 @@
   async function readMobileClipboard() {
     try {
       clipboardDraft = await navigator.clipboard.readText();
-      notice = '已读取手机剪贴板';
+      notice = '已读取本机剪贴板';
     } catch {
       notice = '浏览器未授权读取剪贴板，请手动粘贴';
     }
@@ -637,7 +638,7 @@
   async function writeMobileClipboard() {
     try {
       await navigator.clipboard.writeText(clipboardDraft);
-      notice = '已写入手机剪贴板';
+      notice = '已写入本机剪贴板';
     } catch {
       notice = '浏览器拒绝写入，请手动选择并复制';
     }
@@ -709,7 +710,7 @@
   }
 
   function targetBase(peer: PeerInfo): string | null {
-    if (isMobile) {
+    if (isWeb) {
       if (peer.node_id === node?.node_id) return window.location.origin;
       if (window.location.protocol === 'https:') return `${window.location.origin}/api/v1/mobile/peers/${encodeURIComponent(peer.node_id)}`;
     }
@@ -800,9 +801,9 @@
       pendingMobileUploads.set(offer.transfer_id, { files, items, completedItemIds: new Set() });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
       void watchMobileTransfer(offer.transfer_id);
-      notice = '已发送到手机，等待手机确认';
+      notice = '已发送，等待网页端确认';
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法发送到手机';
+      notice = error instanceof Error ? error.message : '无法发送到网页端';
     }
   }
 
@@ -812,7 +813,7 @@
     for (let attempt = 0; attempt < 180; attempt += 1) {
       try {
         const view = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
-        if (!view) throw new Error('手机传输任务不存在');
+        if (!view) throw new Error('网页端传输任务不存在');
         const progress = view.progress;
         const existing = transfers.find((item) => item.transfer_id === id);
         transfers = [{ ...existing, ...progress, direction: 'send' }, ...transfers.filter((item) => item.transfer_id !== id)];
@@ -855,11 +856,11 @@
         pending.completedItemIds.add(item.item_id);
       }
       mobileUploadAttempts.delete(id);
-      notice = '文件已准备好，手机可以下载';
+      notice = '文件已准备好，网页端可以下载';
     } catch (error) {
       const attempts = (mobileUploadAttempts.get(id) ?? 0) + 1;
       mobileUploadAttempts.set(id, attempts);
-      const message = error instanceof Error ? error.message : '手机文件上传失败';
+      const message = error instanceof Error ? error.message : '网页端文件上传失败';
       if (attempts >= MOBILE_UPLOAD_MAX_ATTEMPTS) {
         await request(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/fail`, {
           method: 'POST',
@@ -969,12 +970,12 @@
   };
 
   function mobileDirectoryPickerAvailable() {
-    return isMobile && window.isSecureContext && typeof (window as MobilePickerWindow).showDirectoryPicker === 'function';
+    return isWeb && window.isSecureContext && typeof (window as MobilePickerWindow).showDirectoryPicker === 'function';
   }
 
   async function chooseMobileReceiveDirectory() {
     if (!mobileDirectoryPickerAvailable()) {
-      notice = window.isSecureContext ? '当前浏览器不支持选择存储目录' : '手机接收需要通过 HTTPS 打开页面';
+      notice = window.isSecureContext ? '当前浏览器不支持选择存储目录' : '网页接收需要通过 HTTPS 打开页面';
       window.setTimeout(() => (notice = ''), 3000);
       return false;
     }
@@ -989,7 +990,7 @@
       return true;
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return false;
-      notice = error instanceof Error ? error.message : '无法选择手机存储目录';
+      notice = error instanceof Error ? error.message : '无法选择接收目录';
       window.setTimeout(() => (notice = ''), 3000);
       return false;
     }
@@ -1003,7 +1004,7 @@
   }
 
   async function mobileTargetHandle(relativePath: string) {
-    if (!mobileReceiveDirectory) throw new Error('请先选择手机存储目录');
+    if (!mobileReceiveDirectory) throw new Error('请先选择接收目录');
     const parts = mobilePathParts(relativePath);
     const fileName = parts.pop();
     if (!fileName) throw new Error('传输文件名无效');
@@ -1020,7 +1021,7 @@
   }
 
   async function downloadMobileItem(view: MobileTransferView, item: TransferItem) {
-    if (!mobileSessionId) throw new Error('手机会话已过期');
+    if (!mobileSessionId) throw new Error('网页会话已过期');
     const { directory, fileName } = await mobileTargetHandle(item.relative_path);
     const response = await fetch(mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId));
     if (!response.ok) {
@@ -1065,10 +1066,10 @@
         if (downloaded.has(item.item_id)) continue;
         await downloadMobileItem(view, item);
       }
-      notice = '文件已保存到手机存储目录';
+      notice = '文件已保存到接收目录';
       await refresh();
     } catch (error) {
-      const message = error instanceof Error ? error.message : '手机文件保存失败';
+      const message = error instanceof Error ? error.message : '网页端文件保存失败';
       notice = message;
       await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/fail`, {
         method: 'POST',
@@ -1118,10 +1119,10 @@
 </script>
 
 <svelte:head>
-  <title>{isMonitor ? 'MeshShare · 硬件监控' : isMobile ? 'MeshShare · 手机连接' : 'MeshShare · 局域网共享'}</title>
+  <title>{isMonitor ? 'MeshShare · 硬件监控' : isWeb ? 'MeshShare · 临时加入' : 'MeshShare · 局域网共享'}</title>
 </svelte:head>
 
-<div class:mobile-shell={isMobile} class:monitor-shell={isMonitor} class:app-shell={!isMobile && !isMonitor}>
+<div class:mobile-shell={isWeb} class:monitor-shell={isMonitor} class:app-shell={!isWeb && !isMonitor}>
   {#if isMonitor}
     <main class="monitor-main" data-tauri-drag-region="deep" on:contextmenu={openMonitorMenu}>
       <div class="monitor-metric"><b>CPU</b><span>{formatPercent(metrics?.cpu_usage_percent)}</span></div>
@@ -1131,13 +1132,13 @@
       <div class="monitor-metric"><b>显存</b><span>{formatPercent(gpuMemoryPercent(metrics))}</span></div>
       <div class="monitor-metric"><b>↓</b><span>{formatRate(metrics?.network_down_bytes_per_sec)}</span></div>
     </main>
-  {:else if isMobile}
+  {:else if isWeb}
     <header class="mobile-topbar">
       <div class="brand">
         <img src="/meshshare.svg" width="28" height="28" alt="" />
         <div class="brand-copy">
           <div class="brand-name">MeshShare</div>
-          <div class="brand-sub">扫码加入局域网</div>
+          <div class="brand-sub">浏览器临时加入</div>
         </div>
       </div>
       <div class="node-status" data-kind={statusKind} role="status" aria-live="polite">
@@ -1156,14 +1157,14 @@
 
       <section class="surface">
         <div class="surface-head">
-          <div class="surface-title"><h2>手机接收目录</h2></div>
+          <div class="surface-title"><h2>接收目录</h2></div>
           <div class="surface-actions"><span class="muted">接收前选择</span></div>
         </div>
         <div class="surface-body">
           <div class="setting">
             <div class="setting-copy">
               <strong>{mobileReceiveDirectoryName || '尚未选择存储目录'}</strong>
-              <span>{mobileDirectoryPickerAvailable() ? '文件会流式写入此目录，不会覆盖同名文件。' : (window.isSecureContext ? '当前浏览器不支持目录选择。' : '请通过 HTTPS 打开手机页面后选择目录。')}</span>
+              <span>{mobileDirectoryPickerAvailable() ? '文件会流式写入此目录，不会覆盖同名文件。' : (window.isSecureContext ? '当前浏览器不支持目录选择。' : '请通过 HTTPS 打开页面后选择目录。')}</span>
             </div>
             <div class="setting-actions">
               <button type="button" class="btn btn-primary btn-sm" on:click={chooseMobileReceiveDirectory} disabled={!mobileDirectoryPickerAvailable()}>选择目录</button>
@@ -1181,8 +1182,8 @@
           <textarea class="field" id="clipboard-editor" bind:value={clipboardDraft} placeholder="粘贴或输入需要同步的文字"></textarea>
           <div class="action-row">
             <button type="button" class="btn btn-primary btn-sm" on:click={publishClipboard}>同步到设备</button>
-            <button type="button" class="btn btn-sm" on:click={readMobileClipboard}>读取手机剪贴板</button>
-            <button type="button" class="btn btn-sm" on:click={writeMobileClipboard}>写入手机剪贴板</button>
+            <button type="button" class="btn btn-sm" on:click={readMobileClipboard}>读取本机剪贴板</button>
+            <button type="button" class="btn btn-sm" on:click={writeMobileClipboard}>写入本机剪贴板</button>
           </div>
         </div>
       </section>

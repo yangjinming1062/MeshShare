@@ -14,11 +14,11 @@
   export let onClose: () => void = () => {};
 </script>
 
-<Dialog {open} title="手机访问" width={420} {onClose}>
+<Dialog {open} title="浏览器访问" width={420} {onClose}>
   {#if addresses.length}
     <div class="qr-wrap">
       {#if qrImage}
-        <img class="qr" src={qrImage} alt="手机访问二维码" />
+        <img class="qr" src={qrImage} alt="浏览器访问二维码" />
       {:else}
         <div class="qr-placeholder">二维码生成中</div>
       {/if}
@@ -30,10 +30,10 @@
       {/each}
     </select>
     <div class="code-block">{mobileUrl}</div>
-    <p class="hint">让手机连接同一网络后扫描二维码。</p>
+    <p class="hint">在其他设备的浏览器打开该地址即可临时加入；手机也可以扫描二维码。</p>
     {#if secureUrl}
-      <p class="hint">手机接收文件前请先安装 <a class="link" href={caUrl} target="_blank" rel="noreferrer">本节点 CA 证书</a>，再打开 HTTPS 地址。</p>
-      <div class="code-block">{secureUrl + '/mobile'}</div>
+      <p class="hint">接收文件前请先安装 <a class="link" href={caUrl} target="_blank" rel="noreferrer">本节点 CA 证书</a>，再打开 HTTPS 地址。</p>
+      <div class="code-block">{secureUrl}</div>
     {/if}
   {:else}
     <div class="empty" role="status">

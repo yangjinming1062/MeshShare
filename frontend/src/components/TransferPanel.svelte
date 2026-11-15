@@ -23,7 +23,7 @@
   function detailLabel(transfer: TransferProgress): string {
     if (transfer.status === 'waiting') return '等待确认';
     if (transfer.status === 'accepted') return '准备接收';
-    if (transfer.status === 'ready') return '等待手机保存';
+    if (transfer.status === 'ready') return '等待网页端保存';
     if (transfer.status === 'completed') return '已完成 · ' + formatSize(transfer.total_bytes);
     if (transfer.status === 'rejected') return '已拒绝';
     if (transfer.status === 'cancelled') return '已取消';

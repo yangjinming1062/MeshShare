@@ -6,12 +6,12 @@
 flowchart LR
   A["桌面节点 A（Rust + Tauri）"] <-->|mDNS / WebSocket| B["桌面节点 B（Rust + Tauri）"]
   A <-->|HTTP 文件直传| B
-  P["手机浏览器"] -->|扫码 HTTP 引导 / HTTPS| A
+  P["网页端浏览器"] -->|HTTP 引导 / HTTPS| A
   P -.->|文件直传路径| B
   M["监控悬浮条"] -->|本机快照 HTTP/WS| A
 ```
 
-手机通过可达的桌面节点进入网页，从该节点读取设备列表，也可以选择当前扫码节点作为文件目标。手机建立临时接收会话后，桌面端可把文件发送到扫码节点的临时文件区；手机先安装节点 CA、打开 HTTPS 页面并选择存储目录，确认后逐项流式写入本地目录；手机网页发送文件仍使用分块哈希直传。
+网页端通过可达的桌面节点进入网页，从该节点读取设备列表，也可以选择当前接入节点作为文件目标。网页端建立临时接收会话后，桌面端可把文件发送到接入节点的临时文件区；网页端先安装节点 CA、打开 HTTPS 页面并选择存储目录，确认后逐项流式写入本地目录；网页端发送文件仍使用分块哈希直传。
 
 ## 硬件指标同步
 
@@ -67,17 +67,17 @@ sequenceDiagram
   R-->>S: progress/status
 ```
 
-手机接收流程使用同一节点的临时文件区：
+网页接收流程使用同一节点的临时文件区：
 
 ```mermaid
 sequenceDiagram
-  participant P as 手机浏览器
-  participant R as 扫码节点
+  participant P as 网页端
+  participant R as 接入节点
   participant U as 桌面端
   P->>R: 创建并续期 MobileSession
-  P->>R: 获取手机 HTTPS 地址和 CA 信息
+  P->>R: 获取网页 HTTPS 地址和 CA 信息
   P->>P: 安装 CA 并选择本地存储目录
-  U->>R: 创建手机下载清单
+  U->>R: 创建网页下载清单
   P->>R: 确认接收
   U->>R: PUT 文件流并校验
   P->>R: GET 文件流下载
