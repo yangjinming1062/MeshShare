@@ -141,8 +141,17 @@ pub struct MobileTransferRecord {
     pub staged_directory: PathBuf,
     pub staged_items: HashSet<String>,
     pub downloaded_items: HashSet<String>,
+    pub retryable_downloads: HashSet<String>,
     pub updated_at_ms: i64,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TransferRetryError {
+    InstallingUpdate,
+    NotRetryable,
+}
+
+pub(crate) const UPDATE_INSTALLING_MESSAGE: &str = "应用正在安装更新，请稍后重试";
 
 struct MobileCa {
     path: PathBuf,
@@ -268,11 +277,28 @@ const CLIPBOARD_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     let mut downloaded_item_ids = record.downloaded_items.iter().cloned().collect::<Vec<_>>();
     downloaded_item_ids.sort();
+    let mut retryable_download_item_ids = record
+        .retryable_downloads
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    retryable_download_item_ids.sort();
     MobileTransferView {
         session_id: record.session_id.clone(),
         progress: record.progress.clone(),
         downloaded_item_ids,
+        retryable_download_item_ids,
     }
+}
+
+fn is_active_transfer(status: &TransferStatus) -> bool {
+    matches!(
+        status,
+        TransferStatus::Waiting
+            | TransferStatus::Accepted
+            | TransferStatus::Uploading
+            | TransferStatus::Ready
+    )
 }
 
 fn mobile_manifest_size(offer: &TransferOffer) -> u64 {
@@ -462,7 +488,7 @@ impl NodeRuntime {
     /// 只从节点私网地址取 CA；命令层收到的 URL 来自渲染进程，不能让它指向公网或任意资源。
     pub async fn fetch_mobile_ca(&self, raw_url: &str) -> Result<Vec<u8>, String> {
         let url = mobile_ca_url(raw_url)?;
-        let response = self
+        let mut response = self
             .http
             .get(url)
             .send()
@@ -477,17 +503,21 @@ impl NodeRuntime {
         if response.content_length().unwrap_or_default() > MAX_MOBILE_CA_BYTES as u64 {
             return Err("节点返回的 CA 证书超出大小限制".to_string());
         }
-        let bytes = response
-            .bytes()
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .map_err(|error| format!("读取 CA 证书失败：{error}"))?;
+            .map_err(|error| format!("读取 CA 证书失败：{error}"))?
+        {
+            if chunk.len() > MAX_MOBILE_CA_BYTES - bytes.len() {
+                return Err("节点返回的 CA 证书超出大小限制".to_string());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
         if bytes.is_empty() {
             return Err("节点返回的 CA 证书为空".to_string());
         }
-        if bytes.len() > MAX_MOBILE_CA_BYTES {
-            return Err("节点返回的 CA 证书超出大小限制".to_string());
-        }
-        Ok(bytes.to_vec())
+        Ok(bytes)
     }
 
     fn mobile_staging_root(&self) -> PathBuf {
@@ -1119,24 +1149,15 @@ impl NodeRuntime {
     }
 
     pub fn has_active_transfers(&self) -> bool {
-        let active = |status: &TransferStatus| {
-            matches!(
-                status,
-                TransferStatus::Waiting
-                    | TransferStatus::Accepted
-                    | TransferStatus::Uploading
-                    | TransferStatus::Ready
-            )
-        };
         self.transfers
             .read()
             .values()
-            .any(|record| active(&record.progress.status))
+            .any(|record| is_active_transfer(&record.progress.status))
             || self
                 .mobile_transfers
                 .read()
                 .values()
-                .any(|record| active(&record.progress.status))
+                .any(|record| is_active_transfer(&record.progress.status))
     }
 
     pub fn begin_update_install(&self) -> bool {
@@ -1373,7 +1394,7 @@ impl NodeRuntime {
         if self.update_installing.load(Ordering::SeqCst) {
             let mut failed = transfer_progress(&offer, "send");
             failed.status = TransferStatus::Failed;
-            failed.error = Some("应用正在安装更新，请稍后重试".to_string());
+            failed.error = Some(UPDATE_INSTALLING_MESSAGE.to_string());
             return failed;
         }
         let mut transfers = self.transfers.write();
@@ -1405,6 +1426,10 @@ impl NodeRuntime {
     }
 
     pub fn update_transfer(&self, transfer_id: &str, progress: TransferProgress) {
+        let _update_gate = self.transfer_update_gate.lock();
+        if is_active_transfer(&progress.status) && self.update_installing.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(record) = self.transfers.write().get_mut(transfer_id) {
             let mut progress = progress;
             progress.offer = Some(record.offer.clone());
@@ -1531,18 +1556,28 @@ impl NodeRuntime {
         transfer_id: &str,
         status: TransferStatus,
         expected_retry_count: Option<u32>,
-    ) -> Option<TransferProgress> {
+    ) -> Result<TransferProgress, TransferRetryError> {
         if !matches!(status, TransferStatus::Waiting | TransferStatus::Accepted) {
-            return None;
+            return Err(TransferRetryError::NotRetryable);
+        }
+        let _update_gate = self.transfer_update_gate.lock();
+        if self.update_installing.load(Ordering::SeqCst) {
+            return Err(TransferRetryError::InstallingUpdate);
         }
         let mut transfers = self.transfers.write();
-        let record = transfers.get_mut(transfer_id)?;
+        let record = transfers
+            .get_mut(transfer_id)
+            .ok_or(TransferRetryError::NotRetryable)?;
         if record.progress.status != TransferStatus::Failed {
-            return None;
+            return Err(TransferRetryError::NotRetryable);
         }
-        let retry_count = record.progress.retry_count.checked_add(1)?;
+        let retry_count = record
+            .progress
+            .retry_count
+            .checked_add(1)
+            .ok_or(TransferRetryError::NotRetryable)?;
         if expected_retry_count.is_some_and(|expected| expected != retry_count) {
-            return None;
+            return Err(TransferRetryError::NotRetryable);
         }
         if status == TransferStatus::Waiting {
             record.accepted_destination = None;
@@ -1553,7 +1588,7 @@ impl NodeRuntime {
         record.progress.error = None;
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
-        Some(record.progress.clone())
+        Ok(record.progress.clone())
     }
 
     /// Remove a failed transfer record. Non-failed records are retained and
@@ -1813,7 +1848,7 @@ impl NodeRuntime {
         }
         let _update_gate = self.transfer_update_gate.lock();
         if self.update_installing.load(Ordering::SeqCst) {
-            return Err("应用正在安装更新，请稍后重试".to_string());
+            return Err(UPDATE_INSTALLING_MESSAGE.to_string());
         }
         let manifest_bytes = mobile_manifest_size(&offer);
         if self
@@ -1847,6 +1882,7 @@ impl NodeRuntime {
             staged_directory,
             staged_items: HashSet::new(),
             downloaded_items: HashSet::new(),
+            retryable_downloads: HashSet::new(),
             updated_at_ms: now_millis(),
         };
         let view = mobile_view(&record);
@@ -1895,10 +1931,12 @@ impl NodeRuntime {
         let Some(record) = transfers.get_mut(transfer_id) else {
             return false;
         };
-        if !matches!(
+        let downloading = matches!(
             record.progress.status,
             TransferStatus::Accepted | TransferStatus::Uploading | TransferStatus::Ready
-        ) {
+        ) || (record.progress.status == TransferStatus::Completed
+            && !record.retryable_downloads.is_empty());
+        if !downloading {
             return false;
         }
         record.updated_at_ms = now_millis();
@@ -2155,6 +2193,7 @@ impl NodeRuntime {
         &self,
         transfer_id: &str,
         item_id: &str,
+        keep_for_retry: bool,
     ) -> Option<MobileTransferView> {
         let mut transfers = self.mobile_transfers.write();
         let record = transfers.get_mut(transfer_id)?;
@@ -2165,7 +2204,14 @@ impl NodeRuntime {
         {
             return None;
         }
-        record.downloaded_items.insert(item_id.to_string());
+        let first_download = record.downloaded_items.insert(item_id.to_string());
+        if keep_for_retry {
+            if first_download {
+                record.retryable_downloads.insert(item_id.to_string());
+            }
+        } else {
+            record.retryable_downloads.remove(item_id);
+        }
         record.updated_at_ms = now_millis();
         if record.downloaded_items.len() >= record.progress.total_items {
             record.progress.status = TransferStatus::Completed;
@@ -3254,7 +3300,7 @@ mod tests {
                 "{name} should be a placeholder"
             );
         }
-        for name in ["YJM-MI-PC", "Redmi-K70", "yangjinmingdeMac-mini.local"] {
+        for name in ["demo-desktop", "demo-phone", "demo-workstation.local"] {
             assert!(
                 !is_placeholder_node_name(name),
                 "{name} should be a usable name"
@@ -3566,6 +3612,14 @@ mod tests {
         runtime
             .fail_mobile_transfer("mobile-active", "test complete".to_string())
             .expect("finish mobile transfer");
+        runtime.add_transfer(mobile_offer(&runtime, "retry-during-update", 1));
+        let failed = runtime
+            .fail_transfer(
+                "retry-during-update",
+                "test failure".to_string(),
+                TransferStatus::Failed,
+            )
+            .expect("mark transfer failed");
         assert!(!runtime.has_active_transfers());
         assert!(runtime.begin_update_install());
         let blocked = runtime.add_outgoing_transfer(mobile_offer(&runtime, "blocked", 1));
@@ -3576,7 +3630,64 @@ mod tests {
                 mobile_offer(&runtime, "blocked-mobile", 1)
             )
             .is_err());
+        assert!(matches!(
+            runtime.retry_transfer("retry-during-update", TransferStatus::Accepted, None),
+            Err(super::TransferRetryError::InstallingUpdate)
+        ));
+        runtime.update_transfer(
+            "retry-during-update",
+            super::TransferProgress {
+                status: TransferStatus::Accepted,
+                retry_count: 1,
+                ..failed
+            },
+        );
+        assert!(!runtime.has_active_transfers());
         runtime.end_update_install();
+        assert!(runtime
+            .retry_transfer("retry-during-update", TransferStatus::Accepted, None)
+            .is_ok());
+        assert!(runtime.has_active_transfers());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn ca_download_rejects_oversized_chunked_body_before_eof() {
+        use futures_util::StreamExt;
+
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let app = axum::Router::new().route(
+            "/ca.crt",
+            axum::routing::get(|| async {
+                let first = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![
+                        b'x';
+                        super::MAX_MOBILE_CA_BYTES
+                            + 1
+                    ]))
+                });
+                axum::body::Body::from_stream(first.chain(futures_util::stream::pending()))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve CA fixture");
+        });
+        let url = format!("http://{address}/ca.crt");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            runtime.fetch_mobile_ca(&url),
+        )
+        .await
+        .expect("reject before the sender reaches EOF")
+        .expect_err("reject oversized CA response");
+        assert!(error.contains("超出大小限制"));
+        server.abort();
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -3949,7 +4060,7 @@ mod tests {
             .expect("stage item");
         assert_eq!(ready.progress.status, TransferStatus::Ready);
         let completed = runtime
-            .mark_mobile_item_downloaded("mobile-transfer", "item")
+            .mark_mobile_item_downloaded("mobile-transfer", "item", false)
             .expect("mark downloaded");
         assert_eq!(completed.progress.status, TransferStatus::Completed);
         assert!(runtime
@@ -4157,7 +4268,7 @@ mod tests {
             .stage_mobile_item("recent-mobile", "recent-mobile-item", 1)
             .expect("stage mobile item");
         runtime
-            .mark_mobile_item_downloaded("recent-mobile", "recent-mobile-item")
+            .mark_mobile_item_downloaded("recent-mobile", "recent-mobile-item", false)
             .expect("download mobile item");
 
         runtime.prune_mobile_transfers();
@@ -4288,7 +4399,7 @@ mod tests {
         assert_eq!(progress.error, None);
         assert!(runtime
             .retry_transfer("retryable", TransferStatus::Accepted, Some(1))
-            .is_none());
+            .is_err());
         let _ = std::fs::remove_dir_all(path);
     }
 

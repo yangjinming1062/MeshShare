@@ -54,7 +54,7 @@ npx --yes @tauri-apps/cli@2 android build --apk --target aarch64
 npx --yes @tauri-apps/cli@2 android build --aab --target aarch64
 ```
 
-Android App 的本机 Rust 节点能力是文件传输和网络指标；它不提供浏览器网页入口，桌面托盘、悬浮监控条、开机自启、桌面自动更新和系统剪贴板轮询不会编译进 Android 运行路径。发送文件使用系统文件选择器，接收文件默认写入应用专属的 Download/MeshShare 目录。Android 验证至少包括启动/关闭节点、局域网 HTTP/WS 连接、双向文件校验、手动剪贴板操作、Wi‑Fi 切换和进程退出后的状态清理。
+Android App 的本机节点提供文件传输和网络指标。`prepare_android_project.py` 将 Android 更新插件和安装权限写入可再生的 `backend/gen/android`，插件源文件在 `backend/android/`。APK 的前端构建以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐 Svelte 渲染所用的 `String.replaceAll`。发送文件使用系统文件选择器，接收文件默认写入应用专属的 Download/MeshShare 目录。Android 节点验证包括启动和关闭、局域网 HTTP/WS 连接、双向文件校验、手动剪贴板操作、Wi-Fi 切换和进程退出后的状态清理。
 
 构建本地调试程序，产物位于 `backend/target/debug/`。
 
@@ -74,7 +74,7 @@ Android Release 构建使用 GitHub Actions Secrets `ANDROID_KEYSTORE_BASE64`、
 
 ### 自动更新发布
 
-更新包由 Tauri updater 签名。首次配置时，在仓库外生成一组 updater 密钥，并将公钥内容写入 `backend/tauri.conf.json`；私钥和密码只保存到 GitHub Actions Secrets `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，不能提交到仓库。
+桌面更新包由 Tauri updater 签名。首次配置时，在仓库外生成一组 updater 密钥，并将公钥内容写入 `backend/tauri.conf.json`；私钥和密码只保存到 GitHub Actions Secrets `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，不能提交到仓库。
 
 ```bash
 npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-updater.key
@@ -83,6 +83,10 @@ npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-upda
 将私钥文件中的完整单行 base64 值原样保存到 `TAURI_SIGNING_PRIVATE_KEY`，不要填写文件路径、密码、URL 编码值（例如 `%2B` 或 `%0A`）、引号或命令输出；密码单独保存到 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会在跨平台构建前检查该值的 base64 和 Tauri/minisign 私钥格式。若私钥丢失，必须重新生成密钥并同步更新 `backend/tauri.conf.json` 中的公钥，已发布版本不会接受新公钥。
 
 Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 将签名内容合并进 `latest.json`；签名文件只在 Actions 构建产物中使用，不作为公开 Release Asset。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在签名校验完成、清单生成且所有安装包上传后才解除 Release 草稿状态，并保持 prerelease 标记；人工验证安装包后，在 GitHub Release 页面取消 prerelease 标记，版本才会进入 `releases/latest` 并允许客户端自动更新。已人工晋级为稳定版的 Release 不会被工作流重跑覆盖。
+
+Android 构建先用 `apksigner` 校验，再用 `aapt2 dump badging` 读取 APK 的包名、ABI、`versionName` 和 `versionCode`。清单生成时核对 `com.meshshare.android`、arm64 和 tag 版本，并在 `latest.json` 的 `android` 字段记录 APK 字节数 `size`、`sha256` 和 `version_code`。`versionCode` 沿用 Tauri 的 `major * 1000000 + minor * 1000 + patch`，同一更新链应使用同一 Android 发布证书。
+
+晋级稳定版前，用同一测试密钥签名的两个递增版本验证 Android 覆盖安装。在 Android 10/11 验证系统确认，在 Android 12 及以上验证免确认及系统要求确认时的回退。复查应用数据保留、活跃传输延后、取消和拒绝授权后恢复、计费网络、断网重试，以及错误签名或版本被拒绝。更新源可在隔离的测试构建中指向受控清单和 APK，正式发布构建使用项目 GitHub 稳定版。
 
 当前 macOS 发布使用 ad-hoc 签名，不需要 Apple Developer 账号。工作流通过 `APPLE_SIGNING_IDENTITY=-` 生成可在 Apple Silicon 上运行的包，并在上传前验证 `.app` 的 ad-hoc 签名和 DMG 校验；由于没有 Apple 公证，首次从浏览器下载后需要用户在「系统设置 → 隐私与安全性」中选择「仍要打开」，或手动移除下载隔离标记。以后如果启用 Developer ID，需要把工作流的 `MACOS_SIGNING_MODE` 扩展为证书签名、公证和 stapling，并补充 Apple 凭据，不能把 ad-hoc 包描述为已公证。
 
@@ -102,9 +106,9 @@ MeshShare 不强制把整个桌面壳切换到 X11。剪贴板会优先使用 Wa
 
 根 README 的界面图存放在 `.github/assets/screenshots/`。桌面图对应 1180×780 逻辑像素的 Tauri 窗口，手机图对应 390×844 逻辑像素的浏览器窄视口；两者都按 2 倍像素采集并保存为 WebP，单张不超过 300 KB。
 
-桌面图用 `npx --yes @tauri-apps/cli@2 dev` 启动的窗口截取；需要固定视口而不受窗口大小和系统缩放影响时，用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 打开 WebView2 远程调试，按 `1180×780` 设置设备尺寸后截图。手机图由浏览器打开节点地址后按 `390×844` 截取，网页端与 Android App 共用这套版式。
+用隔离的演示环境加载实际前端。桌面图使用 Tauri 布局，手机图使用浏览器窄视口，网页端与 Android App 共用这套移动版式。
 
-截图前把节点名改成中性名称，并把本机剪贴板历史替换为演示内容，避免把个人信息写进仓库；采集完成后恢复原配置与历史。README 按固定宽度引用这些图片，更新时保持文件名、裁切范围与图注一致。
+演示环境使用虚构设备名、示例网段、模拟的硬件指标和演示剪贴板内容。截图前检查前景、弹窗背景和每条设备记录都来自演示环境。README 按固定宽度引用这些图片，更新时保持文件名、裁切范围与图注一致。
 
 ## 检查
 

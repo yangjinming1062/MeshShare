@@ -7,10 +7,12 @@ use crate::model::{
     TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
     CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
-use crate::runtime::{validate_receive_directory, NodeRuntime};
+use crate::runtime::{
+    validate_receive_directory, NodeRuntime, TransferRetryError, UPDATE_INSTALLING_MESSAGE,
+};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -192,6 +194,10 @@ pub fn router_with_control(
         .route("/api/v1/ws", get(websocket))
         .route("/api/v1/mobile/access", get(mobile_access))
         .route("/api/v1/mobile/ca", get(download_mobile_ca))
+        .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/info",
+            get(proxy_peer_info),
+        )
         .route(
             "/api/v1/mobile/peers/:peer_id/api/v1/transfers",
             post(proxy_create_transfer),
@@ -393,6 +399,7 @@ async fn proxy_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<
             StatusCode::FORBIDDEN => ApiError::forbidden(message),
             StatusCode::NOT_FOUND => ApiError::not_found(message),
             StatusCode::CONFLICT => ApiError::conflict(message),
+            StatusCode::MISDIRECTED_REQUEST => ApiError::misdirected(message),
             StatusCode::TOO_EARLY => ApiError::too_early(message),
             StatusCode::REQUEST_TIMEOUT => ApiError::request_timeout(message),
             StatusCode::TOO_MANY_REQUESTS => ApiError::too_many_requests(message),
@@ -407,6 +414,35 @@ async fn proxy_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<
         .map_err(|error| ApiError::internal(error.to_string()))
 }
 
+async fn read_proxy_peer_info(
+    state: &AppState,
+    base: &str,
+    peer_id: &str,
+) -> Result<NodeInfo, ApiError> {
+    let response = state
+        .runtime
+        .http
+        .get(format!("{base}/api/v1/info"))
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
+    let Json(info) = proxy_json::<NodeInfo>(response).await?;
+    if info.node_id != peer_id {
+        return Err(ApiError::misdirected("地址上的设备与传输目标不匹配"));
+    }
+    Ok(info)
+}
+
+async fn proxy_peer_info(
+    AxumPath(peer_id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<NodeInfo>, ApiError> {
+    let base = proxy_peer_base(&state, &peer_id)?;
+    read_proxy_peer_info(&state, &base, &peer_id)
+        .await
+        .map(Json)
+}
+
 async fn proxy_create_transfer(
     AxumPath(peer_id): AxumPath<String>,
     State(state): State<AppState>,
@@ -416,6 +452,7 @@ async fn proxy_create_transfer(
         return Err(ApiError::bad_request("目标设备标识不匹配"));
     }
     let base = proxy_peer_base(&state, &peer_id)?;
+    read_proxy_peer_info(&state, &base, &peer_id).await?;
     let response = state
         .runtime
         .proxy_http
@@ -1125,7 +1162,9 @@ async fn create_transfer(
     Json(mut offer): Json<TransferOffer>,
 ) -> Result<Json<TransferProgress>, ApiError> {
     validate_offer(&offer)?;
-    offer.target_node_id = state.runtime.node_id();
+    if offer.target_node_id != state.runtime.node_id() {
+        return Err(ApiError::misdirected("地址上的设备与传输目标不匹配"));
+    }
     offer.created_at_ms = crate::clock::now_millis();
     state.runtime.add_transfer(offer.clone());
     let progress = state
@@ -1365,8 +1404,7 @@ async fn retry_relay_transfer(
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
     let progress = state
         .runtime
-        .retry_transfer(&id, TransferStatus::Waiting, None)
-        .ok_or_else(|| ApiError::conflict("传输不是可重试的失败状态"))?;
+        .retry_transfer(&id, TransferStatus::Waiting, None)?;
     let offer = record.offer;
     let sent_offer = state
         .runtime
@@ -2100,16 +2138,7 @@ async fn upload_mobile_item(
     Ok(Json(progress))
 }
 
-struct MobileDownloadCompletion {
-    runtime: Arc<NodeRuntime>,
-    session_id: String,
-    transfer_id: String,
-    item_id: String,
-    size: u64,
-    auto_complete: bool,
-}
-
-/// 自动完成时下载响应可能尚未关闭文件句柄，Windows 上需要等句柄释放再删除。
+/// Windows 上，显式完成请求可能先于下载响应关闭文件句柄。
 async fn remove_mobile_staged_file(path: &Path) {
     for attempt in 0..10 {
         match fs::remove_file(path).await {
@@ -2130,7 +2159,9 @@ async fn cleanup_mobile_item_artifacts(runtime: &NodeRuntime, transfer_id: &str,
         remove_mobile_staged_file(&path).await;
     }
     if let Some(record) = runtime.mobile_transfer(transfer_id) {
-        if record.progress.status == TransferStatus::Completed {
+        if record.progress.status == TransferStatus::Completed
+            && record.retryable_downloads.is_empty()
+        {
             cleanup_mobile_staging_directory(&record.staged_directory).await;
         }
     }
@@ -2141,7 +2172,7 @@ async fn finish_mobile_item_download(
     transfer_id: &str,
     item_id: &str,
 ) -> Option<MobileTransferView> {
-    let view = runtime.mark_mobile_item_downloaded(transfer_id, item_id)?;
+    let view = runtime.mark_mobile_item_downloaded(transfer_id, item_id, false)?;
     cleanup_mobile_item_artifacts(runtime, transfer_id, item_id).await;
     Some(view)
 }
@@ -2149,6 +2180,7 @@ async fn finish_mobile_item_download(
 async fn download_mobile_item(
     AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
     Query(query): Query<MobileSessionQuery>,
+    method: Method,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     let session_id = query
@@ -2177,6 +2209,10 @@ async fn download_mobile_item(
         .iter()
         .find(|item| item.item_id == item_id)
         .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
+    if record.downloaded_items.contains(&item_id) && !record.retryable_downloads.contains(&item_id)
+    {
+        return Err(ApiError::not_found("暂存文件已清理"));
+    }
     let path = state
         .runtime
         .mobile_item_path(&transfer_id, &item_id)
@@ -2229,55 +2265,24 @@ async fn download_mobile_item(
         }
     ))
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    let completion = Some(MobileDownloadCompletion {
-        runtime: state.runtime.clone(),
-        session_id: session_id.clone(),
-        transfer_id: transfer_id.clone(),
-        item_id: item_id.clone(),
-        size,
-        auto_complete: query.auto_complete,
-    });
-    let stream = futures_util::stream::unfold(
-        (ReaderStream::new(file), completion, 0u64),
-        move |(mut stream, completion, sent)| async move {
-            match stream.next().await {
-                Some(Ok(chunk)) => {
-                    let sent = sent.saturating_add(chunk.len() as u64);
-                    if let Some(state) = completion.as_ref() {
-                        let _ = state.runtime.touch_mobile_session(&state.session_id);
-                        let _ = state
-                            .runtime
-                            .touch_mobile_transfer_activity(&state.transfer_id);
-                        // 显式 Content-Length 会让 hyper 写满后不再轮询流的结尾，
-                        // 所以在交出最后一个分块时确认项目；客户端中途断开读不到
-                        // 这个分块，也就不会标记完成。
-                        if state.auto_complete
-                            && sent == state.size
-                            && state
-                                .runtime
-                                .mark_mobile_item_downloaded(&state.transfer_id, &state.item_id)
-                                .is_some()
-                        {
-                            let runtime = state.runtime.clone();
-                            let transfer_id = state.transfer_id.clone();
-                            let item_id = state.item_id.clone();
-                            tokio::spawn(async move {
-                                cleanup_mobile_item_artifacts(
-                                    runtime.as_ref(),
-                                    &transfer_id,
-                                    &item_id,
-                                )
-                                .await;
-                            });
-                        }
-                    }
-                    Some((Ok(chunk), (stream, completion, sent)))
-                }
-                Some(Err(error)) => Some((Err(error), (stream, None, sent))),
-                None => None,
+    let runtime = state.runtime;
+    let auto_complete = query.auto_complete && method == Method::GET;
+    // Hyper may skip polling an empty body, or stop at Content-Length.
+    // The HTTP download has no browser acknowledgement, so keep the staged data for retry.
+    if auto_complete && size == 0 {
+        runtime.mark_mobile_item_downloaded(&transfer_id, &item_id, true);
+    }
+    let stream = ReaderStream::new(file.take(size)).scan(0u64, move |sent, chunk| {
+        if let Ok(bytes) = &chunk {
+            *sent += bytes.len() as u64;
+            runtime.touch_mobile_session(&session_id);
+            runtime.touch_mobile_transfer_activity(&transfer_id);
+            if auto_complete && *sent == size {
+                runtime.mark_mobile_item_downloaded(&transfer_id, &item_id, true);
             }
-        },
-    );
+        }
+        futures_util::future::ready(Some(chunk))
+    });
     let response = (
         [
             (header::CONTENT_TYPE, content_type),
@@ -2499,10 +2504,7 @@ async fn retry_transfer(
     } else {
         TransferStatus::Waiting
     };
-    let progress = state
-        .runtime
-        .retry_transfer(&id, status, None)
-        .ok_or_else(|| ApiError::conflict("传输不是可重试的失败状态"))?;
+    let progress = state.runtime.retry_transfer(&id, status, None)?;
     if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
         let _ = state
             .runtime
@@ -2941,7 +2943,7 @@ async fn apply_transfer_action(
             }
         }
         "retry" if current_peer == Some(source_node_id.as_str()) => {
-            if let Some(progress) =
+            if let Ok(progress) =
                 runtime.retry_transfer(transfer_id, TransferStatus::Waiting, retry_count)
             {
                 runtime.publish_event(WireMessage::TransferProgress { progress });
@@ -3890,7 +3892,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_download_completes_item_when_stream_finishes() {
+    async fn direct_offer_for_a_different_node_is_not_registered() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-foreign-offer-{}", Uuid::new_v4()));
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let offer = TransferOffer {
+            transfer_id: "foreign-offer".to_string(),
+            source_node_id: "demo-sender".to_string(),
+            source_name: "demo sender".to_string(),
+            target_node_id: "demo-other-node".to_string(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "demo.txt".to_string(),
+                relative_path: "demo.txt".to_string(),
+                size: 0,
+                sha256: format!("{:x}", Sha256::digest([])),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        let error = super::create_transfer(
+            super::State(super::AppState {
+                control: super::ControlPlane::runtime_only(runtime.clone()),
+                runtime: runtime.clone(),
+                static_root: data_dir.clone(),
+            }),
+            super::Json(offer),
+        )
+        .await
+        .expect_err("reject wrong target");
+        assert_eq!(error.status, super::StatusCode::MISDIRECTED_REQUEST);
+        assert!(runtime.transfer("foreign-offer").is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn browser_download_completes_and_keeps_staged_items_retryable() {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-browser-download-{}", Uuid::new_v4()));
         let static_root = data_dir.join("web");
@@ -3902,47 +3942,7 @@ mod tests {
         let session = runtime
             .create_mobile_session("test phone".to_string())
             .expect("create mobile session");
-        let bytes = b"hello browser";
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        let offer = TransferOffer {
-            transfer_id: "browser-download".to_string(),
-            source_node_id: runtime.node_id(),
-            source_name: "desktop".to_string(),
-            target_node_id: runtime.node_id(),
-            items: vec![TransferItem {
-                item_id: "item".to_string(),
-                name: "hello.txt".to_string(),
-                relative_path: "hello.txt".to_string(),
-                size: bytes.len() as u64,
-                sha256: format!("{:x}", hasher.finalize()),
-                media_type: "text/plain".to_string(),
-                directory: false,
-            }],
-            total_bytes: bytes.len() as u64,
-            created_at_ms: crate::clock::now_millis(),
-        };
-        runtime
-            .create_mobile_transfer(&session.session_id, offer)
-            .expect("create mobile transfer");
-        runtime
-            .set_mobile_transfer_status(
-                "browser-download",
-                &session.session_id,
-                TransferStatus::Accepted,
-            )
-            .expect("accept mobile transfer");
-        let record = runtime
-            .mobile_transfer("browser-download")
-            .expect("find mobile transfer");
-        std::fs::create_dir_all(&record.staged_directory).expect("create staged directory");
-        std::fs::write(record.staged_directory.join("hello.txt"), bytes)
-            .expect("write staged file");
-        runtime
-            .stage_mobile_item("browser-download", "item", bytes.len() as u64)
-            .expect("stage mobile item");
-
-        let app = super::router(runtime.clone(), static_root);
+        let app = super::router(runtime.clone(), static_root.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test listener");
@@ -3950,44 +3950,107 @@ mod tests {
         let server_task = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve test router");
         });
-        let response = runtime
-            .http
-            .get(format!(
-                "http://{address}/api/v1/mobile/transfers/browser-download/items/item/download?session_id={}&auto_complete=true",
-                session.session_id
-            ))
-            .send()
-            .await
-            .expect("download mobile item");
-        assert!(response.status().is_success());
-        assert_eq!(
-            response.bytes().await.expect("read download").as_ref(),
-            bytes
-        );
-        // 客户端读完响应与节点收尾不是同一时刻，等后台清理完成再断言。
-        let mut completed = false;
-        for _ in 0..100 {
-            if runtime
-                .mobile_transfer("browser-download")
-                .expect("find completed transfer")
-                .progress
-                .status
-                == TransferStatus::Completed
-            {
-                completed = true;
-                break;
+        for (id, bytes) in [
+            ("empty-download", vec![]),
+            ("browser-download", vec![42; 32 * 1024]),
+        ] {
+            runtime
+                .create_mobile_transfer(
+                    &session.session_id,
+                    TransferOffer {
+                        transfer_id: id.to_string(),
+                        source_node_id: runtime.node_id(),
+                        source_name: "desktop".to_string(),
+                        target_node_id: runtime.node_id(),
+                        items: vec![TransferItem {
+                            item_id: "item".to_string(),
+                            name: "sample.bin".to_string(),
+                            relative_path: "sample.bin".to_string(),
+                            size: bytes.len() as u64,
+                            sha256: format!("{:x}", Sha256::digest(&bytes)),
+                            media_type: "application/octet-stream".to_string(),
+                            directory: false,
+                        }],
+                        total_bytes: bytes.len() as u64,
+                        created_at_ms: crate::clock::now_millis(),
+                    },
+                )
+                .expect("create mobile transfer");
+            runtime
+                .set_mobile_transfer_status(id, &session.session_id, TransferStatus::Accepted)
+                .expect("accept mobile transfer");
+            let record = runtime.mobile_transfer(id).expect("find mobile transfer");
+            std::fs::create_dir_all(&record.staged_directory).expect("create staged directory");
+            let staged = record.staged_directory.join("sample.bin");
+            std::fs::write(&staged, &bytes).expect("write staged file");
+            runtime
+                .stage_mobile_item(id, "item", bytes.len() as u64)
+                .expect("stage item");
+
+            let url = format!("http://{address}/api/v1/mobile/transfers/{id}/items/item/download?session_id={}&auto_complete=true", session.session_id);
+            assert!(runtime
+                .http
+                .head(&url)
+                .send()
+                .await
+                .expect("head download")
+                .status()
+                .is_success());
+            assert_eq!(
+                runtime.mobile_transfer(id).unwrap().progress.status,
+                TransferStatus::Ready
+            );
+            if !bytes.is_empty() {
+                let response = super::download_mobile_item(
+                    super::AxumPath((id.to_string(), "item".to_string())),
+                    super::Query(super::MobileSessionQuery {
+                        session_id: Some(session.session_id.clone()),
+                        auto_complete: true,
+                    }),
+                    super::Method::GET,
+                    super::State(super::AppState {
+                        runtime: runtime.clone(),
+                        control: super::ControlPlane::runtime_only(runtime.clone()),
+                        static_root: static_root.clone(),
+                    }),
+                )
+                .await
+                .expect("start partial download");
+                let mut body = response.into_body().into_data_stream();
+                let first = body.next().await.expect("first chunk").expect("read chunk");
+                assert!(first.len() < bytes.len());
+                drop(body);
+                assert_eq!(
+                    runtime.mobile_transfer(id).unwrap().progress.status,
+                    TransferStatus::Ready
+                );
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(completed, "browser download completes the item");
-        let staged = record.staged_directory.join("hello.txt");
-        for _ in 0..50 {
-            if !staged.exists() {
-                break;
+
+            for _ in 0..2 {
+                let response = runtime
+                    .http
+                    .get(&url)
+                    .send()
+                    .await
+                    .expect("download mobile item");
+                assert!(response.status().is_success());
+                assert_eq!(
+                    response.bytes().await.expect("read download").as_ref(),
+                    bytes
+                );
+                assert_eq!(
+                    runtime.mobile_transfer(id).unwrap().progress.status,
+                    TransferStatus::Completed
+                );
+                assert!(staged.exists());
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let view = runtime
+                .mobile_transfers_snapshot(Some(&session.session_id))
+                .into_iter()
+                .find(|view| view.progress.transfer_id == id)
+                .unwrap();
+            assert_eq!(view.retryable_download_item_ids, ["item"]);
         }
-        assert!(!staged.exists(), "staged file is removed after completion");
         runtime
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4884,6 +4947,12 @@ impl ApiError {
             message: message.into(),
         }
     }
+    fn misdirected(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::MISDIRECTED_REQUEST,
+            message: message.into(),
+        }
+    }
     fn too_early(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::TOO_EARLY,
@@ -4924,6 +4993,15 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+        }
+    }
+}
+
+impl From<TransferRetryError> for ApiError {
+    fn from(error: TransferRetryError) -> Self {
+        match error {
+            TransferRetryError::InstallingUpdate => Self::too_early(UPDATE_INSTALLING_MESSAGE),
+            TransferRetryError::NotRetryable => Self::conflict("传输不是可重试的失败状态"),
         }
     }
 }

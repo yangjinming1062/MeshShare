@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -11,6 +12,10 @@ from pathlib import Path
 
 
 VERSION_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
+APK_PACKAGE_RE = re.compile(
+    r"^package: name='([^']+)' versionCode='([0-9]+)' versionName='([^']*)'",
+    re.MULTILINE,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +53,30 @@ def platform_entry(root: Path, artifact_dir: str, suffix: str, tag: str) -> dict
         "url": f"https://github.com/yangjinming1062/MeshShare/releases/download/{tag}/{asset.name}",
         "signature": signature_text,
     }
+
+
+def android_entry(root: Path, version: str) -> dict[str, int | str]:
+    artifact = "MeshShare-android-arm64"
+    apk = find_asset(root, artifact, f"MeshShare_{version}_android_arm64.apk")
+    badging = find_asset(root, artifact, "android-apk.badging").read_text(encoding="utf-8")
+    package = APK_PACKAGE_RE.search(badging)
+    if not package or package[1] != "com.meshshare.android" or package[3] != version:
+        raise SystemExit(f"Android APK package or version does not match v{version}")
+
+    major, minor, patch = map(int, version.split("."))
+    code = int(package[2])
+    if minor >= 1000 or patch >= 1000 or not 0 < code <= 2_100_000_000 or (
+        code != major * 1_000_000 + minor * 1_000 + patch
+    ):
+        raise SystemExit(f"Invalid Android versionCode {code} for v{version}")
+    if "native-code: 'arm64-v8a'" not in badging.splitlines():
+        raise SystemExit("Expected an arm64 Android APK")
+
+    digest = hashlib.sha256()
+    with apk.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"size": apk.stat().st_size, "sha256": digest.hexdigest(), "version_code": code}
 
 
 def build_manifest(args: argparse.Namespace) -> dict[str, object]:
@@ -93,6 +122,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
         "notes": notes,
         "pub_date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "platforms": platforms,
+        "android": android_entry(args.assets_root, args.version),
     }
 
 

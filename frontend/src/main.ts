@@ -1,3 +1,4 @@
+import 'core-js/es/string/replace-all';
 import App from './App.svelte';
 import './app.css';
 import { mount } from 'svelte';

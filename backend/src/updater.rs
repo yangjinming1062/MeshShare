@@ -332,7 +332,7 @@ impl UpdateCoordinator {
             return CheckResult::Completed;
         }
 
-        if self.runtime.has_active_transfers() || !self.runtime.begin_update_install() {
+        let Some(install_guard) = UpdateInstallGuard::acquire(&self.runtime) else {
             self.set_status(
                 UpdateState::Deferred,
                 Some(update.version),
@@ -341,7 +341,7 @@ impl UpdateCoordinator {
                 Some("等待当前文件传输完成".to_string()),
             );
             return CheckResult::Deferred;
-        }
+        };
 
         self.set_status(
             UpdateState::Installing,
@@ -350,9 +350,6 @@ impl UpdateCoordinator {
             None,
             None,
         );
-        let install_guard = UpdateInstallGuard {
-            runtime: &self.runtime,
-        };
         let result = update.install(&bytes);
         match result {
             Ok(()) => {
@@ -470,8 +467,14 @@ enum CheckResult {
     Deferred,
 }
 
-struct UpdateInstallGuard<'a> {
+pub(crate) struct UpdateInstallGuard<'a> {
     runtime: &'a NodeRuntime,
+}
+
+impl<'a> UpdateInstallGuard<'a> {
+    pub(crate) fn acquire(runtime: &'a NodeRuntime) -> Option<Self> {
+        runtime.begin_update_install().then(|| Self { runtime })
+    }
 }
 
 impl Drop for UpdateInstallGuard<'_> {

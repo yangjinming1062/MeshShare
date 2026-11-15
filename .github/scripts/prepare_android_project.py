@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Apply MeshShare's Android manifest and LAN transport policy after Tauri init."""
+"""Apply MeshShare's Android sources, manifest and transport policy after Tauri init."""
 
 import re
+import shutil
 from pathlib import Path
 
 
 def replace_once(path: Path, old: str, new: str) -> None:
     text = path.read_text(encoding="utf-8")
+    if new in text:
+        return
     if old not in text:
-        if new in text:
-            return
         raise SystemExit(f"Expected Android template text was not found in {path}: {old}")
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
 
@@ -105,6 +106,28 @@ def install_android_icons(root: Path, android: Path) -> None:
     print(f"Installed {copied} Android launcher icon resources")
 
 
+def install_android_updater(root: Path, manifest: Path) -> None:
+    source = root / "backend" / "android"
+    target = manifest.parent / "java" / "com" / "meshshare" / "android" / "update"
+    target.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source / "UpdatePlugin.kt", target / "UpdatePlugin.kt")
+    replace_once(
+        manifest,
+        '    <uses-permission android:name="android.permission.INTERNET" />\n',
+        '    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />\n'
+        '    <uses-permission android:name="android.permission.UPDATE_PACKAGES_WITHOUT_USER_ACTION" />\n'
+        '    <uses-permission android:name="android.permission.INTERNET" />\n',
+    )
+    replace_once(
+        manifest,
+        '    </application>',
+        '        <receiver\n'
+        '            android:name="com.meshshare.android.update.UpdateResultReceiver"\n'
+        '            android:exported="false" />\n'
+        '    </application>',
+    )
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
     android = root / "backend" / "gen" / "android"
@@ -135,6 +158,7 @@ def main() -> None:
     gradle.write_text(gradle_text, encoding="utf-8")
     configure_signing(gradle)
     install_android_icons(root, android)
+    install_android_updater(root, manifest)
 
     manifest_lines = manifest.read_text(encoding="utf-8").splitlines(keepends=True)
     seen_permissions: set[str] = set()

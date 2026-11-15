@@ -280,10 +280,13 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$apk"
           mkdir -p android-release
           cp "$apk" "android-release/MeshShare_${GITHUB_REF_NAME#v}_android_arm64.apk"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt2" dump badging "$apk" > android-release/android-apk.badging
       - uses: actions/upload-artifact@v4
         with:
           name: MeshShare-android-arm64
-          path: android-release/MeshShare_*_android_arm64.apk
+          path: |
+            android-release/MeshShare_*_android_arm64.apk
+            android-release/android-apk.badging
           if-no-files-found: error
 
   release:

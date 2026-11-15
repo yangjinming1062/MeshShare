@@ -145,20 +145,35 @@ export async function digestFile(file: File, options: DigestOptions = {}): Promi
   }
 
   if (typeof file.stream === 'function') {
+    abortIfCancelled(signal);
     const reader = file.stream().getReader();
-    while (true) {
-      abortIfCancelled(signal);
-      const chunk = await reader.read();
-      if (chunk.done) break;
-      await consume(chunk.value);
+    const cancelReader = () => { void reader.cancel().catch(() => undefined); };
+    signal?.addEventListener('abort', cancelReader, { once: true });
+    try {
+      while (true) {
+        abortIfCancelled(signal);
+        const chunk = await reader.read();
+        abortIfCancelled(signal);
+        if (chunk.done) break;
+        await consume(chunk.value);
+      }
+    } catch (error) {
+      if (!signal?.aborted) cancelReader();
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', cancelReader);
+      reader.releaseLock();
     }
   } else {
     const chunkSize = 1024 * 1024;
     for (let offset = 0; offset < file.size; offset += chunkSize) {
       abortIfCancelled(signal);
-      await consume(new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer()));
+      const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
+      abortIfCancelled(signal);
+      await consume(new Uint8Array(chunk));
     }
   }
   onProgress?.(hashedBytes);
+  abortIfCancelled(signal);
   return hasher.digestHex();
 }

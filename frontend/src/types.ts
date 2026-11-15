@@ -223,11 +223,13 @@ export type MobileTransferView = {
   session_id: string;
   progress: TransferProgress;
   downloaded_item_ids?: string[];
+  retryable_download_item_ids?: string[];
 };
 
 export type PhoneTransfer = TransferProgress & {
   peerName?: string;
   downloadedItemIds?: string[];
+  retryableDownloadItemIds?: string[];
 };
 
 export type WireMessage =

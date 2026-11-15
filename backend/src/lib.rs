@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "android", test))]
+mod android_update;
 mod autostart;
 mod clipboard;
 mod clock;
@@ -1068,17 +1070,22 @@ pub fn run() {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(android_update::app::plugin())
         .setup(|app| {
             let data_dir = app
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".meshshare"));
             let (runtime, control) = tauri::async_runtime::block_on(start_node(
-                data_dir,
+                data_dir.clone(),
                 static_root(app.handle()),
                 app.package_info().version.to_string(),
                 app.handle().clone(),
             ))?;
+            if let Err(error) = android_update::app::start(app.handle(), runtime.clone(), &data_dir)
+            {
+                eprintln!("启动 Android 更新服务失败：{error:#}");
+            }
             app.manage(ManagedNode { runtime, control });
             Ok(())
         })
@@ -1092,7 +1099,11 @@ pub fn run() {
             accept_transfer,
             android_receive_directory,
             register_outgoing_transfer,
-            update_transfer_progress
+            update_transfer_progress,
+            android_update::app::android_update_status,
+            android_update::app::android_set_update_frequency,
+            android_update::app::android_check_for_updates,
+            android_update::app::android_continue_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")

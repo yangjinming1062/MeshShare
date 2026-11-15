@@ -319,6 +319,8 @@ pub struct MobileTransferView {
     pub progress: TransferProgress,
     #[serde(default)]
     pub downloaded_item_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retryable_download_item_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

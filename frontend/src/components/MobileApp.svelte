@@ -1,4 +1,5 @@
 <script lang="ts">
+  import AndroidUpdatePanel from './AndroidUpdatePanel.svelte';
   import Icon from './Icon.svelte';
   import {
     clipboardHistoryKind,
@@ -75,6 +76,9 @@
     .filter((transfer) => transfer.direction !== 'send' && (transfer.status === 'accepted' || transfer.status === 'uploading' || transfer.status === 'ready'))
     .sort((left, right) => (right.offer?.created_at_ms ?? 0) - (left.offer?.created_at_ms ?? 0));
   $: inbox = pending.length ? null : (activeIncoming[0] ?? null);
+  $: recentDownloads = mode === 'web' ? transfers.filter((transfer) =>
+    transfer.status === 'completed' && transfer.retryableDownloadItemIds?.length,
+  ) : [];
   $: acceptLabel = mode === 'android'
     ? '接收'
     : canChooseDirectory
@@ -99,6 +103,10 @@
 
   function downloaded(transfer: PhoneTransfer, item: TransferItem): boolean {
     return transfer.downloadedItemIds?.includes(item.item_id) ?? false;
+  }
+
+  function canRetryDownload(transfer: PhoneTransfer, item: TransferItem): boolean {
+    return transfer.retryableDownloadItemIds?.includes(item.item_id) ?? false;
   }
 
   function downloadStarted(transfer: PhoneTransfer, item: TransferItem): boolean {
@@ -186,9 +194,9 @@
                 </button>
               {:else}
                 {#each inbox.offer?.items ?? [] as item (item.item_id)}
-                  {#if !downloaded(inbox, item)}
+                  {#if !downloaded(inbox, item) || canRetryDownload(inbox, item)}
                     <button type="button" class="btn btn-primary" on:click={() => onStartDownload(inbox, item)}>
-                      {downloadStarted(inbox, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
+                      {downloadStarted(inbox, item) || downloaded(inbox, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
                     </button>
                   {/if}
                 {/each}
@@ -201,6 +209,10 @@
         </article>
       {/if}
     </section>
+  {/if}
+
+  {#if mode === 'android'}
+    <AndroidUpdatePanel />
   {/if}
 
   <section class="phone-card">
@@ -375,9 +387,9 @@
                   </button>
                 {:else}
                   {#each transfer.offer?.items ?? [] as item (item.item_id)}
-                    {#if !downloaded(transfer, item)}
+                    {#if !downloaded(transfer, item) || canRetryDownload(transfer, item)}
                       <button type="button" class="btn btn-primary btn-sm" on:click={() => onStartDownload(transfer, item)}>
-                        {downloadStarted(transfer, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
+                        {downloadStarted(transfer, item) || downloaded(transfer, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
                       </button>
                     {/if}
                   {/each}
@@ -392,6 +404,22 @@
         {#if !prepares.length && !activeTransfers.length}
           <div class="empty">还没有传输任务。</div>
         {/if}
+      </div>
+    {/if}
+    {#if recentDownloads.length}
+      <div class="phone-card-head phone-subhead"><h3>最近下载</h3></div>
+      <div class="phone-list">
+        {#each recentDownloads as transfer (transfer.transfer_id)}
+          <article class="transfer-card">
+            <span class="transfer-icon" aria-hidden="true"><Icon name="arrow-down" size={14} /></span>
+            <div class="transfer-copy"><strong>{transferTitle(transfer)}</strong></div>
+            <div class="transfer-actions">
+              {#each (transfer.offer?.items ?? []).filter((item) => canRetryDownload(transfer, item)) as item (item.item_id)}
+                <button type="button" class="btn btn-sm" on:click={() => onStartDownload(transfer, item)}>重新下载 {item.name}</button>
+              {/each}
+            </div>
+          </article>
+        {/each}
       </div>
     {/if}
     {#if failures.length}
