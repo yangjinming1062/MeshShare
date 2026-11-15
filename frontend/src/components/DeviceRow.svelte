@@ -22,10 +22,11 @@
     : (peer ? platformLabel(peer.platform) + ' · ' + (peer.addresses[0]?.address ?? '在线') : '');
   $: metrics = kind === 'mobile' ? null : (peer?.metrics ?? null);
   $: stale = kind === 'peer' && !!peer?.metrics_stale;
-  $: hasMetrics = !!metrics && !stale;
-  $: cpu = metrics?.cpu_usage_percent;
-  $: memory = memoryPercent(metrics);
-  $: gpu = gpuUtilization(metrics);
+  $: hasMetrics = !!metrics;
+  $: displayMetrics = stale ? null : metrics;
+  $: cpu = displayMetrics?.cpu_usage_percent;
+  $: memory = memoryPercent(displayMetrics);
+  $: gpu = gpuUtilization(displayMetrics);
 
   function isInsideRow(event: DragEvent): boolean {
     const row = event.currentTarget;
@@ -75,11 +76,11 @@
         <Meter label="内存" value={formatPercent(memory)} percent={memory} />
         <Meter label="GPU" value={formatPercent(gpu)} percent={gpu} />
         <span class="meter meter-net">
-          <b class="meter-value">↓ {formatRateCompact(metrics?.network_down_bytes_per_sec)}</b>
-          <b class="meter-value">↑ {formatRateCompact(metrics?.network_up_bytes_per_sec)}</b>
+          <b class="meter-value">↓ {formatRateCompact(displayMetrics?.network_down_bytes_per_sec)}</b>
+          <b class="meter-value">↑ {formatRateCompact(displayMetrics?.network_up_bytes_per_sec)}</b>
         </span>
       {:else}
-        <span class="device-metrics-empty" data-stale={stale}>{stale ? '指标已过期' : '指标采集中'}</span>
+        <span class="device-metrics-empty">指标采集中</span>
       {/if}
     </button>
   {/if}

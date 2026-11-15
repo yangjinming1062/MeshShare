@@ -1,27 +1,25 @@
 <script lang="ts">
   import Dialog from './Dialog.svelte';
-  import { formatMemory, formatPercent, formatRate, metricStatus } from '../format';
+  import { formatMemory, formatPercent, formatRate } from '../format';
   import type { PeerInfo } from '../types';
 
   export let open = false;
   export let peer: PeerInfo | null = null;
   export let onClose: () => void = () => {};
 
-  $: gpus = peer?.metrics?.gpus ?? [];
+  $: stale = !!peer?.metrics_stale;
+  $: displayMetrics = stale ? null : (peer?.metrics ?? null);
+  $: gpus = displayMetrics?.gpus ?? [];
 </script>
 
 <Dialog {open} title={(peer?.node_name ?? '设备') + ' 的硬件状态'} width={440} {onClose}>
   <div class="kv-row">
-    <span class="muted">更新时间</span>
-    <span>{metricStatus(peer, peer?.metrics ?? null)}</span>
-  </div>
-  <div class="kv-row">
     <span class="muted">CPU</span>
-    <span>{formatPercent(peer?.metrics?.cpu_usage_percent)}</span>
+    <span>{formatPercent(displayMetrics?.cpu_usage_percent)}</span>
   </div>
   <div class="kv-row">
     <span class="muted">网络</span>
-    <span>↓ {formatRate(peer?.metrics?.network_down_bytes_per_sec)} · ↑ {formatRate(peer?.metrics?.network_up_bytes_per_sec)}</span>
+    <span>↓ {formatRate(displayMetrics?.network_down_bytes_per_sec)} · ↑ {formatRate(displayMetrics?.network_up_bytes_per_sec)}</span>
   </div>
   {#if gpus.length}
     <div class="hw-gpus">
@@ -36,6 +34,12 @@
         {/if}
       {/each}
     </div>
+  {:else if stale}
+    <div class="kv-row">
+      <span class="muted">GPU/显存</span>
+      <span>—</span>
+    </div>
+    <div class="empty">指标已过期，等待最新快照。</div>
   {:else}
     <div class="empty">GPU/显存指标暂不可用，CPU、内存和网络仍会继续采集。</div>
   {/if}

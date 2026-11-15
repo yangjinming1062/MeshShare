@@ -8,7 +8,7 @@
   import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { clipboardHistoryKind, clipboardHistoryPreview, formatPercent, formatRate, formatTime, gpuMemoryPercent, gpuUtilization, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
+  import { clipboardHistoryKind, clipboardHistoryPreview, formatPercent, formatRate, formatTime, gpuMemoryPercent, gpuUtilization, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
   import Icon from './components/Icon.svelte';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
@@ -100,6 +100,7 @@
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
   $: secureMobileUrl = node?.mobile_addresses?.find((address) => address.address === mobileAddress?.address)?.url;
+  $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
   $: mobileTargets = node ? [{
     node_id: node.node_id,
@@ -1242,12 +1243,12 @@
 <div class:mobile-shell={isWeb} class:monitor-shell={isMonitor} class:app-shell={!isWeb && !isMonitor}>
   {#if isMonitor}
     <main class="monitor-main" data-tauri-drag-region="deep" on:contextmenu={openMonitorMenu}>
-      <div class="monitor-metric"><b>CPU</b><span>{formatPercent(metrics?.cpu_usage_percent)}</span></div>
-      <div class="monitor-metric"><b>GPU</b><span>{formatPercent(gpuUtilization(metrics))}</span></div>
-      <div class="monitor-metric"><b>↑</b><span>{formatRate(metrics?.network_up_bytes_per_sec)}</span></div>
-      <div class="monitor-metric"><b>内存</b><span>{formatPercent(memoryPercent(metrics))}</span></div>
-      <div class="monitor-metric"><b>显存</b><span>{formatPercent(gpuMemoryPercent(metrics))}</span></div>
-      <div class="monitor-metric"><b>↓</b><span>{formatRate(metrics?.network_down_bytes_per_sec)}</span></div>
+      <div class="monitor-metric"><b>CPU</b><span>{formatPercent(monitorMetrics?.cpu_usage_percent)}</span></div>
+      <div class="monitor-metric"><b>GPU</b><span>{formatPercent(gpuUtilization(monitorMetrics))}</span></div>
+      <div class="monitor-metric"><b>↑</b><span>{formatRate(monitorMetrics?.network_up_bytes_per_sec)}</span></div>
+      <div class="monitor-metric"><b>内存</b><span>{formatPercent(memoryPercent(monitorMetrics))}</span></div>
+      <div class="monitor-metric"><b>显存</b><span>{formatPercent(gpuMemoryPercent(monitorMetrics))}</span></div>
+      <div class="monitor-metric"><b>↓</b><span>{formatRate(monitorMetrics?.network_down_bytes_per_sec)}</span></div>
     </main>
   {:else if isWeb}
     <header class="mobile-topbar">

@@ -1,5 +1,7 @@
 import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, UpdateFrequency, UpdateStatus } from './types';
 
+export const METRICS_STALE_AFTER_MS = 5_000;
+
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
   if (bytes < 1024 ** 2) return (bytes / 1024).toFixed(1) + ' KB';
@@ -47,16 +49,8 @@ export function gpuMemoryPercent(value: HardwareMetrics | null | undefined): num
   return values.length ? Math.max(...values) : undefined;
 }
 
-export function metricAge(sampledAt: number | undefined, receivedAt?: number): string {
-  const at = receivedAt ?? sampledAt;
-  if (!at) return '等待数据';
-  const seconds = Math.max(0, Math.round((Date.now() - at) / 1000));
-  return seconds <= 1 ? '刚刚更新' : seconds + ' 秒前更新';
-}
-
-export function metricStatus(peer: PeerInfo | null, value: HardwareMetrics | null | undefined): string {
-  if (peer?.metrics_stale) return '指标已过期';
-  return metricAge(value?.sampled_at_ms, peer?.metrics_received_at_ms);
+export function isMetricsStale(value: HardwareMetrics | null | undefined): boolean {
+  return value != null && Date.now() - value.sampled_at_ms > METRICS_STALE_AFTER_MS;
 }
 
 export function peerSummary(peer: PeerInfo): string {

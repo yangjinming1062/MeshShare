@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { formatMemory, formatPercent, formatRate, gpuUtilization, memoryPercent, metricStatus } from '../format';
+  import { formatMemory, formatPercent, formatRate, gpuUtilization, isMetricsStale, memoryPercent } from '../format';
   import type { HardwareMetrics } from '../types';
 
   export let metrics: HardwareMetrics | null = null;
@@ -7,16 +7,21 @@
   export let canClickThrough = false;
   export let onToggleLock: () => void = () => {};
 
-  $: gpus = metrics?.gpus ?? [];
+  $: stale = isMetricsStale(metrics);
+  $: displayMetrics = stale ? null : metrics;
+  $: gpus = displayMetrics?.gpus ?? [];
   $: shownGpus = gpus.slice(0, 2);
   $: moreGpus = Math.max(0, gpus.length - shownGpus.length);
-  $: status = metricStatus(null, metrics);
-  $: cpuPercent = metrics?.cpu_usage_percent;
-  $: memoryUsedPercent = memoryPercent(metrics);
-  $: gpuUsedPercent = gpuUtilization(metrics);
+  $: cpuPercent = displayMetrics?.cpu_usage_percent;
+  $: memoryUsedPercent = memoryPercent(displayMetrics);
+  $: gpuUsedPercent = gpuUtilization(displayMetrics);
   $: cpuBar = bar(cpuPercent);
   $: memoryBar = bar(memoryUsedPercent);
   $: gpuBar = bar(gpuUsedPercent);
+  $: memoryCaption = stale
+    ? '—'
+    : formatMemory(metrics?.memory_used_bytes) + ' / ' + formatMemory(metrics?.memory_total_bytes);
+  $: gpuCaption = stale ? '—' : (gpus.length ? gpus.length + ' 个 GPU' : '未检测到可读指标');
 
   function bar(value: number | undefined): number | undefined {
     if (value === undefined) return undefined;
@@ -28,7 +33,6 @@
   <div class="surface-head">
     <div class="surface-title">
       <h2>本机硬件</h2>
-      <span class="muted">{status}</span>
     </div>
     <div class="surface-actions">
       <button
@@ -53,18 +57,18 @@
         <span class="hw-label">内存</span>
         <strong class="hw-value">{formatPercent(memoryUsedPercent)}</strong>
         {#if memoryBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{memoryBar}"></span></span>{/if}
-        <span class="hw-caption">{formatMemory(metrics?.memory_used_bytes)} / {formatMemory(metrics?.memory_total_bytes)}</span>
+        <span class="hw-caption">{memoryCaption}</span>
       </div>
       <div class="hw-tile">
         <span class="hw-label">GPU</span>
         <strong class="hw-value">{formatPercent(gpuUsedPercent)}</strong>
         {#if gpuBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{gpuBar}"></span></span>{/if}
-        <span class="hw-caption">{gpus.length ? gpus.length + ' 个 GPU' : '未检测到可读指标'}</span>
+        <span class="hw-caption">{gpuCaption}</span>
       </div>
       <div class="hw-tile">
         <span class="hw-label">网络</span>
-        <strong class="hw-value">↓ {formatRate(metrics?.network_down_bytes_per_sec)}</strong>
-        <span class="hw-caption">↑ {formatRate(metrics?.network_up_bytes_per_sec)}</span>
+        <strong class="hw-value">↓ {formatRate(displayMetrics?.network_down_bytes_per_sec)}</strong>
+        <span class="hw-caption">↑ {formatRate(displayMetrics?.network_up_bytes_per_sec)}</span>
         <span class="hw-caption">实时速率</span>
       </div>
     </div>
