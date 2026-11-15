@@ -27,6 +27,10 @@ jobs:
           LLM_MODEL_NAME: ${{ secrets.LLM_MODEL_NAME || vars.LLM_MODEL_NAME }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         run: python3 .github/scripts/gen_release_notes.py "$GITHUB_REF_NAME" release-notes.md
+      - name: Append fixed download guide
+        run: >-
+          python3 .github/scripts/append_release_download_guide.py
+          "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" release-notes.md
       - uses: actions/upload-artifact@v4
         with:
           name: release-notes
@@ -217,21 +221,16 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           expected=(
             "MeshShare_${version}_x64-setup.exe"
-            "MeshShare_${version}_x64-setup.exe.sig"
             "MeshShare_${version}_x64_en-US.msi"
-            "MeshShare_${version}_x64_en-US.msi.sig"
             "MeshShare_${version}_x64.dmg"
             "MeshShare_${version}_aarch64.dmg"
             "MeshShare_${version}_amd64.AppImage"
-            "MeshShare_${version}_amd64.AppImage.sig"
             "MeshShare_${version}_amd64.deb"
-            "MeshShare_${version}_amd64.deb.sig"
             "MeshShare-${version}-1.x86_64.rpm"
-            "MeshShare-${version}-1.x86_64.rpm.sig"
           )
-          mapfile -t mac_updater_assets < <(find release-assets -type f -name '*.app.tar.gz*' -printf '%f\n' | sort -u)
-          if (( ${#mac_updater_assets[@]} != 4 )); then
-            echo "::error::Expected two macOS updater bundles and two signatures"
+          mapfile -t mac_updater_assets < <(find release-assets -type f -name '*.app.tar.gz' -printf '%f\n' | sort -u)
+          if (( ${#mac_updater_assets[@]} != 2 )); then
+            echo "::error::Expected two macOS updater bundles"
             printf '%s\n' "${mac_updater_assets[@]}"
             exit 1
           fi
