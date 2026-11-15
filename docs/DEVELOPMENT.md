@@ -41,6 +41,8 @@ npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 
 推送到 `main` 时，[GitHub Actions 检查工作流](../.github/workflows/ci.yml) 会运行前端检查、构建、Rust 格式与 lint，并在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行 Rust 回归测试。Pull Request 不触发该工作流，仍可按本页检查命令本地验证。
 
+Windows MSVC 的 Rust 测试宿主会链接 Tauri 使用的原生对话框 API。`backend/build.rs` 会把 Common Controls v6 manifest 嵌入 Windows/MSVC 的所有可链接目标，并关闭 `tauri-build` 的默认应用 manifest 资源，避免测试宿主因加载旧版 `comctl32` 在启动前以 `STATUS_ENTRYPOINT_NOT_FOUND` 退出。
+
 推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。Release 工作流不重复运行代码检查，只执行签名校验、前端构建、安装包生成和发布所需的校验。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包、两个 updater archive 和 `latest.json`，不上传独立的 `.sig` 文件；发布说明会在 LLM 内容后附加按平台生成的下载指导，核对 GitHub Release 的附件完整后发布为 prerelease。Tauri CLI 按运行器系统、架构和版本缓存，缓存未命中时从 Cargo 安装固定版本。
 
 ### 自动更新发布
