@@ -45,6 +45,7 @@ h2 { font-size: 13px; font-weight: 600; letter-spacing: 0; }
 
 .muted { color: var(--muted); }
 .hint { color: var(--muted); font-size: 11px; }
+.hint-danger { color: var(--danger); }
 .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
 .hidden-input { display: none; }
@@ -227,6 +228,9 @@ button.device-metrics:hover { background: var(--surface-2); }
 .qr-placeholder { display: grid; place-items: center; width: 180px; height: 180px; border-radius: 12px; background: var(--surface-2); color: var(--muted); font-size: 11px; }
 .code-block { padding: 6px 9px; border-radius: var(--r-sm); background: var(--surface-2); color: var(--primary-hover); font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; overflow-wrap: anywhere; }
 .link { color: var(--primary-hover); font-weight: 600; }
+.install-guide { color: var(--muted); font-size: 11px; }
+.install-guide summary { color: var(--primary-hover); font-weight: 600; cursor: pointer; }
+.install-guide ol { display: grid; gap: 3px; margin: 6px 0 0; padding-left: 17px; line-height: 1.5; }
 .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .confirm-text { font-size: 13px; line-height: 1.6; }
 

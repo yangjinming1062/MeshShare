@@ -1,5 +1,8 @@
 <script lang="ts">
+  import { invoke } from '@tauri-apps/api/core';
   import Dialog from './Dialog.svelte';
+  import { clientPlatform, clientPlatformName } from '../format';
+  import type { ClientPlatform } from '../format';
   import type { AddressInfo } from '../types';
 
   export let open = false;
@@ -13,32 +16,65 @@
   export let onSelect: (url: string) => void = () => {};
   export let onClose: () => void = () => {};
 
-  let caDownloadState: 'idle' | 'downloading' | 'success' | 'error' = 'idle';
+  let caDownloadState: 'idle' | 'saving' | 'error' = 'idle';
   let caDownloadMessage = '';
+  let caSavedPath = '';
+  let caResultUrl = '';
+  let guideOpen = false;
 
-  async function downloadCaCertificate() {
-    if (!caUrl || caDownloadState === 'downloading') return;
-    caDownloadState = 'downloading';
-    caDownloadMessage = '正在下载 CA 证书…';
+  const platform = clientPlatform(navigator.userAgent);
+  const installSteps: Record<ClientPlatform, string[]> = {
+    windows: [
+      '双击保存的证书文件，选择「安装证书」。',
+      '存储位置选择「当前用户」。',
+      '选择「将所有的证书都放入下列存储」，再浏览到「受信任的根证书颁发机构」。',
+      '完成后重启浏览器，再打开 HTTPS 地址。'
+    ],
+    macos: [
+      '双击保存的证书文件，在「钥匙串访问」的「系统」钥匙串中找到 MeshShare Local CA。',
+      '双击该证书并展开「信任」，把「使用此证书时」改为「始终信任」。',
+      '输入登录密码确认后，重启浏览器再打开 HTTPS 地址。'
+    ],
+    linux: [
+      'Debian/Ubuntu：复制到 /usr/local/share/ca-certificates/，再执行 sudo update-ca-certificates。',
+      'Fedora：复制到 /etc/pki/ca-trust/source/anchors/，再执行 sudo update-ca-trust。',
+      'Firefox 使用自己的信任库，需要在浏览器设置里单独导入该证书。',
+      '完成后重启浏览器，再打开 HTTPS 地址。'
+    ],
+    other: [
+      '在系统或浏览器的证书设置中导入保存的证书，并信任为证书颁发机构。',
+      '完成后重启浏览器，再打开 HTTPS 地址。'
+    ]
+  };
+  const installHint = installSteps[platform];
+
+  // 切换访问地址后，上一个地址的保存结果不再适用。
+  $: if (caUrl !== caResultUrl) {
+    caResultUrl = caUrl;
+    caDownloadState = 'idle';
+    caDownloadMessage = '';
+    caSavedPath = '';
+    guideOpen = false;
+  }
+
+  async function saveCaCertificate() {
+    if (!caUrl || caDownloadState === 'saving') return;
+    caDownloadState = 'saving';
+    caDownloadMessage = '';
+    caSavedPath = '';
+    guideOpen = false;
     try {
-      const response = await fetch(caUrl, { cache: 'no-store' });
-      if (!response.ok) throw new Error(`下载失败 (${response.status})`);
-      const blob = await response.blob();
-      if (!blob.size) throw new Error('节点返回的证书为空');
-      const objectUrl = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = objectUrl;
-      anchor.download = 'meshshare-ca.crt';
-      anchor.style.display = 'none';
-      document.body.append(anchor);
-      anchor.click();
-      anchor.remove();
-      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
-      caDownloadState = 'success';
-      caDownloadMessage = '证书已下载，请在系统或浏览器中完成安装。';
+      const saved = await invoke<string | null>('save_ca_certificate', { url: caUrl });
+      if (saved === null) {
+        caDownloadState = 'idle';
+        return;
+      }
+      caDownloadState = 'idle';
+      caSavedPath = saved;
+      guideOpen = true;
     } catch (error) {
       caDownloadState = 'error';
-      caDownloadMessage = error instanceof Error ? error.message : '无法下载 CA 证书';
+      caDownloadMessage = error instanceof Error ? error.message : String(error);
     }
   }
 </script>
@@ -63,14 +99,26 @@
     {#if secureUrl}
       <p class="hint">
         如需选择本地目录并直接写入，请先
-        <button type="button" class="link" on:click={downloadCaCertificate} disabled={!caUrl || caDownloadState === 'downloading'}>
-          {caDownloadState === 'downloading' ? '下载本节点 CA 证书中…' : '下载本节点 CA 证书'}
+        <button type="button" class="link" on:click={saveCaCertificate} disabled={!caUrl || caDownloadState === 'saving'}>
+          {caDownloadState === 'saving' ? '正在保存 CA 证书…' : '下载本节点 CA 证书'}
         </button>
         并完成安装，再打开 HTTPS 地址。
       </p>
       {#if caDownloadMessage}
-        <p class="hint" role="status" aria-live="polite">{caDownloadMessage}</p>
+        <p class="hint hint-danger" role="status" aria-live="polite">{caDownloadMessage}</p>
       {/if}
+      {#if caSavedPath}
+        <p class="hint" role="status" aria-live="polite">证书已保存到：</p>
+        <div class="code-block">{caSavedPath}</div>
+      {/if}
+      <details class="install-guide" bind:open={guideOpen}>
+        <summary>安装步骤（{clientPlatformName(platform)}）</summary>
+        <ol>
+          {#each installHint as step}
+            <li>{step}</li>
+          {/each}
+        </ol>
+      </details>
       <div class="code-block">{secureUrl}</div>
     {/if}
   {:else}

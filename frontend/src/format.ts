@@ -132,14 +132,32 @@ export function platformLabel(platform: string | undefined): string {
   return platform;
 }
 
+export type ClientPlatform = 'windows' | 'macos' | 'linux' | 'other';
+
+const CLIENT_PLATFORM_NAMES: Record<ClientPlatform, string> = {
+  windows: 'Windows',
+  macos: 'macOS',
+  linux: 'Linux',
+  other: '其他系统',
+};
+
+export function clientPlatform(userAgent: string): ClientPlatform {
+  if (/Windows/.test(userAgent)) return 'windows';
+  if (/Macintosh|Mac OS X/.test(userAgent)) return 'macos';
+  if (/Linux/.test(userAgent)) return 'linux';
+  return 'other';
+}
+
+export function clientPlatformName(platform: ClientPlatform): string {
+  return CLIENT_PLATFORM_NAMES[platform];
+}
+
 export function webSessionLabel(userAgent: string): string {
   if (/iPhone|iPod/.test(userAgent)) return 'iPhone 浏览器';
   if (/iPad/.test(userAgent)) return 'iPad 浏览器';
   if (/Android/.test(userAgent)) return 'Android 浏览器';
-  if (/Windows/.test(userAgent)) return 'Windows 浏览器';
-  if (/Macintosh|Mac OS X/.test(userAgent)) return 'macOS 浏览器';
-  if (/Linux/.test(userAgent)) return 'Linux 浏览器';
-  return '网页设备';
+  const platform = clientPlatform(userAgent);
+  return platform === 'other' ? '网页设备' : clientPlatformName(platform) + ' 浏览器';
 }
 
 export function updateFrequencyLabel(value: UpdateFrequency): string {

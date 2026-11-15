@@ -36,6 +36,8 @@ use tauri::{AppHandle, Manager, State};
 #[cfg(not(target_os = "android"))]
 use tauri::{LogicalSize, PhysicalPosition, WindowEvent};
 #[cfg(not(target_os = "android"))]
+use tauri_plugin_dialog::DialogExt;
+#[cfg(not(target_os = "android"))]
 use updater::UpdateCoordinator;
 use updater::UpdateStatus;
 
@@ -151,6 +153,40 @@ pub(crate) fn effective_monitor_locked(_app: &AppHandle, runtime: &NodeRuntime) 
 #[tauri::command]
 fn node_base_url(state: State<'_, ManagedNode>) -> String {
     format!("http://127.0.0.1:{}", state.runtime.node_info().port)
+}
+
+/// 把节点 CA 写到用户选择的位置，返回实际路径；用户取消时返回 `None`。
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+async fn save_ca_certificate(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    state: State<'_, ManagedNode>,
+    url: String,
+) -> Result<Option<String>, String> {
+    let bytes = state.runtime.fetch_mobile_ca(&url).await?;
+    tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_title("保存节点 CA 证书")
+            .set_file_name("meshshare-ca.crt")
+            .add_filter("证书文件", &["crt"])
+            .set_parent(&window);
+        if let Ok(directory) = app.path().download_dir() {
+            dialog = dialog.set_directory(directory);
+        }
+        let Some(target) = dialog.blocking_save_file() else {
+            return Ok(None);
+        };
+        let path = target
+            .into_path()
+            .map_err(|error| format!("保存 CA 证书失败：{error}"))?;
+        std::fs::write(&path, bytes).map_err(|error| format!("保存 CA 证书失败：{error}"))?;
+        Ok(Some(path.display().to_string()))
+    })
+    .await
+    .map_err(|_| "无法打开保存对话框".to_string())?
 }
 
 #[tauri::command]
@@ -985,6 +1021,7 @@ fn run_desktop() {
         })
         .invoke_handler(tauri::generate_handler![
             node_base_url,
+            save_ca_certificate,
             toggle_clipboard_sync,
             clipboard_sync_enabled,
             clipboard_status,

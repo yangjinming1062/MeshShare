@@ -255,6 +255,7 @@ const MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION: usize = 128;
 const MAX_MOBILE_FAILED_TRANSFERS_PER_SESSION: usize = 20;
 const MAX_MOBILE_TRANSFER_RECORDS: usize = 512;
 const MAX_MOBILE_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_MOBILE_CA_BYTES: usize = 64 * 1024;
 const MAX_SEEN_CLIPBOARD_EVENTS: usize = 4_096;
 const DESKTOP_TEMP_REGISTRY_FILE: &str = "desktop-transfer-temp-files.json";
 const MAX_DESKTOP_TEMP_FILES: usize = 512;
@@ -456,6 +457,37 @@ impl NodeRuntime {
 
     pub fn mobile_ca_path(&self) -> Option<PathBuf> {
         self.mobile_ca.read().as_ref().map(|ca| ca.path.clone())
+    }
+
+    /// 只从节点私网地址取 CA；命令层收到的 URL 来自渲染进程，不能让它指向公网或任意资源。
+    pub async fn fetch_mobile_ca(&self, raw_url: &str) -> Result<Vec<u8>, String> {
+        let url = mobile_ca_url(raw_url)?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| format!("无法连接节点 CA 地址：{error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "节点返回 CA 证书失败 ({})",
+                response.status().as_u16()
+            ));
+        }
+        if response.content_length().unwrap_or_default() > MAX_MOBILE_CA_BYTES as u64 {
+            return Err("节点返回的 CA 证书超出大小限制".to_string());
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("读取 CA 证书失败：{error}"))?;
+        if bytes.is_empty() {
+            return Err("节点返回的 CA 证书为空".to_string());
+        }
+        if bytes.len() > MAX_MOBILE_CA_BYTES {
+            return Err("节点返回的 CA 证书超出大小限制".to_string());
+        }
+        Ok(bytes.to_vec())
     }
 
     fn mobile_staging_root(&self) -> PathBuf {
@@ -2781,8 +2813,23 @@ fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
     (u32::from(address) & 0xffc00000) == 0x64400000
 }
 
-fn is_network_ipv4(address: Ipv4Addr) -> bool {
+pub(crate) fn is_network_ipv4(address: Ipv4Addr) -> bool {
     address.is_private() || address.is_link_local() || is_tailscale_ipv4(address)
+}
+
+fn mobile_ca_url(raw: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw).map_err(|_| "CA 地址无效".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("CA 地址只支持 HTTP 或 HTTPS".to_string());
+    }
+    let host = url.host_str().unwrap_or_default();
+    let Some(address) = host.parse::<Ipv4Addr>().ok() else {
+        return Err("CA 地址必须是节点的私网 IPv4 地址".to_string());
+    };
+    if !(address.is_loopback() || is_network_ipv4(address)) {
+        return Err("CA 地址必须是节点的私网 IPv4 地址".to_string());
+    }
+    Ok(url)
 }
 
 fn is_cellular_interface(name: &str) -> bool {
@@ -2911,8 +2958,8 @@ pub fn bind_addresses() -> BTreeSet<Ipv4Addr> {
 mod tests {
     use super::{
         bind_addresses, interface_rank, is_cellular_interface, load_or_create_config,
-        network_addresses_for_bound, NodeRuntime, UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE,
-        MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACTIVITY_TIMEOUT_MS,
+        mobile_ca_url, network_addresses_for_bound, NodeRuntime, UpdateFrequency,
+        DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
@@ -2981,6 +3028,32 @@ mod tests {
             assert!(
                 !is_cellular_interface(name),
                 "{name} should not be cellular"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_ca_url_only_accepts_private_node_addresses() {
+        for allowed in [
+            "http://192.168.1.10:37880/api/v1/mobile/ca",
+            "http://100.64.0.2:37880/api/v1/mobile/ca",
+            "http://169.254.2.3:37880/api/v1/mobile/ca",
+            "https://127.0.0.1:37881/api/v1/mobile/ca",
+        ] {
+            assert!(
+                mobile_ca_url(allowed).is_ok(),
+                "{allowed} should be allowed"
+            );
+        }
+        for rejected in [
+            "http://8.8.8.8:37880/api/v1/mobile/ca",
+            "http://example.com/api/v1/mobile/ca",
+            "file:///etc/passwd",
+            "not a url",
+        ] {
+            assert!(
+                mobile_ca_url(rejected).is_err(),
+                "{rejected} should be rejected"
             );
         }
     }
