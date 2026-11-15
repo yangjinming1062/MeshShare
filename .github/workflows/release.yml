@@ -74,6 +74,66 @@ jobs:
             exit 1
           fi
           printf '{"version":"%s"}\n' "${GITHUB_REF_NAME#v}" > release-version.json
+      - name: Prepare Apple signing and notarization credentials
+        if: startsWith(matrix.name, 'macos-')
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          required=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY)
+          for name in "${required[@]}"; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing required GitHub Actions secret: $name"
+              exit 1
+            fi
+          done
+          if [[ "$APPLE_SIGNING_IDENTITY" != "Developer ID Application:"* ]]; then
+            echo "::error::APPLE_SIGNING_IDENTITY must start with 'Developer ID Application:'"
+            exit 1
+          fi
+
+          has_api_credentials=false
+          if [[ -n "${APPLE_API_KEY:-}" || -n "${APPLE_API_ISSUER:-}" || -n "${APPLE_API_PRIVATE_KEY:-}" ]]; then
+            has_api_credentials=true
+          fi
+          if [[ "$has_api_credentials" == true ]]; then
+            for name in APPLE_API_KEY APPLE_API_ISSUER APPLE_API_PRIVATE_KEY; do
+              if [[ -z "${!name:-}" ]]; then
+                echo "::error::All of APPLE_API_KEY, APPLE_API_ISSUER and APPLE_API_PRIVATE_KEY are required together"
+                exit 1
+              fi
+            done
+            mkdir -p private_keys
+            key_path="$PWD/private_keys/AuthKey_${APPLE_API_KEY}.p8"
+            python3 - "$key_path" <<'PY'
+          import base64
+          import pathlib
+          import sys
+
+          output = pathlib.Path(sys.argv[1])
+          output.write_bytes(base64.b64decode(__import__("os").environ["APPLE_API_PRIVATE_KEY"], validate=True))
+          output.chmod(0o600)
+          PY
+            echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+            echo "APPLE_NOTARY_MODE=api" >> "$GITHUB_ENV"
+          else
+            for name in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+              if [[ -z "${!name:-}" ]]; then
+                echo "::error::Set APPLE_API_KEY/APPLE_API_ISSUER/APPLE_API_PRIVATE_KEY or all of APPLE_ID/APPLE_PASSWORD/APPLE_TEAM_ID"
+                exit 1
+              fi
+            done
+            echo "APPLE_NOTARY_MODE=apple-id" >> "$GITHUB_ENV"
+          fi
       - name: Validate updater signing key
         shell: bash
         run: |
@@ -112,7 +172,63 @@ jobs:
           fi
           cargo tauri --version
       - name: Build application
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: cargo tauri build --config release-version.json -- --locked
+      - name: Notarize and validate macOS installers
+        if: startsWith(matrix.name, 'macos-')
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(backend/target/release/bundle/macos/*.app)
+          dmgs=(backend/target/release/bundle/dmg/*.dmg)
+          if (( ${#apps[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS app bundle"
+            printf '%s\n' "${apps[@]}"
+            exit 1
+          fi
+          if (( ${#dmgs[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS DMG"
+            printf '%s\n' "${dmgs[@]}"
+            exit 1
+          fi
+          app="${apps[0]}"
+          dmg="${dmgs[0]}"
+
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign --display --verbose=4 "$app" 2>&1 | grep -E 'Authority=|TeamIdentifier=|Signature=' || true
+          if [[ "${APPLE_NOTARY_MODE:-}" == api ]]; then
+            xcrun notarytool submit "$dmg" \
+              --key "$APPLE_API_KEY_PATH" \
+              --key-id "$APPLE_API_KEY" \
+              --issuer "$APPLE_API_ISSUER" \
+              --wait
+          else
+            xcrun notarytool submit "$dmg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait
+          fi
+          xcrun stapler staple "$dmg"
+          xcrun stapler validate "$app"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type execute --verbose=4 "$app"
+          hdiutil verify "$dmg"
       - name: Name macOS updater artifacts by architecture
         if: startsWith(matrix.name, 'macos-')
         shell: bash

@@ -86,6 +86,9 @@
       "rpm": {
         "postRemoveScript": "packaging/remove-autostart.sh"
       }
+    },
+    "macOS": {
+      "hardenedRuntime": true
     }
   },
   "plugins": {
