@@ -5,7 +5,7 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
+  import { ApiError, apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
@@ -84,7 +84,7 @@
   let historyDetailOpen = false;
   let metricsPeerOpen = false;
   let clearHistoryOpen = false;
-  const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[]; offer: TransferOffer; relay?: boolean }>();
+  const pendingUploads = new Map<string, { target: string; peer: PeerInfo; files: File[]; items: TransferItem[]; offer: TransferOffer; relay?: boolean }>();
   let remoteMode = false;
   let remotePath = '';
   const uploading = new Set<string>();
@@ -98,7 +98,6 @@
   const uploadStopped = new Set<string>();
   const mobileDownloading = new Set<string>();
   let mobileBrowserDownloadStarted = new Set<string>();
-  let mobileBrowserDownloadConfirming = new Set<string>();
   const MOBILE_UPLOAD_MAX_ATTEMPTS = 6;
   const DESKTOP_UPLOAD_MAX_ATTEMPTS = 6;
   const FILE_UPLOAD_ATTEMPTS = 4;
@@ -202,6 +201,7 @@
     failures = failures.filter((item) => item.progress.transfer_id !== failure.progress.transfer_id);
     dismissedFailures.set(failure.progress.transfer_id, Date.now());
     forgetPendingTransfer(failure.progress.transfer_id);
+    if (failure.progress.error && notice === failure.progress.error) notice = '';
   }
 
   function showTransientNotice(message: string, timeout = 2400) {
@@ -368,9 +368,14 @@
     if (isWeb) {
       mobileTransfers = await getMobileTransfersWithRecovery();
       for (const view of mobileTransfers) {
-        if (view.progress.status === 'ready' && mobileReceiveDirectory && !mobileDownloading.has(view.progress.transfer_id)) {
-          void downloadMobileTransfer(view);
+        if (mobileReceiveDirectory) {
+          if (view.progress.status === 'ready' && !mobileDownloading.has(view.progress.transfer_id)) {
+            void downloadMobileTransfer(view);
+          }
+          continue;
         }
+        autoStartMobileDownloads(view);
+        pruneMobileDownloadKeys(view);
       }
     } else {
       mobileSessions = await getMobileSessions();
@@ -1086,6 +1091,75 @@
     return url ?? (peer.endpoint ? peer.endpoint.replace(/\/api\/v1\/ws$/, '') : null);
   }
 
+  /**
+   * 对端可能同时公布多个地址（WiFi、Tailscale、虚拟网卡），其中只有一部分能被本机访问。
+   * 发送时按公布顺序逐个尝试，全部失败才判定为不可达。
+   */
+  function targetCandidates(peer: PeerInfo): string[] {
+    if (isWeb) {
+      const base = targetBase(peer);
+      return base ? [base] : [];
+    }
+    const bases = peer.addresses.map((address) => address.url).filter((url): url is string => !!url);
+    const endpointBase = peer.endpoint?.replace(/\/api\/v1\/ws$/, '');
+    if (endpointBase) bases.push(endpointBase);
+    const unique = new Set<string>();
+    for (const base of bases) {
+      const normalized = base.replace(/\/$/, '');
+      if (normalized) unique.add(normalized);
+    }
+    const candidates = [...unique];
+    // 链路本地地址只有在没有其他入口时才值得尝试，否则先试常规地址。
+    const routable = candidates.filter((base) => !base.includes('//169.254.'));
+    return (routable.length ? routable : candidates).slice(0, 4);
+  }
+
+  function isTransportFailure(error: unknown): boolean {
+    if (error instanceof ApiError) return error.status >= 500;
+    return error instanceof TypeError || (error instanceof DOMException && error.name === 'AbortError');
+  }
+
+  function describeUnreachable(peerName: string, targets: string): string {
+    return `无法连接 ${peerName}${targets ? '（' + targets + '）' : ''}：请确认设备在同一网络且保持打开`;
+  }
+
+  function describeTransferFailure(error: unknown, peerName: string, targets: string): string {
+    if (error instanceof ApiError) return error.message;
+    if (isTransportFailure(error)) return describeUnreachable(peerName, targets);
+    return error instanceof Error ? error.message : '文件传输失败';
+  }
+
+  async function requestWithTimeout<T>(path: string, options: RequestInit, target: string, timeoutMs = 6000): Promise<T> {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await request<T>(path, { ...options, signal: controller.signal }, target);
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  async function createTransferOnCandidates(offer: TransferOffer, candidates: string[], relay: boolean): Promise<{ base: string; created: TransferProgress }> {
+    let lastError: unknown;
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (const base of candidates) {
+        try {
+          const created = await requestWithTimeout<TransferProgress>(
+            relay ? '/api/v1/relay/transfers' : '/api/v1/transfers',
+            { method: 'POST', body: JSON.stringify(offer) },
+            base,
+          );
+          return { base, created };
+        } catch (error) {
+          if (!isTransportFailure(error)) throw error;
+          lastError = error;
+        }
+      }
+      if (pass === 0) await new Promise((resolve) => window.setTimeout(resolve, 1200));
+    }
+    throw lastError instanceof Error ? lastError : new Error('无法创建传输');
+  }
+
   function resetTargetUi() {
     targetGeneration += 1;
     selectedClipboardHistory = null;
@@ -1102,7 +1176,6 @@
     mobileSessions = [];
     mobileTransfers = [];
     mobileBrowserDownloadStarted = new Set();
-    mobileBrowserDownloadConfirming = new Set();
     mobileAddresses = [];
     selectedAddress = '';
     mobileQr = null;
@@ -1220,12 +1293,12 @@
 
   async function sendFiles(peer: PeerInfo, files: File[]) {
     if (remoteMode && !peer.capabilities.includes(TRANSFER_RELAY_CAPABILITY)) {
-      notice = '目标节点不支持远程文件中继，请先升级目标节点';
+      showTransientNotice('目标节点不支持远程文件中继，请先升级目标节点', 6000);
       return;
     }
-    const target = targetBase(peer);
-    if (!target || !node) {
-      notice = '目标设备没有可访问地址';
+    const candidates = remoteMode ? [activeBaseUrl] : targetCandidates(peer);
+    if (!candidates.length || !node) {
+      showTransientNotice('目标设备没有可访问地址', 6000);
       return;
     }
     selectedPeer = null;
@@ -1249,41 +1322,38 @@
         throw new Error(localProgress.error ?? '传输任务数量已达到上限');
       }
       try {
-        const created = await request<TransferProgress>(remoteMode ? '/api/v1/relay/transfers' : '/api/v1/transfers', {
-          method: 'POST',
-          body: JSON.stringify(offer),
-        }, remoteMode ? activeBaseUrl : target);
-        if (created.status === 'failed') {
-          throw new Error(created.error ?? '无法创建传输');
+        const resolved = await createTransferOnCandidates(offer, candidates, remoteMode);
+        if (resolved.created.status === 'failed') {
+          throw new Error(resolved.created.error ?? '无法创建传输');
         }
+        pendingUploads.set(offer.transfer_id, { target: resolved.base, peer, files, items, offer, relay: remoteMode });
+        transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
+        void watchTransfer(offer.transfer_id, resolved.base, remoteMode);
+        showTransientNotice('已发送传输请求，等待接收端确认', 3600);
       } catch (error) {
-        if (localProgress) {
-          const failedProgress = { ...localProgress, status: 'failed' as const, error: error instanceof Error ? error.message : '无法创建传输', offer, direction: 'send' as const };
-          observeFailure(failedProgress);
-          await invoke('update_transfer_progress', {
-            progress: failedProgress,
-          }).catch(() => undefined);
-        } else {
-          observeFailure({
+        const message = describeTransferFailure(error, peer.node_name, candidates.join('、'));
+        const failedProgress: TransferProgress = {
+          ...(localProgress ?? {
             transfer_id: offer.transfer_id,
-            status: 'failed',
+            status: 'waiting',
             completed_bytes: 0,
             total_bytes: offer.total_bytes,
             completed_items: 0,
             total_items: offer.items.length,
-            error: error instanceof Error ? error.message : '无法创建传输',
-            offer,
-            direction: 'send',
-          });
+          }),
+          status: 'failed',
+          error: message,
+          offer,
+          direction: 'send',
+        };
+        observeFailure(failedProgress);
+        if (localProgress) {
+          await invoke('update_transfer_progress', { progress: failedProgress }).catch(() => undefined);
         }
-        throw error;
+        showTransientNotice(message, 6000);
       }
-      pendingUploads.set(offer.transfer_id, { target: remoteMode ? activeBaseUrl : target, files, items, offer, relay: remoteMode });
-      transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
-      void watchTransfer(offer.transfer_id, remoteMode ? activeBaseUrl : target, remoteMode);
-      notice = '已发送传输请求，等待接收端确认';
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法创建传输';
+      showTransientNotice(error instanceof Error ? error.message : '无法创建传输', 6000);
     }
   }
 
@@ -1311,7 +1381,7 @@
       });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
       void watchMobileTransfer(offer.transfer_id);
-      notice = '已发送，等待网页端确认';
+      showTransientNotice('已发送，等待网页端确认', 3600);
     } catch (error) {
       const message = error instanceof Error ? error.message : '无法发送到网页端';
       if (offerForFailure) {
@@ -1327,7 +1397,7 @@
           direction: 'send',
         });
       }
-      notice = message;
+      showTransientNotice(message, 6000);
     }
   }
 
@@ -1369,7 +1439,7 @@
           return;
         }
       } catch (error) {
-        if (attempt === 359 && error instanceof Error) notice = error.message;
+        if (attempt === 359 && error instanceof Error) showTransientNotice(error.message, 6000);
       }
       await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
@@ -1410,7 +1480,7 @@
         }).catch(() => undefined);
         showTransientNotice(`${message}，已停止重试`);
       } else {
-        notice = `${message}，正在重试（${attempts}/${MOBILE_UPLOAD_MAX_ATTEMPTS}）`;
+        showTransientNotice(`${message}，正在重试（${attempts}/${MOBILE_UPLOAD_MAX_ATTEMPTS}）`, 6000);
       }
     } finally {
       mobileUploading.delete(id);
@@ -1419,12 +1489,64 @@
 
   async function acceptMobileTransfer(view: MobileTransferView) {
     if (!mobileSessionId) return;
+    const sessionId = mobileSessionId;
     if (mobileDirectoryPickerAvailable() && !mobileReceiveDirectory && !(await chooseMobileReceiveDirectory())) return;
-    await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/accept`, {
-      method: 'POST',
-      body: JSON.stringify({ session_id: mobileSessionId }),
-    }).catch((error) => { notice = error instanceof Error ? error.message : '无法接收文件'; });
+    try {
+      await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/accept`, {
+        method: 'POST',
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+    } catch (error) {
+      showTransientNotice(error instanceof Error ? error.message : '无法接收文件', 6000);
+      return;
+    }
     await refresh();
+    if (mobileDirectoryPickerAvailable()) return;
+    showTransientNotice('已接受，正在等待发送方上传', 3000);
+    void waitForMobileDownload(view.progress.transfer_id, sessionId);
+  }
+
+  /**
+   * HTTP 页面无法指定保存目录，接收后立刻等文件就绪并触发浏览器下载，
+   * 用户不必再翻到传输记录里手动点下载。
+   */
+  async function waitForMobileDownload(transferId: string, sessionId: string) {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (sessionId !== mobileSessionId) return;
+      try {
+        const views = await getMobileTransfers(sessionId);
+        if (sessionId !== mobileSessionId) return;
+        const view = views.find((candidate) => candidate.progress.transfer_id === transferId);
+        if (!view) return;
+        if (view.progress.status === 'ready') {
+          autoStartMobileDownloads(view);
+          return;
+        }
+        if (['completed', 'rejected', 'failed', 'cancelled'].includes(view.progress.status)) return;
+      } catch {
+        // 常规刷新会兜底；这里只负责让自动下载尽快发生。
+      }
+      await new Promise((resolve) => window.setTimeout(resolve, 400));
+    }
+  }
+
+  function autoStartMobileDownloads(view: MobileTransferView) {
+    if (view.progress.status !== 'ready' || mobileReceiveDirectory) return;
+    for (const item of view.progress.offer?.items ?? []) {
+      if (view.downloaded_item_ids?.includes(item.item_id)) continue;
+      startMobileBrowserDownload(view, item, true);
+    }
+  }
+
+  function pruneMobileDownloadKeys(view: MobileTransferView) {
+    const downloaded = view.downloaded_item_ids ?? [];
+    if (!downloaded.length) return;
+    const started = new Set(mobileBrowserDownloadStarted);
+    let changed = false;
+    for (const item of view.progress.offer?.items ?? []) {
+      if (downloaded.includes(item.item_id) && started.delete(mobileBrowserDownloadKey(view, item))) changed = true;
+    }
+    if (changed) mobileBrowserDownloadStarted = started;
   }
 
   async function rejectMobileTransfer(view: MobileTransferView) {
@@ -1432,7 +1554,7 @@
     await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/reject`, {
       method: 'POST',
       body: JSON.stringify({ session_id: mobileSessionId }),
-    }).catch((error) => { notice = error instanceof Error ? error.message : '无法拒绝文件'; });
+    }).catch((error) => { showTransientNotice(error instanceof Error ? error.message : '无法拒绝文件', 6000); });
     await refresh();
   }
 
@@ -1441,7 +1563,7 @@
     await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/cancel`, {
       method: 'POST',
       body: JSON.stringify({ session_id: mobileSessionId }),
-    }).catch((error) => { notice = error instanceof Error ? error.message : '无法取消文件'; });
+    }).catch((error) => { showTransientNotice(error instanceof Error ? error.message : '无法取消文件', 6000); });
     await refresh();
   }
 
@@ -1482,6 +1604,26 @@
     watching.delete(id);
   }
 
+  async function uploadPendingItem(id: string, firstTarget: string, item: TransferItem, file: File, pending: { target: string; peer: PeerInfo; relay?: boolean }) {
+    const bases = pending.relay ? [firstTarget] : [firstTarget, pending.target, ...targetCandidates(pending.peer)];
+    let lastError: unknown;
+    for (const base of [...new Set(bases)]) {
+      try {
+        await uploadFileWithRetry(
+          `${base}${pending.relay ? '/api/v1/relay/transfers' : '/api/v1/transfers'}/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
+          file,
+          item.media_type,
+        );
+        pending.target = base;
+        return;
+      } catch (error) {
+        lastError = error;
+        if (!isTransportFailure(error)) throw error;
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('上传失败');
+  }
+
   async function uploadTransfer(id: string, target: string, relay = false) {
     const pending = pendingUploads.get(id);
     if (!pending || uploadStopped.has(id)) return;
@@ -1490,31 +1632,27 @@
       for (const item of pending.items) {
         const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
-        await uploadFileWithRetry(
-          `${target}${relay ? '/api/v1/relay/transfers' : '/api/v1/transfers'}/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
-          file,
-          item.media_type,
-        );
+        await uploadPendingItem(id, target, item, file, pending);
       }
       uploadAttempts.delete(id);
       showTransientNotice('文件发送完成');
     } catch (error) {
-      notice = error instanceof Error ? error.message : '文件发送失败';
+      const message = describeTransferFailure(error, pending.peer.node_name, pending.target);
       const attempts = (uploadAttempts.get(id) ?? 0) + 1;
       uploadAttempts.set(id, attempts);
       if (attempts >= DESKTOP_UPLOAD_MAX_ATTEMPTS) {
         uploadStopped.add(id);
-        const message = `${notice}，已停止重试`;
-        const failPath = relay
+        const failed = `${message}，已停止重试`;
+        const failPath = pending.relay
           ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/fail`
           : `/api/v1/transfers/${encodeURIComponent(id)}/fail`;
-        await request(failPath, { method: 'POST', body: JSON.stringify({ error: message }) }, target).catch(() => undefined);
-        showTransientNotice(message);
+        await request(failPath, { method: 'POST', body: JSON.stringify({ error: failed }) }, pending.target).catch(() => undefined);
+        showTransientNotice(failed, 8000);
       } else {
         // Keep the accepted task alive. watchTransfer will retry the current
         // item after the peer becomes reachable again; PUT is idempotent for
         // an already committed item.
-        notice = `${notice}，连接恢复后将继续（${attempts}/${DESKTOP_UPLOAD_MAX_ATTEMPTS}）`;
+        showTransientNotice(`${message}，连接恢复后将继续（${attempts}/${DESKTOP_UPLOAD_MAX_ATTEMPTS}）`, 6000);
       }
     } finally {
       uploading.delete(id);
@@ -1532,14 +1670,27 @@
         const path = pending.relay
           ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/retry`
           : `/api/v1/transfers/${encodeURIComponent(id)}/retry`;
-        const progress = await request<TransferProgress>(path, { method: 'POST' }, pending.target);
+        const bases = pending.relay ? [pending.target] : [pending.target, ...targetCandidates(pending.peer)];
+        let lastError: unknown;
+        let retried: { base: string; progress: TransferProgress } | null = null;
+        for (const base of [...new Set(bases)]) {
+          try {
+            retried = { base, progress: await request<TransferProgress>(path, { method: 'POST' }, base) };
+            break;
+          } catch (error) {
+            lastError = error;
+            if (!isTransportFailure(error)) throw error;
+          }
+        }
+        if (!retried) throw lastError instanceof Error ? lastError : new Error('无法重试传输');
+        pending.target = retried.base;
         uploadAttempts.delete(id);
         uploadStopped.delete(id);
         failures = failures.filter((item) => item.progress.transfer_id !== id);
-        transfers = [{ ...progress, direction: 'send', offer: progress.offer ?? pending.offer }, ...transfers.filter((item) => item.transfer_id !== id)];
-        void watchTransfer(id, pending.target, pending.relay);
+        transfers = [{ ...retried.progress, direction: 'send', offer: retried.progress.offer ?? pending.offer }, ...transfers.filter((item) => item.transfer_id !== id)];
+        void watchTransfer(id, retried.base, pending.relay);
       } catch (error) {
-        notice = error instanceof Error ? error.message : '无法重试传输';
+        showTransientNotice(error instanceof Error ? error.message : '无法重试传输', 6000);
       } finally {
         transferActionBusy = '';
       }
@@ -1574,7 +1725,7 @@
       transfers = [progress, ...transfers.filter((item) => item.transfer_id !== id)];
       void watchMobileTransfer(offer.transfer_id);
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法重试网页传输';
+      showTransientNotice(error instanceof Error ? error.message : '无法重试网页传输', 6000);
     } finally {
       transferActionBusy = '';
     }
@@ -1700,7 +1851,7 @@
       await refresh();
     } catch (error) {
       const message = error instanceof Error ? error.message : '网页端文件保存失败';
-      notice = message;
+      showTransientNotice(message, 6000);
       await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/fail`, {
         method: 'POST',
         body: JSON.stringify({ error: message }),
@@ -1720,40 +1871,22 @@
     return `${view.progress.transfer_id}:${item.item_id}`;
   }
 
-  function startMobileBrowserDownload(view: MobileTransferView, item: TransferItem) {
+  function startMobileBrowserDownload(view: MobileTransferView, item: TransferItem, auto = false) {
     if (!mobileSessionId || view.progress.status !== 'ready') return;
     if (view.downloaded_item_ids?.includes(item.item_id)) return;
+    const key = mobileBrowserDownloadKey(view, item);
+    if (auto && mobileBrowserDownloadStarted.has(key)) return;
     const anchor = document.createElement('a');
-    anchor.href = mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId);
+    // auto_complete 让节点在流式下载完整结束后直接确认该项目；
+    // HTTPS 目录直写在本地校验后走显式完成接口。
+    anchor.href = mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId, undefined, { autoComplete: true });
     anchor.download = item.name;
     anchor.rel = 'noreferrer';
     document.body.append(anchor);
     anchor.click();
     anchor.remove();
-    const key = mobileBrowserDownloadKey(view, item);
     mobileBrowserDownloadStarted = new Set(mobileBrowserDownloadStarted).add(key);
-    notice = `已开始下载 ${item.name}，完成后点击“确认完成”`;
-  }
-
-  async function confirmMobileBrowserDownload(view: MobileTransferView, item: TransferItem) {
-    if (!mobileSessionId || view.progress.status !== 'ready') return;
-    const key = mobileBrowserDownloadKey(view, item);
-    if (!mobileBrowserDownloadStarted.has(key) || mobileBrowserDownloadConfirming.has(key)) return;
-    mobileBrowserDownloadConfirming = new Set(mobileBrowserDownloadConfirming).add(key);
-    try {
-      await completeMobileItem(view.progress.transfer_id, item.item_id, mobileSessionId);
-      const started = new Set(mobileBrowserDownloadStarted);
-      started.delete(key);
-      mobileBrowserDownloadStarted = started;
-      showTransientNotice(`已确认下载 ${item.name}`);
-      await refresh();
-    } catch (error) {
-      notice = error instanceof Error ? error.message : '无法确认文件下载';
-    } finally {
-      const confirming = new Set(mobileBrowserDownloadConfirming);
-      confirming.delete(key);
-      mobileBrowserDownloadConfirming = confirming;
-    }
+    showTransientNotice(`正在下载 ${item.name}`, 3000);
   }
 
   function phoneTransferView(transfer: PhoneTransfer): MobileTransferView {
@@ -1782,10 +1915,6 @@
     if (isWeb) startMobileBrowserDownload(phoneTransferView(transfer), item);
   }
 
-  function confirmPhoneItem(transfer: PhoneTransfer, item: TransferItem) {
-    if (isWeb) void confirmMobileBrowserDownload(phoneTransferView(transfer), item);
-  }
-
   async function acceptTransfer(transfer: TransferProgress) {
     if (!transfer.offer || transferActionBusy) return;
     let destination: string | string[] | null = null;
@@ -1797,7 +1926,7 @@
       try {
         path = await invoke<string>('android_receive_directory');
       } catch (error) {
-        notice = error instanceof Error ? error.message : '无法准备 Android 接收目录';
+        showTransientNotice(error instanceof Error ? error.message : '无法准备 Android 接收目录', 6000);
         return;
       }
     } else {
@@ -1809,7 +1938,7 @@
       path = Array.isArray(destination) ? destination[0] : destination ?? undefined;
     }
     if (!path) {
-      notice = remoteMode ? '需要输入目标节点上的接收目录' : '当前环境无法选择接收目录';
+      showTransientNotice(remoteMode ? '需要输入目标节点上的接收目录' : '当前环境无法选择接收目录', 6000);
       return;
     }
     transferActionBusy = transfer.transfer_id;
@@ -1822,9 +1951,9 @@
       } else {
         await invoke<TransferProgress>('accept_transfer', { transferId: transfer.transfer_id, destination: path });
       }
-      notice = isAndroidApp && !remoteMode ? '已接受，文件将保存到 MeshShare 应用目录' : '已接受，等待文件直传';
+      showTransientNotice(isAndroidApp && !remoteMode ? '已接受，文件将保存到 MeshShare 应用目录' : '已接受，等待文件直传', 3600);
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法接受传输';
+      showTransientNotice(error instanceof Error ? error.message : '无法接受传输', 6000);
     } finally {
       transferActionBusy = '';
     }
@@ -1883,7 +2012,6 @@
       onCancelTransfer={cancelPhoneTransfer}
       onSaveToDirectory={savePhoneTransfer}
       onStartDownload={downloadPhoneItem}
-      onConfirmDownload={confirmPhoneItem}
       onRetryFailure={retryFailure}
       onDismissFailure={dismissFailure}
       onPublish={publishClipboard}

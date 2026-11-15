@@ -44,7 +44,6 @@
   export let onCancelTransfer: (transfer: PhoneTransfer) => void = () => {};
   export let onSaveToDirectory: (transfer: PhoneTransfer) => void = () => {};
   export let onStartDownload: (transfer: PhoneTransfer, item: TransferItem) => void = () => {};
-  export let onConfirmDownload: (transfer: PhoneTransfer, item: TransferItem) => void = () => {};
   export let onRetryFailure: (failure: TransferFailure) => void = () => {};
   export let onDismissFailure: (failure: TransferFailure) => void = () => {};
   export let onPublish: () => void = () => {};
@@ -68,7 +67,15 @@
   $: pendingBytes = pending.reduce((sum, transfer) => sum + (transfer.offer?.total_bytes ?? transfer.total_bytes), 0);
   $: pendingItems = pending.reduce((sum, transfer) => sum + (transfer.offer?.items.length ?? transfer.total_items), 0);
   $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status) && !pending.some((item) => item.transfer_id === transfer.transfer_id));
-  $: acceptLabel = mode === 'android' ? '接收' : canChooseDirectory && !receiveDirectoryName ? '选择目录并接收' : '开始接收';
+  $: activeIncoming = transfers
+    .filter((transfer) => transfer.direction !== 'send' && (transfer.status === 'accepted' || transfer.status === 'uploading' || transfer.status === 'ready'))
+    .sort((left, right) => (right.offer?.created_at_ms ?? 0) - (left.offer?.created_at_ms ?? 0));
+  $: inbox = pending.length ? null : (activeIncoming[0] ?? null);
+  $: acceptLabel = mode === 'android'
+    ? '接收'
+    : canChooseDirectory
+      ? (receiveDirectoryName ? '开始接收' : '选择目录并接收')
+      : '接收并下载';
   $: if (!transfersAutoOpened) autoOpenTransfers();
 
   function autoOpenTransfers() {
@@ -101,6 +108,10 @@
 
   function transferState(transfer: PhoneTransfer): string {
     if (downloadingIds.includes(transfer.transfer_id)) return '正在保存';
+    if (transfer.status === 'ready' && mode === 'web' && !canChooseDirectory) {
+      const inFlight = (transfer.offer?.items ?? []).some((item) => downloadStarted(transfer, item) && !downloaded(transfer, item));
+      if (inFlight) return '正在下载';
+    }
     return transferStatusText(transfer, mode === 'android' ? 'android' : 'web');
   }
 </script>
@@ -124,14 +135,21 @@
 </header>
 
 <main class="phone-main">
-  {#if pending.length}
-    <section class="phone-card phone-inbox" aria-label="待接收文件">
+  {#if pending.length || inbox}
+    <section class="phone-card phone-inbox" aria-label={pending.length ? '待接收文件' : '正在接收文件'}>
       <div class="inbox-head">
         <span class="inbox-icon" aria-hidden="true"><Icon name="arrow-down" size={16} /></span>
-        <div class="inbox-title">
-          <strong aria-live="polite">{pending.length} 个待接收文件</strong>
-          <span class="muted">{pendingItems} 项 · {formatSize(pendingBytes)}</span>
-        </div>
+        {#if pending.length}
+          <div class="inbox-title">
+            <strong aria-live="polite">{pending.length} 个待接收文件</strong>
+            <span class="muted">{pendingItems} 项 · {formatSize(pendingBytes)}</span>
+          </div>
+        {:else if inbox}
+          <div class="inbox-title">
+            <strong aria-live="polite">来自 {inbox.offer?.source_name ?? '电脑'}</strong>
+            <span class="muted">{transferItemsLabel(inbox)} · {transferState(inbox)}</span>
+          </div>
+        {/if}
       </div>
       {#each shownPending as transfer (transfer.transfer_id)}
         <article class="inbox-item">
@@ -149,6 +167,34 @@
       {/each}
       {#if hiddenPending > 0}
         <p class="inbox-more muted">还有 {hiddenPending} 个待确认，处理完前面的会依次显示。</p>
+      {/if}
+      {#if !pending.length && inbox}
+        <article class="inbox-item">
+          <div class="inbox-copy">
+            <strong>{inbox.offer?.source_name ?? '电脑'} 发来的文件</strong>
+            <span title={transferItemsLabel(inbox)}>{transferItemsLabel(inbox)}</span>
+          </div>
+          <div class="inbox-actions">
+            {#if mode === 'web' && inbox.status === 'ready'}
+              {#if canChooseDirectory}
+                <button type="button" class="btn btn-primary" disabled={downloadingIds.includes(inbox.transfer_id)} on:click={() => onSaveToDirectory(inbox)}>
+                  {receiveDirectoryName ? '保存到已选目录' : '选择目录并保存'}
+                </button>
+              {:else}
+                {#each inbox.offer?.items ?? [] as item (item.item_id)}
+                  {#if !downloaded(inbox, item)}
+                    <button type="button" class="btn btn-primary" on:click={() => onStartDownload(inbox, item)}>
+                      {downloadStarted(inbox, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
+                    </button>
+                  {/if}
+                {/each}
+              {/if}
+            {/if}
+            {#if mode === 'web' && (inbox.status === 'accepted' || inbox.status === 'uploading' || inbox.status === 'ready')}
+              <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(inbox)}>取消</button>
+            {/if}
+          </div>
+        </article>
       {/if}
     </section>
   {/if}
@@ -299,12 +345,9 @@
                 {:else}
                   {#each transfer.offer?.items ?? [] as item (item.item_id)}
                     {#if !downloaded(transfer, item)}
-                      <button type="button" class="btn btn-primary btn-sm" disabled={downloadStarted(transfer, item)} on:click={() => onStartDownload(transfer, item)}>
-                        {downloadStarted(transfer, item) ? '已开始下载' : '下载 ' + item.name}
+                      <button type="button" class="btn btn-primary btn-sm" on:click={() => onStartDownload(transfer, item)}>
+                        {downloadStarted(transfer, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
                       </button>
-                      {#if downloadStarted(transfer, item)}
-                        <button type="button" class="btn btn-ghost btn-sm" on:click={() => onConfirmDownload(transfer, item)}>确认完成</button>
-                      {/if}
                     {/if}
                   {/each}
                 {/if}

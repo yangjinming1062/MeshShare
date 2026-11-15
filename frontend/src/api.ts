@@ -3,6 +3,17 @@ import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapsho
 
 let baseUrl = '';
 
+/** HTTP 状态码保留在错误上，调用方才能区分对端拒绝与网络不可达。 */
+export class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
 export async function initApi(): Promise<string> {
   try {
     baseUrl = await invoke<string>('node_base_url');
@@ -37,7 +48,7 @@ export async function request<T>(path: string, options: RequestInit = {}, target
   });
   const httpError = `请求失败 (${response.status})`;
   const payload: unknown = await response.json().catch((cause: unknown) => {
-    if (!response.ok) throw new Error(httpError, { cause });
+    if (!response.ok) throw new ApiError(httpError, response.status);
     const isHtml = response.headers.get('content-type')?.startsWith('text/html');
     const message = isHtml
       ? '未连接到 MeshShare 节点，请启动桌面应用'
@@ -48,7 +59,7 @@ export async function request<T>(path: string, options: RequestInit = {}, target
     const message = typeof payload === 'object' && payload !== null && 'error' in payload && typeof payload.error === 'string'
       ? payload.error
       : httpError;
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   return payload as T;
 }
@@ -75,5 +86,5 @@ export const getTransfers = (status?: TransferStatus, target = baseUrl) => reque
 export const createMobileSession = (label?: string, target = baseUrl) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) }, target);
 export const getMobileSessions = (target = baseUrl) => requestList<MobileSession>('/api/v1/mobile/sessions', target);
 export const getMobileTransfers = (sessionId?: string, target = baseUrl) => requestList<MobileTransferView>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, target);
-export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}`, target);
+export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, target = baseUrl, options: { autoComplete?: boolean } = {}) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}${options.autoComplete ? '&auto_complete=true' : ''}`, target);
 export const completeMobileItem = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => request<MobileTransferView>(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/complete`, { method: 'POST', body: JSON.stringify({ session_id: sessionId }) }, target);

@@ -113,6 +113,8 @@ pub struct MobileSessionCreateRequest {
 #[derive(Debug, Deserialize)]
 pub struct MobileSessionQuery {
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub auto_complete: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2093,6 +2095,52 @@ async fn upload_mobile_item(
     Ok(Json(progress))
 }
 
+struct MobileDownloadCompletion {
+    runtime: Arc<NodeRuntime>,
+    session_id: String,
+    transfer_id: String,
+    item_id: String,
+    size: u64,
+    auto_complete: bool,
+}
+
+/// 自动完成时下载响应可能尚未关闭文件句柄，Windows 上需要等句柄释放再删除。
+async fn remove_mobile_staged_file(path: &Path) {
+    for attempt in 0..10 {
+        match fs::remove_file(path).await {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if attempt == 9 => {
+                eprintln!("清理网页暂存文件失败 {}：{error}", path.display());
+                return;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+}
+
+/// 项目确认完成后的收尾：删除暂存文件，整单完成时清理暂存目录。
+async fn cleanup_mobile_item_artifacts(runtime: &NodeRuntime, transfer_id: &str, item_id: &str) {
+    if let Some(path) = runtime.mobile_item_path(transfer_id, item_id) {
+        remove_mobile_staged_file(&path).await;
+    }
+    if let Some(record) = runtime.mobile_transfer(transfer_id) {
+        if record.progress.status == TransferStatus::Completed {
+            cleanup_mobile_staging_directory(&record.staged_directory).await;
+        }
+    }
+}
+
+async fn finish_mobile_item_download(
+    runtime: &NodeRuntime,
+    transfer_id: &str,
+    item_id: &str,
+) -> Option<MobileTransferView> {
+    let view = runtime.mark_mobile_item_downloaded(transfer_id, item_id)?;
+    cleanup_mobile_item_artifacts(runtime, transfer_id, item_id).await;
+    Some(view)
+}
+
 async fn download_mobile_item(
     AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
     Query(query): Query<MobileSessionQuery>,
@@ -2176,23 +2224,48 @@ async fn download_mobile_item(
         }
     ))
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    let completion = Some((
-        state.runtime.clone(),
-        session_id.clone(),
-        transfer_id.clone(),
-    ));
+    let completion = Some(MobileDownloadCompletion {
+        runtime: state.runtime.clone(),
+        session_id: session_id.clone(),
+        transfer_id: transfer_id.clone(),
+        item_id: item_id.clone(),
+        size,
+        auto_complete: query.auto_complete,
+    });
     let stream = futures_util::stream::unfold(
         (ReaderStream::new(file), completion, 0u64),
         move |(mut stream, completion, sent)| async move {
             match stream.next().await {
                 Some(Ok(chunk)) => {
-                    if let Some((runtime, session_id, _)) = completion.as_ref() {
-                        let _ = runtime.touch_mobile_session(session_id);
-                    }
-                    if let Some((runtime, _, transfer_id)) = completion.as_ref() {
-                        let _ = runtime.touch_mobile_transfer_activity(transfer_id);
-                    }
                     let sent = sent.saturating_add(chunk.len() as u64);
+                    if let Some(state) = completion.as_ref() {
+                        let _ = state.runtime.touch_mobile_session(&state.session_id);
+                        let _ = state
+                            .runtime
+                            .touch_mobile_transfer_activity(&state.transfer_id);
+                        // 显式 Content-Length 会让 hyper 写满后不再轮询流的结尾，
+                        // 所以在交出最后一个分块时确认项目；客户端中途断开读不到
+                        // 这个分块，也就不会标记完成。
+                        if state.auto_complete
+                            && sent == state.size
+                            && state
+                                .runtime
+                                .mark_mobile_item_downloaded(&state.transfer_id, &state.item_id)
+                                .is_some()
+                        {
+                            let runtime = state.runtime.clone();
+                            let transfer_id = state.transfer_id.clone();
+                            let item_id = state.item_id.clone();
+                            tokio::spawn(async move {
+                                cleanup_mobile_item_artifacts(
+                                    runtime.as_ref(),
+                                    &transfer_id,
+                                    &item_id,
+                                )
+                                .await;
+                            });
+                        }
+                    }
                     Some((Ok(chunk), (stream, completion, sent)))
                 }
                 Some(Err(error)) => Some((Err(error), (stream, None, sent))),
@@ -2237,18 +2310,10 @@ async fn complete_mobile_item(
     {
         return Err(ApiError::not_found("传输项目不存在"));
     }
-    let path = state.runtime.mobile_item_path(&transfer_id, &item_id);
-    let progress = state
-        .runtime
-        .mark_mobile_item_downloaded(&transfer_id, &item_id)
+    let view = finish_mobile_item_download(state.runtime.as_ref(), &transfer_id, &item_id)
+        .await
         .ok_or_else(|| ApiError::conflict("文件尚未准备好下载"))?;
-    if let Some(path) = path {
-        remove_file_with_diagnostics(&path).await;
-    }
-    if progress.progress.status == TransferStatus::Completed {
-        cleanup_mobile_staging_directory(&record.staged_directory).await;
-    }
-    Ok(Json(progress))
+    Ok(Json(view))
 }
 
 async fn reject_transfer(
@@ -3775,6 +3840,112 @@ mod tests {
                 .status,
             TransferStatus::Completed
         );
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn browser_download_completes_item_when_stream_finishes() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-browser-download-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        let bytes = b"hello browser";
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let offer = TransferOffer {
+            transfer_id: "browser-download".to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "hello.txt".to_string(),
+                relative_path: "hello.txt".to_string(),
+                size: bytes.len() as u64,
+                sha256: format!("{:x}", hasher.finalize()),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: bytes.len() as u64,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        runtime
+            .set_mobile_transfer_status(
+                "browser-download",
+                &session.session_id,
+                TransferStatus::Accepted,
+            )
+            .expect("accept mobile transfer");
+        let record = runtime
+            .mobile_transfer("browser-download")
+            .expect("find mobile transfer");
+        std::fs::create_dir_all(&record.staged_directory).expect("create staged directory");
+        std::fs::write(record.staged_directory.join("hello.txt"), bytes)
+            .expect("write staged file");
+        runtime
+            .stage_mobile_item("browser-download", "item", bytes.len() as u64)
+            .expect("stage mobile item");
+
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let response = runtime
+            .http
+            .get(format!(
+                "http://{address}/api/v1/mobile/transfers/browser-download/items/item/download?session_id={}&auto_complete=true",
+                session.session_id
+            ))
+            .send()
+            .await
+            .expect("download mobile item");
+        assert!(response.status().is_success());
+        assert_eq!(
+            response.bytes().await.expect("read download").as_ref(),
+            bytes
+        );
+        // 客户端读完响应与节点收尾不是同一时刻，等后台清理完成再断言。
+        let mut completed = false;
+        for _ in 0..100 {
+            if runtime
+                .mobile_transfer("browser-download")
+                .expect("find completed transfer")
+                .progress
+                .status
+                == TransferStatus::Completed
+            {
+                completed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(completed, "browser download completes the item");
+        let staged = record.staged_directory.join("hello.txt");
+        for _ in 0..50 {
+            if !staged.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!staged.exists(), "staged file is removed after completion");
         runtime
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);

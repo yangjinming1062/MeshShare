@@ -2760,7 +2760,67 @@ fn is_network_ipv4(address: Ipv4Addr) -> bool {
     address.is_private() || address.is_link_local() || is_tailscale_ipv4(address)
 }
 
+fn is_cellular_interface(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ["rmnet", "ccmni", "radio", "clat", "ppp", "wwan"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// 物理以太网和无线地址更可能是对端可达的入口；虚拟网卡与蜂窝地址排在后面，
+/// 让公布顺序与手机、桌面互相直连时实际能用的地址一致。
+fn interface_rank(name: &str) -> u8 {
+    let name = name.to_ascii_lowercase();
+    if is_cellular_interface(&name) {
+        return 2;
+    }
+    if [
+        "vethernet",
+        "veth",
+        "vmnet",
+        "docker",
+        "bridge",
+        "br-",
+        "utun",
+        "tun",
+        "tap",
+        "wg",
+        "tailscale",
+        "zt",
+        "dummy",
+        "ifb",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
+    {
+        return 2;
+    }
+    if ["eth", "en", "wl", "wlan", "wi-fi", "ethernet"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return 0;
+    }
+    1
+}
+
+fn interface_names() -> HashMap<Ipv4Addr, String> {
+    let mut names = HashMap::new();
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => {
+            for interface in interfaces {
+                if let IpAddr::V4(address) = interface.ip() {
+                    names.entry(address).or_insert(interface.name);
+                }
+            }
+        }
+        Err(error) => eprintln!("读取本机网卡名称失败：{error}"),
+    }
+    names
+}
+
 fn network_addresses_for_bound(port: u16, bound: &BTreeSet<Ipv4Addr>) -> Vec<AddressInfo> {
+    let names = interface_names();
     let mut addresses = bound
         .iter()
         .copied()
@@ -2781,10 +2841,21 @@ fn network_addresses_for_bound(port: u16, bound: &BTreeSet<Ipv4Addr>) -> Vec<Add
             }
         })
         .collect::<Vec<_>>();
-    addresses.sort_by_key(|address| match address.kind.as_str() {
-        "lan" => 0,
-        "tailscale" => 1,
-        _ => 2,
+    addresses.sort_by_key(|address| {
+        let kind_rank = match address.kind.as_str() {
+            "lan" => 0,
+            "tailscale" => 1,
+            _ => 2,
+        };
+        let parsed = address.address.parse::<Ipv4Addr>().ok();
+        let interface = parsed
+            .and_then(|ip| names.get(&ip).map(|name| interface_rank(name)))
+            .unwrap_or(1);
+        (
+            kind_rank,
+            interface,
+            parsed.map(u32::from).unwrap_or(u32::MAX),
+        )
     });
     addresses
 }
@@ -2796,6 +2867,10 @@ pub fn bind_addresses() -> BTreeSet<Ipv4Addr> {
             addresses.extend(
                 interfaces
                     .into_iter()
+                    // 蜂窝地址在局域网内没有可达意义，Android 上也不应让节点绑定到运营商地址。
+                    .filter(|interface| {
+                        !(cfg!(target_os = "android") && is_cellular_interface(&interface.name))
+                    })
                     .filter_map(|interface| match interface.ip() {
                         IpAddr::V4(address) if is_network_ipv4(address) => Some(address),
                         _ => None,
@@ -2810,9 +2885,9 @@ pub fn bind_addresses() -> BTreeSet<Ipv4Addr> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_addresses, load_or_create_config, network_addresses_for_bound, NodeRuntime,
-        UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS,
-        TRANSFER_ACTIVITY_TIMEOUT_MS,
+        bind_addresses, interface_rank, is_cellular_interface, load_or_create_config,
+        network_addresses_for_bound, NodeRuntime, UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE,
+        MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
@@ -2870,6 +2945,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["192.168.1.10", "100.64.0.2", "169.254.2.3"]
         );
+    }
+
+    #[test]
+    fn cellular_interfaces_are_recognized_by_name() {
+        for name in ["rmnet_data0", "ccmni0", "radio0", "clat4", "ppp0", "wwan0"] {
+            assert!(is_cellular_interface(name), "{name} should be cellular");
+        }
+        for name in ["wlan0", "eth0", "en0", "vEthernet (WSL)"] {
+            assert!(
+                !is_cellular_interface(name),
+                "{name} should not be cellular"
+            );
+        }
+    }
+
+    #[test]
+    fn physical_networks_rank_before_virtual_and_cellular_interfaces() {
+        for name in [
+            "wlan0",
+            "eth0",
+            "Ethernet",
+            "Ethernet 2",
+            "Wi-Fi",
+            "en0",
+            "wlp2s0",
+        ] {
+            assert_eq!(interface_rank(name), 0, "{name}");
+        }
+        assert_eq!(interface_rank("rmnet_data0"), 2);
+        assert_eq!(interface_rank("vEthernet (WSL)"), 2);
+        assert_eq!(interface_rank("docker0"), 2);
+        assert_eq!(interface_rank("utun4"), 2);
+        assert_eq!(interface_rank("unknown0"), 1);
     }
 
     #[test]
