@@ -3619,8 +3619,16 @@ mod tests {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-forward-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("create test directory");
-        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
-            .expect("create runtime");
+        // This test exercises wire handling only; a view-only profile keeps
+        // its clipboard snapshot without writing the fixture into the host
+        // system clipboard.
+        let runtime = NodeRuntime::new_with_profile(
+            data_dir.clone(),
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+            NodeProfile::Android,
+        )
+        .expect("create runtime");
         runtime.set_peer(PeerInfo {
             node_id: "relay".to_string(),
             node_name: "Relay".to_string(),
@@ -3695,8 +3703,15 @@ mod tests {
         std::fs::create_dir_all(&static_root).expect("create static directory");
         std::fs::write(static_root.join("index.html"), "<html></html>")
             .expect("write static index");
-        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
-            .expect("create runtime");
+        // Clipboard messages are part of the connection smoke test, but the
+        // test must not change the host system clipboard.
+        let runtime = NodeRuntime::new_with_profile(
+            data_dir.clone(),
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+            NodeProfile::Android,
+        )
+        .expect("create runtime");
         let app = super::router(runtime.clone(), static_root);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

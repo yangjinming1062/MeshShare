@@ -463,7 +463,7 @@ async fn run_peer_session(
 #[cfg(test)]
 mod tests {
     use super::{connect_peer, normalize_http_base_url, websocket_endpoint};
-    use crate::runtime::NodeRuntime;
+    use crate::runtime::{NodeProfile, NodeRuntime};
     use crate::server;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -508,9 +508,16 @@ mod tests {
         std::fs::create_dir_all(&static_root).expect("create static directory");
         std::fs::write(static_root.join("index.html"), "<html></html>")
             .expect("write static index");
-        let server_runtime =
-            NodeRuntime::new(server_data.clone(), 0, env!("CARGO_PKG_VERSION").into())
-                .expect("create server runtime");
+        // The reconnect assertion only needs the remote snapshot store.  Use
+        // the view-only profile so this network test cannot write its fixture
+        // text into the host system clipboard through the normal peer path.
+        let server_runtime = NodeRuntime::new_with_profile(
+            server_data.clone(),
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+            NodeProfile::Android,
+        )
+        .expect("create server runtime");
         let client_runtime =
             NodeRuntime::new(client_data.clone(), 0, env!("CARGO_PKG_VERSION").into())
                 .expect("create client runtime");
