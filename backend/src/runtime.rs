@@ -308,7 +308,7 @@ impl NodeRuntime {
         }
         let desktop_temp_files = load_and_cleanup_desktop_temp_files(&data_dir)?;
         cleanup_clipboard_temp_files(&data_dir)?;
-        let config = load_or_create_config(&data_dir)?;
+        let config = load_or_create_config(&data_dir, profile)?;
         let mut clipboard_history = load_clipboard_history(&data_dir)?;
         prune_clipboard_history_records(&mut clipboard_history, &config, now_millis());
         persist_clipboard_history(&data_dir, &clipboard_history)?;
@@ -2247,7 +2247,47 @@ fn evict_terminal_transfer_if_needed(transfers: &mut HashMap<String, TransferRec
     }
 }
 
-fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
+const ANDROID_DEFAULT_NODE_NAME: &str = "移动设备";
+const DESKTOP_DEFAULT_NODE_NAME: &str = "MeshShare 节点";
+
+fn system_hostname() -> Option<String> {
+    hostname::get()
+        .ok()
+        .and_then(|value| value.into_string().ok())
+}
+
+/// 主机名只是系统占位值时不能当设备名：Android 的 net.hostname 默认就是 localhost，
+/// 照抄会让每台手机都以同一个名字出现在其他节点的设备列表里。
+fn is_placeholder_node_name(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    name.is_empty()
+        || matches!(
+            name.as_str(),
+            "localhost" | "localhost.localdomain" | "ip6-localhost" | "ip6-loopback"
+        )
+}
+
+fn default_node_name(profile: NodeProfile, hostname: Option<String>) -> String {
+    if let Some(name) = hostname.filter(|value| !is_placeholder_node_name(value)) {
+        return name.trim().to_string();
+    }
+    if profile.is_android() {
+        ANDROID_DEFAULT_NODE_NAME.to_string()
+    } else {
+        DESKTOP_DEFAULT_NODE_NAME.to_string()
+    }
+}
+
+/// 返回是否改写了名称；调用方负责把结果落盘。
+fn normalize_node_name(name: &mut String, profile: NodeProfile, hostname: Option<String>) -> bool {
+    if !is_placeholder_node_name(name) {
+        return false;
+    }
+    *name = default_node_name(profile, hostname);
+    true
+}
+
+fn load_or_create_config(data_dir: &Path, profile: NodeProfile) -> anyhow::Result<PersistedConfig> {
     let path = data_dir.join("node.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
@@ -2267,6 +2307,11 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
             config.clipboard_history_days = config
                 .clipboard_history_days
                 .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
+            if normalize_node_name(&mut config.node_name, profile, system_hostname()) {
+                if let Err(error) = persist_config(data_dir, &config) {
+                    eprintln!("保存节点名称失败：{error}");
+                }
+            }
             return Ok(config);
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2274,11 +2319,7 @@ fn load_or_create_config(data_dir: &Path) -> anyhow::Result<PersistedConfig> {
     }
     let config = PersistedConfig {
         node_id: Uuid::new_v4().to_string(),
-        node_name: hostname::get()
-            .ok()
-            .and_then(|value| value.into_string().ok())
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "MeshShare 节点".to_string()),
+        node_name: default_node_name(profile, system_hostname()),
         monitor_visible: true,
         monitor_position: None,
         monitor_locked: false,
@@ -2834,7 +2875,13 @@ fn mobile_ca_url(raw: &str) -> Result<reqwest::Url, String> {
 
 fn is_cellular_interface(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["rmnet", "ccmni", "radio", "clat", "ppp", "wwan"]
+    // CLAT 把蜂窝接口包装成 v4-/v6- 前缀的同名接口，判定前先剥掉包装。
+    // 宁可放过未知的运营商网卡名，也不用白名单漏掉手机 Wi-Fi 导致节点不可达。
+    let name = name
+        .strip_prefix("v4-")
+        .or_else(|| name.strip_prefix("v6-"))
+        .unwrap_or(&name);
+    ["rmnet", "ccmni", "radio", "clat", "ppp", "pdp", "wwan"]
         .iter()
         .any(|prefix| name.starts_with(prefix))
 }
@@ -2892,7 +2939,14 @@ fn interface_names() -> HashMap<Ipv4Addr, String> {
 }
 
 fn network_addresses_for_bound(port: u16, bound: &BTreeSet<Ipv4Addr>) -> Vec<AddressInfo> {
-    let names = interface_names();
+    network_addresses(port, bound, &interface_names())
+}
+
+fn network_addresses(
+    port: u16,
+    bound: &BTreeSet<Ipv4Addr>,
+    names: &HashMap<Ipv4Addr, String>,
+) -> Vec<AddressInfo> {
     let mut addresses = bound
         .iter()
         .copied()
@@ -2936,30 +2990,42 @@ pub fn bind_addresses() -> BTreeSet<Ipv4Addr> {
     let mut addresses = BTreeSet::from([Ipv4Addr::LOCALHOST]);
     match if_addrs::get_if_addrs() {
         Ok(interfaces) => {
-            addresses.extend(
-                interfaces
-                    .into_iter()
-                    // 蜂窝地址在局域网内没有可达意义，Android 上也不应让节点绑定到运营商地址。
-                    .filter(|interface| {
-                        !(cfg!(target_os = "android") && is_cellular_interface(&interface.name))
-                    })
-                    .filter_map(|interface| match interface.ip() {
-                        IpAddr::V4(address) if is_network_ipv4(address) => Some(address),
-                        _ => None,
-                    }),
-            )
+            addresses.extend(bindable_addresses(
+                NodeProfile::current(),
+                interfaces.into_iter().map(|interface| {
+                    let ip = interface.ip();
+                    (interface.name, ip)
+                }),
+            ));
         }
         Err(error) => eprintln!("读取本机网卡失败：{error}"),
     }
     addresses
 }
 
+fn bindable_addresses(
+    profile: NodeProfile,
+    interfaces: impl IntoIterator<Item = (String, IpAddr)>,
+) -> BTreeSet<Ipv4Addr> {
+    interfaces
+        .into_iter()
+        // 蜂窝地址在局域网内没有可达意义，Android 上也不应让节点绑定到运营商地址。
+        .filter(|(name, _)| !(profile.is_android() && is_cellular_interface(name)))
+        .filter_map(|(_, ip)| match ip {
+            IpAddr::V4(address) if is_network_ipv4(address) => Some(address),
+            _ => None,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        bind_addresses, interface_rank, is_cellular_interface, load_or_create_config,
-        mobile_ca_url, network_addresses_for_bound, NodeRuntime, UpdateFrequency,
-        DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACTIVITY_TIMEOUT_MS,
+        bind_addresses, bindable_addresses, default_node_name, interface_rank,
+        is_cellular_interface, is_placeholder_node_name, load_or_create_config, mobile_ca_url,
+        network_addresses, network_addresses_for_bound, normalize_node_name, NodeProfile,
+        NodeRuntime, UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS,
+        TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
@@ -2968,7 +3034,8 @@ mod tests {
         METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
         METRICS_SYSTEM_VIEW_CAPABILITY,
     };
-    use std::net::Ipv4Addr;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
     use tokio::sync::mpsc;
     use uuid::Uuid;
@@ -3021,7 +3088,17 @@ mod tests {
 
     #[test]
     fn cellular_interfaces_are_recognized_by_name() {
-        for name in ["rmnet_data0", "ccmni0", "radio0", "clat4", "ppp0", "wwan0"] {
+        for name in [
+            "rmnet_data0",
+            "ccmni0",
+            "radio0",
+            "clat4",
+            "ppp0",
+            "wwan0",
+            "pdp0",
+            "v4-rmnet_data0",
+            "v6-rmnet_data0",
+        ] {
             assert!(is_cellular_interface(name), "{name} should be cellular");
         }
         for name in ["wlan0", "eth0", "en0", "vEthernet (WSL)"] {
@@ -3030,6 +3107,52 @@ mod tests {
                 "{name} should not be cellular"
             );
         }
+    }
+
+    #[test]
+    fn android_skips_cellular_interfaces_when_binding() {
+        let interfaces = vec![
+            (
+                "wlan0".to_string(),
+                "192.168.1.20".parse::<IpAddr>().expect("wlan address"),
+            ),
+            (
+                "rmnet_data0".to_string(),
+                "10.136.144.220"
+                    .parse::<IpAddr>()
+                    .expect("cellular address"),
+            ),
+            (
+                "vEthernet (WSL)".to_string(),
+                "172.20.0.1".parse::<IpAddr>().expect("virtual address"),
+            ),
+        ];
+        let android = bindable_addresses(NodeProfile::Android, interfaces.clone());
+        assert!(android.contains(&Ipv4Addr::new(192, 168, 1, 20)));
+        assert!(!android.contains(&Ipv4Addr::new(10, 136, 144, 220)));
+        let desktop = bindable_addresses(NodeProfile::Desktop, interfaces);
+        assert!(desktop.contains(&Ipv4Addr::new(192, 168, 1, 20)));
+        assert!(desktop.contains(&Ipv4Addr::new(10, 136, 144, 220)));
+        assert!(desktop.contains(&Ipv4Addr::new(172, 20, 0, 1)));
+    }
+
+    #[test]
+    fn physical_address_outranks_cellular_address() {
+        let physical = Ipv4Addr::new(192, 168, 1, 20);
+        let cellular = Ipv4Addr::new(10, 136, 144, 220);
+        let bound = [physical, cellular].into_iter().collect();
+        let names = HashMap::from([
+            (physical, "wlan0".to_string()),
+            (cellular, "rmnet_data0".to_string()),
+        ]);
+        let addresses = network_addresses(37880, &bound, &names);
+        assert_eq!(
+            addresses
+                .iter()
+                .map(|address| address.address.as_str())
+                .collect::<Vec<_>>(),
+            ["192.168.1.20", "10.136.144.220"]
+        );
     }
 
     #[test]
@@ -3124,6 +3247,97 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_hostnames_are_not_node_names() {
+        for name in ["", "  ", "localhost", "LOCALHOST", "localhost.localdomain"] {
+            assert!(
+                is_placeholder_node_name(name),
+                "{name} should be a placeholder"
+            );
+        }
+        for name in ["YJM-MI-PC", "Redmi-K70", "yangjinmingdeMac-mini.local"] {
+            assert!(
+                !is_placeholder_node_name(name),
+                "{name} should be a usable name"
+            );
+        }
+    }
+
+    #[test]
+    fn android_nodes_default_to_mobile_name() {
+        assert_eq!(
+            default_node_name(NodeProfile::Android, Some("localhost".to_string())),
+            "移动设备"
+        );
+        assert_eq!(default_node_name(NodeProfile::Android, None), "移动设备");
+        assert_eq!(
+            default_node_name(NodeProfile::Android, Some("Redmi-K70".to_string())),
+            "Redmi-K70"
+        );
+    }
+
+    #[test]
+    fn desktop_nodes_keep_hostname_or_fallback() {
+        assert_eq!(
+            default_node_name(NodeProfile::Desktop, Some("YJM-MI-PC".to_string())),
+            "YJM-MI-PC"
+        );
+        assert_eq!(
+            default_node_name(NodeProfile::Desktop, Some(" localhost ".to_string())),
+            "MeshShare 节点"
+        );
+        assert_eq!(
+            default_node_name(NodeProfile::Desktop, None),
+            "MeshShare 节点"
+        );
+    }
+
+    #[test]
+    fn placeholder_name_migration_uses_platform_default() {
+        let mut name = "localhost".to_string();
+        assert!(normalize_node_name(
+            &mut name,
+            NodeProfile::Android,
+            Some("localhost".to_string())
+        ));
+        assert_eq!(name, "移动设备");
+
+        let mut kept = "Redmi-K70".to_string();
+        assert!(!normalize_node_name(
+            &mut kept,
+            NodeProfile::Android,
+            Some("localhost".to_string())
+        ));
+        assert_eq!(kept, "Redmi-K70");
+    }
+
+    #[test]
+    fn placeholder_name_is_replaced_and_persisted() {
+        let path = temp_data_dir();
+        std::fs::write(
+            path.join("node.json"),
+            r#"{"node_id":"node-a","node_name":"localhost"}"#,
+        )
+        .expect("write placeholder config");
+        let config = load_or_create_config(&path, NodeProfile::Android).expect("load config");
+        assert!(!is_placeholder_node_name(&config.node_name));
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path.join("node.json")).expect("read config file"),
+        )
+        .expect("parse config file");
+        assert_eq!(persisted["node_name"], config.node_name.as_str());
+        assert_eq!(persisted["node_id"], "node-a");
+
+        std::fs::write(
+            path.join("node.json"),
+            r#"{"node_id":"node-b","node_name":"Redmi-K70"}"#,
+        )
+        .expect("write named config");
+        let named = load_or_create_config(&path, NodeProfile::Android).expect("reload config");
+        assert_eq!(named.node_name, "Redmi-K70");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn old_config_shows_monitor_by_default() {
         let path = temp_data_dir();
         std::fs::write(
@@ -3131,7 +3345,7 @@ mod tests {
             r#"{"node_id":"node-a","node_name":"test"}"#,
         )
         .expect("write old config");
-        let config = load_or_create_config(&path).expect("load config");
+        let config = load_or_create_config(&path, NodeProfile::Desktop).expect("load config");
         assert!(config.monitor_visible);
         assert_eq!(config.monitor_position, None);
         assert!(!config.monitor_locked);
@@ -3178,7 +3392,8 @@ mod tests {
             ),
         ] {
             std::fs::write(path.join("node.json"), legacy).expect("write legacy config");
-            let config = load_or_create_config(&path).expect("load legacy config");
+            let config =
+                load_or_create_config(&path, NodeProfile::Desktop).expect("load legacy config");
             assert_eq!(config.monitor_visible, expected, "legacy: {legacy}");
         }
         let _ = std::fs::remove_dir_all(path);
@@ -3258,7 +3473,7 @@ mod tests {
         let config_path = path.join("node.json");
         std::fs::write(&config_path, "{\"node_id\":").expect("write corrupt config");
 
-        assert!(load_or_create_config(&path).is_err());
+        assert!(load_or_create_config(&path, NodeProfile::Desktop).is_err());
         assert_eq!(
             std::fs::read_to_string(config_path).expect("read corrupt config"),
             "{\"node_id\":"
