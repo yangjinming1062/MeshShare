@@ -5,7 +5,7 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { ApiError, apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
+  import { ApiError, apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
@@ -198,11 +198,26 @@
     pruneFailures();
   }
 
-  function dismissFailure(failure: TransferFailure) {
-    failures = failures.filter((item) => item.progress.transfer_id !== failure.progress.transfer_id);
-    dismissedFailures.set(failure.progress.transfer_id, Date.now());
-    forgetPendingTransfer(failure.progress.transfer_id);
+  async function dismissFailure(failure: TransferFailure) {
+    const id = failure.progress.transfer_id;
+    const mobile = mobileTransfers.some((view) => view.progress.transfer_id === id);
+    failures = failures.filter((item) => item.progress.transfer_id !== id);
+    dismissedFailures.set(id, Date.now());
     if (failure.progress.error && notice === failure.progress.error) notice = '';
+    try {
+      await (mobile ? dismissMobileTransfer(id) : dismissTransfer(id));
+      forgetPendingTransfer(id);
+    } catch (error) {
+      // 记录本来就不在节点上（前端本地合成的失败行）时按移除成功处理。
+      if (error instanceof ApiError && error.status === 404) {
+        forgetPendingTransfer(id);
+        return;
+      }
+      dismissedFailures.delete(id);
+      failures = [failure, ...failures.filter((item) => item.progress.transfer_id !== id)];
+      const message = error instanceof Error ? error.message : '无法连接节点';
+      showTransientNotice(`移除失败：${message}`, 6000);
+    }
   }
 
   function showTransientNotice(message: string, timeout = 2400) {

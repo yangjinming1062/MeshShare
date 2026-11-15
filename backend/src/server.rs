@@ -12,7 +12,7 @@ use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::{SinkExt, StreamExt};
@@ -229,6 +229,10 @@ pub fn router_with_control(
             get(list_mobile_transfers).post(create_mobile_transfer),
         )
         .route(
+            "/api/v1/mobile/transfers/:id",
+            delete(dismiss_mobile_transfer),
+        )
+        .route(
             "/api/v1/mobile/transfers/:id/accept",
             post(accept_mobile_transfer),
         )
@@ -277,6 +281,7 @@ pub fn router_with_control(
             "/api/v1/relay/transfers/:id/retry",
             post(retry_relay_transfer),
         )
+        .route("/api/v1/transfers/:id", delete(dismiss_transfer))
         .route("/api/v1/transfers/:id/reject", post(reject_transfer))
         .route("/api/v1/transfers/:id/cancel", post(cancel_transfer))
         .route("/api/v1/transfers/:id/fail", post(fail_transfer))
@@ -2435,6 +2440,43 @@ async fn fail_transfer(
         progress: progress.clone(),
     });
     Ok(Json(progress))
+}
+
+async fn dismiss_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let record = state
+        .runtime
+        .transfer(&id)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    if record.progress.status != TransferStatus::Failed {
+        return Err(ApiError::conflict("只能移除失败的任务记录"));
+    }
+    let progress = state
+        .runtime
+        .remove_failed_transfer(&id)
+        .ok_or_else(|| ApiError::conflict("传输任务已被移除"))?;
+    Ok(Json(progress))
+}
+
+async fn dismiss_mobile_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let record = state
+        .runtime
+        .mobile_transfer(&id)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+    if record.progress.status != TransferStatus::Failed {
+        return Err(ApiError::conflict("只能移除失败的任务记录"));
+    }
+    let removed = state
+        .runtime
+        .remove_failed_mobile_transfer(&id)
+        .ok_or_else(|| ApiError::conflict("手机传输已被移除"))?;
+    cleanup_mobile_staging_directory(&removed.staged_directory).await;
+    Ok(Json(removed.progress))
 }
 
 async fn retry_transfer(
@@ -4628,6 +4670,191 @@ mod tests {
             .await
             .expect("handshake timeout should close socket");
         assert!(matches!(closed, None | Some(Err(_))));
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    fn test_offer(runtime: &NodeRuntime, transfer_id: &str) -> TransferOffer {
+        TransferOffer {
+            transfer_id: transfer_id.to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "desktop".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: format!("{transfer_id}-item"),
+                name: "file.txt".to_string(),
+                relative_path: "file.txt".to_string(),
+                size: 0,
+                sha256: "0".repeat(64),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: crate::clock::now_millis(),
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_transfer_can_be_removed_and_is_not_listed() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-dismiss-transfer-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_outgoing_transfer(test_offer(&runtime, "dismiss-failed"));
+        runtime
+            .fail_transfer(
+                "dismiss-failed",
+                "failed".to_string(),
+                TransferStatus::Failed,
+            )
+            .expect("fail transfer");
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let removed = runtime
+            .http
+            .delete(format!("http://{address}/api/v1/transfers/dismiss-failed"))
+            .send()
+            .await
+            .expect("remove failed transfer");
+        assert!(removed.status().is_success());
+        let listed = runtime
+            .http
+            .get(format!("http://{address}/api/v1/transfers"))
+            .send()
+            .await
+            .expect("list transfers")
+            .error_for_status()
+            .expect("list response")
+            .json::<Vec<TransferProgress>>()
+            .await
+            .expect("decode transfers");
+        assert!(listed
+            .iter()
+            .all(|progress| progress.transfer_id != "dismiss-failed"));
+        assert!(runtime.transfer("dismiss-failed").is_none());
+        let again = runtime
+            .http
+            .delete(format!("http://{address}/api/v1/transfers/dismiss-failed"))
+            .send()
+            .await
+            .expect("remove again");
+        assert_eq!(again.status().as_u16(), 404);
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn active_transfer_removal_is_rejected() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-dismiss-active-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_outgoing_transfer(test_offer(&runtime, "dismiss-active"));
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let denied = runtime
+            .http
+            .delete(format!("http://{address}/api/v1/transfers/dismiss-active"))
+            .send()
+            .await
+            .expect("remove active transfer");
+        assert_eq!(denied.status().as_u16(), 409);
+        assert!(runtime.transfer("dismiss-active").is_some());
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn failed_mobile_transfer_removal_cleans_staged_directory() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-dismiss-mobile-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        runtime
+            .create_mobile_transfer(&session.session_id, test_offer(&runtime, "mobile-dismiss"))
+            .expect("create mobile transfer");
+        let record = runtime
+            .mobile_transfer("mobile-dismiss")
+            .expect("find mobile transfer");
+        std::fs::create_dir_all(&record.staged_directory).expect("create staging directory");
+        std::fs::write(record.staged_directory.join("stale.part"), b"stale")
+            .expect("write staged file");
+        runtime
+            .fail_mobile_transfer("mobile-dismiss", "failed".to_string())
+            .expect("fail mobile transfer");
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let removed = runtime
+            .http
+            .delete(format!(
+                "http://{address}/api/v1/mobile/transfers/mobile-dismiss"
+            ))
+            .send()
+            .await
+            .expect("remove failed mobile transfer");
+        assert!(removed.status().is_success());
+        assert!(runtime.mobile_transfer("mobile-dismiss").is_none());
+        assert!(!record.staged_directory.exists());
+        let again = runtime
+            .http
+            .delete(format!(
+                "http://{address}/api/v1/mobile/transfers/mobile-dismiss"
+            ))
+            .send()
+            .await
+            .expect("remove again");
+        assert_eq!(again.status().as_u16(), 404);
 
         runtime
             .stopping

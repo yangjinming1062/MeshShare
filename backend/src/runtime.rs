@@ -1524,6 +1524,16 @@ impl NodeRuntime {
         Some(record.progress.clone())
     }
 
+    /// Remove a failed transfer record. Non-failed records are retained and
+    /// rejected so an active task cannot be dropped without cancelling it.
+    pub fn remove_failed_transfer(&self, transfer_id: &str) -> Option<TransferProgress> {
+        let mut transfers = self.transfers.write();
+        if transfers.get(transfer_id)?.progress.status != TransferStatus::Failed {
+            return None;
+        }
+        transfers.remove(transfer_id).map(|record| record.progress)
+    }
+
     pub fn transfers_snapshot(&self, status: Option<TransferStatus>) -> Vec<TransferProgress> {
         self.prune_transfers();
         let mut transfers = self
@@ -1993,6 +2003,21 @@ impl NodeRuntime {
 
     pub fn mobile_transfer(&self, transfer_id: &str) -> Option<MobileTransferRecord> {
         self.mobile_transfers.read().get(transfer_id).cloned()
+    }
+
+    /// Remove a failed mobile transfer record and release its manifest budget.
+    pub fn remove_failed_mobile_transfer(&self, transfer_id: &str) -> Option<MobileTransferRecord> {
+        let mut transfers = self.mobile_transfers.write();
+        if transfers.get(transfer_id)?.progress.status != TransferStatus::Failed {
+            return None;
+        }
+        let record = transfers.remove(transfer_id)?;
+        let manifest_bytes = mobile_manifest_size(&record.offer);
+        if manifest_bytes > 0 {
+            self.mobile_manifest_bytes
+                .fetch_sub(manifest_bytes, Ordering::SeqCst);
+        }
+        Some(record)
     }
 
     pub fn set_mobile_transfer_status(
@@ -3875,6 +3900,79 @@ mod tests {
             .updated_at_ms = crate::clock::now_millis() - 11 * 60 * 1000;
         runtime.prune_transfers();
         assert!(runtime.transfer("old-terminal").is_none());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn failed_transfer_removal_drops_record_and_keeps_active() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_outgoing_transfer(mobile_offer(&runtime, "removable", 1));
+        runtime
+            .fail_transfer("removable", "failed".to_string(), TransferStatus::Failed)
+            .expect("fail transfer");
+        runtime.add_outgoing_transfer(mobile_offer(&runtime, "active", 1));
+
+        assert!(runtime.remove_failed_transfer("active").is_none());
+        assert!(runtime.transfer("active").is_some());
+
+        let removed = runtime
+            .remove_failed_transfer("removable")
+            .expect("remove failed transfer");
+        assert_eq!(removed.status, TransferStatus::Failed);
+        assert!(runtime.transfer("removable").is_none());
+        assert!(runtime
+            .transfers_snapshot(None)
+            .iter()
+            .all(|progress| progress.transfer_id != "removable"));
+        assert!(runtime.remove_failed_transfer("removable").is_none());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn failed_mobile_transfer_removal_releases_manifest_bytes() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let session = runtime
+            .create_mobile_session("test phone".to_string())
+            .expect("create mobile session");
+        let offer = mobile_offer(&runtime, "mobile-removable", 1);
+        let manifest_bytes = super::mobile_manifest_size(&offer);
+        runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        assert_eq!(
+            runtime
+                .mobile_manifest_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            manifest_bytes
+        );
+        assert!(runtime
+            .remove_failed_mobile_transfer("mobile-removable")
+            .is_none());
+        runtime
+            .fail_mobile_transfer("mobile-removable", "failed".to_string())
+            .expect("fail mobile transfer");
+
+        let removed = runtime
+            .remove_failed_mobile_transfer("mobile-removable")
+            .expect("remove failed mobile transfer");
+        assert_eq!(removed.progress.status, TransferStatus::Failed);
+        assert!(runtime.mobile_transfer("mobile-removable").is_none());
+        assert_eq!(
+            runtime
+                .mobile_manifest_bytes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        runtime
+            .create_mobile_transfer(
+                &session.session_id,
+                mobile_offer(&runtime, "mobile-after-removal", 1),
+            )
+            .expect("create mobile transfer after removal");
         let _ = std::fs::remove_dir_all(path);
     }
 

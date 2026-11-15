@@ -27,6 +27,7 @@
 | `POST` | `/api/v1/transfers/{id}/cancel` | 取消任务 |
 | `POST` | `/api/v1/transfers/{id}/fail` | 发送端重试耗尽后标记失败 |
 | `POST` | `/api/v1/transfers/{id}/retry` | 重新打开可恢复的失败任务 |
+| `DELETE` | `/api/v1/transfers/{id}` | 移除失败任务记录 |
 | `GET` | `/api/v1/transfers/{id}/status` | 查询进度 |
 | `PUT` | `/api/v1/transfers/{id}/items/{item_id}` | 直接写入单个文件流 |
 | `POST` | `/api/v1/relay/transfers` | 远程管理界面在目标节点创建由目标节点拥有的发送任务 |
@@ -42,12 +43,13 @@
 | `POST` | `/api/v1/mobile/transfers/{id}/reject` | 网页端拒绝文件 |
 | `POST` | `/api/v1/mobile/transfers/{id}/cancel` | 网页端取消未完成或待下载文件 |
 | `POST` | `/api/v1/mobile/transfers/{id}/fail` | 桌面端上传无法恢复时标记失败 |
+| `DELETE` | `/api/v1/mobile/transfers/{id}` | 移除失败的网页传输记录并清理暂存目录 |
 | `PUT` | `/api/v1/mobile/transfers/{id}/items/{item_id}` | 桌面端把文件流写入网页端临时文件区 |
 | `GET` | `/api/v1/mobile/transfers/{id}/items/{item_id}/download?session_id=...` | 网页端按流下载已准备好的文件；带 `auto_complete=true` 时节点在完整写出该项目后直接确认 |
 | `POST` | `/api/v1/mobile/transfers/{id}/items/{item_id}/complete` | 网页端完成本地写入后确认单个项目 |
 | `POST/GET/PUT` | `/api/v1/mobile/peers/{peer_id}/api/v1/transfers/...` | HTTPS 网页通过接入节点代理访问其他桌面节点的传输接口，避免浏览器混合内容和跨节点证书问题 |
 
-接口业务错误使用 `{ "error": "..." }`。`GET /api/v1/clipboard` 查询返回最新快照；历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容，避免一次加载全部历史图片或大文本。历史接口只访问目标节点本机保存的记录，不修改节点间 WebSocket 的最新快照交换。`GET/PATCH /api/v1/settings` 供桌面管理界面读取和修改目标节点设置；自动更新、开机自启和监控操作在目标节点本机执行。`POST /api/v1/transfers/{id}/accept` 的 `destination` 必须是目标节点上已存在且通过目录校验的路径，管理端不会把本机文件选择器的路径当作远程路径。文件接口按传输任务查询状态。网页端选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径。
+接口业务错误使用 `{ "error": "..." }`。`GET /api/v1/clipboard` 查询返回最新快照；历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容，避免一次加载全部历史图片或大文本。历史接口只访问目标节点本机保存的记录，不修改节点间 WebSocket 的最新快照交换。`GET/PATCH /api/v1/settings` 供桌面管理界面读取和修改目标节点设置；自动更新、开机自启和监控操作在目标节点本机执行。`POST /api/v1/transfers/{id}/accept` 的 `destination` 必须是目标节点上已存在且通过目录校验的路径，管理端不会把本机文件选择器的路径当作远程路径。文件接口按传输任务查询状态。只有 `failed` 记录可以被删除：删除后该任务立即从节点状态移除，后续 `GET` 列表不再返回；记录不存在时返回 404，任务不处于失败状态时返回 409。网页端选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径。
 
 桌面主窗口可以直接连接在线节点的 HTTP 和 WebSocket 地址，在同一窗口切换管理目标。目标节点通过 `NodeInfo.capabilities` 声明远程管理能力；缺少能力标记或返回接口不存在时，界面保留本机上下文并提示目标节点需要升级。远程管理继续沿用受信任私网和 Tailscale 网络的无账号模型，不应通过端口转发暴露到互联网。
 
