@@ -98,6 +98,14 @@ MeshShare 不强制把整个桌面壳切换到 X11。剪贴板会优先使用 Wa
 
 重跑失败任务会沿用原提交和已构建的安装包。修复涉及发布工作流或脚本时，需推送指向修复提交的版本 tag 来触发新的运行。如果发布任务报告有额外附件，先到对应 Release 核对并清理旧附件，再重跑发布任务。
 
+## README 截图
+
+根 README 的界面图存放在 `.github/assets/screenshots/`。桌面图对应 1180×780 逻辑像素的 Tauri 窗口，手机图对应 390×844 逻辑像素的浏览器窄视口；两者都按 2 倍像素采集并保存为 WebP，单张不超过 300 KB。
+
+桌面图用 `npx --yes @tauri-apps/cli@2 dev` 启动的窗口截取；需要固定视口而不受窗口大小和系统缩放影响时，用 `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` 打开 WebView2 远程调试，按 `1180×780` 设置设备尺寸后截图。手机图由浏览器打开节点地址后按 `390×844` 截取，网页端与 Android App 共用这套版式。
+
+截图前把节点名改成中性名称，并把本机剪贴板历史替换为演示内容，避免把个人信息写进仓库；采集完成后恢复原配置与历史。README 按固定宽度引用这些图片，更新时保持文件名、裁切范围与图注一致。
+
 ## 检查
 
 Rust 格式和 lint 检查需要 `rustfmt` 和 `clippy` 组件，可通过 `rustup component add rustfmt clippy` 安装。
