@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "com.meshshare.android",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "MeshShare · 局域网共享",
+        "width": 1180,
+        "height": 780,
+        "resizable": true,
+        "visible": true,
+        "decorations": true,
+        "url": "index.html"
+      }
+    ]
+  },
+  "build": {
+    "beforeBuildCommand": "npm --prefix ../frontend run build"
+  },
+  "bundle": {
+    "android": {
+      "minSdkVersion": 29
+    }
+  }
+}

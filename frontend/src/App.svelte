@@ -25,9 +25,10 @@
   const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
   if (isMonitor) document.documentElement.dataset.window = 'monitor';
   const inTauri = isTauri();
+  const isAndroidApp = inTauri && /Android/i.test(navigator.userAgent);
   // 浏览器访问（根地址或 /mobile）一律渲染网页临时加入界面，Tauri 窗口按窗口类型区分
   const isWeb = !inTauri && !isMonitor;
-  const isDesktopWindow = inTauri && !isMonitor;
+  const isDesktopWindow = inTauri && !isMonitor && !isAndroidApp;
   let node: NodeInfo | null = null;
   let activeBaseUrl = '';
   let remoteTarget: PeerInfo | null = null;
@@ -69,6 +70,7 @@
   let mobileTransfers: MobileTransferView[] = [];
   let mobileSessionId = '';
   let manualAddress = '';
+  let savedNodeUrls: string[] = [];
   let monitorLocked = false;
   let settingsOpen = false;
   let mobileAccessOpen = false;
@@ -134,6 +136,17 @@
 
   onMount(() => {
     pageStopped = false;
+    try {
+      const stored = window.localStorage.getItem('meshshare-saved-node-urls');
+      const parsed = stored ? JSON.parse(stored) : [];
+      if (Array.isArray(parsed)) {
+        savedNodeUrls = parsed
+          .filter((value): value is string => typeof value === 'string')
+          .slice(0, 8);
+      }
+    } catch {
+      savedNodeUrls = [];
+    }
     folderInput?.setAttribute('webkitdirectory', '');
     folderInput?.setAttribute('directory', '');
     let timer: number | undefined;
@@ -188,7 +201,7 @@
       try {
         const base = await initApi();
         if (!activeBaseUrl) activeBaseUrl = base;
-        if (inTauri && !isWeb) {
+        if (isDesktopWindow) {
           monitorCapabilities = await invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities);
           monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
         }
@@ -242,7 +255,7 @@
   async function refresh() {
     const generation = targetGeneration;
     const target = activeBaseUrl;
-    if (inTauri && !isWeb && !remoteMode) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
+    if (isDesktopWindow && !remoteMode) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
       if (generation !== targetGeneration || target !== activeBaseUrl) return;
@@ -803,8 +816,19 @@
   async function connectManualPeer() {
     const url = manualAddress.trim().replace(/\/$/, '');
     if (!url) return;
+    await connectSavedPeer(url);
+  }
+
+  async function connectSavedPeer(url: string) {
     try {
       await request('/api/v1/peers/connect', { method: 'POST', body: JSON.stringify({ url }) });
+      const next = [url, ...savedNodeUrls.filter((item) => item !== url)].slice(0, 8);
+      savedNodeUrls = next;
+      try {
+        window.localStorage.setItem('meshshare-saved-node-urls', JSON.stringify(next));
+      } catch {
+        // Persisting a convenience shortcut must not block the connection.
+      }
       manualAddress = '';
       addDeviceOpen = false;
       await refresh();
@@ -1480,6 +1504,13 @@
     if (remoteMode) {
       const remotePath = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
       path = remotePath?.trim() || undefined;
+    } else if (isAndroidApp) {
+      try {
+        path = await invoke<string>('android_receive_directory');
+      } catch (error) {
+        notice = error instanceof Error ? error.message : '无法准备 Android 接收目录';
+        return;
+      }
     } else {
       try {
         destination = await open({ directory: true, multiple: false, title: '选择接收目录' });
@@ -1501,7 +1532,7 @@
       } else {
         await invoke<TransferProgress>('accept_transfer', { transferId: transfer.transfer_id, destination: path });
       }
-      notice = '已接受，等待文件直传';
+      notice = isAndroidApp && !remoteMode ? '已接受，文件将保存到 MeshShare 应用目录' : '已接受，等待文件直传';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法接受传输';
     }
@@ -1742,6 +1773,7 @@
     <AppHeader
       {node}
       remote={remoteMode}
+      mobileApp={isAndroidApp}
       {remotePath}
       {status}
       {statusKind}
@@ -1760,12 +1792,16 @@
     <main class="app-main">
       <DevicePanel
         peers={peers}
-        mobileSessions={mobileSessions}
+        mobileSessions={isAndroidApp ? [] : mobileSessions}
+        savedAddresses={savedNodeUrls}
+        showMobileAccess={!isAndroidApp}
+        showMobileSessions={!isAndroidApp}
         draggingKey={dragPeer}
         addOpen={addDeviceOpen}
         bind:manualAddress
         onToggleAdd={() => (addDeviceOpen = !addDeviceOpen)}
         onConnect={connectManualPeer}
+        onConnectSaved={connectSavedPeer}
         onOpenPeer={openRemotePeer}
         onMobileAccess={() => (mobileAccessOpen = true)}
         onSendPeer={(peer) => startChoose(peer)}
@@ -1780,40 +1816,60 @@
       />
       <HardwarePanel
         metrics={metrics}
+        compactNetwork={isAndroidApp && !remoteMode}
         {monitorLocked}
         canClickThrough={monitorCapabilities.can_click_through}
         onToggleLock={toggleMonitorLock}
       />
-      <ClipboardPanel
-        {clipboard}
-        bind:draft={clipboardDraft}
-        history={clipboardHistory}
-        bind:tab={clipboardTab}
-        busy={clipboardHistoryBusy}
-        onPublish={publishClipboard}
-        onOpenHistory={openClipboardHistory}
-        onClearHistory={requestClearHistory}
-      />
+      {#if !isAndroidApp}
+        <ClipboardPanel
+          {clipboard}
+          bind:draft={clipboardDraft}
+          history={clipboardHistory}
+          bind:tab={clipboardTab}
+          busy={clipboardHistoryBusy}
+          onPublish={publishClipboard}
+          manualOnly={false}
+          onOpenHistory={openClipboardHistory}
+          onClearHistory={requestClearHistory}
+        />
+      {:else}
+        <ClipboardPanel
+          {clipboard}
+          bind:draft={clipboardDraft}
+          history={[]}
+          tab="current"
+          busy={clipboardHistoryBusy}
+          onPublish={publishClipboard}
+          manualOnly={true}
+          onReadLocal={readMobileClipboard}
+          onWriteLocal={writeMobileClipboard}
+          onOpenHistory={() => {}}
+          onClearHistory={() => {}}
+        />
+      {/if}
       <TransferPanel {transfers} onAccept={acceptTransfer} onReject={rejectTransfer} />
     </main>
-    <SettingsDialog
-      open={settingsOpen}
-      {node}
-      {updateFrequency}
-      {updateStatus}
-      {updateBusy}
-      {receiveSettings}
-      receiveBusy={receiveSettingsBusy}
-      historySettings={clipboardHistorySettings}
-      historyBusy={clipboardHistorySettingsBusy}
-      onFrequency={setUpdateFrequency}
-      onCheckUpdates={checkForUpdates}
-      onReceiveMode={setReceiveMode}
-      onChooseDirectory={chooseReceiveDirectory}
-      onHistoryMode={setClipboardHistoryMode}
-      onHistoryValue={setClipboardHistoryValue}
-      onClose={() => (settingsOpen = false)}
-    />
+    {#if !isAndroidApp}
+      <SettingsDialog
+        open={settingsOpen}
+        {node}
+        {updateFrequency}
+        {updateStatus}
+        {updateBusy}
+        {receiveSettings}
+        receiveBusy={receiveSettingsBusy}
+        historySettings={clipboardHistorySettings}
+        historyBusy={clipboardHistorySettingsBusy}
+        onFrequency={setUpdateFrequency}
+        onCheckUpdates={checkForUpdates}
+        onReceiveMode={setReceiveMode}
+        onChooseDirectory={chooseReceiveDirectory}
+        onHistoryMode={setClipboardHistoryMode}
+        onHistoryValue={setClipboardHistoryValue}
+        onClose={() => (settingsOpen = false)}
+      />
+    {/if}
     <MobileAccessDialog
       open={mobileAccessOpen}
       nodeReady={!!node}

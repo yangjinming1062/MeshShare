@@ -4,6 +4,8 @@
 
 安装 Git、Rust stable（当前 Tauri 2 依赖链和 single-instance 插件要求 Rust 1.90 或更高）和 Node.js 22，准备对应系统的构建依赖。Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1、Wayland 开发库和 Ayatana AppIndicator 等开发包。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
 
+Android 开发还需要 Android Studio 或 Android command-line tools、JDK、Android SDK Platform、Build Tools、NDK 和四个 Rust Android targets。当前 App 使用局域网明文 HTTP/WebSocket，因此 Android 发行构建必须保留 `usesCleartextTraffic`；该设置只适用于受信任局域网，不表示公网安全。
+
 以下命令从仓库根目录执行。Tauri CLI 由 `npx` 按需运行。
 
 ```bash
@@ -31,6 +33,26 @@ npx --yes @tauri-apps/cli@2 icon frontend/public/meshshare.svg --output backend/
 npx --yes @tauri-apps/cli@2 dev -- --locked
 ```
 
+初始化 Android 工程并运行：
+
+```bash
+export JAVA_HOME="/path/to/jdk"
+export ANDROID_HOME="/path/to/android-sdk"
+rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+npx --yes @tauri-apps/cli@2 android init --ci --skip-targets-install
+python3 .github/scripts/prepare_android_project.py
+npx --yes @tauri-apps/cli@2 android dev
+```
+
+构建 APK 或 AAB：
+
+```bash
+npx --yes @tauri-apps/cli@2 android build --apk --target aarch64
+npx --yes @tauri-apps/cli@2 android build --aab --target aarch64
+```
+
+Android App 的本机 Rust 节点能力是文件传输和网络指标；它不提供浏览器网页入口，桌面托盘、悬浮监控条、开机自启、桌面自动更新和系统剪贴板轮询不会编译进 Android 运行路径。发送文件使用系统文件选择器，接收文件默认写入应用专属的 Download/MeshShare 目录。Android 验证至少包括启动/关闭节点、局域网 HTTP/WS 连接、双向文件校验、手动剪贴板操作、Wi‑Fi 切换和进程退出后的状态清理。
+
 构建本地调试程序，产物位于 `backend/target/debug/`。
 
 ```bash
@@ -43,7 +65,9 @@ npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 
 Windows MSVC 的 Rust 测试宿主会链接 Tauri 使用的原生对话框 API。`backend/build.rs` 会把 Common Controls v6 manifest 嵌入 Windows/MSVC 的所有可链接目标，并关闭 `tauri-build` 的默认应用 manifest 资源，避免测试宿主因加载旧版 `comctl32` 在启动前以 `STATUS_ENTRYPOINT_NOT_FOUND` 退出。
 
-推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。Release 工作流不重复运行代码检查，只执行签名校验、前端构建、安装包生成和发布所需的校验。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个安装包、两个 updater archive 和 `latest.json`，不上传独立的 `.sig` 文件；发布说明会在 LLM 内容后附加按平台生成的下载指导，核对 GitHub Release 的附件完整后发布为 prerelease。Tauri CLI 按运行器系统、架构和版本缓存，缓存未命中时从 Cargo 安装固定版本。
+推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。Release 工作流不重复运行代码检查，只执行签名校验、前端构建、安装包生成和发布所需的校验。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个桌面安装包，以及一个签名的 Android arm64 APK、两个 macOS updater archive 和 `latest.json`，不上传独立的 `.sig` 文件；发布说明会在 LLM 内容后附加按平台生成的下载指导，核对 GitHub Release 的附件完整后发布为 prerelease。Tauri CLI 按运行器系统、架构和版本缓存，缓存未命中时从 Cargo 安装固定版本。
+
+Android Release 构建使用 GitHub Actions Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS` 和 `ANDROID_KEY_PASSWORD`。`ANDROID_KEYSTORE_BASE64` 是 Android 发布 keystore 的 base64 内容，不能把 keystore 或密码提交到仓库；缺少任一 Secret 时，Android 发布 job 会失败并阻止 Release 发布。普通用户下载 `MeshShare_<版本>_android_arm64.apk` 直接安装；AAB 仍通过本地 Android 构建命令生成，用于应用商店或 `bundletool`，不上传到普通下载指引。
 
 ### 自动更新发布
 
@@ -67,7 +91,7 @@ Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/
 
 MeshShare 不强制把整个桌面壳切换到 X11。剪贴板会优先使用 Wayland data-control，没有该协议时尝试 XWayland；两者都不可用时，界面应报告原因，设备间共享、历史和文件传输仍应可用。Wayland 不提供全局窗口坐标、强制置顶或点击穿透保证，因此这些行为只能在 X11 会话中作为强保证验收。
 
-发布说明由 OpenAI 兼容接口根据上一版本到当前 tag 的提交记录生成，随后追加 `.github/release-download-guide.md` 模板；模板中的链接由 `.github/scripts/append_release_download_guide.py` 根据当前 tag 和仓库名生成。`LLM_API_KEY` 取自 Actions Secrets，`LLM_BASE_URL` 和 `LLM_MODEL_NAME` 可配置为 Actions Secrets 或 Variables。生成失败时发布任务等待重跑。
+发布说明由 OpenAI 兼容接口根据上一版本到当前 tag 的提交记录生成，随后追加 `.github/release-download-guide.md` 模板；模板中的桌面与 Android APK 链接由 `.github/scripts/append_release_download_guide.py` 根据当前 tag 和仓库名生成。`LLM_API_KEY` 取自 Actions Secrets，`LLM_BASE_URL` 和 `LLM_MODEL_NAME` 可配置为 Actions Secrets 或 Variables。生成失败时发布任务等待重跑。
 
 重跑失败任务会沿用原提交和已构建的安装包。修复涉及发布工作流或脚本时，需推送指向修复提交的版本 tag 来触发新的运行。如果发布任务报告有额外附件，先到对应 Release 核对并清理旧附件，再重跑发布任务。
 

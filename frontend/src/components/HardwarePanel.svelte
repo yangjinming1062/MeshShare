@@ -3,6 +3,7 @@
   import type { HardwareMetrics } from '../types';
 
   export let metrics: HardwareMetrics | null = null;
+  export let compactNetwork = false;
   export let monitorLocked = false;
   export let canClickThrough = false;
   export let onToggleLock: () => void = () => {};
@@ -32,7 +33,7 @@
 <section class="surface area-hardware">
   <div class="surface-head">
     <div class="surface-title">
-      <h2>本机硬件</h2>
+      <h2>{compactNetwork ? '本机网络' : '本机硬件'}</h2>
     </div>
     <div class="surface-actions">
       <button
@@ -46,33 +47,48 @@
     </div>
   </div>
   <div class="surface-body">
-    <div class="hw-grid">
-      <div class="hw-tile">
-        <span class="hw-label">CPU</span>
-        <strong class="hw-value">{formatPercent(cpuPercent)}</strong>
-        {#if cpuBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{cpuBar}"></span></span>{/if}
-        <span class="hw-caption">系统总使用率</span>
+    {#if compactNetwork}
+      <div class="hw-grid">
+        <div class="hw-tile">
+          <span class="hw-label">上传</span>
+          <strong class="hw-value">↑ {formatRate(displayMetrics?.network_up_bytes_per_sec)}</strong>
+          <span class="hw-caption">本机网络实时速率</span>
+        </div>
+        <div class="hw-tile">
+          <span class="hw-label">下载</span>
+          <strong class="hw-value">↓ {formatRate(displayMetrics?.network_down_bytes_per_sec)}</strong>
+          <span class="hw-caption">本机网络实时速率</span>
+        </div>
       </div>
-      <div class="hw-tile">
-        <span class="hw-label">内存</span>
-        <strong class="hw-value">{formatPercent(memoryUsedPercent)}</strong>
-        {#if memoryBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{memoryBar}"></span></span>{/if}
-        <span class="hw-caption">{memoryCaption}</span>
+    {:else}
+      <div class="hw-grid">
+        <div class="hw-tile">
+          <span class="hw-label">CPU</span>
+          <strong class="hw-value">{formatPercent(cpuPercent)}</strong>
+          {#if cpuBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{cpuBar}"></span></span>{/if}
+          <span class="hw-caption">系统总使用率</span>
+        </div>
+        <div class="hw-tile">
+          <span class="hw-label">内存</span>
+          <strong class="hw-value">{formatPercent(memoryUsedPercent)}</strong>
+          {#if memoryBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{memoryBar}"></span></span>{/if}
+          <span class="hw-caption">{memoryCaption}</span>
+        </div>
+        <div class="hw-tile">
+          <span class="hw-label">GPU</span>
+          <strong class="hw-value">{formatPercent(gpuUsedPercent)}</strong>
+          {#if gpuBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{gpuBar}"></span></span>{/if}
+          <span class="hw-caption">{gpuCaption}</span>
+        </div>
+        <div class="hw-tile">
+          <span class="hw-label">网络</span>
+          <strong class="hw-value">↓ {formatRate(displayMetrics?.network_down_bytes_per_sec)}</strong>
+          <span class="hw-caption">↑ {formatRate(displayMetrics?.network_up_bytes_per_sec)}</span>
+          <span class="hw-caption">实时速率</span>
+        </div>
       </div>
-      <div class="hw-tile">
-        <span class="hw-label">GPU</span>
-        <strong class="hw-value">{formatPercent(gpuUsedPercent)}</strong>
-        {#if gpuBar !== undefined}<span class="hw-meter" aria-hidden="true"><span style="--p:{gpuBar}"></span></span>{/if}
-        <span class="hw-caption">{gpuCaption}</span>
-      </div>
-      <div class="hw-tile">
-        <span class="hw-label">网络</span>
-        <strong class="hw-value">↓ {formatRate(displayMetrics?.network_down_bytes_per_sec)}</strong>
-        <span class="hw-caption">↑ {formatRate(displayMetrics?.network_up_bytes_per_sec)}</span>
-        <span class="hw-caption">实时速率</span>
-      </div>
-    </div>
-    {#if gpus.length}
+    {/if}
+    {#if !compactNetwork && gpus.length}
       <div class="hw-gpus">
         {#each shownGpus as gpu, index (gpu.name + index)}
           <div class="hw-gpu" title={gpu.unavailable_reason}>

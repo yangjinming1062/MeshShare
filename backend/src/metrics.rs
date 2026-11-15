@@ -32,9 +32,10 @@ pub fn start(runtime: Arc<NodeRuntime>) {
         .name("meshshare-metrics".to_string())
         .spawn(move || {
             let mut collector = Collector::new(&runtime.node_id());
+            let network_only = runtime.is_android_profile();
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 let started = Instant::now();
-                let snapshot = collector.sample();
+                let snapshot = collector.sample(network_only);
                 runtime.set_local_metrics(snapshot.clone());
                 runtime.publish_metrics(snapshot);
                 let elapsed = started.elapsed();
@@ -72,7 +73,7 @@ impl Collector {
         }
     }
 
-    fn sample(&mut self) -> HardwareMetrics {
+    fn sample(&mut self, network_only: bool) -> HardwareMetrics {
         self.system.refresh_cpu_usage();
         self.system.refresh_memory();
         self.networks.refresh_list();
@@ -101,14 +102,23 @@ impl Collector {
             self.cpu_ready = true;
             None
         };
-        let gpus = self.gpus.sample();
+        let (cpu_usage_percent, memory_used_bytes, memory_total_bytes, gpus) = if network_only {
+            (None, None, None, Vec::new())
+        } else {
+            (
+                cpu_usage_percent,
+                Some(self.system.used_memory()),
+                Some(self.system.total_memory()),
+                self.gpus.sample(),
+            )
+        };
 
         HardwareMetrics {
             node_id: self.node_id.clone(),
             sampled_at_ms: now_millis(),
             cpu_usage_percent,
-            memory_used_bytes: Some(self.system.used_memory()),
-            memory_total_bytes: Some(self.system.total_memory()),
+            memory_used_bytes,
+            memory_total_bytes,
             network_down_bytes_per_sec: network_down,
             network_up_bytes_per_sec: network_up,
             gpus,

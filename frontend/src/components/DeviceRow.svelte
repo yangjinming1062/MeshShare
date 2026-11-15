@@ -29,6 +29,8 @@
   $: cpu = displayMetrics?.cpu_usage_percent;
   $: memory = memoryPercent(displayMetrics);
   $: gpu = gpuUtilization(displayMetrics);
+  $: hasSystemMetrics = cpu !== undefined || memory !== undefined;
+  $: hasGpuMetrics = gpu !== undefined || !!displayMetrics?.gpus.length;
   $: openable = allowOpen && kind === 'peer' && !!peer?.addresses.length;
 
   function isInsideRow(event: DragEvent): boolean {
@@ -85,9 +87,9 @@
       on:click={onDetails}
     >
       {#if hasMetrics}
-        <Meter label="CPU" value={formatPercent(cpu)} percent={cpu} />
-        <Meter label="内存" value={formatPercent(memory)} percent={memory} />
-        <Meter label="GPU" value={formatPercent(gpu)} percent={gpu} />
+        {#if hasSystemMetrics}<Meter label="CPU" value={formatPercent(cpu)} percent={cpu} />{/if}
+        {#if hasSystemMetrics}<Meter label="内存" value={formatPercent(memory)} percent={memory} />{/if}
+        {#if hasGpuMetrics}<Meter label="GPU" value={formatPercent(gpu)} percent={gpu} />{/if}
         <span class="meter meter-net">
           <b class="meter-value">↓ {formatRateCompact(displayMetrics?.network_down_bytes_per_sec)}</b>
           <b class="meter-value">↑ {formatRateCompact(displayMetrics?.network_up_bytes_per_sec)}</b>

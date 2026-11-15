@@ -93,11 +93,12 @@ fn register_service(daemon: &ServiceDaemon, node: &NodeInfo) -> Option<String> {
     let address = service_address(node)?;
     let host = format!("{}.local.", node.node_id.replace('-', ""));
     let protocol = PROTOCOL_VERSION.to_string();
+    let features = node.capabilities.join(",");
     let properties = [
         ("node_id", node.node_id.as_str()),
         ("node_name", node.node_name.as_str()),
         ("protocol", protocol.as_str()),
-        ("features", "clipboard,transfer,web,metrics"),
+        ("features", features.as_str()),
     ];
     let info = ServiceInfo::new(
         SERVICE_TYPE,
@@ -425,13 +426,15 @@ async fn run_peer_session(
                             }
                             if is_hello && !received_hello {
                                 received_hello = true;
-                                if let Some(snapshot) = runtime.clipboard_snapshot() {
-                                    let _ = runtime
-                                        .send_to_peer_with_retry(
-                                            node_id,
-                                            WireMessage::ClipboardSnapshot { snapshot },
-                                        )
-                                        .await;
+                                if runtime.peer_supports_clipboard(node_id) {
+                                    if let Some(snapshot) = runtime.clipboard_snapshot() {
+                                        let _ = runtime
+                                            .send_to_peer_with_retry(
+                                                node_id,
+                                                WireMessage::ClipboardSnapshot { snapshot },
+                                            )
+                                            .await;
+                                    }
                                 }
                                 server::replay_active_offers(runtime, node_id).await;
                             }

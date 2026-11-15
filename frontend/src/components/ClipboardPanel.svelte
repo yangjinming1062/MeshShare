@@ -8,6 +8,9 @@
   export let tab: 'current' | 'history' = 'current';
   export let busy = false;
   export let onPublish: () => void = () => {};
+  export let manualOnly = false;
+  export let onReadLocal: () => void = () => {};
+  export let onWriteLocal: () => void = () => {};
   export let onOpenHistory: (item: ClipboardHistoryItem) => void = () => {};
   export let onClearHistory: () => void = () => {};
 
@@ -22,7 +25,7 @@
   <div class="surface-head">
     <div class="surface-title">
       <h2>共享剪贴板</h2>
-      <span class="muted">{clipboard ? clipboard.source_name + ' · ' + formatTime(clipboard.updated_at_ms) : '复制后自动同步'}</span>
+        <span class="muted">{clipboard ? clipboard.source_name + ' · ' + formatTime(clipboard.updated_at_ms) : manualOnly ? '仅手动读取和发布' : '复制后自动同步'}</span>
     </div>
     <div class="surface-actions">
       <div class="clip-tabs" role="tablist" tabindex="-1" aria-label="剪贴板视图" on:keydown={handleTabKey}>
@@ -38,7 +41,7 @@
           id="clipboard-editor"
           class="field clip-editor"
           bind:value={draft}
-          placeholder="在任意设备复制文字或图片，这里会显示最近内容"
+          placeholder={manualOnly ? '输入或粘贴文字，然后手动发布' : '在任意设备复制文字或图片，这里会显示最近内容'}
         ></textarea>
         {#if clipboard?.image_png}
           <img class="clip-image" src={'data:image/png;base64,' + clipboard.image_png} alt="共享图片" />
@@ -46,7 +49,13 @@
       </div>
       <div class="action-row">
         <button type="button" class="btn btn-primary btn-sm" on:click={onPublish}>立即同步当前文字</button>
-        <span class="hint">桌面端复制后会自动推送</span>
+        {#if manualOnly}
+          <button type="button" class="btn btn-ghost btn-sm" on:click={onReadLocal}>读取本机剪贴板</button>
+          <button type="button" class="btn btn-ghost btn-sm" on:click={onWriteLocal}>写入本机剪贴板</button>
+          <span class="hint">不会自动监听或回写系统剪贴板</span>
+        {:else}
+          <span class="hint">桌面端复制后会自动推送</span>
+        {/if}
       </div>
     </div>
   {:else}

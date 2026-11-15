@@ -191,8 +191,87 @@ jobs:
           path: ${{ matrix.bundles }}
           if-no-files-found: error
 
+  android:
+    name: Build (android-arm64)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set application version from tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Expected a release tag such as v1.2.3"
+            exit 1
+          fi
+          printf '{"version":"%s"}\n' "${GITHUB_REF_NAME#v}" > release-version.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK components
+        run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci
+      - name: Initialize Android project
+        run: npx --yes @tauri-apps/cli@2 android init --ci --skip-targets-install
+        working-directory: backend
+      - name: Prepare Android signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          for variable in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Missing required Android signing secret: $variable"
+              exit 1
+            fi
+          done
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > backend/gen/android/app/android-release.keystore
+          {
+            printf 'storeFile=android-release.keystore\n'
+            printf 'storePassword=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$ANDROID_KEY_PASSWORD"
+          } > backend/gen/android/app/android-signing.properties
+          chmod 600 backend/gen/android/app/android-release.keystore backend/gen/android/app/android-signing.properties
+      - run: python3 .github/scripts/prepare_android_project.py
+      - name: Build signed Android APK
+        run: npx --yes @tauri-apps/cli@2 android build --config ../release-version.json --apk --target aarch64
+        working-directory: backend
+      - name: Verify and name Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk="backend/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+          if [[ ! -s "$apk" ]]; then
+            echo "::error::Signed Android APK was not produced"
+            exit 1
+          fi
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose "$apk"
+          mkdir -p android-release
+          cp "$apk" "android-release/MeshShare_${GITHUB_REF_NAME#v}_android_arm64.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeshShare-android-arm64
+          path: android-release/MeshShare_*_android_arm64.apk
+          if-no-files-found: error
+
   release:
-    needs: [notes, build]
+    needs: [notes, build, android]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -227,6 +306,7 @@ jobs:
             "MeshShare_${version}_amd64.AppImage"
             "MeshShare_${version}_amd64.deb"
             "MeshShare-${version}-1.x86_64.rpm"
+            "MeshShare_${version}_android_arm64.apk"
           )
           mapfile -t mac_updater_assets < <(find release-assets -type f -name '*.app.tar.gz' -printf '%f\n' | sort -u)
           if (( ${#mac_updater_assets[@]} != 2 )); then

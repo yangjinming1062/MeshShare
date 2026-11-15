@@ -14,7 +14,6 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-arboard = { version = "3.4", features = ["wayland-data-control"] }
 anyhow = "1"
 axum = { version = "0.7", features = ["ws", "multipart"] }
 axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
@@ -47,6 +46,9 @@ walkdir = "2"
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = { version = "3.4", features = ["wayland-data-control"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"

@@ -5,7 +5,7 @@ use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot,
     HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferOffer,
     TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
-    METRICS_SYSTEM_CAPABILITY,
+    CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::NodeRuntime;
 use axum::body::Body;
@@ -863,6 +863,12 @@ pub(crate) async fn handle_wire_message(
         }
         WireMessage::ClipboardUpdate { event } => {
             let peer_id = current_peer?;
+            let can_write_system_clipboard = runtime.supports_capability("clipboard.text");
+            let can_receive_clipboard = can_write_system_clipboard
+                || runtime.supports_capability(CLIPBOARD_VIEW_CAPABILITY);
+            if !can_receive_clipboard {
+                return Some(peer_id.to_string());
+            }
             if !validate_clipboard_event(&event) {
                 return Some(peer_id.to_string());
             }
@@ -870,20 +876,35 @@ pub(crate) async fn handle_wire_message(
                 .peer_name(peer_id)
                 .unwrap_or_else(|| "远端设备".to_string());
             if runtime.accept_clipboard(event.clone(), source_name) {
-                if let Some(snapshot) = runtime.clipboard_snapshot() {
-                    if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
-                        eprintln!("无法写入远端剪贴板：{error}");
+                if can_write_system_clipboard {
+                    if let Some(snapshot) = runtime.clipboard_snapshot() {
+                        if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
+                            eprintln!("无法写入远端剪贴板：{error}");
+                        }
                     }
                 }
-                runtime.publish_event(WireMessage::ClipboardUpdate {
-                    event: event.clone(),
-                });
-                runtime.send_to_peers_except(Some(peer_id), WireMessage::ClipboardUpdate { event });
+                if can_write_system_clipboard {
+                    runtime.publish_event(WireMessage::ClipboardUpdate {
+                        event: event.clone(),
+                    });
+                    runtime.send_to_peers_except(
+                        Some(peer_id),
+                        WireMessage::ClipboardUpdate { event },
+                    );
+                } else {
+                    runtime.publish_event(WireMessage::ClipboardUpdate { event });
+                }
             }
             Some(peer_id.to_string())
         }
         WireMessage::ClipboardSnapshot { snapshot } => {
             let peer_id = current_peer?;
+            let can_write_system_clipboard = runtime.supports_capability("clipboard.text");
+            let can_receive_clipboard = can_write_system_clipboard
+                || runtime.supports_capability(CLIPBOARD_VIEW_CAPABILITY);
+            if !can_receive_clipboard {
+                return Some(peer_id.to_string());
+            }
             if snapshot.source_name.len() > 256 {
                 return Some(peer_id.to_string());
             }
@@ -906,15 +927,24 @@ pub(crate) async fn handle_wire_message(
                 return Some(peer_id.to_string());
             }
             if runtime.accept_clipboard(event.clone(), source_name) {
-                if let Some(snapshot) = runtime.clipboard_snapshot() {
-                    if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
-                        eprintln!("无法写入远端剪贴板：{error}");
+                if can_write_system_clipboard {
+                    if let Some(snapshot) = runtime.clipboard_snapshot() {
+                        if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
+                            eprintln!("无法写入远端剪贴板：{error}");
+                        }
                     }
                 }
-                runtime.publish_event(WireMessage::ClipboardUpdate {
-                    event: event.clone(),
-                });
-                runtime.send_to_peers_except(Some(peer_id), WireMessage::ClipboardUpdate { event });
+                if can_write_system_clipboard {
+                    runtime.publish_event(WireMessage::ClipboardUpdate {
+                        event: event.clone(),
+                    });
+                    runtime.send_to_peers_except(
+                        Some(peer_id),
+                        WireMessage::ClipboardUpdate { event },
+                    );
+                } else {
+                    runtime.publish_event(WireMessage::ClipboardUpdate { event });
+                }
             }
             Some(peer_id.to_string())
         }
@@ -1001,7 +1031,8 @@ pub(crate) async fn handle_wire_message(
         WireMessage::MetricsUpdate { metrics } => {
             let peer_id = current_peer?;
             if validate_metrics(&metrics)
-                && runtime.peer_supports(peer_id, METRICS_SYSTEM_CAPABILITY)
+                && (runtime.peer_supports(peer_id, METRICS_SYSTEM_CAPABILITY)
+                    || runtime.peer_supports(peer_id, METRICS_NETWORK_CAPABILITY))
                 && runtime.update_peer_metrics(peer_id, metrics.clone())
             {
                 runtime.publish_event(WireMessage::MetricsUpdate { metrics });
@@ -2471,7 +2502,7 @@ mod tests {
         TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_TEXT_LIMIT,
         METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
     };
-    use crate::runtime::NodeRuntime;
+    use crate::runtime::{NodeProfile, NodeRuntime};
     use futures_util::{SinkExt, StreamExt};
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
@@ -2800,6 +2831,47 @@ mod tests {
         )
         .await;
         assert!(runtime.clipboard_snapshot().is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn android_view_only_peer_stores_remote_clipboard_without_system_write() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "meshshare-android-view-clipboard-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new_with_profile(
+            data_dir.clone(),
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+            NodeProfile::Android,
+        )
+        .expect("create Android runtime");
+        let event = ClipboardEvent {
+            event_id: "android-view".to_string(),
+            origin_node_id: "peer".to_string(),
+            clock: Hlc {
+                physical_ms: 1,
+                logical: 0,
+                node_id: "peer".to_string(),
+            },
+            text: Some("from desktop".to_string()),
+            image_png: None,
+            updated_at_ms: 1,
+        };
+        handle_wire_message(
+            WireMessage::ClipboardUpdate { event },
+            &runtime,
+            Some("peer"),
+        )
+        .await;
+        assert_eq!(
+            runtime
+                .clipboard_snapshot()
+                .and_then(|snapshot| snapshot.text),
+            Some("from desktop".to_string())
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

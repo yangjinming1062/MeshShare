@@ -5,6 +5,7 @@
   import type { NodeInfo } from '../types';
 
   export let node: NodeInfo | null = null;
+  export let mobileApp = false;
   export let status = '';
   export let statusKind: 'ok' | 'warn' | 'error' = 'warn';
   export let syncEnabled = true;
@@ -41,10 +42,12 @@
     </div>
   {/if}
   <div class="header-actions">
-    <TogglePill active={syncEnabled} label="自动同步" pressedLabel="同步已暂停" onToggle={onSync} />
-    <TogglePill active={autostartEnabled} label="开机自启" pressedLabel="自启已关闭" disabled={autostartBusy} onToggle={onAutostart} />
-    <button type="button" class="btn-icon" aria-label="设置" title="设置" on:click={onSettings}>
-      <Icon name="settings" size={17} />
-    </button>
+    {#if !mobileApp}
+      <TogglePill active={syncEnabled} label="自动同步" pressedLabel="同步已暂停" onToggle={onSync} />
+      <TogglePill active={autostartEnabled} label="开机自启" pressedLabel="自启已关闭" disabled={autostartBusy} onToggle={onAutostart} />
+      <button type="button" class="btn-icon" aria-label="设置" title="设置" on:click={onSettings}>
+        <Icon name="settings" size={17} />
+      </button>
+    {/if}
   </div>
 </header>

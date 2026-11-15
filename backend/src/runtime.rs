@@ -5,9 +5,10 @@ use crate::model::{
     ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession,
     MobileTransferView, MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings,
     TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT,
-    CLIPBOARD_TEXT_LIMIT, DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS,
-    MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS, MAX_MOBILE_SESSIONS,
-    MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY, DEFAULT_CLIPBOARD_HISTORY_COUNT,
+    DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS,
+    MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_GPU_VIEW_CAPABILITY,
+    METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY, METRICS_SYSTEM_VIEW_CAPABILITY,
     REMOTE_MANAGEMENT_CAPABILITY, TRANSFER_RELAY_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -149,6 +150,7 @@ struct MobileCa {
 }
 
 pub struct NodeRuntime {
+    profile: NodeProfile,
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
     pub clipboard: RwLock<Option<ClipboardSnapshot>>,
@@ -180,6 +182,51 @@ pub struct NodeRuntime {
     pub http: reqwest::Client,
     pub proxy_http: reqwest::Client,
     transfer_update_gate: Mutex<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeProfile {
+    Desktop,
+    Android,
+}
+
+impl NodeProfile {
+    pub const fn current() -> Self {
+        if cfg!(target_os = "android") {
+            Self::Android
+        } else {
+            Self::Desktop
+        }
+    }
+
+    pub const fn is_android(self) -> bool {
+        matches!(self, Self::Android)
+    }
+
+    pub fn capabilities(self) -> Vec<String> {
+        match self {
+            Self::Desktop => vec![
+                "clipboard.text".to_string(),
+                "clipboard.image/png".to_string(),
+                "transfer.file".to_string(),
+                "transfer.folder".to_string(),
+                "web.mobile".to_string(),
+                METRICS_SYSTEM_CAPABILITY.to_string(),
+                METRICS_GPU_CAPABILITY.to_string(),
+                METRICS_NETWORK_CAPABILITY.to_string(),
+                REMOTE_MANAGEMENT_CAPABILITY.to_string(),
+                TRANSFER_RELAY_CAPABILITY.to_string(),
+            ],
+            Self::Android => vec![
+                "transfer.file".to_string(),
+                "transfer.folder".to_string(),
+                CLIPBOARD_VIEW_CAPABILITY.to_string(),
+                METRICS_NETWORK_CAPABILITY.to_string(),
+                METRICS_SYSTEM_VIEW_CAPABILITY.to_string(),
+                METRICS_GPU_VIEW_CAPABILITY.to_string(),
+            ],
+        }
+    }
 }
 
 fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress {
@@ -238,6 +285,15 @@ fn is_clipboard_message(message: &WireMessage) -> bool {
 
 impl NodeRuntime {
     pub fn new(data_dir: PathBuf, port: u16, version: String) -> anyhow::Result<Arc<Self>> {
+        Self::new_with_profile(data_dir, port, version, NodeProfile::current())
+    }
+
+    pub fn new_with_profile(
+        data_dir: PathBuf,
+        port: u16,
+        version: String,
+        profile: NodeProfile,
+    ) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)?;
         let staging_root = data_dir.join("mobile-transfers");
         match std::fs::remove_dir_all(&staging_root) {
@@ -269,20 +325,11 @@ impl NodeRuntime {
             port,
             addresses: Vec::new(),
             mobile_addresses: Vec::new(),
-            capabilities: vec![
-                "clipboard.text".to_string(),
-                "clipboard.image/png".to_string(),
-                "transfer.file".to_string(),
-                "transfer.folder".to_string(),
-                "web.mobile".to_string(),
-                METRICS_SYSTEM_CAPABILITY.to_string(),
-                METRICS_GPU_CAPABILITY.to_string(),
-                REMOTE_MANAGEMENT_CAPABILITY.to_string(),
-                TRANSFER_RELAY_CAPABILITY.to_string(),
-            ],
+            capabilities: profile.capabilities(),
         };
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
+            profile,
             clock,
             node: RwLock::new(node),
             clipboard: RwLock::new(clipboard),
@@ -322,6 +369,18 @@ impl NodeRuntime {
                 .build()?,
             transfer_update_gate: Mutex::new(()),
         }))
+    }
+
+    pub fn is_android_profile(&self) -> bool {
+        self.profile.is_android()
+    }
+
+    pub fn supports_capability(&self, capability: &str) -> bool {
+        self.node
+            .read()
+            .capabilities
+            .iter()
+            .any(|item| item == capability)
     }
 
     pub fn node_info(&self) -> NodeInfo {
@@ -448,12 +507,17 @@ impl NodeRuntime {
                 (
                     node_id.clone(),
                     (
+                        peer.capabilities.iter().any(|capability| {
+                            capability == METRICS_SYSTEM_CAPABILITY
+                                || capability == METRICS_SYSTEM_VIEW_CAPABILITY
+                        }),
+                        peer.capabilities.iter().any(|capability| {
+                            capability == METRICS_GPU_CAPABILITY
+                                || capability == METRICS_GPU_VIEW_CAPABILITY
+                        }),
                         peer.capabilities
                             .iter()
-                            .any(|capability| capability == METRICS_SYSTEM_CAPABILITY),
-                        peer.capabilities
-                            .iter()
-                            .any(|capability| capability == METRICS_GPU_CAPABILITY),
+                            .any(|capability| capability == METRICS_NETWORK_CAPABILITY),
                     ),
                 )
             })
@@ -463,13 +527,23 @@ impl NodeRuntime {
             .lock()
             .iter()
             .filter_map(|(node_id, channel)| {
-                let (supports_system, supports_gpu) = peer_capabilities.get(node_id)?;
-                if !*supports_system {
+                let (supports_system, supports_gpu, supports_network) =
+                    peer_capabilities.get(node_id)?;
+                if !*supports_system && !*supports_network {
                     return None;
                 }
                 let mut outgoing = metrics.clone();
+                if !*supports_system {
+                    outgoing.cpu_usage_percent = None;
+                    outgoing.memory_used_bytes = None;
+                    outgoing.memory_total_bytes = None;
+                }
                 if !*supports_gpu {
                     outgoing.gpus.clear();
+                }
+                if !*supports_network {
+                    outgoing.network_down_bytes_per_sec = None;
+                    outgoing.network_up_bytes_per_sec = None;
                 }
                 Some((
                     channel.clone(),
@@ -536,8 +610,12 @@ impl NodeRuntime {
     }
 
     pub fn send_to_peer(&self, node_id: &str, message: WireMessage) -> bool {
-        let channel = self.peer_channels.lock().get(node_id).cloned();
         let is_clipboard = is_clipboard_message(&message);
+        if is_clipboard && !self.peer_supports_clipboard(node_id) {
+            self.pending_clipboard_resync.lock().remove(node_id);
+            return true;
+        }
+        let channel = self.peer_channels.lock().get(node_id).cloned();
         let Some(channel) = channel else {
             return false;
         };
@@ -577,14 +655,17 @@ impl NodeRuntime {
     }
 
     pub fn send_to_peers_except(&self, except: Option<&str>, message: WireMessage) {
+        let is_clipboard = is_clipboard_message(&message);
         let channels = self
             .peer_channels
             .lock()
             .iter()
-            .filter(|(node_id, _)| Some(node_id.as_str()) != except)
+            .filter(|(node_id, _)| {
+                Some(node_id.as_str()) != except
+                    && (!is_clipboard || self.peer_supports_clipboard(node_id))
+            })
             .map(|(node_id, channel)| (node_id.clone(), channel.clone()))
             .collect::<Vec<_>>();
-        let is_clipboard = is_clipboard_message(&message);
         for (node_id, channel) in channels {
             match channel.try_send(message.clone()) {
                 Ok(()) => {}
@@ -598,6 +679,10 @@ impl NodeRuntime {
 
     pub fn flush_clipboard_resync(&self, node_id: &str) -> bool {
         if !self.pending_clipboard_resync.lock().contains(node_id) {
+            return false;
+        }
+        if !self.peer_supports_clipboard(node_id) {
+            self.pending_clipboard_resync.lock().remove(node_id);
             return false;
         }
         let Some(snapshot) = self.clipboard_snapshot() else {
@@ -653,6 +738,20 @@ impl NodeRuntime {
             .read()
             .get(node_id)
             .is_some_and(|peer| peer.capabilities.iter().any(|item| item == capability))
+    }
+
+    /// Empty capability lists belong to legacy peers that predate capability
+    /// negotiation. Keep clipboard delivery compatible with those peers while
+    /// treating an explicit capability list without `clipboard.text` or
+    /// `clipboard.view` as an intentional opt-out.
+    pub fn peer_supports_clipboard(&self, node_id: &str) -> bool {
+        self.peers.read().get(node_id).is_none_or(|peer| {
+            peer.capabilities.is_empty()
+                || peer
+                    .capabilities
+                    .iter()
+                    .any(|item| item == "clipboard.text" || item == CLIPBOARD_VIEW_CAPABILITY)
+        })
     }
 
     pub fn peer_name(&self, node_id: &str) -> Option<String> {
@@ -2617,7 +2716,9 @@ mod tests {
     use crate::model::{
         ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
         PeerInfo, ReceiveMode, TransferItem, TransferOffer, TransferStatus, WireMessage,
-        MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_SYSTEM_CAPABILITY,
+        CLIPBOARD_VIEW_CAPABILITY, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
+        METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+        METRICS_SYSTEM_VIEW_CAPABILITY,
     };
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
@@ -3027,6 +3128,135 @@ mod tests {
         runtime
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn network_metric_peers_receive_only_network_fields() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let (tx, mut rx) = mpsc::channel(8);
+        runtime.set_peer(test_peer(
+            "network-only",
+            vec![METRICS_NETWORK_CAPABILITY.to_string()],
+        ));
+        runtime.add_peer_channel("network-only".to_string(), tx);
+        runtime.publish_metrics(HardwareMetrics {
+            node_id: runtime.node_id(),
+            sampled_at_ms: 1,
+            cpu_usage_percent: Some(12.0),
+            memory_used_bytes: Some(10),
+            memory_total_bytes: Some(20),
+            network_down_bytes_per_sec: Some(30),
+            network_up_bytes_per_sec: Some(40),
+            gpus: vec![GpuMetrics {
+                name: "GPU".to_string(),
+                utilization_percent: Some(50.0),
+                memory_used_bytes: Some(1),
+                memory_total_bytes: Some(2),
+                memory_kind: GpuMemoryKind::Dedicated,
+                unavailable_reason: None,
+            }],
+        });
+        let message = rx.try_recv().expect("network peer receives metrics");
+        match message {
+            WireMessage::MetricsUpdate { metrics } => {
+                assert_eq!(metrics.cpu_usage_percent, None);
+                assert_eq!(metrics.memory_used_bytes, None);
+                assert_eq!(metrics.network_down_bytes_per_sec, Some(30));
+                assert_eq!(metrics.network_up_bytes_per_sec, Some(40));
+                assert!(metrics.gpus.is_empty());
+            }
+            _ => panic!("unexpected message"),
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn android_view_peers_receive_desktop_system_and_gpu_metrics() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let (tx, mut rx) = mpsc::channel(8);
+        runtime.set_peer(test_peer(
+            "android",
+            vec![
+                METRICS_NETWORK_CAPABILITY.to_string(),
+                METRICS_SYSTEM_VIEW_CAPABILITY.to_string(),
+                METRICS_GPU_VIEW_CAPABILITY.to_string(),
+            ],
+        ));
+        runtime.add_peer_channel("android".to_string(), tx);
+        runtime.publish_metrics(HardwareMetrics {
+            node_id: runtime.node_id(),
+            sampled_at_ms: 1,
+            cpu_usage_percent: Some(12.0),
+            memory_used_bytes: Some(10),
+            memory_total_bytes: Some(20),
+            network_down_bytes_per_sec: Some(30),
+            network_up_bytes_per_sec: Some(40),
+            gpus: vec![GpuMetrics {
+                name: "GPU".to_string(),
+                utilization_percent: Some(50.0),
+                memory_used_bytes: Some(1),
+                memory_total_bytes: Some(2),
+                memory_kind: GpuMemoryKind::Dedicated,
+                unavailable_reason: None,
+            }],
+        });
+        match rx.try_recv().expect("Android view peer receives metrics") {
+            WireMessage::MetricsUpdate { metrics } => {
+                assert_eq!(metrics.cpu_usage_percent, Some(12.0));
+                assert_eq!(metrics.memory_used_bytes, Some(10));
+                assert_eq!(metrics.memory_total_bytes, Some(20));
+                assert_eq!(metrics.network_down_bytes_per_sec, Some(30));
+                assert_eq!(metrics.network_up_bytes_per_sec, Some(40));
+                assert_eq!(metrics.gpus.len(), 1);
+            }
+            _ => panic!("unexpected message"),
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn android_profile_advertises_transfer_network_and_view_metrics() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new_with_profile(
+            path.clone(),
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+            super::NodeProfile::Android,
+        )
+        .expect("create Android runtime");
+        let node = runtime.node_info();
+        assert!(runtime.is_android_profile());
+        assert!(node.capabilities.iter().any(|item| item == "transfer.file"));
+        assert!(node
+            .capabilities
+            .iter()
+            .any(|item| item == METRICS_NETWORK_CAPABILITY));
+        assert!(!node
+            .capabilities
+            .iter()
+            .any(|item| item == METRICS_SYSTEM_CAPABILITY));
+        assert!(node
+            .capabilities
+            .iter()
+            .any(|item| item == METRICS_SYSTEM_VIEW_CAPABILITY));
+        assert!(node
+            .capabilities
+            .iter()
+            .any(|item| item == METRICS_GPU_VIEW_CAPABILITY));
+        assert!(!node
+            .capabilities
+            .iter()
+            .any(|item| item == "clipboard.text"));
+        assert!(node
+            .capabilities
+            .iter()
+            .any(|item| item == CLIPBOARD_VIEW_CAPABILITY));
+        assert!(!node.capabilities.iter().any(|item| item == "web.mobile"));
         let _ = std::fs::remove_dir_all(path);
     }
 
@@ -3448,6 +3678,7 @@ mod tests {
             .create_local_clipboard_named(Some("latest".to_string()), None, "local".to_string())
             .expect("create clipboard event");
         let (tx, mut rx) = mpsc::channel(1);
+        runtime.set_peer(test_peer("peer", vec!["clipboard.text".to_string()]));
         runtime.add_peer_channel("peer".to_string(), tx);
         assert!(runtime.send_to_peer("peer", WireMessage::Ping { at_ms: 1 }));
         assert!(!runtime.send_to_peer(
@@ -3464,6 +3695,60 @@ mod tests {
             }
             _ => panic!("expected clipboard snapshot"),
         }
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_messages_skip_peers_without_clipboard_capability() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let event = runtime
+            .create_local_clipboard_named(Some("manual".to_string()), None, "local".to_string())
+            .expect("create clipboard event");
+        let (tx, mut rx) = mpsc::channel(8);
+        runtime.set_peer(test_peer(
+            "android",
+            vec![
+                "transfer.file".to_string(),
+                METRICS_NETWORK_CAPABILITY.to_string(),
+            ],
+        ));
+        runtime.add_peer_channel("android".to_string(), tx);
+
+        assert!(runtime.send_to_peer(
+            "android",
+            WireMessage::ClipboardUpdate {
+                event: event.clone()
+            },
+        ));
+        runtime.send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
+        assert!(rx.try_recv().is_err());
+
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_messages_reach_view_only_peers() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let event = runtime
+            .create_local_clipboard_named(Some("view".to_string()), None, "local".to_string())
+            .expect("create clipboard event");
+        let (tx, mut rx) = mpsc::channel(8);
+        runtime.set_peer(test_peer(
+            "android",
+            vec![CLIPBOARD_VIEW_CAPABILITY.to_string()],
+        ));
+        runtime.add_peer_channel("android".to_string(), tx);
+
+        assert!(runtime.send_to_peer("android", WireMessage::ClipboardUpdate { event },));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(WireMessage::ClipboardUpdate { .. })
+        ));
+
         let _ = std::fs::remove_dir_all(path);
     }
 

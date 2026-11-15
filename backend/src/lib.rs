@@ -11,10 +11,13 @@ mod runtime;
 mod server;
 mod updater;
 
+#[cfg(not(target_os = "android"))]
 use anyhow::Context;
+#[cfg(not(target_os = "android"))]
+use model::MonitorPosition;
 use model::{
-    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, MonitorPosition, ReceiveMode,
-    ReceiveSettings, TransferProgress,
+    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, ReceiveMode, ReceiveSettings,
+    TransferProgress,
 };
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
@@ -23,11 +26,16 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(not(target_os = "android"))]
 use tauri::menu::{Menu, MenuItem};
 #[cfg(target_os = "macos")]
 use tauri::RunEvent;
-use tauri::{AppHandle, Manager, PhysicalPosition, State, WindowEvent};
-use updater::{UpdateCoordinator, UpdateStatus};
+use tauri::{AppHandle, Manager, State};
+#[cfg(not(target_os = "android"))]
+use tauri::{PhysicalPosition, WindowEvent};
+#[cfg(not(target_os = "android"))]
+use updater::UpdateCoordinator;
+use updater::UpdateStatus;
 
 #[derive(Clone)]
 struct ManagedNode {
@@ -35,6 +43,7 @@ struct ManagedNode {
     control: Arc<control::ControlPlane>,
 }
 
+#[cfg(not(target_os = "android"))]
 struct TrayHandles {
     window_toggle: MenuItem<tauri::Wry>,
     monitor_toggle: MenuItem<tauri::Wry>,
@@ -60,6 +69,7 @@ pub(crate) struct MonitorCapabilities {
     pub(crate) can_keep_above: bool,
 }
 
+#[cfg(not(target_os = "android"))]
 fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilities {
     match backend {
         MonitorBackend::Wayland => MonitorCapabilities {
@@ -83,6 +93,7 @@ fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilit
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn monitor_backend<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> MonitorBackend {
     #[cfg(target_os = "linux")]
     {
@@ -100,14 +111,31 @@ fn monitor_backend<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> Monit
     }
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabilities {
     app.get_webview_window("monitor")
         .map(|window| monitor_capabilities_for_backend(monitor_backend(&window)))
         .unwrap_or_else(|| monitor_capabilities_for_backend(MonitorBackend::Unknown))
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn effective_monitor_locked(app: &AppHandle, runtime: &NodeRuntime) -> bool {
     current_monitor_capabilities(app).can_click_through && runtime.monitor_locked()
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn current_monitor_capabilities(_app: &AppHandle) -> MonitorCapabilities {
+    MonitorCapabilities {
+        backend: MonitorBackend::Unknown,
+        can_persist_position: false,
+        can_click_through: false,
+        can_keep_above: false,
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn effective_monitor_locked(_app: &AppHandle, runtime: &NodeRuntime) -> bool {
+    runtime.monitor_locked()
 }
 
 #[tauri::command]
@@ -218,6 +246,19 @@ fn accept_transfer(
     control::accept_transfer_at(&state.runtime, transfer_id, PathBuf::from(destination))
 }
 
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn android_receive_directory(app: AppHandle) -> Result<String, String> {
+    let directory = app
+        .path()
+        .download_dir()
+        .map_err(|error| format!("无法取得 Android 应用存储目录：{error}"))?
+        .join("MeshShare");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("无法创建 Android 接收目录：{error}"))?;
+    Ok(directory.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 fn register_outgoing_transfer(
     state: State<'_, ManagedNode>,
@@ -232,16 +273,19 @@ fn update_transfer_progress(state: State<'_, ManagedNode>, progress: TransferPro
     state.runtime.update_transfer(&transfer_id, progress);
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn monitor_capabilities(app: AppHandle) -> MonitorCapabilities {
     current_monitor_capabilities(&app)
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn monitor_locked(app: AppHandle, state: State<'_, ManagedNode>) -> bool {
     effective_monitor_locked(&app, state.runtime.as_ref())
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn apply_monitor_locked(
     app: &AppHandle,
     runtime: &NodeRuntime,
@@ -267,6 +311,7 @@ pub(crate) fn apply_monitor_locked(
     Ok(locked)
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn set_monitor_locked(
     app: AppHandle,
@@ -276,6 +321,7 @@ fn set_monitor_locked(
     apply_monitor_locked(&app, state.runtime.as_ref(), locked)
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn popup_monitor_menu(app: AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window("monitor") else {
@@ -297,6 +343,7 @@ fn popup_monitor_menu(app: AppHandle) -> Result<(), String> {
         .map_err(|error| format!("无法打开悬浮条菜单：{error}"))
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
 fn set_monitor_position(
     app: AppHandle,
@@ -313,6 +360,7 @@ fn set_monitor_position(
         .map_err(|error| error.to_string())
 }
 
+#[cfg(not(target_os = "android"))]
 fn window_toggle_label(visible: bool) -> &'static str {
     if visible {
         "隐藏窗口"
@@ -321,6 +369,7 @@ fn window_toggle_label(visible: bool) -> &'static str {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn monitor_toggle_label(visible: bool) -> &'static str {
     if visible {
         "隐藏悬浮监控条"
@@ -329,6 +378,7 @@ fn monitor_toggle_label(visible: bool) -> &'static str {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn monitor_lock_toggle_label(locked: bool) -> &'static str {
     if locked {
         "解锁悬浮条"
@@ -337,11 +387,13 @@ fn monitor_lock_toggle_label(locked: bool) -> &'static str {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn tray_monitor_locked(app: &AppHandle) -> bool {
     app.try_state::<ManagedNode>()
         .is_some_and(|state| effective_monitor_locked(app, state.runtime.as_ref()))
 }
 
+#[cfg(not(target_os = "android"))]
 fn clipboard_sync_toggle_label(enabled: bool) -> &'static str {
     if enabled {
         "暂停剪贴板同步"
@@ -350,6 +402,7 @@ fn clipboard_sync_toggle_label(enabled: bool) -> &'static str {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn tray_sync_enabled(app: &AppHandle) -> bool {
     app.try_state::<ManagedNode>().is_some_and(|state| {
         state
@@ -359,18 +412,21 @@ fn tray_sync_enabled(app: &AppHandle) -> bool {
     })
 }
 
+#[cfg(not(target_os = "android"))]
 fn main_window_visible(app: &AppHandle) -> bool {
     app.get_webview_window("main")
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false)
 }
 
+#[cfg(not(target_os = "android"))]
 fn monitor_window_visible(app: &AppHandle) -> bool {
     app.get_webview_window("monitor")
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false)
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn sync_tray_labels(app: &AppHandle) {
     let Some(tray) = app.try_state::<TrayHandles>() else {
         return;
@@ -389,6 +445,7 @@ pub(crate) fn sync_tray_labels(app: &AppHandle) {
         .set_text(clipboard_sync_toggle_label(tray_sync_enabled(app)));
 }
 
+#[cfg(not(target_os = "android"))]
 fn set_main_window_visible(app: &AppHandle, visible: bool) {
     if let Some(window) = app.get_webview_window("main") {
         if visible {
@@ -402,6 +459,7 @@ fn set_main_window_visible(app: &AppHandle, visible: bool) {
     sync_tray_labels(app);
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked: bool) {
     let Some(window) = app.get_webview_window("monitor") else {
         return;
@@ -416,6 +474,25 @@ pub(crate) fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked:
     sync_tray_labels(app);
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn sync_tray_labels(_app: &AppHandle) {}
+
+#[cfg(target_os = "android")]
+pub(crate) fn set_monitor_window_visible(_app: &AppHandle, _visible: bool, _locked: bool) {}
+
+#[cfg(target_os = "android")]
+pub(crate) fn apply_monitor_locked(
+    _app: &AppHandle,
+    runtime: &NodeRuntime,
+    locked: bool,
+) -> Result<bool, String> {
+    runtime
+        .set_monitor_locked(locked)
+        .map_err(|error| error.to_string())?;
+    Ok(locked)
+}
+
+#[cfg(not(target_os = "android"))]
 fn apply_autostart_registration(
     registration: &autostart::Registration,
     enabled: bool,
@@ -431,6 +508,7 @@ fn apply_autostart_registration(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn sync_autostart_registration(runtime: &NodeRuntime) {
     if cfg!(debug_assertions) {
         return;
@@ -447,16 +525,20 @@ fn sync_autostart_registration(runtime: &NodeRuntime) {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn is_autostart_launch() -> bool {
     autostart::launched_from_args(std::env::args())
 }
 
+#[cfg(not(target_os = "android"))]
 fn show_main_window(app: &AppHandle) {
     set_main_window_visible(app, true);
 }
 
+#[cfg(not(target_os = "android"))]
 const MONITOR_MARGIN_PX: i32 = 16;
 
+#[cfg(not(target_os = "android"))]
 fn point_is_in_work_area(position: &MonitorPosition, monitor: &tauri::Monitor) -> bool {
     let area = monitor.work_area();
     let left = i64::from(area.position.x);
@@ -468,6 +550,7 @@ fn point_is_in_work_area(position: &MonitorPosition, monitor: &tauri::Monitor) -
     x >= left && x < right && y >= top && y < bottom
 }
 
+#[cfg(not(target_os = "android"))]
 fn clamp_monitor_position(
     position: MonitorPosition,
     monitor: &tauri::Monitor,
@@ -486,6 +569,7 @@ fn clamp_monitor_position(
     )
 }
 
+#[cfg(not(target_os = "android"))]
 fn clamp_position_to_work_area(
     position: MonitorPosition,
     area_x: i32,
@@ -509,6 +593,7 @@ fn clamp_position_to_work_area(
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn position_monitor_window<R: tauri::Runtime>(
     window: &tauri::WebviewWindow<R>,
     runtime: &NodeRuntime,
@@ -631,6 +716,7 @@ fn static_root(app: &AppHandle) -> PathBuf {
     bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/dist"))
 }
 
+#[cfg(not(target_os = "android"))]
 fn setup_tray_menu(app: &AppHandle) -> anyhow::Result<()> {
     let tray = app
         .tray_by_id("meshshare")
@@ -734,7 +820,8 @@ fn setup_tray_menu(app: &AppHandle) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run() {
+#[cfg(not(target_os = "android"))]
+fn run_desktop() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
@@ -845,6 +932,47 @@ pub fn run() {
             #[cfg(not(target_os = "macos"))]
             let _ = (app, event);
         });
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn run() {
+    run_desktop();
+}
+
+#[cfg(target_os = "android")]
+#[tauri::mobile_entry_point]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from(".meshshare"));
+            let (runtime, control) = tauri::async_runtime::block_on(start_node(
+                data_dir,
+                static_root(app.handle()),
+                app.package_info().version.to_string(),
+                app.handle().clone(),
+            ))?;
+            app.manage(ManagedNode { runtime, control });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            node_base_url,
+            clipboard_status,
+            clipboard_history_settings,
+            set_clipboard_history_settings,
+            receive_settings,
+            set_receive_settings,
+            accept_transfer,
+            android_receive_directory,
+            register_outgoing_transfer,
+            update_transfer_progress
+        ])
+        .build(tauri::generate_context!())
+        .expect("error while building MeshShare")
+        .run(|_app, _event| {});
 }
 
 pub fn cleanup_autostart() {
