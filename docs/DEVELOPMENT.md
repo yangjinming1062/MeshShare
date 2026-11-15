@@ -4,7 +4,7 @@
 
 安装 Git、Rust stable（当前 Tauri 2 依赖链和 single-instance 插件要求 Rust 1.90 或更高）和 Node.js 22，准备对应系统的构建依赖。Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1、Wayland 开发库和 Ayatana AppIndicator 等开发包。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
 
-Android 开发还需要 Android Studio 或 Android command-line tools、JDK、Android SDK Platform、Build Tools、NDK 和四个 Rust Android targets。当前 App 使用局域网明文 HTTP/WebSocket，因此 Android 发行构建必须保留 `usesCleartextTraffic`；该设置只适用于受信任局域网，不表示公网安全。
+Android 开发还需要 Android Studio 或 Android command-line tools、JDK、Android SDK Platform、Build Tools、NDK 和四个 Rust Android targets。CI Android 构建固定使用 NDK 27.2.12479018，本地构建也应显式设置 `NDK_HOME`，避免多个 NDK 版本被自动选错。当前 App 使用局域网明文 HTTP/WebSocket，因此 Android 发行构建必须保留 `usesCleartextTraffic`；该设置只适用于受信任局域网，不表示公网安全。
 
 以下命令从仓库根目录执行。Tauri CLI 由 `npx` 按需运行。
 
@@ -38,6 +38,7 @@ npx --yes @tauri-apps/cli@2 dev -- --locked
 ```bash
 export JAVA_HOME="/path/to/jdk"
 export ANDROID_HOME="/path/to/android-sdk"
+export NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
 rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
 npx --yes @tauri-apps/cli@2 android init --ci --skip-targets-install
 python3 .github/scripts/prepare_android_project.py

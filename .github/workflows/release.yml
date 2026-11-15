@@ -220,6 +220,20 @@ jobs:
           packages: platform-tools
       - name: Install Android SDK components
         run: sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
+      - name: Select Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ndk_home="$ANDROID_HOME/ndk/27.2.12479018"
+          compiler="$ndk_home/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+          if [[ ! -x "$compiler" ]]; then
+            echo "::error::Android NDK 27.2.12479018 compiler is missing: $compiler"
+            exit 1
+          fi
+          echo "NDK_HOME=$ndk_home" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk_home" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ndk_home" >> "$GITHUB_ENV"
+          echo "$ndk_home/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android

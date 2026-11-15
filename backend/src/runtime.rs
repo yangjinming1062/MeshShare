@@ -2690,7 +2690,7 @@ fn network_addresses_for_bound(port: u16, bound: &BTreeSet<Ipv4Addr>) -> Vec<Add
 
 pub fn bind_addresses() -> BTreeSet<Ipv4Addr> {
     let mut addresses = BTreeSet::from([Ipv4Addr::LOCALHOST]);
-    match get_if_addrs::get_if_addrs() {
+    match if_addrs::get_if_addrs() {
         Ok(interfaces) => {
             addresses.extend(
                 interfaces

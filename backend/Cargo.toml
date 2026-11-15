@@ -19,7 +19,7 @@ axum = { version = "0.7", features = ["ws", "multipart"] }
 axum-server = { version = "0.9", features = ["tls-rustls-ring"] }
 base64 = "0.22"
 futures-util = "0.3"
-get_if_addrs = "0.5"
+if-addrs = "0.13"
 hostname = "0.4"
 http-body-util = "0.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
