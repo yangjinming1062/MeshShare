@@ -55,10 +55,6 @@ npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-upda
 
 Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 合并成 `latest.json`。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在清单、签名和所有安装包都上传后才解除 Release 草稿状态，并保持 prerelease 标记；人工验证安装包后，在 GitHub Release 页面取消 prerelease 标记，版本才会进入 `releases/latest` 并允许客户端自动更新。已人工晋级为稳定版的 Release 不会被工作流重跑覆盖。
 
-macOS 公开发布必须使用 Apple Developer ID Application 证书签名并完成公证。发布工作流在两个 macOS 构建任务开始前校验以下 GitHub Actions Secrets：`APPLE_CERTIFICATE`（导出的 `.p12` 文件，使用 `openssl base64 -A` 编码）、`APPLE_CERTIFICATE_PASSWORD` 和 `APPLE_SIGNING_IDENTITY`（必须以 `Developer ID Application:` 开头）。公证凭据可使用 App Store Connect API Key：`APPLE_API_KEY`、`APPLE_API_ISSUER`、`APPLE_API_PRIVATE_KEY`（`AuthKey_*.p8` 的 base64 内容）；也可使用 Apple ID：`APPLE_ID`、`APPLE_PASSWORD`（应用专用密码）和 `APPLE_TEAM_ID`。两种公证方式只能配置一种，凭据不能提交到仓库。
-
-构建阶段由 Tauri 使用证书签名并公证 `.app`，随后工作流再次提交 DMG 到 Apple Notary Service、装订票据并执行 `codesign`、`stapler`、`spctl` 和 `hdiutil` 验证。任一 macOS 凭据缺失或验证失败都会停止发布，避免生成可下载但被 Gatekeeper 判定为损坏的安装包。旧版本的 ad-hoc 包不能通过修改用户电脑恢复为 Developer ID 签名；修复后必须推送新的版本 tag。
-
 开发构建不会执行 GitHub 更新检查。
 
 ### Wayland 运行验收
