@@ -5,8 +5,10 @@
   export let metrics: HardwareMetrics | null = null;
   export let compactNetwork = false;
   export let monitorLocked = false;
+  export let monitorVisible = true;
   export let canClickThrough = false;
   export let onToggleLock: () => void = () => {};
+  export let onToggleVisible: () => void = () => {};
 
   $: stale = isMetricsStale(metrics);
   $: displayMetrics = stale ? null : metrics;
@@ -36,6 +38,13 @@
       <h2>{compactNetwork ? '本机网络' : '本机硬件'}</h2>
     </div>
     <div class="surface-actions">
+      <button
+        type="button"
+        class="btn btn-ghost btn-sm"
+        aria-pressed={monitorVisible}
+        title="显示或隐藏悬浮监控条"
+        on:click={onToggleVisible}
+      >{monitorVisible ? '隐藏悬浮条' : '显示悬浮条'}</button>
       <button
         type="button"
         class="btn btn-ghost btn-sm monitor-lock-toggle"

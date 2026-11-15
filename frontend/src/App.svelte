@@ -76,6 +76,7 @@
   let manualAddress = '';
   let savedNodeUrls: string[] = [];
   let monitorLocked = false;
+  let monitorVisible = true;
   let settingsOpen = false;
   let mobileAccessOpen = false;
   let addDeviceOpen = false;
@@ -279,7 +280,10 @@
         if (!activeBaseUrl) activeBaseUrl = base;
         if (isDesktopWindow) {
           monitorCapabilities = await invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities);
-          monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
+          [monitorLocked, monitorVisible] = await Promise.all([
+            invoke<boolean>('monitor_locked').catch(() => monitorLocked),
+            invoke<boolean>('monitor_visible').catch(() => monitorVisible),
+          ]);
         }
         if (isDesktopWindow) {
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
@@ -332,7 +336,12 @@
     const requestId = ++refreshRequestId;
     const generation = targetGeneration;
     const target = activeBaseUrl;
-    if (isDesktopWindow && !remoteMode) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
+    if (isDesktopWindow && !remoteMode) {
+      [monitorLocked, monitorVisible] = await Promise.all([
+        invoke<boolean>('monitor_locked').catch(() => monitorLocked),
+        invoke<boolean>('monitor_visible').catch(() => monitorVisible),
+      ]);
+    }
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
       if (generation !== targetGeneration || target !== activeBaseUrl) return;
@@ -447,6 +456,7 @@
     clipboardHistorySettings = settings.clipboard_history_settings;
     clipboardStatus = settings.clipboard_status;
     monitorLocked = settings.monitor.locked;
+    monitorVisible = settings.monitor.visible;
     monitorCapabilities = settings.monitor.capabilities;
   }
 
@@ -869,6 +879,20 @@
       notice = monitorLocked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法更新悬浮监控条状态';
+    }
+    window.setTimeout(() => (notice = ''), 2400);
+  }
+
+  async function toggleMonitorVisibility() {
+    try {
+      if (remoteMode) {
+        applyRemoteSettings(await patchSettings({ monitor: { visible: !monitorVisible } }));
+      } else {
+        monitorVisible = await invoke<boolean>('set_monitor_visible', { visible: !monitorVisible });
+      }
+      notice = monitorVisible ? '悬浮监控条已显示' : '悬浮监控条已隐藏';
+    } catch (error) {
+      notice = typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新悬浮监控条可见性';
     }
     window.setTimeout(() => (notice = ''), 2400);
   }
@@ -1915,8 +1939,10 @@
       <HardwarePanel
         metrics={metrics}
         {monitorLocked}
+        {monitorVisible}
         canClickThrough={monitorCapabilities.can_click_through}
         onToggleLock={toggleMonitorLock}
+        onToggleVisible={toggleMonitorVisibility}
       />
       <ClipboardPanel
         {clipboard}

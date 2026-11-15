@@ -2930,7 +2930,8 @@ mod tests {
             .json(&serde_json::json!({
                 "clipboard_sync_enabled": false,
                 "update_frequency": "daily",
-                "clipboard_history_settings": { "mode": "count", "value": 2 }
+                "clipboard_history_settings": { "mode": "count", "value": 2 },
+                "monitor": { "visible": false }
             }))
             .send()
             .await
@@ -2942,7 +2943,9 @@ mod tests {
             .expect("decode patched settings");
         assert_eq!(patched["clipboard_sync_enabled"], false);
         assert_eq!(patched["update_frequency"], "daily");
+        assert_eq!(patched["monitor"]["visible"], false);
         assert_eq!(runtime.clipboard_history_settings().count, 2);
+        assert!(!runtime.monitor_visible());
 
         let offer = TransferOffer {
             transfer_id: "remote-accept".to_string(),

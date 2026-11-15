@@ -325,6 +325,23 @@ fn set_monitor_locked(
 
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
+fn monitor_visible(state: State<'_, ManagedNode>) -> bool {
+    state.runtime.monitor_visible()
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+fn set_monitor_visible(
+    app: AppHandle,
+    state: State<'_, ManagedNode>,
+    visible: bool,
+) -> Result<bool, String> {
+    apply_monitor_visible(&app, state.runtime.as_ref(), visible)?;
+    Ok(state.runtime.monitor_visible())
+}
+
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
 fn popup_monitor_menu(app: AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window("monitor") else {
         return Err("悬浮监控条尚未创建".to_string());
@@ -493,11 +510,44 @@ pub(crate) fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked:
     sync_tray_labels(app);
 }
 
+#[cfg(not(target_os = "android"))]
+pub(crate) fn apply_monitor_visible(
+    app: &AppHandle,
+    runtime: &NodeRuntime,
+    visible: bool,
+) -> Result<(), String> {
+    runtime
+        .set_monitor_visible(visible)
+        .map_err(|error| error.to_string())?;
+    set_monitor_window_visible(app, visible, effective_monitor_locked(app, runtime));
+    Ok(())
+}
+
+#[cfg(not(target_os = "android"))]
+fn hide_monitor_persisted(app: &AppHandle) {
+    if let Some(state) = app.try_state::<ManagedNode>() {
+        if let Err(error) = apply_monitor_visible(app, state.runtime.as_ref(), false) {
+            eprintln!("保存悬浮监控条可见性失败：{error}");
+        }
+    }
+}
+
 #[cfg(target_os = "android")]
 pub(crate) fn sync_tray_labels(_app: &AppHandle) {}
 
 #[cfg(target_os = "android")]
 pub(crate) fn set_monitor_window_visible(_app: &AppHandle, _visible: bool, _locked: bool) {}
+
+#[cfg(target_os = "android")]
+pub(crate) fn apply_monitor_visible(
+    _app: &AppHandle,
+    runtime: &NodeRuntime,
+    visible: bool,
+) -> Result<(), String> {
+    runtime
+        .set_monitor_visible(visible)
+        .map_err(|error| error.to_string())
+}
 
 #[cfg(target_os = "android")]
 pub(crate) fn apply_monitor_locked(
@@ -808,13 +858,8 @@ fn setup_tray_menu(app: &AppHandle) -> anyhow::Result<()> {
         "toggle-monitor" => {
             if let Some(state) = app.try_state::<ManagedNode>() {
                 let visible = !monitor_window_visible(app);
-                match state.runtime.set_monitor_visible(visible) {
-                    Ok(()) => set_monitor_window_visible(
-                        app,
-                        visible,
-                        effective_monitor_locked(app, state.runtime.as_ref()),
-                    ),
-                    Err(error) => eprintln!("保存悬浮监控条可见性失败：{error}"),
+                if let Err(error) = apply_monitor_visible(app, state.runtime.as_ref(), visible) {
+                    eprintln!("保存悬浮监控条可见性失败：{error}");
                 }
             }
         }
@@ -903,9 +948,7 @@ fn run_desktop() {
                             }
                         }
                     }
-                    "monitor-hide-now" => {
-                        set_monitor_window_visible(&app_for_menu, false, false);
-                    }
+                    "monitor-hide-now" => hide_monitor_persisted(&app_for_menu),
                     _ => {}
                 });
             }
@@ -926,7 +969,7 @@ fn run_desktop() {
                 window.on_window_event(move |event| {
                     if let WindowEvent::CloseRequested { api, .. } = event {
                         api.prevent_close();
-                        set_monitor_window_visible(&app_for_close, false, false);
+                        hide_monitor_persisted(&app_for_close);
                     }
                 });
             }
@@ -953,6 +996,8 @@ fn run_desktop() {
             monitor_capabilities,
             monitor_locked,
             set_monitor_locked,
+            monitor_visible,
+            set_monitor_visible,
             popup_monitor_menu,
             set_monitor_position
         ])

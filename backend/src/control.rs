@@ -307,17 +307,13 @@ impl ControlPlane {
     }
 
     fn set_monitor_visible(&self, visible: bool) -> Result<(), String> {
-        self.runtime
-            .set_monitor_visible(visible)
-            .map_err(|error| error.to_string())?;
-        if let Some(app) = self.app.as_ref() {
-            crate::set_monitor_window_visible(
-                app,
-                visible,
-                crate::effective_monitor_locked(app, self.runtime.as_ref()),
-            );
+        match self.app.as_ref() {
+            Some(app) => crate::apply_monitor_visible(app, self.runtime.as_ref(), visible),
+            None => self
+                .runtime
+                .set_monitor_visible(visible)
+                .map_err(|error| error.to_string()),
         }
-        Ok(())
     }
 
     fn set_monitor_locked(&self, locked: bool) -> Result<(), String> {
