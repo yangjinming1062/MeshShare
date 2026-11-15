@@ -55,7 +55,8 @@
   let autostartBusy = false;
   let updateFrequency: UpdateFrequency = 'weekly';
   let updateStatus: UpdateStatus | null = null;
-  let monitorCapabilities: MonitorCapabilities = { backend: 'unknown', can_persist_position: false, can_click_through: false, can_keep_above: false };
+  const UNKNOWN_MONITOR_CAPABILITIES: MonitorCapabilities = { backend: 'unknown', can_persist_position: false, can_click_through: false, can_keep_above: false };
+  let monitorCapabilities: MonitorCapabilities = UNKNOWN_MONITOR_CAPABILITIES;
   let updateBusy = false;
   let receiveSettings: ReceiveSettings = { mode: 'confirm' };
   let receiveSettingsBusy = false;
@@ -279,13 +280,6 @@
         const base = await initApi();
         if (!activeBaseUrl) activeBaseUrl = base;
         if (isDesktopWindow) {
-          monitorCapabilities = await invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities);
-          [monitorLocked, monitorVisible] = await Promise.all([
-            invoke<boolean>('monitor_locked').catch(() => monitorLocked),
-            invoke<boolean>('monitor_visible').catch(() => monitorVisible),
-          ]);
-        }
-        if (isDesktopWindow) {
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
           updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
           clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
@@ -332,16 +326,23 @@
     };
   });
 
+  async function refreshLocalMonitorState(): Promise<void> {
+    if (!isDesktopWindow || remoteMode) return;
+    const [capabilities, locked, visible] = await Promise.all([
+      invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities),
+      invoke<boolean>('monitor_locked').catch(() => monitorLocked),
+      invoke<boolean>('monitor_visible').catch(() => monitorVisible),
+    ]);
+    monitorCapabilities = capabilities;
+    monitorLocked = locked;
+    monitorVisible = visible;
+  }
+
   async function refresh() {
     const requestId = ++refreshRequestId;
     const generation = targetGeneration;
     const target = activeBaseUrl;
-    if (isDesktopWindow && !remoteMode) {
-      [monitorLocked, monitorVisible] = await Promise.all([
-        invoke<boolean>('monitor_locked').catch(() => monitorLocked),
-        invoke<boolean>('monitor_visible').catch(() => monitorVisible),
-      ]);
-    }
+    await refreshLocalMonitorState();
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
       if (generation !== targetGeneration || target !== activeBaseUrl) return;

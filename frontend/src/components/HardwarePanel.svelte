@@ -50,7 +50,7 @@
         class="btn btn-ghost btn-sm monitor-lock-toggle"
         aria-pressed={monitorLocked}
         disabled={!canClickThrough}
-        title={canClickThrough ? '锁定或解锁悬浮监控条' : 'Wayland 下不支持点击穿透，置顶由合成器管理'}
+        title={canClickThrough ? '锁定或解锁悬浮监控条' : '当前桌面环境不支持点击穿透，可从托盘隐藏悬浮条'}
         on:click={onToggleLock}
       >{monitorLocked ? '解锁悬浮条' : '锁定悬浮条'}</button>
     </div>

@@ -115,9 +115,17 @@ fn monitor_backend<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> Monit
 
 #[cfg(not(target_os = "android"))]
 pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabilities {
-    app.get_webview_window("monitor")
-        .map(|window| monitor_capabilities_for_backend(monitor_backend(&window)))
-        .unwrap_or_else(|| monitor_capabilities_for_backend(MonitorBackend::Unknown))
+    #[cfg(target_os = "linux")]
+    {
+        app.get_webview_window("monitor")
+            .map(|window| monitor_capabilities_for_backend(monitor_backend(&window)))
+            .unwrap_or_else(|| monitor_capabilities_for_backend(MonitorBackend::Unknown))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = app;
+        monitor_capabilities_for_backend(MonitorBackend::Other)
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -295,7 +303,7 @@ pub(crate) fn apply_monitor_locked(
 ) -> Result<bool, String> {
     let capabilities = current_monitor_capabilities(app);
     if locked && !capabilities.can_click_through {
-        return Err("当前 Wayland 会话不支持悬浮条点击穿透，请从托盘隐藏悬浮条".to_string());
+        return Err("当前桌面环境不支持悬浮条点击穿透，请从托盘隐藏悬浮条".to_string());
     }
     let previous = runtime.monitor_locked();
     if let Some(window) = app.get_webview_window("monitor") {
@@ -371,7 +379,7 @@ fn set_monitor_position(
     y: i32,
 ) -> Result<(), String> {
     if !current_monitor_capabilities(&app).can_persist_position {
-        return Err("当前 Wayland 会话不支持保存悬浮条全局坐标".to_string());
+        return Err("当前桌面环境不支持保存悬浮条全局坐标".to_string());
     }
     state
         .runtime
@@ -1105,6 +1113,17 @@ mod tests {
         assert!(!capabilities.can_persist_position);
         assert!(!capabilities.can_click_through);
         assert!(!capabilities.can_keep_above);
+    }
+
+    #[test]
+    fn non_wayland_monitor_capabilities_allow_global_controls() {
+        for backend in [MonitorBackend::Other, MonitorBackend::X11] {
+            let capabilities = monitor_capabilities_for_backend(backend);
+            assert!(capabilities.can_persist_position);
+            assert!(capabilities.can_click_through);
+            assert!(capabilities.can_keep_above);
+        }
+        assert!(!monitor_capabilities_for_backend(MonitorBackend::Unknown).can_click_through);
     }
 
     #[test]
