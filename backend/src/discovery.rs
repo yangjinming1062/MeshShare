@@ -259,12 +259,12 @@ pub(crate) async fn connect_peer(
     endpoint: String,
 ) {
     let mut attempt = 0u32;
+    if !runtime.begin_peer_connection(&node_id) {
+        return;
+    }
     loop {
         if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
             break;
-        }
-        if !runtime.begin_peer_connection(&node_id) {
-            return;
         }
         let connected =
             match tokio::time::timeout(Duration::from_secs(5), connect_async(&endpoint)).await {
@@ -272,14 +272,35 @@ pub(crate) async fn connect_peer(
                     let Some(connected) =
                         run_peer_session(&runtime, &node_id, &node_name, &endpoint, socket).await
                     else {
+                        // Another socket won the race between the connection
+                        // guard and the handshake. Keep this discovery task
+                        // alive as a watcher so that it can resume dialing if
+                        // the winning channel later disappears. The winning
+                        // socket registration clears the original guard;
+                        // release any remaining marker before waiting so this
+                        // watcher can resume dialing after that socket closes.
                         runtime.cancel_peer_connection(&node_id);
-                        return;
+                        while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst)
+                            && runtime.has_peer_channel(&node_id)
+                        {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
+                        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst)
+                            || !runtime.begin_peer_connection(&node_id)
+                        {
+                            return;
+                        }
+                        attempt = 0;
+                        continue;
                     };
                     connected
                 }
                 Ok(Err(_)) | Err(_) => false,
             };
-        runtime.remove_peer(&node_id);
+        // Keep the connection slot reserved until this task exits.  mDNS may
+        // resolve the same peer repeatedly while it is offline; releasing the
+        // slot before sleeping would defeat the retry backoff.
+        runtime.remove_peer_for_retry(&node_id);
         if connected {
             attempt = 0;
         } else {
@@ -292,6 +313,7 @@ pub(crate) async fn connect_peer(
         let jitter = (Uuid::new_v4().as_u128() % 400) as u64;
         tokio::time::sleep(Duration::from_millis(backoff * 1_000 + jitter)).await;
     }
+    runtime.cancel_peer_connection(&node_id);
 }
 
 async fn run_peer_session(
@@ -308,6 +330,10 @@ async fn run_peer_session(
     if !runtime.add_peer_channel(node_id.to_string(), tx) {
         return None;
     }
+    // `add_peer_channel` clears the handshake guard. Reclaim it for the
+    // dialer's entire session so mDNS cannot bypass reconnect backoff after a
+    // disconnect.
+    runtime.reserve_peer_connection(node_id);
     if !matches!(
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -321,7 +347,6 @@ async fn run_peer_session(
         .await,
         Ok(Ok(()))
     ) {
-        runtime.remove_peer(node_id);
         return Some(false);
     }
     runtime.set_peer(PeerInfo {
@@ -423,7 +448,6 @@ async fn run_peer_session(
             }
         }
     }
-    runtime.remove_peer(node_id);
     Some(true)
 }
 

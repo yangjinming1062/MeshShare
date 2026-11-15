@@ -80,11 +80,22 @@
   const mobileUploading = new Set<string>();
   const mobileWatching = new Set<string>();
   const mobileUploadAttempts = new Map<string, number>();
+  const mobileUploadStopped = new Set<string>();
+  const uploadAttempts = new Map<string, number>();
+  const uploadStopped = new Set<string>();
   const mobileDownloading = new Set<string>();
-  const MOBILE_UPLOAD_MAX_ATTEMPTS = 3;
+  const MOBILE_UPLOAD_MAX_ATTEMPTS = 6;
+  const DESKTOP_UPLOAD_MAX_ATTEMPTS = 6;
+  const FILE_UPLOAD_ATTEMPTS = 4;
+  const WS_RECONNECT_BASE_MS = 1500;
+  const WS_RECONNECT_MAX_MS = 30000;
   let mobileReceiveDirectory: MobileDirectoryHandle | null = null;
   let mobileReceiveDirectoryName = '';
   let pageStopped = false;
+  let wsReconnectTimer: number | undefined;
+  let wsReconnectAttempt = 0;
+  let wsGeneration = 0;
+  let wsPingTimer: number | undefined;
 
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
@@ -197,7 +208,13 @@
       stopped = true;
       pageStopped = true;
       if (timer) window.clearInterval(timer);
+      if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = undefined;
+      if (wsPingTimer) window.clearInterval(wsPingTimer);
+      wsPingTimer = undefined;
+      wsGeneration += 1;
       ws?.close();
+      ws = null;
       if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
       monitorPositionUnlisten?.();
       updateStatusUnlisten?.();
@@ -291,17 +308,50 @@
   }
 
   function connectWebSocket() {
+    if (pageStopped) return;
+    if (wsReconnectTimer) {
+      window.clearTimeout(wsReconnectTimer);
+      wsReconnectTimer = undefined;
+    }
+    if (wsPingTimer) {
+      window.clearInterval(wsPingTimer);
+      wsPingTimer = undefined;
+    }
+    const socket = new WebSocket(websocketUrl());
+    const generation = ++wsGeneration;
     ws?.close();
-    ws = new WebSocket(websocketUrl());
-    ws.onopen = () => { status = '已连接'; statusKind = 'ok'; };
-    ws.onclose = () => {
-      if (pageStopped) return;
-      status = '连接断开，重试中…';
-      statusKind = 'warn';
-      window.setTimeout(() => !pageStopped && connectWebSocket(), 1800);
+    ws = socket;
+    socket.onopen = () => {
+      if (generation !== wsGeneration || socket !== ws) return;
+      wsReconnectAttempt = 0;
+      status = '已连接';
+      statusKind = 'ok';
+      const sendPing = () => {
+        if (generation !== wsGeneration || socket !== ws || socket.readyState !== WebSocket.OPEN) return;
+        socket.send(JSON.stringify({ type: 'Ping', payload: { at_ms: Date.now() } }));
+      };
+      sendPing();
+      if (wsPingTimer) window.clearInterval(wsPingTimer);
+      wsPingTimer = window.setInterval(sendPing, 15000);
     };
-    ws.onerror = () => { status = '同步连接失败'; statusKind = 'error'; };
-    ws.onmessage = (event) => {
+    socket.onclose = () => {
+      if (generation !== wsGeneration || socket !== ws || pageStopped) return;
+      ws = null;
+      if (wsPingTimer) window.clearInterval(wsPingTimer);
+      wsPingTimer = undefined;
+      status = '连接暂时中断，正在恢复…';
+      statusKind = 'warn';
+      scheduleWebSocketReconnect();
+    };
+    socket.onerror = () => {
+      if (generation !== wsGeneration || socket !== ws || pageStopped) return;
+      // onerror is followed by onclose in browsers. Keep one user-facing
+      // recovery state instead of starting another connection here.
+      status = '同步连接暂时不可用，正在恢复…';
+      statusKind = 'warn';
+    };
+    socket.onmessage = (event) => {
+      if (generation !== wsGeneration || socket !== ws) return;
       try {
         const message = JSON.parse(event.data) as WireMessage;
         handleWireMessage(message);
@@ -311,8 +361,26 @@
     };
   }
 
+  function scheduleWebSocketReconnect() {
+    if (pageStopped || wsReconnectTimer) return;
+    const exponential = Math.min(WS_RECONNECT_MAX_MS, WS_RECONNECT_BASE_MS * 2 ** wsReconnectAttempt);
+    const jitter = Math.round(exponential * (0.1 * Math.random()));
+    const delay = Math.min(WS_RECONNECT_MAX_MS, exponential + jitter);
+    wsReconnectAttempt = Math.min(wsReconnectAttempt + 1, 8);
+    wsReconnectTimer = window.setTimeout(() => {
+      wsReconnectTimer = undefined;
+      if (!pageStopped && !ws) connectWebSocket();
+    }, delay);
+  }
+
   function handleWireMessage(message: WireMessage) {
     const { type, payload } = message;
+    if (type === 'Ping') {
+      if (ws?.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'Pong', payload: { at_ms: payload.at_ms } }));
+      }
+      return;
+    }
     if (type === 'Hello') {
       void refresh();
       return;
@@ -737,6 +805,40 @@
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
   }
 
+  async function uploadFileWithRetry(url: string, file: File, mediaType: string): Promise<Response> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < FILE_UPLOAD_ATTEMPTS; attempt += 1) {
+      let stopRetry = false;
+      try {
+        const response = await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': mediaType },
+          body: file,
+        });
+        if (response.ok) return response;
+        const payload = await response.json().catch(() => ({}));
+        const message = typeof payload === 'object' && payload !== null && 'error' in payload && typeof payload.error === 'string'
+          ? payload.error
+          : `上传失败 (${response.status})`;
+        // Validation and state errors cannot be fixed by sending the same
+        // request repeatedly. Retry only transport and server back-pressure.
+        if (![408, 425, 429].includes(response.status) && response.status < 500) {
+          lastError = new Error(message);
+          stopRetry = true;
+        } else {
+          lastError = new Error(message);
+        }
+      } catch (error) {
+        if (!stopRetry) lastError = error;
+      }
+      if (stopRetry) break;
+      if (attempt + 1 < FILE_UPLOAD_ATTEMPTS) {
+        await new Promise((resolve) => window.setTimeout(resolve, Math.min(8000, 800 * 2 ** attempt)));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('上传失败');
+  }
+
   async function sendFiles(peer: PeerInfo, files: File[]) {
     const target = targetBase(peer);
     if (!target || !node) {
@@ -810,33 +912,34 @@
   async function watchMobileTransfer(id: string) {
     if (mobileWatching.has(id)) return;
     mobileWatching.add(id);
-    for (let attempt = 0; attempt < 180; attempt += 1) {
+    for (let attempt = 0; attempt < 360; attempt += 1) {
       try {
         const view = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
         if (!view) throw new Error('网页端传输任务不存在');
         const progress = view.progress;
         const existing = transfers.find((item) => item.transfer_id === id);
         transfers = [{ ...existing, ...progress, direction: 'send' }, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (['accepted', 'uploading'].includes(progress.status) && !mobileUploading.has(id)) {
+        if (['accepted', 'uploading'].includes(progress.status) && !mobileUploading.has(id) && !mobileUploadStopped.has(id)) {
           await uploadMobileTransfer(id);
         }
         if (['ready', 'completed', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
           pendingMobileUploads.delete(id);
           mobileUploadAttempts.delete(id);
+          mobileUploadStopped.delete(id);
           mobileWatching.delete(id);
           return;
         }
       } catch (error) {
-        if (attempt === 179 && error instanceof Error) notice = error.message;
+        if (attempt === 359 && error instanceof Error) notice = error.message;
       }
-      await new Promise((resolve) => window.setTimeout(resolve, 800));
+      await new Promise((resolve) => window.setTimeout(resolve, 1000));
     }
     mobileWatching.delete(id);
   }
 
   async function uploadMobileTransfer(id: string) {
     const pending = pendingMobileUploads.get(id);
-    if (!pending) return;
+    if (!pending || mobileUploadStopped.has(id)) return;
     mobileUploading.add(id);
     try {
       const latest = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
@@ -847,12 +950,11 @@
         if (pending.completedItemIds.has(item.item_id)) continue;
         const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
-        const response = await fetch(apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`), {
-          method: 'PUT',
-          headers: { 'Content-Type': item.media_type },
-          body: file,
-        });
-        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `上传失败 (${response.status})`);
+        await uploadFileWithRetry(
+          apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`),
+          file,
+          item.media_type,
+        );
         pending.completedItemIds.add(item.item_id);
       }
       mobileUploadAttempts.delete(id);
@@ -862,6 +964,7 @@
       mobileUploadAttempts.set(id, attempts);
       const message = error instanceof Error ? error.message : '网页端文件上传失败';
       if (attempts >= MOBILE_UPLOAD_MAX_ATTEMPTS) {
+        mobileUploadStopped.add(id);
         await request(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/fail`, {
           method: 'POST',
           body: JSON.stringify({ error: message }),
@@ -906,15 +1009,17 @@
   async function watchTransfer(id: string, target: string) {
     if (watching.has(id)) return;
     watching.add(id);
-    for (let attempt = 0; attempt < 180; attempt += 1) {
+    for (let attempt = 0; attempt < 360; attempt += 1) {
       try {
         const progress = await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, target);
         void invoke('update_transfer_progress', { progress }).catch(() => undefined);
         const existing = transfers.find((item) => item.transfer_id === id);
         transfers = [{ ...existing, ...progress, direction: existing?.direction ?? progress.direction }, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (progress.status === 'accepted' && !uploading.has(id)) await uploadTransfer(id, target);
+        if (['accepted', 'uploading'].includes(progress.status) && !uploading.has(id) && !uploadStopped.has(id)) await uploadTransfer(id, target);
         if (['completed', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
           pendingUploads.delete(id);
+          uploadAttempts.delete(id);
+          uploadStopped.delete(id);
           watching.delete(id);
           return;
         }
@@ -928,23 +1033,34 @@
 
   async function uploadTransfer(id: string, target: string) {
     const pending = pendingUploads.get(id);
-    if (!pending) return;
+    if (!pending || uploadStopped.has(id)) return;
     uploading.add(id);
     try {
       for (const item of pending.items) {
         const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
-        const response = await fetch(`${target}/api/v1/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': item.media_type },
-          body: file,
-        });
-        if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error ?? `上传失败 (${response.status})`);
+        await uploadFileWithRetry(
+          `${target}/api/v1/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
+          file,
+          item.media_type,
+        );
       }
+      uploadAttempts.delete(id);
       notice = '文件发送完成';
     } catch (error) {
       notice = error instanceof Error ? error.message : '文件发送失败';
-      await request(`/api/v1/transfers/${encodeURIComponent(id)}/cancel`, { method: 'POST' }, target).catch(() => undefined);
+      const attempts = (uploadAttempts.get(id) ?? 0) + 1;
+      uploadAttempts.set(id, attempts);
+      if (attempts >= DESKTOP_UPLOAD_MAX_ATTEMPTS) {
+        uploadStopped.add(id);
+        await request(`/api/v1/transfers/${encodeURIComponent(id)}/cancel`, { method: 'POST' }, target).catch(() => undefined);
+        notice = `${notice}，已停止重试`;
+      } else {
+        // Keep the accepted task alive. watchTransfer will retry the current
+        // item after the peer becomes reachable again; PUT is idempotent for
+        // an already committed item.
+        notice = `${notice}，连接恢复后将继续（${attempts}/${DESKTOP_UPLOAD_MAX_ATTEMPTS}）`;
+      }
     } finally {
       uploading.delete(id);
     }

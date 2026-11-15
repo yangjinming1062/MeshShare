@@ -502,6 +502,18 @@ impl NodeRuntime {
         self.pending_clipboard_resync.lock().remove(node_id);
     }
 
+    /// Remove a dialer's current channel while retaining its connection slot.
+    ///
+    /// The discovery task owns that slot across its reconnect backoff.  Keeping
+    /// it reserved prevents a burst of mDNS resolutions from starting parallel
+    /// sockets and bypassing the exponential retry delay after a disconnect.
+    pub fn remove_peer_for_retry(&self, node_id: &str) {
+        self.peers.write().remove(node_id);
+        self.peer_channels.lock().remove(node_id);
+        self.pending_clipboard_resync.lock().remove(node_id);
+        self.connecting_peers.lock().insert(node_id.to_string());
+    }
+
     pub fn cancel_peer_connection(&self, node_id: &str) {
         self.connecting_peers.lock().remove(node_id);
     }
@@ -513,6 +525,10 @@ impl NodeRuntime {
         }
         drop(channels);
         self.connecting_peers.lock().insert(node_id.to_string())
+    }
+
+    pub fn reserve_peer_connection(&self, node_id: &str) {
+        self.connecting_peers.lock().insert(node_id.to_string());
     }
 
     pub fn send_to_peer(&self, node_id: &str, message: WireMessage) -> bool {
@@ -1302,6 +1318,24 @@ impl NodeRuntime {
         }
         record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
+    }
+
+    /// Return the current progress when an upload item was already committed.
+    ///
+    /// A sender may lose the HTTP response after the receiver has committed a
+    /// file and then retry the same PUT. Keeping this check in the runtime
+    /// makes that retry observable without incrementing transfer progress a
+    /// second time.
+    pub fn transfer_item_already_received(
+        &self,
+        transfer_id: &str,
+        item_id: &str,
+    ) -> Option<TransferProgress> {
+        let record = self.transfers.read().get(transfer_id)?.clone();
+        record
+            .received_items
+            .contains(item_id)
+            .then_some(record.progress)
     }
 
     pub fn fail_transfer(
@@ -3027,6 +3061,24 @@ mod tests {
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
         assert!(runtime.begin_peer_connection("peer"));
+        assert!(!runtime.begin_peer_connection("peer"));
+        runtime.cancel_peer_connection("peer");
+        assert!(runtime.begin_peer_connection("peer"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn retry_cleanup_keeps_connection_slot_reserved_until_backoff_ends() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert!(runtime.begin_peer_connection("peer"));
+        let (tx, _rx) = mpsc::channel(1);
+        assert!(runtime.add_peer_channel("peer".to_string(), tx));
+
+        runtime.remove_peer_for_retry("peer");
+
+        assert!(!runtime.has_peer_channel("peer"));
         assert!(!runtime.begin_peer_connection("peer"));
         runtime.cancel_peer_connection("peer");
         assert!(runtime.begin_peer_connection("peer"));

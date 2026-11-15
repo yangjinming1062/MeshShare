@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
@@ -566,6 +566,7 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
     }
     let mut peer_id: Option<String> = None;
     let mut owns_peer_channel = false;
+    let mut ui_client = false;
     let mut clipboard_resync = tokio::time::interval(std::time::Duration::from_secs(1));
     // A client must identify itself promptly.  Keeping an unauthenticated
     // socket alive would retain the receiver task and broadcast subscription
@@ -575,12 +576,39 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
 
     loop {
         tokio::select! {
-            _ = &mut handshake_deadline, if peer_id.is_none() => break,
+            _ = &mut handshake_deadline, if peer_id.is_none() && !ui_client => break,
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(axum::extract::ws::Message::Text(text))) => {
                         match serde_json::from_str::<WireMessage>(&text) {
                             Ok(message) => {
+                                if let WireMessage::Ping { at_ms } = &message {
+                                    if peer_id.is_none() {
+                                        // Browser clients do not identify as a
+                                        // peer node. Their application-level
+                                        // heartbeat still needs a response and
+                                        // must keep the handshake deadline from
+                                        // closing the UI channel.
+                                        ui_client = true;
+                                        let pong = serde_json::to_string(
+                                            &WireMessage::Pong { at_ms: *at_ms },
+                                        )
+                                        .unwrap_or_default();
+                                        if !matches!(
+                                            tokio::time::timeout(
+                                                Duration::from_secs(10),
+                                                sender.send(
+                                                    axum::extract::ws::Message::Text(pong),
+                                                ),
+                                            )
+                                            .await,
+                                            Ok(Ok(()))
+                                        ) {
+                                            break;
+                                        }
+                                        continue;
+                                    }
+                                }
                                 if let WireMessage::Hello { node } = &message {
                                     if peer_id
                                         .as_deref()
@@ -1729,11 +1757,6 @@ async fn upload_item(
         .runtime
         .transfer(&transfer_id)
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if record.progress.status != TransferStatus::Accepted
-        && record.progress.status != TransferStatus::Uploading
-    {
-        return Err(ApiError::conflict("传输尚未被接收端接受"));
-    }
     let destination = record
         .accepted_destination
         .clone()
@@ -1748,7 +1771,28 @@ async fn upload_item(
     {
         return Err(ApiError::bad_request("传输路径无效"));
     }
+    let already_received = record.received_items.contains(&item_id);
+    if !matches!(
+        record.progress.status,
+        TransferStatus::Accepted | TransferStatus::Uploading
+    ) && !(record.progress.status == TransferStatus::Completed && already_received)
+    {
+        return Err(ApiError::conflict("传输尚未被接收端接受"));
+    }
     let _item_lock = TransferItemLock::new(&state.runtime, &transfer_id, &item_id)?;
+    // The receiver may have committed the file while the sender was losing
+    // the HTTP response. Treat a repeated PUT as an idempotent acknowledgement
+    // when the committed item and its final file are still present.
+    if let Some(progress) = state
+        .runtime
+        .transfer_item_already_received(&transfer_id, &item_id)
+    {
+        let target = resolve_target(&destination, &item.relative_path).await?;
+        if existing_file_matches(&target, item.size, &item.sha256).await? {
+            return Ok(Json(progress));
+        }
+        return Err(ApiError::conflict("已完成的传输项目与目标文件校验不一致"));
+    }
     let target = prepare_target(&destination, &item.relative_path).await?;
     let progress = state
         .runtime
@@ -1891,7 +1935,10 @@ struct TransferItemLock {
 impl TransferItemLock {
     fn new(runtime: &Arc<NodeRuntime>, transfer_id: &str, item_id: &str) -> Result<Self, ApiError> {
         if !runtime.try_lock_transfer_item(transfer_id, item_id) {
-            return Err(ApiError::conflict("文件项目正在上传"));
+            // A duplicate request can race with the original upload after a
+            // transient disconnect. Tell senders that retrying is safe once
+            // the in-flight request releases the item lock.
+            return Err(ApiError::too_early("文件项目正在上传"));
         }
         Ok(Self {
             runtime: runtime.clone(),
@@ -1909,6 +1956,24 @@ impl Drop for TransferItemLock {
 }
 
 async fn prepare_target(destination: &Path, relative_path: &str) -> Result<PathBuf, ApiError> {
+    let target = resolve_target(destination, relative_path).await?;
+    match fs::symlink_metadata(&target).await {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(ApiError::conflict("目标文件是符号链接"));
+            }
+            return Err(ApiError::conflict(format!(
+                "目标已存在：{}",
+                target.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ApiError::internal(error.to_string())),
+    }
+    Ok(target)
+}
+
+async fn resolve_target(destination: &Path, relative_path: &str) -> Result<PathBuf, ApiError> {
     let metadata = fs::symlink_metadata(destination)
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -1951,21 +2016,43 @@ async fn prepare_target(destination: &Path, relative_path: &str) -> Result<PathB
             Err(error) => return Err(ApiError::internal(error.to_string())),
         }
     }
-    let target = parent.join(file_name);
-    match fs::symlink_metadata(&target).await {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(ApiError::conflict("目标文件是符号链接"));
-            }
-            return Err(ApiError::conflict(format!(
-                "目标已存在：{}",
-                target.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    Ok(parent.join(file_name))
+}
+
+async fn existing_file_matches(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<bool, ApiError> {
+    let metadata = match fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(ApiError::internal(error.to_string())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != expected_size {
+        return Ok(false);
     }
-    Ok(target)
+    let mut file = fs::File::open(path)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| ApiError::payload_too_large("文件大小溢出"))?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok(total == expected_size
+        && format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(expected_sha256))
 }
 
 async fn ensure_directory_without_symlink(path: &Path) -> Result<(), ApiError> {
@@ -2817,6 +2904,26 @@ mod tests {
                 .await
                 .expect("upload item");
             assert!(response.status().is_success());
+            if item_id == "first" {
+                // A lost response must be safe to retry after the receiver
+                // has already committed the item.
+                let duplicate = runtime
+                    .http
+                    .put(format!(
+                        "http://{address}/api/v1/transfers/multi-upload/items/{item_id}"
+                    ))
+                    .body(bytes.to_vec())
+                    .send()
+                    .await
+                    .expect("retry committed item");
+                assert!(duplicate.status().is_success());
+                let progress = runtime
+                    .transfer("multi-upload")
+                    .expect("find transfer after retry")
+                    .progress;
+                assert_eq!(progress.completed_items, 1);
+                assert_eq!(progress.completed_bytes, first.len() as u64);
+            }
         }
         assert_eq!(
             runtime
@@ -3136,6 +3243,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_keeps_ui_client_alive_with_application_ping() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-ui-heartbeat-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+        let (mut socket, _) = connect_async(format!("ws://{address}/api/v1/ws"))
+            .await
+            .expect("connect websocket");
+        let _ = socket.next().await.expect("server hello");
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::Ping { at_ms: 1 }).expect("ping"),
+            ))
+            .await
+            .expect("send ui ping");
+        let pong = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let message = socket
+                    .next()
+                    .await
+                    .expect("pong response")
+                    .expect("valid message");
+                if let tokio_tungstenite::tungstenite::Message::Text(body) = message {
+                    if matches!(
+                        serde_json::from_str::<WireMessage>(&body).expect("decode pong"),
+                        WireMessage::Pong { .. }
+                    ) {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            pong.is_ok(),
+            "UI heartbeat should receive an application pong"
+        );
+        tokio::time::sleep(PEER_HANDSHAKE_TIMEOUT + Duration::from_millis(100)).await;
+        socket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&WireMessage::Ping { at_ms: 2 }).expect("second ping"),
+            ))
+            .await
+            .expect("send second ui ping");
+        let pong = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let message = socket
+                    .next()
+                    .await
+                    .expect("second pong response")
+                    .expect("valid message");
+                if let tokio_tungstenite::tungstenite::Message::Text(body) = message {
+                    if matches!(
+                        serde_json::from_str::<WireMessage>(&body).expect("decode second pong"),
+                        WireMessage::Pong { .. }
+                    ) {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(
+            pong.is_ok(),
+            "UI socket should remain alive after handshake deadline"
+        );
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = socket.close(None).await;
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn websocket_closes_if_peer_never_sends_hello() {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-handshake-test-{}", Uuid::new_v4()));
@@ -3190,6 +3387,12 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::CONFLICT,
+            message: message.into(),
+        }
+    }
+    fn too_early(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_EARLY,
             message: message.into(),
         }
     }
