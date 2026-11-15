@@ -34,7 +34,7 @@ use tauri::tray::{MouseButton, TrayIconEvent};
 use tauri::RunEvent;
 use tauri::{AppHandle, Manager, State};
 #[cfg(not(target_os = "android"))]
-use tauri::{PhysicalPosition, WindowEvent};
+use tauri::{LogicalSize, PhysicalPosition, WindowEvent};
 #[cfg(not(target_os = "android"))]
 use updater::UpdateCoordinator;
 use updater::UpdateStatus;
@@ -558,6 +558,19 @@ fn show_main_window(app: &AppHandle) {
 const MONITOR_MARGIN_PX: i32 = 16;
 
 #[cfg(not(target_os = "android"))]
+const MONITOR_WIDTH: f64 = 220.0;
+
+#[cfg(not(target_os = "android"))]
+const MONITOR_HEIGHT: f64 = 50.0;
+
+#[cfg(not(target_os = "android"))]
+fn normalize_monitor_size<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
+    if let Err(error) = window.set_size(LogicalSize::new(MONITOR_WIDTH, MONITOR_HEIGHT)) {
+        eprintln!("设置监控条尺寸失败：{error}");
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 fn point_is_in_work_area(position: &MonitorPosition, monitor: &tauri::Monitor) -> bool {
     let area = monitor.work_area();
     let left = i64::from(area.position.x);
@@ -870,6 +883,7 @@ fn run_desktop() {
             sync_autostart_registration(runtime.as_ref());
             setup_tray_menu(app.handle())?;
             if let Some(window) = app.get_webview_window("monitor") {
+                normalize_monitor_size(&window);
                 position_monitor_window(&window, runtime.as_ref());
             }
             set_monitor_window_visible(
