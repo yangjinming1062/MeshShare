@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ClipboardImage from './ClipboardImage.svelte';
   import { clipboardHistoryPreview, formatTime } from '../format';
   import type { ClipboardHistoryItem, ClipboardSnapshot } from '../types';
 
@@ -44,7 +45,7 @@
           placeholder={manualOnly ? '输入或粘贴文字，然后手动发布' : '在任意设备复制文字或图片，这里会显示最近内容'}
         ></textarea>
         {#if clipboard?.image_png}
-          <img class="clip-image" src={'data:image/png;base64,' + clipboard.image_png} alt="共享图片" />
+          <ClipboardImage imagePng={clipboard.image_png} />
         {/if}
       </div>
       <div class="action-row">

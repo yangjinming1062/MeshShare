@@ -156,9 +156,19 @@ button.device-metrics:hover { background: var(--surface-2); }
 .clip-tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--surface-2); }
 .clip-tab { height: 22px; padding: 0 9px; border-radius: 7px; color: var(--muted); font-size: 11px; font-weight: 600; }
 .clip-tab[aria-selected="true"] { background: var(--surface); color: var(--ink); box-shadow: var(--shadow-1); }
-.clip-grid { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; }
+.clip-grid { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 .clip-editor { flex: 1; min-height: 84px; }
-.clip-image { width: 96px; height: 96px; object-fit: contain; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.clip-preview { display: grid; gap: 6px; margin: 0; }
+.clip-preview-stage { display: grid; place-items: center; width: 100%; min-height: 96px; padding: 8px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-2); cursor: zoom-in; }
+.clip-preview-stage img { display: block; max-width: 100%; max-height: min(44vh, 360px); border-radius: 6px; }
+.clip-preview-caption { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.clip-preview-open { margin-left: auto; }
+.clip-preview-text { min-height: 120px; max-height: 220px; }
+.area-clipboard .clip-preview-stage img { max-height: min(20vh, 160px); }
+.clip-viewer { max-width: 92vw; max-height: 88vh; padding: 0; border: 0; border-radius: 12px; background: transparent; }
+.clip-viewer::backdrop { background: rgba(15, 23, 42, .72); }
+.clip-viewer img { display: block; max-width: 92vw; max-height: 88vh; border-radius: 12px; }
+.clip-viewer-close { position: absolute; top: 8px; right: 8px; border-radius: 999px; background: rgba(15, 23, 42, .6); color: #fff; }
 .history-list { flex: 1; min-height: 0; display: grid; gap: 2px; align-content: start; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 .history-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 34px; padding: 4px 8px; border-radius: var(--r-sm); text-align: left; color: var(--ink); transition: background 120ms var(--ease); }
 .history-row:hover { background: var(--surface-2); }
@@ -168,8 +178,6 @@ button.device-metrics:hover { background: var(--surface-2); }
 .history-detail-meta { display: grid; gap: 2px; }
 .history-detail-meta strong { font-size: 12px; font-weight: 600; }
 .history-detail-meta span { font-size: 11px; }
-.history-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: start; }
-.history-detail-grid textarea { min-height: 120px; }
 
 .transfer-list { display: grid; gap: 6px; align-content: start; max-height: 132px; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 .transfer-row { display: grid; grid-template-columns: 28px minmax(120px, 1fr) minmax(160px, 1.4fr) auto; align-items: center; gap: 10px; min-height: 40px; padding: 5px 10px; border-radius: var(--r-sm); background: var(--surface-2); }
@@ -307,7 +315,6 @@ html[data-shell="android"] {
 .phone-shell .clip-editor { min-height: 96px; }
 .phone-shell .history-list { max-height: 320px; }
 .phone-shell .history-row { min-height: 44px; }
-.phone-shell .clip-image { width: 100%; max-width: 160px; height: auto; }
 
 @media (min-width: 720px) {
   .phone-main { max-width: 1120px; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }

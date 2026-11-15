@@ -1,5 +1,7 @@
 <script lang="ts">
   import AndroidUpdatePanel from './AndroidUpdatePanel.svelte';
+  import ClipboardImage from './ClipboardImage.svelte';
+  import ClipboardPreview from './ClipboardPreview.svelte';
   import Icon from './Icon.svelte';
   import {
     clipboardHistoryKind,
@@ -282,10 +284,7 @@
           <strong>{selectedHistory.item.source_name}</strong>
           <span class="muted">{clipboardHistoryKind(selectedHistory.item)} · {formatTime(selectedHistory.item.updated_at_ms)}</span>
         </div>
-        <textarea class="field" readonly value={selectedHistory.snapshot.text ?? ''} placeholder="图片内容"></textarea>
-        {#if selectedHistory.snapshot.image_png}
-          <img class="clip-image" src={'data:image/png;base64,' + selectedHistory.snapshot.image_png} alt="历史共享图片" />
-        {/if}
+        <ClipboardPreview snapshot={selectedHistory.snapshot} sizeBytes={selectedHistory.item.size_bytes} />
         <div class="phone-actions">
           <button type="button" class="btn btn-primary" on:click={onRestoreHistory} disabled={historyBusy}>恢复并同步</button>
           <button type="button" class="btn" on:click={onCloseHistory}>返回历史列表</button>
@@ -309,7 +308,7 @@
     {:else}
       <textarea class="field" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
       {#if clipboard?.image_png}
-        <img class="clip-image" src={'data:image/png;base64,' + clipboard.image_png} alt="共享图片" />
+        <ClipboardImage imagePng={clipboard.image_png} />
       {/if}
       <div class="phone-actions">
         <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>
