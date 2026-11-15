@@ -74,6 +74,21 @@ jobs:
             exit 1
           fi
           printf '{"version":"%s"}\n' "${GITHUB_REF_NAME#v}" > release-version.json
+      - name: Configure macOS ad-hoc signing
+        if: startsWith(matrix.name, 'macos-')
+        shell: bash
+        env:
+          MACOS_SIGNING_MODE: ${{ vars.MACOS_SIGNING_MODE || 'adhoc' }}
+        run: |
+          set -euo pipefail
+          if [[ "$MACOS_SIGNING_MODE" != "adhoc" ]]; then
+            echo "::error::This workflow currently supports only MACOS_SIGNING_MODE=adhoc"
+            exit 1
+          fi
+          {
+            echo "MACOS_SIGNING_MODE=adhoc"
+            echo "APPLE_SIGNING_IDENTITY=-"
+          } >> "$GITHUB_ENV"
       - name: Validate updater signing key
         shell: bash
         run: |
@@ -113,6 +128,32 @@ jobs:
           cargo tauri --version
       - name: Build application
         run: cargo tauri build --config release-version.json -- --locked
+      - name: Validate macOS ad-hoc installers
+        if: startsWith(matrix.name, 'macos-')
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(backend/target/release/bundle/macos/*.app)
+          dmgs=(backend/target/release/bundle/dmg/*.dmg)
+          if (( ${#apps[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS app bundle"
+            printf '%s\n' "${apps[@]}"
+            exit 1
+          fi
+          if (( ${#dmgs[@]} != 1 )); then
+            echo "::error::Expected exactly one macOS DMG"
+            printf '%s\n' "${dmgs[@]}"
+            exit 1
+          fi
+          app="${apps[0]}"
+          dmg="${dmgs[0]}"
+          signature=$(codesign --display --verbose=4 "$app" 2>&1)
+          printf '%s\n' "$signature" | grep -F 'Signature=adhoc'
+          printf '%s\n' "$signature" | grep -F 'TeamIdentifier=not set'
+          test -x "$app/Contents/MacOS/meshshare"
+          file "$app/Contents/MacOS/meshshare" | grep -E 'Mach-O (.* )?(arm64|x86_64)'
+          hdiutil verify "$dmg"
       - name: Name macOS updater artifacts by architecture
         if: startsWith(matrix.name, 'macos-')
         shell: bash

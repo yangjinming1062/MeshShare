@@ -113,7 +113,23 @@ sequenceDiagram
 | macOS | Apple Silicon · Intel | `.dmg` |
 | Linux | x64 | `.AppImage` · `.deb` · `.rpm` |
 
-正式安装包默认开启开机自启动，登录系统后以托盘模式运行，可在主窗口中关闭。正式版本默认每周检查一次更新，也可以改成每天或关闭。若 macOS 提示无法验证开发者，可在「系统设置 → 隐私与安全性」中允许运行。
+正式安装包默认开启开机自启动，登录系统后以托盘模式运行，可在主窗口中关闭。正式版本默认每周检查一次更新，也可以改成每天或关闭。
+
+### macOS 安装与首次打开
+
+当前 GitHub Release 提供的是 ad-hoc 签名包，没有 Apple Developer ID 公证。它可以正常运行 MeshShare 的设备发现、剪贴板和文件传输功能，但 macOS 首次打开时可能显示「MeshShare 已损坏，无法打开」或「无法验证开发者」。
+
+1. 在「关于本机」确认芯片：Apple Silicon 下载 `aarch64.dmg`，Intel 下载 `x64.dmg`。
+2. 双击 DMG，将 `MeshShare.app` 拖到「应用程序」文件夹。
+3. 首次打开后，到「系统设置 → 隐私与安全性」，在“安全性”区域点击「仍要打开」，再确认打开。
+4. 如果没有出现「仍要打开」，确认 DMG 来自 [GitHub Releases](https://github.com/yangjinming1062/MeshShare/releases/latest) 后，在终端执行：
+
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/MeshShare.app"
+   open "/Applications/MeshShare.app"
+   ```
+
+不要使用 `spctl --master-disable` 关闭整台 Mac 的 Gatekeeper。设备自动发现依赖同一局域网的 mDNS；如果列表为空，可先确认其他节点已启动并在同一网络，再展开「手动连接设备」输入 `http://设备地址:37880`。局域网隔离时需要允许 UDP 5353（mDNS）和 TCP 37880（节点连接）。
 
 ## 快速上手
 

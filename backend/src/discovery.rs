@@ -51,7 +51,10 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     if protocol != Some(PROTOCOL_VERSION) {
                         continue;
                     }
-                    if node_id == node.node_id || node.node_id.as_str() > node_id.as_str() {
+                    // mDNS visibility can be asymmetric across Wi-Fi, VPN and guest networks.
+                    // Let either side dial; add_peer_channel rejects the duplicate session so
+                    // simultaneous discovery still settles on one stable WebSocket channel.
+                    if node_id == node.node_id {
                         continue;
                     }
                     let Some(address) = info.get_addresses().iter().find_map(|address| {

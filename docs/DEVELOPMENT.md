@@ -55,6 +55,8 @@ npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-upda
 
 Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 合并成 `latest.json`。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在清单、签名和所有安装包都上传后才解除 Release 草稿状态，并保持 prerelease 标记；人工验证安装包后，在 GitHub Release 页面取消 prerelease 标记，版本才会进入 `releases/latest` 并允许客户端自动更新。已人工晋级为稳定版的 Release 不会被工作流重跑覆盖。
 
+当前 macOS 发布使用 ad-hoc 签名，不需要 Apple Developer 账号。工作流通过 `APPLE_SIGNING_IDENTITY=-` 生成可在 Apple Silicon 上运行的包，并在上传前验证 `.app` 的 ad-hoc 签名和 DMG 校验；由于没有 Apple 公证，首次从浏览器下载后需要用户在「系统设置 → 隐私与安全性」中选择「仍要打开」，或手动移除下载隔离标记。以后如果启用 Developer ID，需要把工作流的 `MACOS_SIGNING_MODE` 扩展为证书签名、公证和 stapling，并补充 Apple 凭据，不能把 ad-hoc 包描述为已公证。
+
 开发构建不会执行 GitHub 更新检查。
 
 ### Wayland 运行验收
