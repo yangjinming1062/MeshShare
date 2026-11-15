@@ -3236,6 +3236,21 @@ mod tests {
             .expect("download mobile item");
         assert!(response.status().is_success());
         assert_eq!(
+            response
+                .headers()
+                .get("content-disposition")
+                .and_then(|value| value.to_str().ok()),
+            Some("attachment; filename=\"hello.txt\"")
+        );
+        let expected_content_length = bytes.len().to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get("content-length")
+                .and_then(|value| value.to_str().ok()),
+            Some(expected_content_length.as_str())
+        );
+        assert_eq!(
             response.bytes().await.expect("read download").as_ref(),
             bytes
         );

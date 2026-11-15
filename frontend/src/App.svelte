@@ -89,6 +89,8 @@
   const uploadAttempts = new Map<string, number>();
   const uploadStopped = new Set<string>();
   const mobileDownloading = new Set<string>();
+  let mobileBrowserDownloadStarted = new Set<string>();
+  let mobileBrowserDownloadConfirming = new Set<string>();
   const MOBILE_UPLOAD_MAX_ATTEMPTS = 6;
   const DESKTOP_UPLOAD_MAX_ATTEMPTS = 6;
   const FILE_UPLOAD_ATTEMPTS = 4;
@@ -918,6 +920,8 @@
     transfers = [];
     mobileSessions = [];
     mobileTransfers = [];
+    mobileBrowserDownloadStarted = new Set();
+    mobileBrowserDownloadConfirming = new Set();
     mobileAddresses = [];
     selectedAddress = '';
     mobileQr = null;
@@ -1195,7 +1199,7 @@
 
   async function acceptMobileTransfer(view: MobileTransferView) {
     if (!mobileSessionId) return;
-    if (!mobileReceiveDirectory && !(await chooseMobileReceiveDirectory())) return;
+    if (mobileDirectoryPickerAvailable() && !mobileReceiveDirectory && !(await chooseMobileReceiveDirectory())) return;
     await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/accept`, {
       method: 'POST',
       body: JSON.stringify({ session_id: mobileSessionId }),
@@ -1318,7 +1322,7 @@
 
   async function chooseMobileReceiveDirectory() {
     if (!mobileDirectoryPickerAvailable()) {
-      notice = window.isSecureContext ? '当前浏览器不支持选择存储目录' : '网页接收需要通过 HTTPS 打开页面';
+      notice = window.isSecureContext ? '当前浏览器不支持选择存储目录，可使用浏览器默认下载' : '当前页面将使用浏览器默认下载，选择目录请打开 HTTPS 地址';
       window.setTimeout(() => (notice = ''), 3000);
       return false;
     }
@@ -1423,6 +1427,52 @@
     }
   }
 
+  async function chooseAndDownloadMobileTransfer(view: MobileTransferView) {
+    if (!mobileDirectoryPickerAvailable()) return;
+    if (!mobileReceiveDirectory && !(await chooseMobileReceiveDirectory())) return;
+    await downloadMobileTransfer(view);
+  }
+
+  function mobileBrowserDownloadKey(view: MobileTransferView, item: TransferItem) {
+    return `${view.progress.transfer_id}:${item.item_id}`;
+  }
+
+  function startMobileBrowserDownload(view: MobileTransferView, item: TransferItem) {
+    if (!mobileSessionId || view.progress.status !== 'ready') return;
+    if (view.downloaded_item_ids?.includes(item.item_id)) return;
+    const anchor = document.createElement('a');
+    anchor.href = mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId);
+    anchor.download = item.name;
+    anchor.rel = 'noreferrer';
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    const key = mobileBrowserDownloadKey(view, item);
+    mobileBrowserDownloadStarted = new Set(mobileBrowserDownloadStarted).add(key);
+    notice = `已开始下载 ${item.name}，完成后点击“确认完成”`;
+  }
+
+  async function confirmMobileBrowserDownload(view: MobileTransferView, item: TransferItem) {
+    if (!mobileSessionId || view.progress.status !== 'ready') return;
+    const key = mobileBrowserDownloadKey(view, item);
+    if (!mobileBrowserDownloadStarted.has(key) || mobileBrowserDownloadConfirming.has(key)) return;
+    mobileBrowserDownloadConfirming = new Set(mobileBrowserDownloadConfirming).add(key);
+    try {
+      await completeMobileItem(view.progress.transfer_id, item.item_id, mobileSessionId);
+      const started = new Set(mobileBrowserDownloadStarted);
+      started.delete(key);
+      mobileBrowserDownloadStarted = started;
+      notice = `已确认下载 ${item.name}`;
+      await refresh();
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法确认文件下载';
+    } finally {
+      const confirming = new Set(mobileBrowserDownloadConfirming);
+      confirming.delete(key);
+      mobileBrowserDownloadConfirming = confirming;
+    }
+  }
+
   async function acceptTransfer(transfer: TransferProgress) {
     if (!transfer.offer) return;
     let destination: string | string[] | null = null;
@@ -1463,11 +1513,14 @@
 
   function mobileTransferStatus(view: MobileTransferView): string {
     const status = view.progress.status;
-    if (status === 'waiting') return '等待选择目录';
+    if (status === 'waiting') return mobileDirectoryPickerAvailable() ? '等待选择目录' : '等待开始接收';
     if (status === 'accepted') return '准备中';
     if (status === 'uploading') return '正在传输';
-    if (status === 'ready') return mobileDownloading.has(view.progress.transfer_id) ? '正在保存' : '等待保存';
-    if (status === 'completed') return '已保存';
+    if (status === 'ready') {
+      if (mobileDownloading.has(view.progress.transfer_id)) return '正在保存';
+      return mobileDirectoryPickerAvailable() ? '等待保存' : '等待逐项下载';
+    }
+    if (status === 'completed') return '已完成';
     if (status === 'rejected') return '已拒绝';
     return view.progress.error ?? status;
   }
@@ -1513,19 +1566,28 @@
 
       <section class="surface">
         <div class="surface-head">
-          <div class="surface-title"><h2>接收目录</h2></div>
-          <div class="surface-actions"><span class="muted">接收前选择</span></div>
+          <div class="surface-title"><h2>{mobileDirectoryPickerAvailable() ? '接收目录' : '文件接收'}</h2></div>
+          <div class="surface-actions"><span class="muted">{mobileDirectoryPickerAvailable() ? '接收前选择' : '无需安装证书'}</span></div>
         </div>
         <div class="surface-body">
-          <div class="setting">
-            <div class="setting-copy">
-              <strong>{mobileReceiveDirectoryName || '尚未选择存储目录'}</strong>
-              <span>{mobileDirectoryPickerAvailable() ? '文件会流式写入此目录，不会覆盖同名文件。' : (window.isSecureContext ? '当前浏览器不支持目录选择。' : '请通过 HTTPS 打开页面后选择目录。')}</span>
+          {#if mobileDirectoryPickerAvailable()}
+            <div class="setting">
+              <div class="setting-copy">
+                <strong>{mobileReceiveDirectoryName || '尚未选择存储目录'}</strong>
+                <span>文件会流式写入此目录，不会覆盖同名文件。</span>
+              </div>
+              <div class="setting-actions">
+                <button type="button" class="btn btn-primary btn-sm" on:click={chooseMobileReceiveDirectory}>选择目录</button>
+              </div>
             </div>
-            <div class="setting-actions">
-              <button type="button" class="btn btn-primary btn-sm" on:click={chooseMobileReceiveDirectory} disabled={!mobileDirectoryPickerAvailable()}>选择目录</button>
+          {:else}
+            <div class="setting">
+              <div class="setting-copy">
+                <strong>浏览器默认下载</strong>
+                <span>无需安装证书。文件会逐项下载到浏览器默认位置，下载完成后请手动确认。HTTP 不提供链路加密和完整性保护，仅适用于受信任网络。</span>
+              </div>
             </div>
-          </div>
+          {/if}
         </div>
       </section>
 
@@ -1632,16 +1694,42 @@
                 </div>
                 <div class="transfer-actions">
                   {#if view.progress.status === 'waiting'}
-                    <button type="button" class="btn btn-primary btn-sm" on:click={() => acceptMobileTransfer(view)}>{mobileReceiveDirectory ? '开始接收' : '选择目录并接收'}</button>
+                    <button type="button" class="btn btn-primary btn-sm" on:click={() => acceptMobileTransfer(view)}>{mobileDirectoryPickerAvailable() && !mobileReceiveDirectory ? '选择目录并接收' : '开始接收'}</button>
                     <button type="button" class="btn btn-ghost btn-sm" on:click={() => rejectMobileTransfer(view)}>拒绝</button>
                   {/if}
                   {#if ['accepted', 'uploading', 'ready'].includes(view.progress.status)}
                     <button type="button" class="btn btn-ghost btn-sm" on:click={() => cancelMobileTransfer(view)}>取消</button>
                   {/if}
-                  {#if view.progress.status === 'ready' && !mobileDownloading.has(view.progress.transfer_id)}
-                    <button type="button" class="btn btn-primary btn-sm" on:click={() => mobileReceiveDirectory ? downloadMobileTransfer(view) : chooseMobileReceiveDirectory().then((selected) => { if (selected) void downloadMobileTransfer(view); })}>{mobileReceiveDirectory ? '保存到已选目录' : '选择目录并保存'}</button>
+                  {#if view.progress.status === 'ready' && mobileDirectoryPickerAvailable() && !mobileDownloading.has(view.progress.transfer_id)}
+                    <button type="button" class="btn btn-primary btn-sm" on:click={() => void chooseAndDownloadMobileTransfer(view)}>{mobileReceiveDirectory ? '保存到已选目录' : '选择目录并保存'}</button>
                   {/if}
                 </div>
+                {#if view.progress.status === 'ready' && !mobileDirectoryPickerAvailable()}
+                  <div class="transfer-actions">
+                    {#each view.progress.offer?.items ?? [] as item (item.item_id)}
+                      {#if !view.downloaded_item_ids?.includes(item.item_id)}
+                        <button
+                          type="button"
+                          class="btn btn-primary btn-sm"
+                          on:click={() => startMobileBrowserDownload(view, item)}
+                          disabled={mobileBrowserDownloadStarted.has(mobileBrowserDownloadKey(view, item))}
+                        >
+                          {mobileBrowserDownloadStarted.has(mobileBrowserDownloadKey(view, item)) ? '已开始下载' : `下载 ${item.name}`}
+                        </button>
+                        {#if mobileBrowserDownloadStarted.has(mobileBrowserDownloadKey(view, item))}
+                          <button
+                            type="button"
+                            class="btn btn-ghost btn-sm"
+                            on:click={() => void confirmMobileBrowserDownload(view, item)}
+                            disabled={mobileBrowserDownloadConfirming.has(mobileBrowserDownloadKey(view, item))}
+                          >
+                            {mobileBrowserDownloadConfirming.has(mobileBrowserDownloadKey(view, item)) ? '确认中…' : '确认完成'}
+                          </button>
+                        {/if}
+                      {/if}
+                    {/each}
+                  </div>
+                {/if}
               </article>
             {:else}
               <div class="empty">还没有收到文件。</div>
