@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use tauri::utils::{config::BundleType, platform::bundle_type};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Notify;
@@ -12,6 +14,7 @@ use tokio::sync::Notify;
 const UPDATE_STATUS_EVENT: &str = "update-status";
 const CHECK_RETRY_MS: i64 = 60 * 60 * 1000;
 const ACTIVE_TRANSFER_RETRY_MS: i64 = 15 * 60 * 1000;
+const LOCAL_AUTH_RETRY_MS: i64 = 24 * 60 * 60 * 1000;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,6 +146,9 @@ impl UpdateCoordinator {
                     }
                     CheckResult::Deferred => {
                         retry_at_ms = Some(now_millis().saturating_add(ACTIVE_TRANSFER_RETRY_MS));
+                    }
+                    CheckResult::NeedsLocalAuthorization => {
+                        retry_at_ms = Some(now_millis().saturating_add(LOCAL_AUTH_RETRY_MS));
                     }
                     CheckResult::Completed => {
                         retry_at_ms = None;
@@ -295,6 +301,20 @@ impl UpdateCoordinator {
         if self.frequency() == UpdateFrequency::Disabled && !manual {
             self.set_status(UpdateState::Disabled, None, 0, None, None);
             return CheckResult::Completed;
+        }
+
+        if linux_system_package_requires_local_authorization() {
+            self.set_status(
+                UpdateState::Error,
+                Some(update.version),
+                0,
+                None,
+                Some(
+                    "Linux .deb/.rpm 更新需要本机授权；为避免后台弹出密码框，请在 Ubuntu 本机手动安装，或改用 AppImage。"
+                        .to_string(),
+                ),
+            );
+            return CheckResult::NeedsLocalAuthorization;
         }
 
         let coordinator = self;
@@ -465,6 +485,22 @@ enum CheckResult {
     Completed,
     RetryLater,
     Deferred,
+    NeedsLocalAuthorization,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_system_package_requires_local_authorization() -> bool {
+    linux_bundle_requires_local_authorization(bundle_type())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_system_package_requires_local_authorization() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn linux_bundle_requires_local_authorization(bundle: Option<BundleType>) -> bool {
+    matches!(bundle, Some(BundleType::Deb) | Some(BundleType::Rpm))
 }
 
 pub(crate) struct UpdateInstallGuard<'a> {
@@ -507,8 +543,36 @@ fn is_due(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_due, should_retry_check_error, should_retry_install_error};
+    #[cfg(not(target_os = "linux"))]
+    use super::linux_system_package_requires_local_authorization;
+    use super::{
+        is_due, should_retry_check_error, should_retry_install_error, LOCAL_AUTH_RETRY_MS,
+    };
     use crate::runtime::UpdateFrequency;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_package_updates_require_local_authorization() {
+        use super::linux_bundle_requires_local_authorization;
+        use tauri::utils::config::BundleType;
+
+        assert!(linux_bundle_requires_local_authorization(Some(
+            BundleType::Deb
+        )));
+        assert!(linux_bundle_requires_local_authorization(Some(
+            BundleType::Rpm
+        )));
+        assert!(!linux_bundle_requires_local_authorization(Some(
+            BundleType::AppImage
+        )));
+        assert!(!linux_bundle_requires_local_authorization(None));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_updates_do_not_require_linux_authorization() {
+        assert!(!linux_system_package_requires_local_authorization());
+    }
 
     #[test]
     fn update_schedule_uses_daily_and_weekly_boundaries() {
@@ -595,6 +659,14 @@ mod tests {
             false,
             Some(100),
             100,
+            false
+        ));
+        assert!(!is_due(
+            UpdateFrequency::Weekly,
+            Some(10),
+            true,
+            Some(LOCAL_AUTH_RETRY_MS),
+            LOCAL_AUTH_RETRY_MS - 1,
             false
         ));
     }

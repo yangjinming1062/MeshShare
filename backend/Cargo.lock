@@ -2554,6 +2554,8 @@ dependencies = [
  "axum",
  "axum-server",
  "base64 0.22.1",
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
  "futures-util",
  "hostname",
  "http-body-util",

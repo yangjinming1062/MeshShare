@@ -6,6 +6,8 @@ mod clock;
 mod control;
 mod discovery;
 mod listeners;
+#[cfg(target_os = "macos")]
+mod macos_security_scope;
 mod metrics;
 mod mobile_tls;
 mod model;

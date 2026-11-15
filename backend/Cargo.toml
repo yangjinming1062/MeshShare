@@ -51,6 +51,10 @@ custom-protocol = ["tauri/custom-protocol"]
 [target.'cfg(not(target_os = "android"))'.dependencies]
 arboard = { version = "3.4", features = ["wayland-data-control"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { version = "0.10", features = ["mac_os_10_8_features"] }
+core-foundation-sys = "0.8"
+
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"
 windows-result = "0.4"

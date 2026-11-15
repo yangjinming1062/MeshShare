@@ -2687,18 +2687,38 @@ async fn upload_item(
         temp_guard.cleanup().await;
         return Err(ApiError::conflict("传输已取消"));
     }
-    // Keep the link-and-mark step free of an await point. If the request is
-    // cancelled after the link succeeds, the guard must already know which
-    // target it owns so it can remove the incomplete commit.
-    if let Err(error) = std::fs::hard_link(&temp, &target) {
+    // Mark the guard's target immediately after the commit. If the request is
+    // cancelled before the transfer is marked complete, it removes the
+    // incomplete final file as well as any remaining temporary file.
+    if let Err(error) = commit_desktop_temp_file(&temp, &target).await {
         temp_guard.cleanup().await;
         if error.kind() == std::io::ErrorKind::AlreadyExists {
+            let message = format!("目标已存在：{}", target.display());
+            if let Some(progress) =
+                state
+                    .runtime
+                    .fail_transfer(&transfer_id, message.clone(), TransferStatus::Failed)
+            {
+                state
+                    .runtime
+                    .publish_event(WireMessage::TransferProgress { progress });
+            }
             return Err(ApiError::conflict(format!(
                 "目标已存在：{}",
                 target.display()
             )));
         }
-        return Err(ApiError::internal(error.to_string()));
+        let message = format!("无法提交接收文件：{error}");
+        if let Some(progress) =
+            state
+                .runtime
+                .fail_transfer(&transfer_id, message.clone(), TransferStatus::Failed)
+        {
+            state
+                .runtime
+                .publish_event(WireMessage::TransferProgress { progress });
+        }
+        return Err(ApiError::internal(message));
     }
     temp_guard.mark_linked(target.clone());
     let Some(progress) = state
@@ -2761,6 +2781,42 @@ async fn prepare_target(destination: &Path, relative_path: &str) -> Result<PathB
         Err(error) => return Err(ApiError::internal(error.to_string())),
     }
     Ok(target)
+}
+
+/// Commit a verified upload without replacing an existing file.
+///
+/// The desktop implementation uses a hard link so the final name appears
+/// atomically and the temporary file guard can remove an incomplete commit.
+/// Android's app-specific Download storage is commonly backed by emulated/FUSE
+/// storage, where hard links are rejected even though ordinary file writes
+/// succeed. Android therefore falls back to an atomic rename after rechecking
+/// that the target is still absent; the per-item transfer lock prevents a
+/// concurrent MeshShare upload from racing this check.
+async fn commit_desktop_temp_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
+    match fs::hard_link(temp, target).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if cfg!(target_os = "android")
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Unsupported
+                        | std::io::ErrorKind::PermissionDenied
+                        | std::io::ErrorKind::CrossesDevices
+                ) =>
+        {
+            match fs::symlink_metadata(target).await {
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "目标文件已存在",
+                )),
+                Err(check) if check.kind() == std::io::ErrorKind::NotFound => {
+                    fs::rename(temp, target).await
+                }
+                Err(check) => Err(check),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn resolve_target(destination: &Path, relative_path: &str) -> Result<PathBuf, ApiError> {

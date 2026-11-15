@@ -107,6 +107,10 @@ struct PersistedConfig {
     receive_mode: ReceiveMode,
     #[serde(default)]
     receive_directory: Option<String>,
+    /// macOS security-scoped bookmark for the selected receive directory.
+    /// Other platforms leave this unset and continue using the path field.
+    #[serde(default)]
+    receive_directory_bookmark: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -334,7 +338,33 @@ impl NodeRuntime {
         }
         let desktop_temp_files = load_and_cleanup_desktop_temp_files(&data_dir)?;
         cleanup_clipboard_temp_files(&data_dir)?;
-        let config = load_or_create_config(&data_dir, profile)?;
+        let mut config = load_or_create_config(&data_dir, profile)?;
+        #[cfg(target_os = "macos")]
+        {
+            // Configurations written before bookmark support only contain a
+            // path.  Try to migrate that path without opening a new panel;
+            // if macOS still requires a user grant, the next explicit folder
+            // selection will create the bookmark.
+            if config.receive_directory_bookmark.is_none() {
+                if let Some(path) = config.receive_directory.as_deref().map(Path::new) {
+                    if let Ok(bookmark) = crate::macos_security_scope::create_bookmark(path) {
+                        config.receive_directory_bookmark = Some(bookmark);
+                        if let Err(error) = persist_config(&data_dir, &config) {
+                            eprintln!("保存接收目录授权失败：{error}");
+                        }
+                    }
+                }
+            }
+            if let Some(path) = activate_receive_directory_access(&config) {
+                let resolved = path.to_string_lossy().into_owned();
+                if config.receive_directory.as_deref() != Some(resolved.as_str()) {
+                    config.receive_directory = Some(resolved);
+                    if let Err(error) = persist_config(&data_dir, &config) {
+                        eprintln!("更新接收目录路径失败：{error}");
+                    }
+                }
+            }
+        }
         let mut clipboard_history = load_clipboard_history(&data_dir)?;
         prune_clipboard_history_records(&mut clipboard_history, &config, now_millis());
         persist_clipboard_history(&data_dir, &clipboard_history)?;
@@ -947,6 +977,17 @@ impl NodeRuntime {
         next.receive_directory = canonical_directory
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
+        #[cfg(target_os = "macos")]
+        {
+            next.receive_directory_bookmark = canonical_directory
+                .as_deref()
+                .and_then(|path| crate::macos_security_scope::create_bookmark(path).ok());
+            if let Some(bookmark) = next.receive_directory_bookmark.as_deref() {
+                if let Err(error) = crate::macos_security_scope::activate_bookmark(bookmark) {
+                    eprintln!("激活接收目录授权失败：{error}");
+                }
+            }
+        }
         persist_config(&self.data_dir, &next)?;
         *config = next;
         drop(config);
@@ -2378,9 +2419,22 @@ fn load_or_create_config(data_dir: &Path, profile: NodeProfile) -> anyhow::Resul
         clipboard_history_days: default_clipboard_history_days(),
         receive_mode: default_receive_mode(),
         receive_directory: None,
+        receive_directory_bookmark: None,
     };
     persist_config(data_dir, &config)?;
     Ok(config)
+}
+
+#[cfg(target_os = "macos")]
+fn activate_receive_directory_access(config: &PersistedConfig) -> Option<PathBuf> {
+    let bookmark = config.receive_directory_bookmark.as_deref()?;
+    match crate::macos_security_scope::activate_bookmark(bookmark) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            eprintln!("恢复接收目录授权失败：{error}");
+            None
+        }
+    }
 }
 
 pub fn validate_receive_directory(path: &Path) -> anyhow::Result<PathBuf> {
