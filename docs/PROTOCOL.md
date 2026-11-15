@@ -57,7 +57,7 @@
 
 ## 硬件指标
 
-`HardwareMetrics` 只包含当前快照：`node_id`、`sampled_at_ms`、系统 CPU 使用率、内存已用/总量、网络下行/上行字节速率和逐 GPU 的利用率、显存已用/总量。显存只统计独立显存，共享显存与统一内存不折算进去，没有独立显存的核显因此字段为空：Windows 读取 GPU 性能计数器的独立占用并用注册表记录的独立容量，Linux 逐卡读取 sysfs 的 VRAM，macOS 读取 `spdisplays_vram`。Windows 的性能计数器只有适配器 LUID 维度、没有每卡容量，因此聚合成一条记录；Linux 与 macOS 按卡分别上报。`memory_kind` 只是平台内存类型提示；平台没有对应能力时字段为空并附带 `unavailable_reason`。
+`HardwareMetrics` 只包含当前快照：`node_id`、`sampled_at_ms`、系统 CPU 使用率、内存已用/总量、网络下行/上行字节速率和逐 GPU 的利用率、显存已用/总量。显存只统计独立显存，共享显存与统一内存不折算进去，没有独立显存的核显因此字段为空：Windows 读取 GPU 性能计数器的独立占用并用注册表记录的独立容量，Linux 逐卡读取 sysfs 的 VRAM，并通过 PCI 设备信息填充人类可读型号；PCI 数据库把多个 AMD Navi 31 变体合并命名时，在显存容量能唯一对应型号的情况下进一步细化名称，缺少 `lspci` 时回退到驱动名；macOS 读取 `spdisplays_vram`。Windows 的性能计数器只有适配器 LUID 维度、没有每卡容量，因此聚合成一条记录；Linux 与 macOS 按卡分别上报。`memory_kind` 只是平台内存类型提示；平台没有对应能力时字段为空并附带 `unavailable_reason`。
 
 `PeerInfo.metrics_received_at_ms` 是本地收到远端快照的时间。`metrics_stale` 由服务端按 5 秒阈值计算，供 UI 区分尚未采集和已过期状态。
 

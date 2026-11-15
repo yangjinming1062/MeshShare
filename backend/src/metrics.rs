@@ -421,13 +421,17 @@ fn probe_linux_gpus() -> Vec<GpuMetrics> {
             .find_map(|file| read_percent(&device.join(file)));
         let memory_used = read_u64(&device.join("mem_info_vram_used"));
         let memory_total = read_u64(&device.join("mem_info_vram_total"));
-        let driver = read_driver(&device).unwrap_or_else(|| name.clone());
         if utilization.is_none() && memory_used.is_none() && memory_total.is_none() {
             continue;
         }
-        let label = read_uevent_field(&device, "PCI_SLOT_NAME").unwrap_or_else(|| name.clone());
+        let slot = read_uevent_field(&device, "PCI_SLOT_NAME");
+        let display_name = slot
+            .as_deref()
+            .and_then(|slot| read_linux_gpu_name(slot, memory_total))
+            .or_else(|| read_driver(&device))
+            .unwrap_or_else(|| name.clone());
         gpus.push(GpuMetrics {
-            name: format!("{} ({})", driver, label),
+            name: display_name,
             utilization_percent: utilization,
             memory_used_bytes: memory_used,
             memory_total_bytes: memory_total,
@@ -444,6 +448,72 @@ fn probe_linux_gpus() -> Vec<GpuMetrics> {
         });
     }
     gpus
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_gpu_name(slot: &str, memory_total_bytes: Option<u64>) -> Option<String> {
+    let slot = slot.strip_prefix("0000:").unwrap_or(slot);
+    let output = hidden_command("lspci")
+        .args(["-mm", "-s", slot])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let fields = parse_lspci_machine_fields(&String::from_utf8_lossy(&output.stdout))?;
+    fields
+        .get(2)
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| refine_linux_gpu_name(value.trim(), memory_total_bytes))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn refine_linux_gpu_name(name: &str, memory_total_bytes: Option<u64>) -> String {
+    // pci.ids groups the consumer Navi 31 cards under one device ID. Their
+    // dedicated VRAM capacities distinguish the common 20 GiB XT and 24 GiB
+    // XTX variants without depending on an optional vendor utility.
+    if name.contains("Navi 31") {
+        if let Some(memory_total_bytes) = memory_total_bytes {
+            let memory_gib =
+                memory_total_bytes.saturating_add(512 * 1024 * 1024) / (1024 * 1024 * 1024);
+            if memory_gib == 20 {
+                return "Radeon RX 7900 XT".to_string();
+            }
+            if memory_gib == 24 {
+                return "Radeon RX 7900 XTX".to_string();
+            }
+        }
+    }
+    name.to_string()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_lspci_machine_fields(output: &str) -> Option<Vec<String>> {
+    let line = output.lines().find(|line| !line.trim().is_empty())?;
+    let mut fields = Vec::new();
+    let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        if character != '"' {
+            continue;
+        }
+        let mut field = String::new();
+        let mut escaped = false;
+        for character in chars.by_ref() {
+            if escaped {
+                field.push(character);
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                break;
+            } else {
+                field.push(character);
+            }
+        }
+        fields.push(field);
+    }
+    (!fields.is_empty()).then_some(fields)
 }
 
 #[cfg(target_os = "linux")]
@@ -540,7 +610,10 @@ fn parse_human_memory(value: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_loopback_interface, network_totals, parse_nvidia_line, rate};
+    use super::{
+        is_loopback_interface, network_totals, parse_lspci_machine_fields, parse_nvidia_line, rate,
+        refine_linux_gpu_name,
+    };
     use sysinfo::Networks;
 
     #[test]
@@ -563,6 +636,52 @@ mod tests {
         assert_eq!(gpu.utilization_percent, None);
         assert_eq!(gpu.memory_used_bytes, None);
         assert_eq!(gpu.memory_total_bytes, Some(2048 * 1024 * 1024));
+    }
+
+    #[test]
+    fn lspci_parser_extracts_human_readable_device_name() {
+        let fields = parse_lspci_machine_fields(
+            r#"03:00.0 "VGA compatible controller" "Advanced Micro Devices, Inc. [AMD/ATI]" "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]" -rcc -p00 "XFX Limited" "Device 7905""#,
+        )
+        .expect("parse lspci output");
+        assert_eq!(
+            fields.get(2).map(String::as_str),
+            Some("Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]")
+        );
+    }
+
+    #[test]
+    fn lspci_parser_unescapes_quoted_fields() {
+        let fields = parse_lspci_machine_fields(
+            r#"01:00.0 "Display controller" "Vendor" "Model \"Edition\"" -r01"#,
+        )
+        .expect("parse lspci output");
+        assert_eq!(fields.get(2).map(String::as_str), Some("Model \"Edition\""));
+    }
+
+    #[test]
+    fn grouped_navi_31_name_uses_vram_capacity_when_unambiguous() {
+        assert_eq!(
+            refine_linux_gpu_name(
+                "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]",
+                Some(21_458_059_264),
+            ),
+            "Radeon RX 7900 XT"
+        );
+        assert_eq!(
+            refine_linux_gpu_name(
+                "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]",
+                Some(24 * 1024 * 1024 * 1024),
+            ),
+            "Radeon RX 7900 XTX"
+        );
+        assert_eq!(
+            refine_linux_gpu_name(
+                "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]",
+                Some(16 * 1024 * 1024 * 1024),
+            ),
+            "Navi 31 [Radeon RX 7900 XT/7900 XTX/7900 GRE/7900M]"
+        );
     }
 
     #[test]
