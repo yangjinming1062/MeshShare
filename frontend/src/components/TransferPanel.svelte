@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import { formatSize } from '../format';
+  import { transferItemsLabel, transferStatusText } from '../format';
   import type { TransferProgress } from '../types';
 
   export let transfers: TransferProgress[] = [];
@@ -14,23 +14,6 @@
     return Math.max(0, Math.min(1, transfer.completed_bytes / transfer.total_bytes));
   }
 
-  function itemsLabel(transfer: TransferProgress): string {
-    const names = transfer.offer?.items.map((item) => item.name) ?? [];
-    if (names.length) return names.slice(0, 2).join('、') + (names.length > 2 ? ' 等 ' + names.length + ' 项' : '');
-    return transfer.total_items + ' 个项目';
-  }
-
-  function detailLabel(transfer: TransferProgress): string {
-    if (transfer.status === 'waiting') return '等待确认';
-    if (transfer.status === 'accepted') return '准备接收';
-    if (transfer.status === 'ready') return '等待网页端保存';
-    if (transfer.status === 'completed') return '已完成 · ' + formatSize(transfer.total_bytes);
-    if (transfer.status === 'rejected') return '已拒绝';
-    if (transfer.status === 'cancelled') return '已取消';
-    if (transfer.status === 'failed') return transfer.error ?? '失败';
-    return formatSize(transfer.completed_bytes) + ' / ' + formatSize(transfer.total_bytes)
-      + ' · ' + Math.round(ratio(transfer) * 100) + '%';
-  }
 </script>
 
 <section class="surface area-transfers">
@@ -55,7 +38,7 @@
           </span>
           <div class="transfer-copy">
             <strong title={transfer.offer?.source_name ?? '文件传输'}>{transfer.offer?.source_name ?? '文件传输'}</strong>
-            <span title={itemsLabel(transfer)}>{itemsLabel(transfer)}</span>
+            <span title={transferItemsLabel(transfer)}>{transferItemsLabel(transfer)}</span>
           </div>
           <div class="transfer-progress">
             <div
@@ -68,7 +51,7 @@
             >
               <span class="progress-fill" style="--p:{ratio(transfer)}"></span>
             </div>
-            <span>{detailLabel(transfer)}</span>
+            <span>{transferStatusText(transfer, 'desktop')}</span>
           </div>
           {#if transfer.direction === 'receive' && transfer.status === 'waiting'}
             <div class="transfer-actions">

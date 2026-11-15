@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <!-- 品牌主色：取自 meshshare.svg 的 tile 渐变中段，保证自适应图标外圈与图标底色一致 -->
+  <color name="ic_launcher_background">#2854e4</color>
+</resources>

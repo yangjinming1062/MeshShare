@@ -7,15 +7,14 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
-  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { clipboardHistoryKind, clipboardHistoryPreview, formatPercent, formatRate, formatTime, gpuMemoryPercent, gpuUtilization, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
-  import Icon from './components/Icon.svelte';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
-  import DeviceRow from './components/DeviceRow.svelte';
   import HardwarePanel from './components/HardwarePanel.svelte';
   import ClipboardPanel from './components/ClipboardPanel.svelte';
   import TransferPanel from './components/TransferPanel.svelte';
+  import MobileApp from './components/MobileApp.svelte';
   import SettingsDialog from './components/SettingsDialog.svelte';
   import MobileAccessDialog from './components/MobileAccessDialog.svelte';
   import HistoryDetailDialog from './components/HistoryDetailDialog.svelte';
@@ -29,6 +28,8 @@
   // 浏览器访问（根地址或 /mobile）一律渲染网页临时加入界面，Tauri 窗口按窗口类型区分
   const isWeb = !inTauri && !isMonitor;
   const isDesktopWindow = inTauri && !isMonitor && !isAndroidApp;
+  const isPhone = isWeb || isAndroidApp;
+  document.documentElement.dataset.shell = isMonitor ? 'monitor' : isPhone ? (isWeb ? 'web' : 'android') : 'desktop';
   let node: NodeInfo | null = null;
   let activeBaseUrl = '';
   let remoteTarget: PeerInfo | null = null;
@@ -69,6 +70,7 @@
   let mobileSessions: MobileSession[] = [];
   let mobileTransfers: MobileTransferView[] = [];
   let mobileSessionId = '';
+  let transferActionBusy = '';
   let manualAddress = '';
   let savedNodeUrls: string[] = [];
   let monitorLocked = false;
@@ -113,6 +115,14 @@
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
   $: secureMobileUrl = node?.mobile_addresses?.find((address) => address.address === mobileAddress?.address)?.url;
+  $: phoneTransfers = isWeb
+    ? mobileTransfers.map((transfer): PhoneTransfer => ({ ...transfer.progress, direction: 'receive', downloadedItemIds: transfer.downloaded_item_ids }))
+    : transfers.map((transfer): PhoneTransfer => ({
+        ...transfer,
+        peerName: transfer.direction === 'send'
+          ? peers.find((peer) => peer.node_id === transfer.offer?.target_node_id)?.node_name
+          : undefined,
+      }));
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
   $: remotePath = remoteMode
@@ -1541,8 +1551,38 @@
     }
   }
 
+  function phoneTransferView(transfer: PhoneTransfer): MobileTransferView {
+    return { session_id: mobileSessionId, progress: transfer, downloaded_item_ids: transfer.downloadedItemIds };
+  }
+
+  function acceptPhoneTransfer(transfer: PhoneTransfer) {
+    if (isWeb) void acceptMobileTransfer(phoneTransferView(transfer));
+    else void acceptTransfer(transfer);
+  }
+
+  function rejectPhoneTransfer(transfer: PhoneTransfer) {
+    if (isWeb) void rejectMobileTransfer(phoneTransferView(transfer));
+    else void rejectTransfer(transfer);
+  }
+
+  function cancelPhoneTransfer(transfer: PhoneTransfer) {
+    if (isWeb) void cancelMobileTransfer(phoneTransferView(transfer));
+  }
+
+  function savePhoneTransfer(transfer: PhoneTransfer) {
+    if (isWeb) void chooseAndDownloadMobileTransfer(phoneTransferView(transfer));
+  }
+
+  function downloadPhoneItem(transfer: PhoneTransfer, item: TransferItem) {
+    if (isWeb) startMobileBrowserDownload(phoneTransferView(transfer), item);
+  }
+
+  function confirmPhoneItem(transfer: PhoneTransfer, item: TransferItem) {
+    if (isWeb) void confirmMobileBrowserDownload(phoneTransferView(transfer), item);
+  }
+
   async function acceptTransfer(transfer: TransferProgress) {
-    if (!transfer.offer) return;
+    if (!transfer.offer || transferActionBusy) return;
     let destination: string | string[] | null = null;
     let path: string | undefined;
     if (remoteMode) {
@@ -1567,6 +1607,7 @@
       notice = remoteMode ? '需要输入目标节点上的接收目录' : '当前环境无法选择接收目录';
       return;
     }
+    transferActionBusy = transfer.transfer_id;
     try {
       if (remoteMode) {
         await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/accept`, {
@@ -1579,25 +1620,19 @@
       notice = isAndroidApp && !remoteMode ? '已接受，文件将保存到 MeshShare 应用目录' : '已接受，等待文件直传';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法接受传输';
+    } finally {
+      transferActionBusy = '';
     }
   }
 
   async function rejectTransfer(transfer: TransferProgress) {
-    await request(`/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/reject`, { method: 'POST' }).catch(() => undefined);
-  }
-
-  function mobileTransferStatus(view: MobileTransferView): string {
-    const status = view.progress.status;
-    if (status === 'waiting') return mobileDirectoryPickerAvailable() ? '等待选择目录' : '等待开始接收';
-    if (status === 'accepted') return '准备中';
-    if (status === 'uploading') return '正在传输';
-    if (status === 'ready') {
-      if (mobileDownloading.has(view.progress.transfer_id)) return '正在保存';
-      return mobileDirectoryPickerAvailable() ? '等待保存' : '等待逐项下载';
+    if (transferActionBusy) return;
+    transferActionBusy = transfer.transfer_id;
+    try {
+      await request(`/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/reject`, { method: 'POST' }).catch(() => undefined);
+    } finally {
+      transferActionBusy = '';
     }
-    if (status === 'completed') return '已完成';
-    if (status === 'rejected') return '已拒绝';
-    return view.progress.error ?? status;
   }
 
 </script>
@@ -1606,7 +1641,7 @@
   <title>{isMonitor ? 'MeshShare · 硬件监控' : isWeb ? 'MeshShare · 临时加入' : 'MeshShare · 局域网共享'}</title>
 </svelte:head>
 
-<div class:mobile-shell={isWeb} class:monitor-shell={isMonitor} class:app-shell={!isWeb && !isMonitor}>
+<div class:phone-shell={isPhone} class:monitor-shell={isMonitor} class:app-shell={!isPhone && !isMonitor}>
   {#if isMonitor}
     <main class="monitor-main" data-tauri-drag-region="deep" on:contextmenu={openMonitorMenu}>
       <div class="monitor-metric"><b>CPU</b><span>{formatPercent(monitorMetrics?.cpu_usage_percent)}</span></div>
@@ -1616,208 +1651,46 @@
       <div class="monitor-metric"><b>显存</b><span>{formatPercent(gpuMemoryPercent(monitorMetrics))}</span></div>
       <div class="monitor-metric"><b>↓</b><span>{formatRate(monitorMetrics?.network_down_bytes_per_sec)}</span></div>
     </main>
-  {:else if isWeb}
-    <header class="mobile-topbar">
-      <div class="brand">
-        <img src="/meshshare.svg" width="28" height="28" alt="" />
-        <div class="brand-copy">
-          <div class="brand-name">MeshShare</div>
-          <div class="brand-sub">浏览器临时加入</div>
-        </div>
-      </div>
-      <div class="node-status" data-kind={statusKind} role="status" aria-live="polite">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span class="status-text">{status}</span>
-      </div>
-    </header>
-    {#if notice}<div class="notice" role="status">{notice}</div>{/if}
-    <main class="mobile-main">
-      <section class="surface">
-        <div class="surface-body">
-          <h1>{node?.node_name ?? 'MeshShare 节点'}</h1>
-          <p class="muted">选择下面的设备，直接发送文件或文件夹。</p>
-        </div>
-      </section>
-
-      <section class="surface">
-        <div class="surface-head">
-          <div class="surface-title"><h2>{mobileDirectoryPickerAvailable() ? '接收目录' : '文件接收'}</h2></div>
-          <div class="surface-actions"><span class="muted">{mobileDirectoryPickerAvailable() ? '接收前选择' : '无需安装证书'}</span></div>
-        </div>
-        <div class="surface-body">
-          {#if mobileDirectoryPickerAvailable()}
-            <div class="setting">
-              <div class="setting-copy">
-                <strong>{mobileReceiveDirectoryName || '尚未选择存储目录'}</strong>
-                <span>文件会流式写入此目录，不会覆盖同名文件。</span>
-              </div>
-              <div class="setting-actions">
-                <button type="button" class="btn btn-primary btn-sm" on:click={chooseMobileReceiveDirectory}>选择目录</button>
-              </div>
-            </div>
-          {:else}
-            <div class="setting">
-              <div class="setting-copy">
-                <strong>浏览器默认下载</strong>
-                <span>无需安装证书。文件会逐项下载到浏览器默认位置，下载完成后请手动确认。HTTP 不提供链路加密和完整性保护，仅适用于受信任网络。</span>
-              </div>
-            </div>
-          {/if}
-        </div>
-      </section>
-
-      <section class="surface">
-        <div class="surface-head">
-          <div class="surface-title"><h2>共享剪贴板</h2></div>
-          <div class="surface-actions"><span class="muted">{clipboard ? formatTime(clipboard.updated_at_ms) : '暂无内容'}</span></div>
-        </div>
-        <div class="surface-body">
-          <textarea class="field" id="clipboard-editor" bind:value={clipboardDraft} placeholder="粘贴或输入需要同步的文字"></textarea>
-          <div class="action-row">
-            <button type="button" class="btn btn-primary btn-sm" on:click={publishClipboard}>同步到设备</button>
-            <button type="button" class="btn btn-sm" on:click={readMobileClipboard}>读取本机剪贴板</button>
-            <button type="button" class="btn btn-sm" on:click={writeMobileClipboard}>写入本机剪贴板</button>
-          </div>
-        </div>
-      </section>
-
-      <section class="surface">
-        <div class="surface-head">
-          <div class="surface-title"><h2>剪贴板历史</h2><span class="chip">{clipboardHistory.length}</span></div>
-        </div>
-        <div class="surface-body">
-          {#if selectedClipboardHistory}
-            <div class="history-detail-meta">
-              <strong>{selectedClipboardHistory.item.source_name}</strong>
-              <span class="muted">{clipboardHistoryKind(selectedClipboardHistory.item)} · {formatTime(selectedClipboardHistory.item.updated_at_ms)}</span>
-            </div>
-            <div class="history-detail-grid">
-              <textarea class="field" readonly value={selectedClipboardHistory.snapshot.text ?? ''} placeholder="图片内容"></textarea>
-              {#if selectedClipboardHistory.snapshot.image_png}
-                <img class="clip-image" src={'data:image/png;base64,' + selectedClipboardHistory.snapshot.image_png} alt="历史共享图片" />
-              {/if}
-            </div>
-            <div class="action-row">
-              <button type="button" class="btn btn-primary btn-sm" on:click={restoreClipboardHistoryItem} disabled={clipboardHistoryBusy}>恢复并同步</button>
-              <button type="button" class="btn btn-ghost btn-sm" on:click={closeHistoryDetail}>返回历史列表</button>
-            </div>
-          {:else}
-            <div class="history-list">
-              {#each clipboardHistory as item (item.event_id)}
-                <button type="button" class="history-row" on:click={() => openClipboardHistory(item)}>
-                  <span class="history-kind">{item.has_image ? 'PNG' : '文字'}</span>
-                  <span class="history-preview">{clipboardHistoryPreview(item)}</span>
-                  <span class="history-time">{formatTime(item.updated_at_ms)}</span>
-                </button>
-              {:else}
-                <div class="empty">还没有保存的剪贴板历史。</div>
-              {/each}
-            </div>
-            <div class="action-row">
-              <button type="button" class="btn btn-ghost btn-sm" on:click={clearClipboardHistoryItems} disabled={clipboardHistoryBusy || !clipboardHistory.length}>清空历史</button>
-            </div>
-          {/if}
-        </div>
-      </section>
-
-      <section class="surface">
-        <div class="surface-head">
-          <div class="surface-title"><h2>在线设备</h2><span class="chip">{mobileTargets.length}</span></div>
-        </div>
-        <div class="surface-body">
-          <ul class="device-list device-list--stacked" role="list">
-            {#each mobileTargets as peer (peer.node_id)}
-              <DeviceRow
-                kind="peer"
-                {peer}
-                onSend={() => startChoose(peer)}
-                onSendFolder={() => startChoose(peer, true)}
-                onDropFile={(event) => onDrop(peer, event)}
-              />
-            {:else}
-              <li class="empty">暂时没有发现其他在线桌面设备。</li>
-            {/each}
-          </ul>
-        </div>
-      </section>
-
-      <section class="surface">
-        <div class="surface-head">
-          <div class="surface-title"><h2>收到的文件</h2><span class="chip">{mobileTransfers.length}</span></div>
-        </div>
-        <div class="surface-body">
-          <div class="transfer-list">
-            {#each mobileTransfers as view (view.progress.transfer_id)}
-              <article class="transfer-row transfer-row--mobile">
-                <span class="transfer-icon" aria-hidden="true"><Icon name="arrow-down" size={14} /></span>
-                <div class="transfer-copy">
-                  <strong>{view.progress.offer?.source_name ?? '电脑文件'}</strong>
-                  <span>{view.progress.offer?.items.map((item) => item.name).join('、') ?? '文件传输'}</span>
-                </div>
-                <div class="transfer-progress">
-                  <div
-                    class="progress"
-                    role="progressbar"
-                    aria-valuemin="0"
-                    aria-valuemax="100"
-                    aria-valuenow={view.progress.total_bytes ? Math.round(Math.min(100, view.progress.completed_bytes / view.progress.total_bytes * 100)) : 0}
-                    aria-label="传输进度"
-                  >
-                    <span class="progress-fill" style="--p:{view.progress.total_bytes ? Math.min(1, view.progress.completed_bytes / view.progress.total_bytes) : 0}"></span>
-                  </div>
-                  <span>{mobileTransferStatus(view)}</span>
-                </div>
-                <div class="transfer-actions">
-                  {#if view.progress.status === 'waiting'}
-                    <button type="button" class="btn btn-primary btn-sm" on:click={() => acceptMobileTransfer(view)}>{mobileDirectoryPickerAvailable() && !mobileReceiveDirectory ? '选择目录并接收' : '开始接收'}</button>
-                    <button type="button" class="btn btn-ghost btn-sm" on:click={() => rejectMobileTransfer(view)}>拒绝</button>
-                  {/if}
-                  {#if ['accepted', 'uploading', 'ready'].includes(view.progress.status)}
-                    <button type="button" class="btn btn-ghost btn-sm" on:click={() => cancelMobileTransfer(view)}>取消</button>
-                  {/if}
-                  {#if view.progress.status === 'ready' && mobileDirectoryPickerAvailable() && !mobileDownloading.has(view.progress.transfer_id)}
-                    <button type="button" class="btn btn-primary btn-sm" on:click={() => void chooseAndDownloadMobileTransfer(view)}>{mobileReceiveDirectory ? '保存到已选目录' : '选择目录并保存'}</button>
-                  {/if}
-                </div>
-                {#if view.progress.status === 'ready' && !mobileDirectoryPickerAvailable()}
-                  <div class="transfer-actions">
-                    {#each view.progress.offer?.items ?? [] as item (item.item_id)}
-                      {#if !view.downloaded_item_ids?.includes(item.item_id)}
-                        <button
-                          type="button"
-                          class="btn btn-primary btn-sm"
-                          on:click={() => startMobileBrowserDownload(view, item)}
-                          disabled={mobileBrowserDownloadStarted.has(mobileBrowserDownloadKey(view, item))}
-                        >
-                          {mobileBrowserDownloadStarted.has(mobileBrowserDownloadKey(view, item)) ? '已开始下载' : `下载 ${item.name}`}
-                        </button>
-                        {#if mobileBrowserDownloadStarted.has(mobileBrowserDownloadKey(view, item))}
-                          <button
-                            type="button"
-                            class="btn btn-ghost btn-sm"
-                            on:click={() => void confirmMobileBrowserDownload(view, item)}
-                            disabled={mobileBrowserDownloadConfirming.has(mobileBrowserDownloadKey(view, item))}
-                          >
-                            {mobileBrowserDownloadConfirming.has(mobileBrowserDownloadKey(view, item)) ? '确认中…' : '确认完成'}
-                          </button>
-                        {/if}
-                      {/if}
-                    {/each}
-                  </div>
-                {/if}
-              </article>
-            {:else}
-              <div class="empty">还没有收到文件。</div>
-            {/each}
-          </div>
-        </div>
-      </section>
-    </main>
+  {:else if isPhone}
+    <MobileApp
+      mode={isWeb ? 'web' : 'android'}
+      {node}
+      {status}
+      {statusKind}
+      peers={isWeb ? mobileTargets : peers}
+      transfers={phoneTransfers}
+      {clipboard}
+      bind:draft={clipboardDraft}
+      history={clipboardHistory}
+      historyBusy={clipboardHistoryBusy}
+      selectedHistory={selectedClipboardHistory}
+      {metrics}
+      canChooseDirectory={mobileDirectoryPickerAvailable()}
+      receiveDirectoryName={mobileReceiveDirectoryName}
+      actionBusyId={transferActionBusy}
+      downloadingIds={[...mobileDownloading]}
+      startedDownloadKeys={[...mobileBrowserDownloadStarted]}
+      onSendFile={(peer) => startChoose(peer)}
+      onSendFolder={(peer) => startChoose(peer, true)}
+      onAcceptTransfer={acceptPhoneTransfer}
+      onRejectTransfer={rejectPhoneTransfer}
+      onCancelTransfer={cancelPhoneTransfer}
+      onSaveToDirectory={savePhoneTransfer}
+      onStartDownload={downloadPhoneItem}
+      onConfirmDownload={confirmPhoneItem}
+      onPublish={publishClipboard}
+      onReadLocal={readMobileClipboard}
+      onWriteLocal={writeMobileClipboard}
+      onChooseDirectory={chooseMobileReceiveDirectory}
+      onOpenHistory={openClipboardHistory}
+      onRestoreHistory={restoreClipboardHistoryItem}
+      onCloseHistory={closeHistoryDetail}
+      onClearHistory={clearClipboardHistoryItems}
+    />
   {:else}
     <AppHeader
       {node}
       remote={remoteMode}
-      mobileApp={isAndroidApp}
       {remotePath}
       {status}
       {statusKind}
@@ -1829,17 +1702,14 @@
       onSettings={() => (settingsOpen = true)}
       onBack={returnToPreviousTarget}
     />
-    {#if notice}<div class="notice" role="status">{notice}</div>{/if}
     {#if isDesktopWindow && node && !clipboardStatus.available}
       <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
     {/if}
     <main class="app-main">
       <DevicePanel
         peers={peers}
-        mobileSessions={isAndroidApp ? [] : mobileSessions}
+        {mobileSessions}
         savedAddresses={savedNodeUrls}
-        showMobileAccess={!isAndroidApp}
-        showMobileSessions={!isAndroidApp}
         draggingKey={dragPeer}
         addOpen={addDeviceOpen}
         bind:manualAddress
@@ -1860,60 +1730,41 @@
       />
       <HardwarePanel
         metrics={metrics}
-        compactNetwork={isAndroidApp && !remoteMode}
         {monitorLocked}
         canClickThrough={monitorCapabilities.can_click_through}
         onToggleLock={toggleMonitorLock}
       />
-      {#if !isAndroidApp}
-        <ClipboardPanel
-          {clipboard}
-          bind:draft={clipboardDraft}
-          history={clipboardHistory}
-          bind:tab={clipboardTab}
-          busy={clipboardHistoryBusy}
-          onPublish={publishClipboard}
-          manualOnly={false}
-          onOpenHistory={openClipboardHistory}
-          onClearHistory={requestClearHistory}
-        />
-      {:else}
-        <ClipboardPanel
-          {clipboard}
-          bind:draft={clipboardDraft}
-          history={[]}
-          tab="current"
-          busy={clipboardHistoryBusy}
-          onPublish={publishClipboard}
-          manualOnly={true}
-          onReadLocal={readMobileClipboard}
-          onWriteLocal={writeMobileClipboard}
-          onOpenHistory={() => {}}
-          onClearHistory={() => {}}
-        />
-      {/if}
+      <ClipboardPanel
+        {clipboard}
+        bind:draft={clipboardDraft}
+        history={clipboardHistory}
+        bind:tab={clipboardTab}
+        busy={clipboardHistoryBusy}
+        onPublish={publishClipboard}
+        onOpenHistory={openClipboardHistory}
+        onClearHistory={requestClearHistory}
+      />
       <TransferPanel {transfers} onAccept={acceptTransfer} onReject={rejectTransfer} />
     </main>
-    {#if !isAndroidApp}
-      <SettingsDialog
-        open={settingsOpen}
-        {node}
-        {updateFrequency}
-        {updateStatus}
-        {updateBusy}
-        {receiveSettings}
-        receiveBusy={receiveSettingsBusy}
-        historySettings={clipboardHistorySettings}
-        historyBusy={clipboardHistorySettingsBusy}
-        onFrequency={setUpdateFrequency}
-        onCheckUpdates={checkForUpdates}
-        onReceiveMode={setReceiveMode}
-        onChooseDirectory={chooseReceiveDirectory}
-        onHistoryMode={setClipboardHistoryMode}
-        onHistoryValue={setClipboardHistoryValue}
-        onClose={() => (settingsOpen = false)}
-      />
-    {/if}
+    <SettingsDialog
+      open={settingsOpen}
+      {node}
+      {updateFrequency}
+      {updateStatus}
+      {updateBusy}
+      {receiveSettings}
+      receiveBusy={receiveSettingsBusy}
+      historySettings={clipboardHistorySettings}
+      historyBusy={clipboardHistorySettingsBusy}
+      onFrequency={setUpdateFrequency}
+      onCheckUpdates={checkForUpdates}
+      onReceiveMode={setReceiveMode}
+      onChooseDirectory={chooseReceiveDirectory}
+      onHistoryMode={setClipboardHistoryMode}
+      onHistoryValue={setClipboardHistoryValue}
+      onClose={() => (settingsOpen = false)}
+    />
+
     <MobileAccessDialog
       open={mobileAccessOpen}
       nodeReady={!!node}
@@ -1947,6 +1798,7 @@
       onCancel={cancelClearHistory}
     />
   {/if}
+  {#if notice}<div class="notice" role="status">{notice}</div>{/if}
 </div>
 
 <input bind:this={fileInput} class="hidden-input" type="file" multiple on:change={onFileInput} />

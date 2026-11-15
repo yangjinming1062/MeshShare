@@ -17,13 +17,15 @@ npm --prefix frontend run build
 
 ## 更新项目图标
 
-项目标志和网页共用 `frontend/public/meshshare.svg`。修改源图后，从仓库根目录运行 Tauri CLI 生成桌面图标。
+项目标志和网页共用 `frontend/public/meshshare.svg`。修改源图后，从仓库根目录运行 Tauri CLI 生成各平台图标。
 
 ```bash
 npx --yes @tauri-apps/cli@2 icon frontend/public/meshshare.svg --output backend/target/meshshare-icon-generation
 ```
 
 将生成的 ICO、ICNS 和 `backend/tauri.conf.json` 列出的 PNG 更新到 `backend/icons/`。这些文件随仓库维护，日常构建直接使用。
+
+同一命令还会产出移动端图标，按平台放在 `backend/icons/mobile/<platform>/` 下，避免和桌面图标混在一个目录。当前 Android 使用 `backend/icons/mobile/android/`：把产物中的 `android/` 目录整份更新到这里，由 `.github/scripts/prepare_android_project.py` 在 `tauri android init` 之后写入 `gen/android/app/src/main/res`。因此 `backend/gen` 可再生，不要手工修改生成工程里的图标。自适应图标由 `mipmap-anydpi-v26/ic_launcher.xml`、`values/ic_launcher_background.xml` 与各密度 `ic_launcher_foreground.png` 组成，minSdk 29 起始终生效。
 
 ## 启动与构建
 

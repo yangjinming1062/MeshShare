@@ -1,4 +1,4 @@
-import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, UpdateFrequency, UpdateStatus } from './types';
+import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, TransferProgress, UpdateFrequency, UpdateStatus } from './types';
 
 export const METRICS_STALE_AFTER_MS = 5_000;
 
@@ -74,6 +74,34 @@ export function formatConnectedSince(since: number): string {
   const hours = Math.round(minutes / 60);
   if (hours < 24) return hours + ' 小时';
   return Math.round(hours / 24) + ' 天';
+}
+
+export function transferItemsLabel(transfer: TransferProgress): string {
+  const names = transfer.offer?.items.map((item) => item.name) ?? [];
+  if (names.length) return names.slice(0, 2).join('、') + (names.length > 2 ? ' 等 ' + names.length + ' 项' : '');
+  return transfer.total_items + ' 个项目';
+}
+
+export function transferItemKey(transferId: string, itemId: string): string {
+  return transferId + ':' + itemId;
+}
+
+export function transferStatusText(transfer: TransferProgress, surface: 'desktop' | 'web' | 'android'): string {
+  const ratio = transfer.total_bytes
+    ? Math.max(0, Math.min(1, transfer.completed_bytes / transfer.total_bytes))
+    : 0;
+  if (transfer.status === 'waiting') return '等待确认';
+  if (transfer.status === 'accepted') return '准备接收';
+  if (transfer.status === 'ready') {
+    if (surface === 'desktop') return '等待网页端保存';
+    return surface === 'android' ? '正在写入应用目录' : '等待保存';
+  }
+  if (transfer.status === 'completed') return '已完成 · ' + formatSize(transfer.total_bytes);
+  if (transfer.status === 'rejected') return '已拒绝';
+  if (transfer.status === 'cancelled') return '已取消';
+  if (transfer.status === 'failed') return transfer.error ?? '失败';
+  return formatSize(transfer.completed_bytes) + ' / ' + formatSize(transfer.total_bytes)
+    + ' · ' + Math.round(ratio * 100) + '%';
 }
 
 export function clipboardHistoryPreview(item: ClipboardHistoryItem): string {

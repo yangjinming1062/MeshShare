@@ -82,6 +82,29 @@ def configure_signing(gradle: Path) -> None:
     gradle.write_text(text, encoding="utf-8")
 
 
+def install_android_icons(root: Path, android: Path) -> None:
+    """把仓库内的品牌启动图标写入生成的 Android 工程。"""
+
+    source = root / "backend" / "icons" / "mobile" / "android"
+    res = android / "app" / "src" / "main" / "res"
+    if not source.is_dir():
+        raise SystemExit(f"Missing Android launcher icon assets: {source}")
+    if not (res / "mipmap-mdpi").is_dir():
+        raise SystemExit(
+            "Expected mipmap resources in the generated Android project: "
+            f"{res / 'mipmap-mdpi'}"
+        )
+    copied = 0
+    for asset in sorted(source.rglob("*")):
+        if not asset.is_file():
+            continue
+        target = res / asset.relative_to(source)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(asset.read_bytes())
+        copied += 1
+    print(f"Installed {copied} Android launcher icon resources")
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
     android = root / "backend" / "gen" / "android"
@@ -111,6 +134,7 @@ def main() -> None:
     gradle_text = re.sub(r"        targetSdk = \d+", "        targetSdk = 35", gradle_text, count=1)
     gradle.write_text(gradle_text, encoding="utf-8")
     configure_signing(gradle)
+    install_android_icons(root, android)
 
     manifest_lines = manifest.read_text(encoding="utf-8").splitlines(keepends=True)
     seen_permissions: set[str] = set()

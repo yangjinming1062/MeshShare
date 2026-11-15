@@ -209,6 +209,11 @@ export type MobileTransferView = {
   downloaded_item_ids?: string[];
 };
 
+export type PhoneTransfer = TransferProgress & {
+  peerName?: string;
+  downloadedItemIds?: string[];
+};
+
 export type WireMessage =
   | { type: 'Hello'; payload: { node: NodeInfo } }
   | { type: 'Ping'; payload: { at_ms: number } }
