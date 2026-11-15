@@ -12,8 +12,8 @@ mod updater;
 
 use anyhow::Context;
 use model::{
-    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, HardwareMetrics,
-    MonitorPosition, ReceiveMode, ReceiveSettings, TransferProgress, WireMessage,
+    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, MonitorPosition, ReceiveMode,
+    ReceiveSettings, TransferProgress, WireMessage,
 };
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
@@ -670,80 +670,6 @@ fn position_monitor_window<R: tauri::Runtime>(
     }
 }
 
-fn format_tray_metrics(metrics: &HardwareMetrics) -> String {
-    let cpu = metrics
-        .cpu_usage_percent
-        .map(|value| format!("CPU {:.0}%", value))
-        .unwrap_or_else(|| "CPU —".to_string());
-    let memory = match (metrics.memory_used_bytes, metrics.memory_total_bytes) {
-        (Some(used), Some(total)) if total > 0 => {
-            format!("内存 {:.0}%", used as f64 / total as f64 * 100.0)
-        }
-        _ => "内存 —".to_string(),
-    };
-    let gpu = metrics
-        .gpus
-        .iter()
-        .filter_map(|gpu| gpu.utilization_percent)
-        .reduce(f32::max)
-        .map(|value| format!("GPU {:.0}%", value))
-        .unwrap_or_else(|| "GPU —".to_string());
-    let (vram_used, vram_total) = metrics
-        .gpus
-        .iter()
-        .fold((0u64, 0u64), |(used, total), gpu| {
-            (
-                used.saturating_add(gpu.memory_used_bytes.unwrap_or_default()),
-                total.saturating_add(gpu.memory_total_bytes.unwrap_or_default()),
-            )
-        });
-    let vram = if vram_total > 0 {
-        format!(
-            "显存 {} / {}",
-            format_bytes(vram_used),
-            format_bytes(vram_total)
-        )
-    } else {
-        "显存 —".to_string()
-    };
-    format!(
-        "{} · {} · {} · {} · ↓{} ↑{}",
-        cpu,
-        gpu,
-        memory,
-        vram,
-        format_rate(metrics.network_down_bytes_per_sec),
-        format_rate(metrics.network_up_bytes_per_sec)
-    )
-}
-
-fn format_bytes(value: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-    if value as f64 >= MIB {
-        format!("{:.1} MB", value as f64 / MIB)
-    } else if value as f64 >= KIB {
-        format!("{:.1} KB", value as f64 / KIB)
-    } else {
-        format!("{} B", value)
-    }
-}
-
-fn format_rate(value: Option<u64>) -> String {
-    let Some(value) = value else {
-        return "—".to_string();
-    };
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = 1024.0 * 1024.0;
-    if value as f64 >= MIB {
-        format!("{:.1} MB/s", value as f64 / MIB)
-    } else if value as f64 >= KIB {
-        format!("{:.1} KB/s", value as f64 / KIB)
-    } else {
-        format!("{} B/s", value)
-    }
-}
-
 async fn start_node(
     data_dir: PathBuf,
     static_root: PathBuf,
@@ -802,7 +728,7 @@ fn static_root(app: &AppHandle) -> PathBuf {
     bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/dist"))
 }
 
-fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result<()> {
+fn setup_tray_menu(app: &AppHandle) -> anyhow::Result<()> {
     let tray = app
         .tray_by_id("meshshare")
         .context("MeshShare tray icon is missing")?;
@@ -811,13 +737,6 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         "toggle-window",
         window_toggle_label(main_window_visible(app)),
         true,
-        None::<&str>,
-    )?;
-    let metrics_summary = MenuItem::with_id(
-        app,
-        "metrics-summary",
-        "硬件监控：采集中…",
-        false,
         None::<&str>,
     )?;
     let monitor_toggle = MenuItem::with_id(
@@ -845,7 +764,6 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
     let menu = Menu::with_items(
         app,
         &[
-            &metrics_summary,
             &monitor_toggle,
             &lock_toggle,
             &window_toggle,
@@ -861,32 +779,6 @@ fn setup_tray_menu(app: &AppHandle, runtime: Arc<NodeRuntime>) -> anyhow::Result
         sync_toggle,
     });
     sync_tray_labels(app);
-    let mut events = runtime.subscribe();
-    let metrics_summary_for_task = metrics_summary.clone();
-    let tray_runtime = runtime.clone();
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                    if tray_runtime
-                        .stopping
-                        .load(std::sync::atomic::Ordering::SeqCst)
-                    {
-                        break;
-                    }
-                }
-                message = events.recv() => {
-                    match message {
-                        Ok(WireMessage::MetricsUpdate { metrics }) => {
-                            let _ = metrics_summary_for_task.set_text(format_tray_metrics(&metrics));
-                        }
-                        Ok(_) => {}
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    });
     tray.on_menu_event(|app, event| match event.id().as_ref() {
         "toggle-window" => {
             set_main_window_visible(app, !main_window_visible(app));
@@ -966,7 +858,7 @@ pub fn run() {
             });
             updater.start();
             sync_autostart_registration(runtime.as_ref());
-            setup_tray_menu(app.handle(), runtime.clone())?;
+            setup_tray_menu(app.handle())?;
             if let Some(window) = app.get_webview_window("monitor") {
                 position_monitor_window(&window, runtime.as_ref());
             }
