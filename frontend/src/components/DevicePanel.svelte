@@ -4,6 +4,7 @@
   import type { MobileSession, PeerInfo } from '../types';
 
   export let peers: PeerInfo[] = [];
+  export let homeNodeId = '';
   export let mobileSessions: MobileSession[] = [];
   export let savedAddresses: string[] = [];
   export let draggingKey = '';
@@ -75,6 +76,7 @@
         <DeviceRow
           kind="peer"
           {peer}
+          isHome={peer.node_id === homeNodeId}
           dragging={draggingKey === 'peer:' + peer.node_id}
           onSend={() => onSendPeer(peer)}
           onSendFolder={() => onSendPeerFolder(peer)}

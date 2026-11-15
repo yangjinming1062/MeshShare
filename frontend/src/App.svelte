@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke, isTauri } from '@tauri-apps/api/core';
@@ -33,7 +33,9 @@
   let node: NodeInfo | null = null;
   let activeBaseUrl = '';
   let remoteTarget: PeerInfo | null = null;
-  let targetHistory: Array<{ baseUrl: string; node: NodeInfo | null; peer: PeerInfo | null }> = [];
+  let localBaseUrl = '';
+  let localNodeId = '';
+  let contextGeneration = 0;
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
   let clipboardHistory: ClipboardHistoryItem[] = [];
@@ -92,7 +94,6 @@
   type PendingUpload = TransferRoute & { peer: PeerInfo; files: File[]; items: TransferItem[]; offer: TransferOffer };
   const pendingUploads = new Map<string, PendingUpload>();
   let remoteMode = false;
-  let remotePath = '';
   const uploading = new Set<string>();
   const watching = new Set<string>();
   const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[]; completedItemIds: Set<string>; sessionId: string; offer: TransferOffer }>();
@@ -144,9 +145,6 @@
   $: phoneFailures = failures;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
-  $: remotePath = remoteMode
-    ? [...targetHistory.map((entry) => entry.node?.node_name ?? '本机'), node?.node_name ?? '目标节点'].join(' / ')
-    : '';
   $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
   $: mobileTargets = node ? [{
     node_id: node.node_id,
@@ -334,6 +332,7 @@
       if (pageStopped) return;
       try {
         const base = await initApi();
+        localBaseUrl = base;
         if (!activeBaseUrl) activeBaseUrl = base;
         if (isDesktopWindow) {
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
@@ -450,6 +449,7 @@
     if (requestId !== refreshRequestId || generation !== targetGeneration || target !== activeBaseUrl) return;
     pruneFailures();
     node = nextNode;
+    if (!remoteMode) localNodeId = nextNode.node_id;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
     clipboardStatus = nextClipboardStatus;
@@ -1236,6 +1236,15 @@
 
   function resetTargetUi() {
     targetGeneration += 1;
+    node = null;
+    peers = [];
+    clipboard = null;
+    metrics = null;
+    clipboardStatus = { session: 'unknown', available: false, retrying: true, message: '正在连接系统剪贴板…' };
+    settingsOpen = false;
+    mobileAccessOpen = false;
+    addDeviceOpen = false;
+    clearHistoryOpen = false;
     selectedClipboardHistory = null;
     historyDetailOpen = false;
     metricsPeerOpen = false;
@@ -1258,8 +1267,46 @@
     mobileQr = null;
   }
 
+  /**
+   * 远程目标只有一层：进入其他设备直接替换当前目标，返回始终回到本机。
+   * 目标设备列表包含本机节点，按 node_id 识别后等同于返回。
+   */
+  async function applyTargetContext(baseUrl: string, target: PeerInfo | null) {
+    const context = ++contextGeneration;
+    wsGeneration += 1;
+    ws?.close();
+    ws = null;
+    if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = undefined;
+    if (wsPingTimer) window.clearInterval(wsPingTimer);
+    wsPingTimer = undefined;
+    remoteTarget = target;
+    activeBaseUrl = baseUrl;
+    setApiTarget(baseUrl);
+    resetTargetUi();
+    status = target ? '正在连接目标节点…' : '正在返回本机…';
+    statusKind = 'warn';
+    wsReconnectAttempt = 0;
+    await tick();
+    if (context !== contextGeneration) return;
+    await refresh().catch((error) => {
+      if (context !== contextGeneration) return;
+      status = error instanceof Error ? error.message : target ? '无法连接目标节点' : '无法连接本机节点';
+      statusKind = 'error';
+    });
+    if (context !== contextGeneration) return;
+    if (!target) await refreshLocalSettings();
+    if (context !== contextGeneration) return;
+    connectWebSocket();
+  }
+
   async function openRemotePeer(peer: PeerInfo) {
-    if (isWeb || !peer.online) return;
+    if (isWeb) return;
+    if (peer.node_id === localNodeId) {
+      await returnToLocal();
+      return;
+    }
+    if (!peer.online) return;
     if (!peer.capabilities.includes(REMOTE_MANAGEMENT_CAPABILITY)) {
       showTransientNotice('目标节点不支持远程管理，请先升级目标节点', 6000);
       return;
@@ -1269,48 +1316,13 @@
       showTransientNotice('目标设备没有可访问地址', 6000);
       return;
     }
-    wsGeneration += 1;
-    ws?.close();
-    ws = null;
-    if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
-    wsReconnectTimer = undefined;
-    if (wsPingTimer) window.clearInterval(wsPingTimer);
-    wsPingTimer = undefined;
-    targetHistory = [...targetHistory, { baseUrl: activeBaseUrl, node, peer: remoteTarget }];
-    remoteTarget = peer;
-    activeBaseUrl = target;
-    setApiTarget(target);
-    resetTargetUi();
-    wsReconnectAttempt = 0;
-    await refresh().catch((error) => {
-      status = error instanceof Error ? error.message : '无法连接目标节点';
-      statusKind = 'error';
-    });
-    connectWebSocket();
+    localBaseUrl ||= activeBaseUrl;
+    await applyTargetContext(target, peer);
   }
 
-  async function returnToPreviousTarget() {
-    const previous = targetHistory.pop();
-    if (!previous) return;
-    wsGeneration += 1;
-    ws?.close();
-    ws = null;
-    if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
-    wsReconnectTimer = undefined;
-    if (wsPingTimer) window.clearInterval(wsPingTimer);
-    wsPingTimer = undefined;
-    targetHistory = targetHistory;
-    remoteTarget = previous.peer;
-    activeBaseUrl = previous.baseUrl;
-    setApiTarget(activeBaseUrl);
-    resetTargetUi();
-    wsReconnectAttempt = 0;
-    await refresh().catch((error) => {
-      status = error instanceof Error ? error.message : '无法返回上一级节点';
-      statusKind = 'error';
-    });
-    await refreshLocalSettings();
-    connectWebSocket();
+  async function returnToLocal() {
+    if (!remoteMode) return;
+    await applyTargetContext(localBaseUrl, null);
   }
 
   function updatePrepare(prepareId: string, hashedBytes: number) {
@@ -2018,8 +2030,8 @@
     let destination: string | string[] | null = null;
     let path: string | undefined;
     if (remoteMode) {
-      const remotePath = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
-      path = remotePath?.trim() || undefined;
+      const remoteDirectory = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
+      path = remoteDirectory?.trim() || undefined;
     } else if (isAndroidApp) {
       try {
         path = await invoke<string>('android_receive_directory');
@@ -2127,7 +2139,6 @@
     <AppHeader
       {node}
       remote={remoteMode}
-      {remotePath}
       {status}
       {statusKind}
       {syncEnabled}
@@ -2136,7 +2147,7 @@
       onSync={toggleSync}
       onAutostart={toggleAutostart}
       onSettings={() => (settingsOpen = true)}
-      onBack={returnToPreviousTarget}
+      onBack={returnToLocal}
     />
     {#if isDesktopWindow && node && !clipboardStatus.available}
       <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
@@ -2144,6 +2155,7 @@
     <main class="app-main">
       <DevicePanel
         peers={peers}
+        homeNodeId={remoteMode ? localNodeId : ''}
         {mobileSessions}
         savedAddresses={savedNodeUrls}
         draggingKey={dragPeer}

@@ -12,7 +12,6 @@
   export let autostartEnabled = true;
   export let autostartBusy = false;
   export let remote = false;
-  export let remotePath = '';
   export let onBack: () => void = () => {};
   export let onSync: () => void = () => {};
   export let onAutostart: () => void = () => {};
@@ -30,7 +29,6 @@
   </span>
   <h1 title={node?.node_name}>{node?.node_name ?? 'MeshShare 节点'}</h1>
   {#if remote}<span class="chip remote-chip">远程管理</span>{/if}
-  {#if remote && remotePath}<span class="remote-path" title={remotePath}>{remotePath}</span>{/if}
   <span class="status-text" class:sr-only={statusKind === 'ok'} role="status" aria-live="polite">{status}</span>
   {#if node}
     <div class="header-chips">

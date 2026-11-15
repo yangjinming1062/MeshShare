@@ -9,6 +9,7 @@
   export let peer: PeerInfo | null = null;
   export let session: MobileSession | null = null;
   export let dragging = false;
+  export let isHome = false;
   export let onSend: () => void = () => {};
   export let onSendFolder: () => void = () => {};
   export let onDetails: () => void = () => {};
@@ -21,7 +22,7 @@
   $: name = kind === 'mobile' ? (session?.label ?? '网页设备') : (peer?.node_name ?? '设备');
   $: meta = kind === 'mobile'
     ? (session ? session.node_name + ' · 网页加入' : '网页加入')
-    : (peer ? platformLabel(peer.platform) + ' · ' + (peer.addresses[0]?.address ?? '在线') : '');
+    : (peer ? (isHome ? '本机 · ' : '') + platformLabel(peer.platform) + ' · ' + (peer.addresses[0]?.address ?? '在线') : '');
   $: metrics = kind === 'mobile' ? null : (peer?.metrics ?? null);
   $: stale = kind === 'peer' && !!peer?.metrics_stale;
   $: hasMetrics = !!metrics;
@@ -31,7 +32,7 @@
   $: gpu = gpuUtilization(displayMetrics);
   $: hasSystemMetrics = cpu !== undefined || memory !== undefined;
   $: hasGpuMetrics = gpu !== undefined || !!displayMetrics?.gpus.length;
-  $: openable = allowOpen && kind === 'peer' && !!peer?.addresses.length;
+  $: openable = allowOpen && kind === 'peer' && (isHome || !!peer?.addresses.length);
 
   function isInsideRow(event: DragEvent): boolean {
     const row = event.currentTarget;
@@ -61,8 +62,8 @@
     class="device-identity"
     class:device-identity--openable={openable}
     disabled={!openable}
-    aria-label={openable ? '管理 ' + name : name}
-    title={openable ? '进入 ' + name : name}
+    aria-label={isHome ? '返回本机' : openable ? '管理 ' + name : name}
+    title={isHome ? '返回本机' : openable ? '进入 ' + name : name}
     on:click|stopPropagation={onOpen}
   >
     <span class="device-icon" aria-hidden="true">
