@@ -108,6 +108,7 @@
   let wsGeneration = 0;
   let wsPingTimer: number | undefined;
   let targetGeneration = 0;
+  let refreshRequestId = 0;
 
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
@@ -253,6 +254,7 @@
   });
 
   async function refresh() {
+    const requestId = ++refreshRequestId;
     const generation = targetGeneration;
     const target = activeBaseUrl;
     if (isDesktopWindow && !remoteMode) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
@@ -296,7 +298,7 @@
         }
       }
     }
-    if (generation !== targetGeneration || target !== activeBaseUrl) return;
+    if (requestId !== refreshRequestId || generation !== targetGeneration || target !== activeBaseUrl) return;
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
@@ -307,7 +309,17 @@
       selectedClipboardHistory = null;
     }
     metrics = nextMetrics;
-    transfers = [...nextTransfers, ...transfers.filter((item) => !nextTransfers.some((next) => next.transfer_id === item.transfer_id))];
+    const refreshedTransfers = nextTransfers.map((next) => {
+      const current = transfers.find((item) => item.transfer_id === next.transfer_id);
+      if (current && shouldKeepTransferProgress(current, next)) {
+        return { ...next, ...current, offer: next.offer ?? current.offer };
+      }
+      return { ...current, ...next, offer: next.offer ?? current?.offer };
+    });
+    transfers = [
+      ...refreshedTransfers,
+      ...transfers.filter((item) => !nextTransfers.some((next) => next.transfer_id === item.transfer_id)),
+    ];
     for (const transfer of nextTransfers) {
       if (mobileTransfers.some((view) => view.progress.transfer_id === transfer.transfer_id)) continue;
       if (transfer.direction !== 'send' || !transfer.offer || ['completed', 'rejected', 'failed', 'cancelled'].includes(transfer.status) || watching.has(transfer.transfer_id)) continue;
@@ -495,23 +507,55 @@
     }
     if (type === 'TransferOffer') {
       const offer = payload.offer;
+      const existing = transfers.find((item) => item.transfer_id === offer.transfer_id);
+      // An auto-accepted transfer can deliver its offer after the accepted
+      // progress event during reconnect. Keep the newest known lifecycle
+      // state instead of turning it back into a confirmation request.
+      const next = existing
+        ? {
+            ...existing,
+            offer: existing.offer ?? offer,
+            total_bytes: existing.total_bytes || offer.total_bytes,
+            total_items: existing.total_items || offer.items.length,
+          }
+        : {
+            transfer_id: offer.transfer_id,
+            status: 'waiting' as const,
+            completed_bytes: 0,
+            total_bytes: offer.total_bytes,
+            completed_items: 0,
+            total_items: offer.items.length,
+            offer,
+            direction: 'receive' as const,
+          };
       transfers = [{
-        transfer_id: offer.transfer_id,
-        status: 'waiting',
-        completed_bytes: 0,
-        total_bytes: offer.total_bytes,
-        completed_items: 0,
-        total_items: offer.items.length,
-        offer,
-        direction: 'receive',
+        ...next,
       }, ...transfers.filter((item) => item.transfer_id !== offer.transfer_id)];
       return;
     }
     if (type === 'TransferProgress') {
       const progress = payload.progress;
       const existing = transfers.find((item) => item.transfer_id === progress.transfer_id);
-      transfers = [{ ...existing, ...progress }, ...transfers.filter((item) => item.transfer_id !== progress.transfer_id)];
+      const next = existing && shouldKeepTransferProgress(existing, progress)
+        ? { ...progress, ...existing, offer: progress.offer ?? existing.offer }
+        : { ...existing, ...progress, offer: progress.offer ?? existing?.offer };
+      transfers = [next, ...transfers.filter((item) => item.transfer_id !== progress.transfer_id)];
     }
+  }
+
+  function transferStatusRank(status: TransferProgress['status']): number {
+    if (status === 'waiting') return 0;
+    if (status === 'accepted') return 1;
+    if (status === 'uploading') return 2;
+    if (status === 'ready') return 3;
+    if (status === 'completed') return 5;
+    return 4;
+  }
+
+  function shouldKeepTransferProgress(current: TransferProgress, next: TransferProgress): boolean {
+    const currentRank = transferStatusRank(current.status);
+    const nextRank = transferStatusRank(next.status);
+    return nextRank < currentRank;
   }
 
   async function refreshQr(url: string): Promise<void> {

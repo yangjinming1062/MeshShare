@@ -1324,8 +1324,11 @@ impl NodeRuntime {
             },
         );
         drop(transfers);
-        self.publish_event(WireMessage::TransferOffer { offer });
+        // Progress carries the offer as well. Publish it first so an
+        // auto-accepted transfer cannot briefly appear as a new confirmation
+        // request in a UI that receives the two events at different times.
         self.publish_event(WireMessage::TransferProgress { progress });
+        self.publish_event(WireMessage::TransferOffer { offer });
         true
     }
 
@@ -2918,6 +2921,30 @@ mod tests {
                 .status,
             TransferStatus::Waiting
         );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn auto_receive_publishes_progress_before_offer() {
+        let path = temp_data_dir();
+        let destination = path.join("received");
+        std::fs::create_dir_all(&destination).expect("create receive directory");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .set_receive_settings(ReceiveMode::Auto, Some(destination))
+            .expect("save receive settings");
+        let mut events = runtime.subscribe();
+
+        assert!(runtime.add_transfer(mobile_offer(&runtime, "auto-order", 1)));
+        let first = events.recv().await.expect("receive progress event");
+        let second = events.recv().await.expect("receive offer event");
+        assert!(matches!(
+            first,
+            WireMessage::TransferProgress { progress }
+                if progress.status == TransferStatus::Accepted
+        ));
+        assert!(matches!(second, WireMessage::TransferOffer { .. }));
         let _ = std::fs::remove_dir_all(path);
     }
 

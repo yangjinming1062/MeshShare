@@ -1559,9 +1559,85 @@ async fn remove_file_with_diagnostics(path: &Path) -> bool {
     }
 }
 
-async fn remove_tracked_temp_file(runtime: &Arc<NodeRuntime>, path: &Path) {
-    if remove_file_with_diagnostics(path).await {
-        runtime.unregister_desktop_temp_file(path);
+/// Owns a registered desktop upload temporary file until it is committed or
+/// explicitly cleaned up. The synchronous drop path covers a request future
+/// that is cancelled while the body is still being streamed.
+struct DesktopTempFileGuard {
+    runtime: Arc<NodeRuntime>,
+    path: PathBuf,
+    linked_target: Option<PathBuf>,
+    committed: bool,
+    armed: bool,
+}
+
+impl DesktopTempFileGuard {
+    fn new(runtime: Arc<NodeRuntime>, path: PathBuf) -> Self {
+        Self {
+            runtime,
+            path,
+            linked_target: None,
+            committed: false,
+            armed: true,
+        }
+    }
+
+    fn mark_linked(&mut self, target: PathBuf) {
+        self.linked_target = Some(target);
+    }
+
+    fn mark_committed(&mut self) {
+        self.committed = true;
+    }
+
+    async fn cleanup(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let temp_removed = remove_file_with_diagnostics(&self.path).await;
+        let target_removed = if self.committed {
+            true
+        } else if let Some(target) = self.linked_target.as_deref() {
+            remove_file_with_diagnostics(target).await
+        } else {
+            true
+        };
+        if temp_removed && target_removed {
+            self.runtime.unregister_desktop_temp_file(&self.path);
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for DesktopTempFileGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let temp_removed = match std::fs::remove_file(&self.path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                eprintln!("清理临时文件失败 {}：{error}", self.path.display());
+                false
+            }
+        };
+        let target_removed = if self.committed {
+            true
+        } else if let Some(target) = self.linked_target.as_deref() {
+            match std::fs::remove_file(target) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => {
+                    eprintln!("清理已提交目标文件失败 {}：{error}", target.display());
+                    false
+                }
+            }
+        } else {
+            true
+        };
+        if temp_removed && target_removed {
+            self.runtime.unregister_desktop_temp_file(&self.path);
+        }
     }
 }
 
@@ -2153,6 +2229,7 @@ async fn upload_item(
         }
         return Err(ApiError::internal(message));
     }
+    let mut temp_guard = DesktopTempFileGuard::new(state.runtime.clone(), temp.clone());
     let mut file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2161,7 +2238,6 @@ async fn upload_item(
     {
         Ok(file) => file,
         Err(error) => {
-            state.runtime.unregister_desktop_temp_file(&temp);
             let message = format!("无法创建桌面临时文件：{error}");
             if let Some(progress) =
                 state
@@ -2213,12 +2289,12 @@ async fn upload_item(
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
-            remove_tracked_temp_file(&state.runtime, &temp).await;
+            temp_guard.cleanup().await;
             return Err(error);
         }
     };
     if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
-        remove_tracked_temp_file(&state.runtime, &temp).await;
+        temp_guard.cleanup().await;
         let message = "文件校验失败".to_string();
         let progress = state
             .runtime
@@ -2232,16 +2308,19 @@ async fn upload_item(
     let target = match prepare_target(&destination, &item.relative_path).await {
         Ok(target) => target,
         Err(error) => {
-            remove_tracked_temp_file(&state.runtime, &temp).await;
+            temp_guard.cleanup().await;
             return Err(error);
         }
     };
     if !state.runtime.transfer_upload_active(&transfer_id) {
-        remove_tracked_temp_file(&state.runtime, &temp).await;
+        temp_guard.cleanup().await;
         return Err(ApiError::conflict("传输已取消"));
     }
-    if let Err(error) = fs::hard_link(&temp, &target).await {
-        remove_tracked_temp_file(&state.runtime, &temp).await;
+    // Keep the link-and-mark step free of an await point. If the request is
+    // cancelled after the link succeeds, the guard must already know which
+    // target it owns so it can remove the incomplete commit.
+    if let Err(error) = std::fs::hard_link(&temp, &target) {
+        temp_guard.cleanup().await;
         if error.kind() == std::io::ErrorKind::AlreadyExists {
             return Err(ApiError::conflict(format!(
                 "目标已存在：{}",
@@ -2250,14 +2329,16 @@ async fn upload_item(
         }
         return Err(ApiError::internal(error.to_string()));
     }
-    remove_tracked_temp_file(&state.runtime, &temp).await;
+    temp_guard.mark_linked(target.clone());
     let Some(progress) = state
         .runtime
         .mark_item_received(&transfer_id, &item_id, total)
     else {
-        remove_file_with_diagnostics(&target).await;
+        temp_guard.cleanup().await;
         return Err(ApiError::conflict("传输已取消或已完成"));
     };
+    temp_guard.mark_committed();
+    temp_guard.cleanup().await;
     state.runtime.publish_event(WireMessage::TransferProgress {
         progress: progress.clone(),
     });
@@ -3432,6 +3513,56 @@ mod tests {
             .stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         server_task.abort();
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn cancelled_upload_guard_removes_registered_temp_file() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-upload-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create data directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let temp = data_dir.join("received.meshshare-test.part");
+        runtime
+            .register_desktop_temp_file(&temp)
+            .expect("register temp file");
+        std::fs::write(&temp, b"partial").expect("write partial file");
+
+        let guard = super::DesktopTempFileGuard::new(runtime.clone(), temp.clone());
+        drop(guard);
+
+        assert!(!temp.exists());
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join("desktop-transfer-temp-files.json"))
+                .expect("read temp registry")
+                .trim(),
+            "[]"
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn cancelled_upload_guard_removes_incomplete_hard_link_commit() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-upload-link-guard-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create data directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let temp = data_dir.join("received.meshshare-test.part");
+        let target = data_dir.join("received.png");
+        runtime
+            .register_desktop_temp_file(&temp)
+            .expect("register temp file");
+        std::fs::write(&temp, b"partial").expect("write partial file");
+        std::fs::hard_link(&temp, &target).expect("link partial file");
+
+        let mut guard = super::DesktopTempFileGuard::new(runtime.clone(), temp.clone());
+        guard.mark_linked(target.clone());
+        drop(guard);
+
+        assert!(!temp.exists());
+        assert!(!target.exists());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
