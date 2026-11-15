@@ -1,13 +1,17 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import { transferItemsLabel, transferStatusText } from '../format';
-  import type { TransferProgress } from '../types';
+  import { formatTime, isActiveTransferStatus, transferItemsLabel, transferStatusText } from '../format';
+  import type { TransferFailure, TransferProgress } from '../types';
 
   export let transfers: TransferProgress[] = [];
+  export let failures: TransferFailure[] = [];
   export let onAccept: (transfer: TransferProgress) => void = () => {};
   export let onReject: (transfer: TransferProgress) => void = () => {};
+  export let onRetry: (failure: TransferFailure) => void = () => {};
+  export let onDismissFailure: (failure: TransferFailure) => void = () => {};
 
-  $: waiting = transfers.some((transfer) => transfer.direction === 'receive' && transfer.status === 'waiting');
+  $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status));
+  $: waiting = activeTransfers.some((transfer) => transfer.direction === 'receive' && transfer.status === 'waiting');
 
   function ratio(transfer: TransferProgress): number {
     if (!transfer.total_bytes) return 0;
@@ -20,7 +24,7 @@
   <div class="surface-head">
     <div class="surface-title">
       <h2>传输任务</h2>
-      <span class="chip">{transfers.length}</span>
+      <span class="chip">{activeTransfers.length}</span>
       {#if waiting}
         <span class="status-dot status-dot--warning" aria-hidden="true"></span>
       {/if}
@@ -31,7 +35,7 @@
   </div>
   <div class="surface-body">
     <div class="transfer-list">
-      {#each transfers as transfer (transfer.transfer_id)}
+      {#each activeTransfers as transfer (transfer.transfer_id)}
         <article class="transfer-row" class:waiting={transfer.direction === 'receive' && transfer.status === 'waiting'}>
           <span class="transfer-icon" aria-hidden="true">
             <Icon name={transfer.direction === 'receive' ? 'arrow-down' : 'arrow-up'} size={14} />
@@ -61,8 +65,31 @@
           {/if}
         </article>
       {:else}
-        <div class="empty">还没有传输任务。</div>
+        <div class="empty">当前没有待处理或进行中的传输任务。</div>
       {/each}
     </div>
+    {#if failures.length}
+      <div class="transfer-failures">
+        <div class="transfer-subhead"><strong>失败任务</strong><span class="chip chip--danger">{failures.length}</span></div>
+        <div class="transfer-list transfer-list--failures">
+          {#each failures as failure (failure.progress.transfer_id)}
+            <article class="transfer-row transfer-row--failure">
+              <span class="transfer-icon transfer-icon--failure" aria-hidden="true"><Icon name="close" size={14} /></span>
+              <div class="transfer-copy">
+                <strong title={failure.progress.offer?.source_name ?? '文件传输'}>{failure.progress.offer?.source_name ?? '文件传输'}</strong>
+                <span title={transferItemsLabel(failure.progress)}>{transferItemsLabel(failure.progress)} · {formatTime(failure.failed_at_ms)}</span>
+              </div>
+              <div class="transfer-progress"><span title={failure.progress.error ?? '传输失败'}>{failure.progress.error ?? '传输失败'}</span></div>
+              <div class="transfer-actions">
+                {#if failure.retryable}
+                  <button type="button" class="btn btn-primary btn-sm" on:click={() => onRetry(failure)}>重试</button>
+                {/if}
+                <button type="button" class="btn btn-ghost btn-sm" on:click={() => onDismissFailure(failure)}>移除</button>
+              </div>
+            </article>
+          {/each}
+        </div>
+      </div>
+    {/if}
   </div>
 </section>

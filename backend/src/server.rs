@@ -7,7 +7,7 @@ use crate::model::{
     TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
     CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
-use crate::runtime::NodeRuntime;
+use crate::runtime::{validate_receive_directory, NodeRuntime};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -120,7 +120,7 @@ pub struct MobileSessionRequest {
     pub session_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MobileTransferFailureRequest {
     pub error: Option<String>,
 }
@@ -207,6 +207,14 @@ pub fn router_with_control(
             post(proxy_cancel_transfer),
         )
         .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/transfers/:id/fail",
+            post(proxy_fail_transfer),
+        )
+        .route(
+            "/api/v1/mobile/peers/:peer_id/api/v1/transfers/:id/retry",
+            post(proxy_retry_transfer),
+        )
+        .route(
             "/api/v1/mobile/peers/:peer_id/api/v1/transfers/:id/items/:item_id",
             put(proxy_upload_item),
         )
@@ -259,8 +267,18 @@ pub fn router_with_control(
             "/api/v1/relay/transfers/:id/cancel",
             post(cancel_relay_transfer),
         )
+        .route(
+            "/api/v1/relay/transfers/:id/fail",
+            post(fail_relay_transfer),
+        )
+        .route(
+            "/api/v1/relay/transfers/:id/retry",
+            post(retry_relay_transfer),
+        )
         .route("/api/v1/transfers/:id/reject", post(reject_transfer))
         .route("/api/v1/transfers/:id/cancel", post(cancel_transfer))
+        .route("/api/v1/transfers/:id/fail", post(fail_transfer))
+        .route("/api/v1/transfers/:id/retry", post(retry_transfer))
         .route("/api/v1/transfers/:id/accept", post(accept_transfer))
         .route("/api/v1/transfers/:id/status", get(transfer_status))
         .route("/api/v1/transfers/:id/items/:item_id", put(upload_item))
@@ -446,6 +464,30 @@ async fn proxy_cancel_transfer(
     State(state): State<AppState>,
 ) -> Result<Json<TransferProgress>, ApiError> {
     proxy_transfer_action(peer_id, transfer_id, "cancel", &state).await
+}
+
+async fn proxy_fail_transfer(
+    AxumPath((peer_id, transfer_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileTransferFailureRequest>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let base = proxy_peer_base(&state, &peer_id)?;
+    let response = state
+        .runtime
+        .proxy_http
+        .post(format!("{base}/api/v1/transfers/{transfer_id}/fail"))
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
+    proxy_json(response).await
+}
+
+async fn proxy_retry_transfer(
+    AxumPath((peer_id, transfer_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    proxy_transfer_action(peer_id, transfer_id, "retry", &state).await
 }
 
 async fn proxy_upload_item(
@@ -981,6 +1023,7 @@ pub(crate) async fn handle_wire_message(
                                 transfer_id,
                                 action: "accept".to_string(),
                                 reason: None,
+                                retry_count: None,
                             },
                         )
                         .await;
@@ -992,6 +1035,7 @@ pub(crate) async fn handle_wire_message(
             transfer_id,
             action,
             reason,
+            retry_count,
         } => {
             if reason
                 .as_ref()
@@ -999,8 +1043,15 @@ pub(crate) async fn handle_wire_message(
             {
                 return current_peer.map(str::to_string);
             }
-            let _ =
-                apply_transfer_action(runtime, &transfer_id, &action, reason, current_peer).await;
+            let _ = apply_transfer_action(
+                runtime,
+                &transfer_id,
+                &action,
+                reason,
+                retry_count,
+                current_peer,
+            )
+            .await;
             current_peer.map(str::to_string)
         }
         WireMessage::TransferProgress { progress } => {
@@ -1227,6 +1278,7 @@ async fn cancel_relay_transfer(
                 transfer_id: id.clone(),
                 action: "cancel".to_string(),
                 reason: progress.error.clone(),
+                retry_count: None,
             },
         )
         .await;
@@ -1234,7 +1286,125 @@ async fn cancel_relay_transfer(
         transfer_id: id,
         action: "cancel".to_string(),
         reason: progress.error.clone(),
+        retry_count: None,
     });
+    state.runtime.publish_event(WireMessage::TransferProgress {
+        progress: progress.clone(),
+    });
+    Ok(Json(progress))
+}
+
+async fn fail_relay_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileTransferFailureRequest>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let (source_node_id, target_node_id) = state
+        .runtime
+        .transfer_peer_ids(&id)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    if source_node_id != state.runtime.node_id() {
+        return Err(ApiError::bad_request("目标传输不是本节点的中继任务"));
+    }
+    let message = payload
+        .error
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "文件上传失败，已停止重试".to_string());
+    if message.len() > MAX_WIRE_ERROR_LENGTH {
+        return Err(ApiError::bad_request("失败原因过长"));
+    }
+    let progress = state
+        .runtime
+        .fail_transfer(&id, message, TransferStatus::Failed)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    let delivered = state
+        .runtime
+        .send_to_peer_with_retry(
+            &target_node_id,
+            WireMessage::TransferAction {
+                transfer_id: id.clone(),
+                action: "fail".to_string(),
+                reason: progress.error.clone(),
+                retry_count: Some(progress.retry_count),
+            },
+        )
+        .await;
+    if !delivered {
+        state.runtime.publish_event(WireMessage::TransferProgress {
+            progress: progress.clone(),
+        });
+        return Err(ApiError::conflict("无法同步目标设备的失败状态"));
+    }
+    state.runtime.publish_event(WireMessage::TransferProgress {
+        progress: progress.clone(),
+    });
+    Ok(Json(progress))
+}
+
+async fn retry_relay_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let (source_node_id, target_node_id) = state
+        .runtime
+        .transfer_peer_ids(&id)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    if source_node_id != state.runtime.node_id() {
+        return Err(ApiError::bad_request("目标传输不是本节点的中继任务"));
+    }
+    let record = state
+        .runtime
+        .transfer(&id)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    let progress = state
+        .runtime
+        .retry_transfer(&id, TransferStatus::Waiting, None)
+        .ok_or_else(|| ApiError::conflict("传输不是可重试的失败状态"))?;
+    let offer = record.offer;
+    let sent_offer = state
+        .runtime
+        .send_to_peer_with_retry(&target_node_id, WireMessage::TransferOffer { offer })
+        .await;
+    if !sent_offer {
+        let failed = state
+            .runtime
+            .fail_transfer(
+                &id,
+                "无法同步目标设备的重试请求".to_string(),
+                TransferStatus::Failed,
+            )
+            .unwrap_or(progress.clone());
+        state
+            .runtime
+            .publish_event(WireMessage::TransferProgress { progress: failed });
+        return Err(ApiError::conflict("无法同步目标设备的重试请求"));
+    }
+    let sent_retry = state
+        .runtime
+        .send_to_peer_with_retry(
+            &target_node_id,
+            WireMessage::TransferAction {
+                transfer_id: id.clone(),
+                action: "retry".to_string(),
+                reason: None,
+                retry_count: Some(progress.retry_count),
+            },
+        )
+        .await;
+    if !sent_retry {
+        let failed = state
+            .runtime
+            .fail_transfer(
+                &id,
+                "无法同步目标设备的重试请求".to_string(),
+                TransferStatus::Failed,
+            )
+            .unwrap_or(progress.clone());
+        state
+            .runtime
+            .publish_event(WireMessage::TransferProgress { progress: failed });
+        return Err(ApiError::conflict("无法同步目标设备的重试请求"));
+    }
     state.runtime.publish_event(WireMessage::TransferProgress {
         progress: progress.clone(),
     });
@@ -1430,6 +1600,17 @@ fn progress_is_monotonic(current: &TransferProgress, next: &TransferProgress) ->
         || next.completed_items < current.completed_items
     {
         return false;
+    }
+    if next.retry_count < current.retry_count {
+        return false;
+    }
+    if next.retry_count > current.retry_count {
+        return current.status == TransferStatus::Failed
+            && next.retry_count == current.retry_count.saturating_add(1)
+            && matches!(
+                next.status,
+                TransferStatus::Waiting | TransferStatus::Accepted | TransferStatus::Uploading
+            );
     }
     if matches!(
         current.status,
@@ -2091,6 +2272,7 @@ async fn reject_transfer(
                     transfer_id: id.clone(),
                     action: "reject".to_string(),
                     reason: progress.error.clone(),
+                    retry_count: None,
                 },
             )
             .await;
@@ -2099,6 +2281,7 @@ async fn reject_transfer(
         transfer_id: id,
         action: "reject".to_string(),
         reason: progress.error.clone(),
+        retry_count: None,
     });
     state.runtime.publish_event(WireMessage::TransferProgress {
         progress: progress.clone(),
@@ -2136,6 +2319,7 @@ async fn cancel_transfer(
                     transfer_id: id.clone(),
                     action: "cancel".to_string(),
                     reason: progress.error.clone(),
+                    retry_count: None,
                 },
             )
             .await;
@@ -2144,7 +2328,85 @@ async fn cancel_transfer(
         transfer_id: id,
         action: "cancel".to_string(),
         reason: progress.error.clone(),
+        retry_count: None,
     });
+    state.runtime.publish_event(WireMessage::TransferProgress {
+        progress: progress.clone(),
+    });
+    Ok(Json(progress))
+}
+
+async fn fail_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<MobileTransferFailureRequest>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let message = payload
+        .error
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "文件上传失败，已停止重试".to_string());
+    if message.len() > MAX_WIRE_ERROR_LENGTH {
+        return Err(ApiError::bad_request("失败原因过长"));
+    }
+    let progress = state
+        .runtime
+        .fail_transfer(&id, message, TransferStatus::Failed)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
+        let _ = state
+            .runtime
+            .send_to_peer_with_retry(
+                &source_node_id,
+                WireMessage::TransferAction {
+                    transfer_id: id.clone(),
+                    action: "fail".to_string(),
+                    reason: progress.error.clone(),
+                    retry_count: Some(progress.retry_count),
+                },
+            )
+            .await;
+    }
+    state.runtime.publish_event(WireMessage::TransferProgress {
+        progress: progress.clone(),
+    });
+    Ok(Json(progress))
+}
+
+async fn retry_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let record = state
+        .runtime
+        .transfer(&id)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    if record.offer.target_node_id != state.runtime.node_id() {
+        return Err(ApiError::bad_request("只有目标节点可以重试该传输"));
+    }
+    let status = if record
+        .accepted_destination
+        .as_deref()
+        .is_some_and(|destination| validate_receive_directory(destination).is_ok())
+    {
+        TransferStatus::Accepted
+    } else {
+        TransferStatus::Waiting
+    };
+    let progress = state
+        .runtime
+        .retry_transfer(&id, status, None)
+        .ok_or_else(|| ApiError::conflict("传输不是可重试的失败状态"))?;
+    if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
+        let _ = state
+            .runtime
+            .send_to_peer_with_retry(
+                &source_node_id,
+                WireMessage::TransferProgress {
+                    progress: progress.clone(),
+                },
+            )
+            .await;
+    }
     state.runtime.publish_event(WireMessage::TransferProgress {
         progress: progress.clone(),
     });
@@ -2516,6 +2778,7 @@ async fn apply_transfer_action(
     transfer_id: &str,
     action: &str,
     reason: Option<String>,
+    retry_count: Option<u32>,
     current_peer: Option<&str>,
 ) -> Result<(), ApiError> {
     let Some((source_node_id, target_node_id)) = runtime.transfer_peer_ids(transfer_id) else {
@@ -2551,6 +2814,29 @@ async fn apply_transfer_action(
                 reason.unwrap_or_else(|| "传输已取消".to_string()),
                 TransferStatus::Cancelled,
             ) {
+                runtime.publish_event(WireMessage::TransferProgress { progress });
+            }
+        }
+        "fail" => {
+            let generation_matches = retry_count.is_none_or(|expected| {
+                runtime
+                    .transfer(transfer_id)
+                    .is_some_and(|record| record.progress.retry_count == expected)
+            });
+            if generation_matches {
+                if let Some(progress) = runtime.fail_transfer(
+                    transfer_id,
+                    reason.unwrap_or_else(|| "文件上传失败，已停止重试".to_string()),
+                    TransferStatus::Failed,
+                ) {
+                    runtime.publish_event(WireMessage::TransferProgress { progress });
+                }
+            }
+        }
+        "retry" if current_peer == Some(source_node_id.as_str()) => {
+            if let Some(progress) =
+                runtime.retry_transfer(transfer_id, TransferStatus::Waiting, retry_count)
+            {
                 runtime.publish_event(WireMessage::TransferProgress { progress });
             }
         }
@@ -3131,6 +3417,7 @@ mod tests {
             WireMessage::TransferProgress {
                 progress: TransferProgress {
                     transfer_id: "progress-order".to_string(),
+                    retry_count: 0,
                     status: TransferStatus::Waiting,
                     completed_bytes: 0,
                     total_bytes: 0,
@@ -3154,6 +3441,64 @@ mod tests {
                 .status,
             TransferStatus::Completed
         );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn retry_progress_can_reopen_only_with_next_generation() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-retry-progress-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create test directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let offer = TransferOffer {
+            transfer_id: "retry-progress".to_string(),
+            source_node_id: "peer".to_string(),
+            source_name: "peer".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "empty.txt".to_string(),
+                relative_path: "empty.txt".to_string(),
+                size: 0,
+                sha256: "0".repeat(64),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime.add_transfer(offer);
+        runtime
+            .fail_transfer(
+                "retry-progress",
+                "temporary".to_string(),
+                TransferStatus::Failed,
+            )
+            .expect("fail transfer");
+        handle_wire_message(
+            WireMessage::TransferProgress {
+                progress: TransferProgress {
+                    transfer_id: "retry-progress".to_string(),
+                    retry_count: 1,
+                    status: TransferStatus::Accepted,
+                    completed_bytes: 0,
+                    total_bytes: 0,
+                    completed_items: 0,
+                    total_items: 1,
+                    destination: None,
+                    error: None,
+                    offer: None,
+                    direction: None,
+                },
+            },
+            &runtime,
+            Some("peer"),
+        )
+        .await;
+        let record = runtime.transfer("retry-progress").expect("find transfer");
+        assert_eq!(record.progress.status, TransferStatus::Accepted);
+        assert_eq!(record.progress.retry_count, 1);
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

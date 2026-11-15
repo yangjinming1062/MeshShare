@@ -232,6 +232,7 @@ impl NodeProfile {
 fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress {
     TransferProgress {
         transfer_id: offer.transfer_id.clone(),
+        retry_count: 0,
         status: TransferStatus::Waiting,
         completed_bytes: 0,
         total_bytes: offer.total_bytes,
@@ -246,9 +247,12 @@ fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress
 
 const MOBILE_SESSION_TTL_MS: i64 = 90_000;
 const TRANSFER_RETENTION_MS: i64 = 10 * 60 * 1000;
+const FAILED_TRANSFER_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
 const TRANSFER_ACTIVITY_TIMEOUT_MS: i64 = 5 * 60 * 1000;
 const MAX_TERMINAL_TRANSFERS: usize = 256;
+const MAX_FAILED_TRANSFERS: usize = 20;
 const MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION: usize = 128;
+const MAX_MOBILE_FAILED_TRANSFERS_PER_SESSION: usize = 20;
 const MAX_MOBILE_TRANSFER_RECORDS: usize = 512;
 const MAX_MOBILE_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SEEN_CLIPBOARD_EVENTS: usize = 4_096;
@@ -1490,6 +1494,36 @@ impl NodeRuntime {
         Some(record.progress.clone())
     }
 
+    pub fn retry_transfer(
+        &self,
+        transfer_id: &str,
+        status: TransferStatus,
+        expected_retry_count: Option<u32>,
+    ) -> Option<TransferProgress> {
+        if !matches!(status, TransferStatus::Waiting | TransferStatus::Accepted) {
+            return None;
+        }
+        let mut transfers = self.transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if record.progress.status != TransferStatus::Failed {
+            return None;
+        }
+        let retry_count = record.progress.retry_count.checked_add(1)?;
+        if expected_retry_count.is_some_and(|expected| expected != retry_count) {
+            return None;
+        }
+        if status == TransferStatus::Waiting {
+            record.accepted_destination = None;
+            record.progress.destination = None;
+        }
+        record.progress.retry_count = retry_count;
+        record.progress.status = status;
+        record.progress.error = None;
+        record.updated_at_ms = now_millis();
+        record.progress.offer = Some(record.offer.clone());
+        Some(record.progress.clone())
+    }
+
     pub fn transfers_snapshot(&self, status: Option<TransferStatus>) -> Vec<TransferProgress> {
         self.prune_transfers();
         let mut transfers = self
@@ -1533,7 +1567,12 @@ impl NodeRuntime {
         }
         transfers.retain(|_, record| {
             !terminal(&record.progress.status)
-                || now.saturating_sub(record.updated_at_ms) <= TRANSFER_RETENTION_MS
+                || now.saturating_sub(record.updated_at_ms)
+                    <= if record.progress.status == TransferStatus::Failed {
+                        FAILED_TRANSFER_RETENTION_MS
+                    } else {
+                        TRANSFER_RETENTION_MS
+                    }
         });
         let mut terminal_ids = transfers
             .iter()
@@ -1544,6 +1583,21 @@ impl NodeRuntime {
         let remove_count = terminal_ids.len().saturating_sub(MAX_TERMINAL_TRANSFERS);
         for (transfer_id, _) in terminal_ids.into_iter().take(remove_count) {
             transfers.remove(&transfer_id);
+        }
+        let mut failed_ids = transfers
+            .iter()
+            .filter(|(_, record)| record.progress.status == TransferStatus::Failed)
+            .map(|(id, record)| (id.clone(), record.updated_at_ms))
+            .collect::<Vec<_>>();
+        failed_ids.sort_by_key(|(_, updated_at)| *updated_at);
+        let failed_remove_count = failed_ids.len().saturating_sub(MAX_FAILED_TRANSFERS);
+        for (transfer_id, _) in failed_ids.into_iter().take(failed_remove_count) {
+            if transfers
+                .get(&transfer_id)
+                .is_some_and(|record| record.progress.status == TransferStatus::Failed)
+            {
+                transfers.remove(&transfer_id);
+            }
         }
         drop(transfers);
         for progress in stale {
@@ -1839,9 +1893,15 @@ impl NodeRuntime {
         let mut remove = transfers
             .iter()
             .filter(|(_, record)| {
-                !sessions.contains_key(&record.session_id)
+                (!sessions.contains_key(&record.session_id)
+                    && record.progress.status != TransferStatus::Failed)
                     || (terminal(&record.progress.status)
-                        && now.saturating_sub(record.updated_at_ms) > TRANSFER_RETENTION_MS)
+                        && now.saturating_sub(record.updated_at_ms)
+                            > if record.progress.status == TransferStatus::Failed {
+                                FAILED_TRANSFER_RETENTION_MS
+                            } else {
+                                TRANSFER_RETENTION_MS
+                            })
             })
             .map(|(transfer_id, record)| (transfer_id.clone(), record.staged_directory.clone()))
             .collect::<Vec<_>>();
@@ -1870,6 +1930,44 @@ impl NodeRuntime {
                     .map(|(transfer_id, _, directory)| (transfer_id.clone(), directory.clone())),
             );
         }
+        for records in terminal_by_session.values_mut() {
+            records.retain(|(transfer_id, _, _)| {
+                transfers
+                    .get(transfer_id)
+                    .is_some_and(|record| record.progress.status == TransferStatus::Failed)
+            });
+            records.sort_by_key(|(_, updated_at, _)| *updated_at);
+            let count = records
+                .len()
+                .saturating_sub(MAX_MOBILE_FAILED_TRANSFERS_PER_SESSION);
+            remove.extend(
+                records
+                    .iter()
+                    .take(count)
+                    .map(|(transfer_id, _, directory)| (transfer_id.clone(), directory.clone())),
+            );
+        }
+        let mut failed_ids = transfers
+            .iter()
+            .filter(|(_, record)| record.progress.status == TransferStatus::Failed)
+            .map(|(transfer_id, record)| {
+                (
+                    transfer_id.clone(),
+                    record.updated_at_ms,
+                    record.staged_directory.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        failed_ids.sort_by_key(|(_, updated_at, _)| *updated_at);
+        let failed_remove_count = failed_ids
+            .len()
+            .saturating_sub(MAX_MOBILE_FAILED_TRANSFERS_PER_SESSION);
+        remove.extend(
+            failed_ids
+                .into_iter()
+                .take(failed_remove_count)
+                .map(|(transfer_id, _, directory)| (transfer_id, directory)),
+        );
         remove.sort_by(|left, right| left.0.cmp(&right.0));
         remove.dedup_by(|left, right| left.0 == right.0);
         let mut released_manifest_bytes = 0u64;
@@ -3669,6 +3767,34 @@ mod tests {
             .updated_at_ms = crate::clock::now_millis() - 11 * 60 * 1000;
         runtime.prune_transfers();
         assert!(runtime.transfer("old-terminal").is_none());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn failed_transfer_retry_preserves_progress_and_increments_generation() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_outgoing_transfer(mobile_offer(&runtime, "retryable", 8));
+        {
+            let mut transfers = runtime.transfers.write();
+            let record = transfers.get_mut("retryable").expect("find transfer");
+            record.progress.status = TransferStatus::Failed;
+            record.progress.completed_bytes = 4;
+            record.progress.completed_items = 1;
+            record.progress.error = Some("temporary".to_string());
+        }
+        let progress = runtime
+            .retry_transfer("retryable", TransferStatus::Accepted, None)
+            .expect("retry failed transfer");
+        assert_eq!(progress.status, TransferStatus::Accepted);
+        assert_eq!(progress.retry_count, 1);
+        assert_eq!(progress.completed_bytes, 4);
+        assert_eq!(progress.completed_items, 1);
+        assert_eq!(progress.error, None);
+        assert!(runtime
+            .retry_transfer("retryable", TransferStatus::Accepted, Some(1))
+            .is_none());
         let _ = std::fs::remove_dir_all(path);
     }
 

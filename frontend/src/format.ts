@@ -1,4 +1,4 @@
-import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, TransferProgress, UpdateFrequency, UpdateStatus } from './types';
+import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
 
 export const METRICS_STALE_AFTER_MS = 5_000;
 
@@ -84,6 +84,10 @@ export function transferItemsLabel(transfer: TransferProgress): string {
 
 export function transferItemKey(transferId: string, itemId: string): string {
   return transferId + ':' + itemId;
+}
+
+export function isActiveTransferStatus(status: TransferStatus): boolean {
+  return status === 'waiting' || status === 'accepted' || status === 'uploading' || status === 'ready';
 }
 
 export function transferStatusText(transfer: TransferProgress, surface: 'desktop' | 'web' | 'android'): string {

@@ -356,6 +356,7 @@ pub fn accept_transfer_at(
             transfer_id,
             action: "accept".to_string(),
             reason: None,
+            retry_count: None,
         };
         if !runtime.send_to_peer(&source_node_id, message.clone()) {
             let runtime = runtime.clone();

@@ -7,8 +7,8 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
-  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
   import HardwarePanel from './components/HardwarePanel.svelte';
@@ -67,8 +67,10 @@
   let dragPeer = '';
   let notice = '';
   let transfers: TransferProgress[] = [];
+  let failures: TransferFailure[] = [];
   let mobileSessions: MobileSession[] = [];
   let mobileTransfers: MobileTransferView[] = [];
+  let phoneFailures: TransferFailure[] = [];
   let mobileSessionId = '';
   let transferActionBusy = '';
   let manualAddress = '';
@@ -80,12 +82,13 @@
   let clipboardTab: 'current' | 'history' = 'current';
   let historyDetailOpen = false;
   let metricsPeerOpen = false;
-  let clearHistoryOpen = false;  const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[]; relay?: boolean }>();
+  let clearHistoryOpen = false;
+  const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[]; offer: TransferOffer; relay?: boolean }>();
   let remoteMode = false;
   let remotePath = '';
   const uploading = new Set<string>();
   const watching = new Set<string>();
-  const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[]; completedItemIds: Set<string> }>();
+  const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[]; completedItemIds: Set<string>; sessionId: string; offer: TransferOffer }>();
   const mobileUploading = new Set<string>();
   const mobileWatching = new Set<string>();
   const mobileUploadAttempts = new Map<string, number>();
@@ -111,6 +114,9 @@
   let wsPingTimer: number | undefined;
   let targetGeneration = 0;
   let refreshRequestId = 0;
+  const FAILURE_RETENTION_MS = 24 * 60 * 60 * 1000;
+  const MAX_FAILURES = 20;
+  const dismissedFailures = new Map<string, number>();
 
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
@@ -123,6 +129,7 @@
           ? peers.find((peer) => peer.node_id === transfer.offer?.target_node_id)?.node_name
           : undefined,
       }));
+  $: phoneFailures = failures;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
   $: remotePath = remoteMode
@@ -144,6 +151,64 @@
     metrics_received_at_ms: undefined,
     metrics_stale: false,
   } satisfies PeerInfo, ...peers] : peers;
+
+  function failureRetryable(progress: TransferProgress): boolean {
+    if (progress.direction !== 'send') return false;
+    return pendingUploads.has(progress.transfer_id) || pendingMobileUploads.has(progress.transfer_id);
+  }
+
+  function forgetPendingTransfer(transferId: string) {
+    pendingUploads.delete(transferId);
+    pendingMobileUploads.delete(transferId);
+    uploadAttempts.delete(transferId);
+    uploadStopped.delete(transferId);
+    mobileUploadAttempts.delete(transferId);
+    mobileUploadStopped.delete(transferId);
+  }
+
+  function pruneFailures() {
+    const now = Date.now();
+    for (const [transferId, dismissedAt] of dismissedFailures) {
+      if (now - dismissedAt > FAILURE_RETENTION_MS) dismissedFailures.delete(transferId);
+    }
+    const next = failures
+      .filter((failure) => now - failure.failed_at_ms <= FAILURE_RETENTION_MS)
+      .sort((left, right) => right.failed_at_ms - left.failed_at_ms)
+      .slice(0, MAX_FAILURES);
+    const kept = new Set(next.map((failure) => failure.progress.transfer_id));
+    for (const failure of failures) {
+      if (!kept.has(failure.progress.transfer_id)) forgetPendingTransfer(failure.progress.transfer_id);
+    }
+    failures = next.map((failure) => ({ ...failure, retryable: failureRetryable(failure.progress) }));
+  }
+
+  function observeFailure(progress: TransferProgress) {
+    if (progress.status !== 'failed') return;
+    if (dismissedFailures.has(progress.transfer_id)) return;
+    const existing = failures.find((failure) => failure.progress.transfer_id === progress.transfer_id);
+    failures = [
+      {
+        progress,
+        failed_at_ms: existing?.failed_at_ms ?? Date.now(),
+        retryable: failureRetryable(progress),
+      },
+      ...failures.filter((failure) => failure.progress.transfer_id !== progress.transfer_id),
+    ];
+    pruneFailures();
+  }
+
+  function dismissFailure(failure: TransferFailure) {
+    failures = failures.filter((item) => item.progress.transfer_id !== failure.progress.transfer_id);
+    dismissedFailures.set(failure.progress.transfer_id, Date.now());
+    forgetPendingTransfer(failure.progress.transfer_id);
+  }
+
+  function showTransientNotice(message: string, timeout = 2400) {
+    notice = message;
+    window.setTimeout(() => {
+      if (notice === message) notice = '';
+    }, timeout);
+  }
 
   onMount(() => {
     pageStopped = false;
@@ -309,6 +374,7 @@
       }
     }
     if (requestId !== refreshRequestId || generation !== targetGeneration || target !== activeBaseUrl) return;
+    pruneFailures();
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
@@ -328,8 +394,14 @@
     });
     transfers = [
       ...refreshedTransfers,
-      ...transfers.filter((item) => !nextTransfers.some((next) => next.transfer_id === item.transfer_id)),
+      ...transfers.filter((item) => isActiveTransferStatus(item.status) && !nextTransfers.some((next) => next.transfer_id === item.transfer_id)),
     ];
+    for (const transfer of refreshedTransfers) observeFailure(transfer);
+    if (isWeb) {
+      for (const view of mobileTransfers) {
+        observeFailure({ ...view.progress, direction: 'receive' });
+      }
+    }
     for (const transfer of nextTransfers) {
       if (mobileTransfers.some((view) => view.progress.transfer_id === transfer.transfer_id)) continue;
       if (transfer.direction !== 'send' || !transfer.offer || ['completed', 'rejected', 'failed', 'cancelled'].includes(transfer.status) || watching.has(transfer.transfer_id)) continue;
@@ -549,6 +621,7 @@
       const next = existing && shouldKeepTransferProgress(existing, progress)
         ? { ...progress, ...existing, offer: progress.offer ?? existing.offer }
         : { ...existing, ...progress, offer: progress.offer ?? existing?.offer };
+      observeFailure(next);
       transfers = [next, ...transfers.filter((item) => item.transfer_id !== progress.transfer_id)];
     }
   }
@@ -563,6 +636,9 @@
   }
 
   function shouldKeepTransferProgress(current: TransferProgress, next: TransferProgress): boolean {
+    const currentRetry = current.retry_count ?? 0;
+    const nextRetry = next.retry_count ?? 0;
+    if (nextRetry !== currentRetry) return nextRetry < currentRetry;
     const currentRank = transferStatusRank(current.status);
     const nextRank = transferStatusRank(next.status);
     return nextRank < currentRank;
@@ -996,6 +1072,9 @@
     selectedMobileSession = null;
     clipboardHistory = [];
     transfers = [];
+    for (const failure of failures) forgetPendingTransfer(failure.progress.transfer_id);
+    failures = [];
+    dismissedFailures.clear();
     mobileSessions = [];
     mobileTransfers = [];
     mobileBrowserDownloadStarted = new Set();
@@ -1142,6 +1221,7 @@
         ? undefined
         : await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
       if (localProgress?.status === 'failed') {
+        observeFailure({ ...localProgress, offer, direction: 'send' });
         throw new Error(localProgress.error ?? '传输任务数量已达到上限');
       }
       try {
@@ -1154,13 +1234,27 @@
         }
       } catch (error) {
         if (localProgress) {
+          const failedProgress = { ...localProgress, status: 'failed' as const, error: error instanceof Error ? error.message : '无法创建传输', offer, direction: 'send' as const };
+          observeFailure(failedProgress);
           await invoke('update_transfer_progress', {
-            progress: { ...localProgress, status: 'failed', error: error instanceof Error ? error.message : '无法创建传输' },
+            progress: failedProgress,
           }).catch(() => undefined);
+        } else {
+          observeFailure({
+            transfer_id: offer.transfer_id,
+            status: 'failed',
+            completed_bytes: 0,
+            total_bytes: offer.total_bytes,
+            completed_items: 0,
+            total_items: offer.items.length,
+            error: error instanceof Error ? error.message : '无法创建传输',
+            offer,
+            direction: 'send',
+          });
         }
         throw error;
       }
-      pendingUploads.set(offer.transfer_id, { target: remoteMode ? activeBaseUrl : target, files, items, relay: remoteMode });
+      pendingUploads.set(offer.transfer_id, { target: remoteMode ? activeBaseUrl : target, files, items, offer, relay: remoteMode });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
       void watchTransfer(offer.transfer_id, remoteMode ? activeBaseUrl : target, remoteMode);
       notice = '已发送传输请求，等待接收端确认';
@@ -1173,6 +1267,7 @@
     if (!node) return;
     selectedMobileSession = null;
     notice = `正在准备发送 ${files.length} 个项目…`;
+    let offerForFailure: TransferOffer | undefined;
     try {
       const items = await Promise.all(files.map(createItem));
       const offer: TransferOffer = {
@@ -1184,16 +1279,31 @@
         total_bytes: items.reduce((sum, item) => sum + item.size, 0),
         created_at_ms: Date.now(),
       };
+      offerForFailure = offer;
+      pendingMobileUploads.set(offer.transfer_id, { files, items, completedItemIds: new Set(), sessionId: session.session_id, offer });
       await request<MobileTransferView>('/api/v1/mobile/transfers', {
         method: 'POST',
         body: JSON.stringify({ session_id: session.session_id, offer }),
       });
-      pendingMobileUploads.set(offer.transfer_id, { files, items, completedItemIds: new Set() });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
       void watchMobileTransfer(offer.transfer_id);
       notice = '已发送，等待网页端确认';
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法发送到网页端';
+      const message = error instanceof Error ? error.message : '无法发送到网页端';
+      if (offerForFailure) {
+        observeFailure({
+          transfer_id: offerForFailure.transfer_id,
+          status: 'failed',
+          completed_bytes: 0,
+          total_bytes: offerForFailure.total_bytes,
+          completed_items: 0,
+          total_items: offerForFailure.items.length,
+          error: message,
+          offer: offerForFailure,
+          direction: 'send',
+        });
+      }
+      notice = message;
     }
   }
 
@@ -1213,16 +1323,24 @@
           return;
         }
         if (!view) throw new Error('网页端传输任务不存在');
-        const progress = view.progress;
+        const progress = { ...view.progress, direction: 'send' as const };
         const existing = transfers.find((item) => item.transfer_id === id);
-        transfers = [{ ...existing, ...progress, direction: 'send' }, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (['accepted', 'uploading'].includes(progress.status) && !mobileUploading.has(id) && !mobileUploadStopped.has(id)) {
+        const nextProgress = existing && shouldKeepTransferProgress(existing, progress)
+          ? { ...progress, ...existing, offer: progress.offer ?? existing.offer, direction: 'send' as const }
+          : { ...existing, ...progress, direction: 'send' as const, offer: progress.offer ?? existing?.offer };
+        observeFailure(nextProgress);
+        transfers = [nextProgress, ...transfers.filter((item) => item.transfer_id !== id)];
+        if (['accepted', 'uploading'].includes(nextProgress.status) && !mobileUploading.has(id) && !mobileUploadStopped.has(id)) {
           await uploadMobileTransfer(id);
         }
-        if (['ready', 'completed', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
-          pendingMobileUploads.delete(id);
-          mobileUploadAttempts.delete(id);
-          mobileUploadStopped.delete(id);
+        if (['ready', 'completed', 'rejected', 'failed', 'cancelled'].includes(nextProgress.status)) {
+          if (nextProgress.status !== 'failed') forgetPendingTransfer(id);
+          if (nextProgress.status === 'failed') {
+            mobileUploadAttempts.delete(id);
+          } else {
+            mobileUploadAttempts.delete(id);
+            mobileUploadStopped.delete(id);
+          }
           mobileWatching.delete(id);
           return;
         }
@@ -1255,7 +1373,7 @@
         pending.completedItemIds.add(item.item_id);
       }
       mobileUploadAttempts.delete(id);
-      notice = '文件已准备好，网页端可以下载';
+      showTransientNotice('文件已准备好，网页端可以下载');
     } catch (error) {
       const attempts = (mobileUploadAttempts.get(id) ?? 0) + 1;
       mobileUploadAttempts.set(id, attempts);
@@ -1266,7 +1384,7 @@
           method: 'POST',
           body: JSON.stringify({ error: message }),
         }).catch(() => undefined);
-        notice = `${message}，已停止重试`;
+        showTransientNotice(`${message}，已停止重试`);
       } else {
         notice = `${message}，正在重试（${attempts}/${MOBILE_UPLOAD_MAX_ATTEMPTS}）`;
       }
@@ -1320,12 +1438,15 @@
         }
         if (!remoteMode) void invoke('update_transfer_progress', { progress }).catch(() => undefined);
         const existing = transfers.find((item) => item.transfer_id === id);
-        transfers = [{ ...existing, ...progress, direction: existing?.direction ?? progress.direction }, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (['accepted', 'uploading'].includes(progress.status) && !uploading.has(id) && !uploadStopped.has(id)) await uploadTransfer(id, target, relay);
-        if (['completed', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
-          pendingUploads.delete(id);
-          uploadAttempts.delete(id);
-          uploadStopped.delete(id);
+        const nextProgress = existing && shouldKeepTransferProgress(existing, progress)
+          ? { ...progress, ...existing, offer: progress.offer ?? existing.offer }
+          : { ...existing, ...progress, offer: progress.offer ?? existing?.offer };
+        observeFailure(nextProgress);
+        transfers = [nextProgress, ...transfers.filter((item) => item.transfer_id !== id)];
+        if (['accepted', 'uploading'].includes(nextProgress.status) && !uploading.has(id) && !uploadStopped.has(id)) await uploadTransfer(id, target, relay);
+        if (['completed', 'rejected', 'failed', 'cancelled'].includes(nextProgress.status)) {
+          if (nextProgress.status !== 'failed') forgetPendingTransfer(id);
+          else uploadAttempts.delete(id);
           watching.delete(id);
           return;
         }
@@ -1352,18 +1473,19 @@
         );
       }
       uploadAttempts.delete(id);
-      notice = '文件发送完成';
+      showTransientNotice('文件发送完成');
     } catch (error) {
       notice = error instanceof Error ? error.message : '文件发送失败';
       const attempts = (uploadAttempts.get(id) ?? 0) + 1;
       uploadAttempts.set(id, attempts);
       if (attempts >= DESKTOP_UPLOAD_MAX_ATTEMPTS) {
         uploadStopped.add(id);
-        const cancelPath = relay
-          ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/cancel`
-          : `/api/v1/transfers/${encodeURIComponent(id)}/cancel`;
-        await request(cancelPath, { method: 'POST' }, target).catch(() => undefined);
-        notice = `${notice}，已停止重试`;
+        const message = `${notice}，已停止重试`;
+        const failPath = relay
+          ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/fail`
+          : `/api/v1/transfers/${encodeURIComponent(id)}/fail`;
+        await request(failPath, { method: 'POST', body: JSON.stringify({ error: message }) }, target).catch(() => undefined);
+        showTransientNotice(message);
       } else {
         // Keep the accepted task alive. watchTransfer will retry the current
         // item after the peer becomes reachable again; PUT is idempotent for
@@ -1372,6 +1494,65 @@
       }
     } finally {
       uploading.delete(id);
+    }
+  }
+
+  async function retryFailure(failure: TransferFailure) {
+    if (transferActionBusy) return;
+    const id = failure.progress.transfer_id;
+    dismissedFailures.delete(id);
+    const pending = pendingUploads.get(id);
+    if (pending) {
+      transferActionBusy = id;
+      try {
+        const path = pending.relay
+          ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/retry`
+          : `/api/v1/transfers/${encodeURIComponent(id)}/retry`;
+        const progress = await request<TransferProgress>(path, { method: 'POST' }, pending.target);
+        uploadAttempts.delete(id);
+        uploadStopped.delete(id);
+        failures = failures.filter((item) => item.progress.transfer_id !== id);
+        transfers = [{ ...progress, direction: 'send', offer: progress.offer ?? pending.offer }, ...transfers.filter((item) => item.transfer_id !== id)];
+        void watchTransfer(id, pending.target, pending.relay);
+      } catch (error) {
+        notice = error instanceof Error ? error.message : '无法重试传输';
+      } finally {
+        transferActionBusy = '';
+      }
+      return;
+    }
+    const mobilePending = pendingMobileUploads.get(id);
+    if (!mobilePending) return;
+    transferActionBusy = id;
+    try {
+      const offer: TransferOffer = {
+        ...mobilePending.offer,
+        transfer_id: randomId(),
+        created_at_ms: Date.now(),
+      };
+      await request<MobileTransferView>('/api/v1/mobile/transfers', {
+        method: 'POST',
+        body: JSON.stringify({ session_id: mobilePending.sessionId, offer }),
+      });
+      pendingMobileUploads.delete(id);
+      pendingMobileUploads.set(offer.transfer_id, { ...mobilePending, offer, completedItemIds: new Set() });
+      failures = failures.filter((item) => item.progress.transfer_id !== id);
+      const progress: TransferProgress = {
+        transfer_id: offer.transfer_id,
+        status: 'waiting',
+        completed_bytes: 0,
+        total_bytes: offer.total_bytes,
+        completed_items: 0,
+        total_items: offer.items.length,
+        offer,
+        direction: 'send',
+      };
+      transfers = [progress, ...transfers.filter((item) => item.transfer_id !== id)];
+      void watchMobileTransfer(offer.transfer_id);
+    } catch (error) {
+      notice = error instanceof Error ? error.message : '无法重试网页传输';
+    } finally {
+      transferActionBusy = '';
     }
   }
 
@@ -1491,7 +1672,7 @@
         if (downloaded.has(item.item_id)) continue;
         await downloadMobileItem(view, item);
       }
-      notice = '文件已保存到接收目录';
+      showTransientNotice('文件已保存到接收目录');
       await refresh();
     } catch (error) {
       const message = error instanceof Error ? error.message : '网页端文件保存失败';
@@ -1540,7 +1721,7 @@
       const started = new Set(mobileBrowserDownloadStarted);
       started.delete(key);
       mobileBrowserDownloadStarted = started;
-      notice = `已确认下载 ${item.name}`;
+      showTransientNotice(`已确认下载 ${item.name}`);
       await refresh();
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法确认文件下载';
@@ -1659,6 +1840,7 @@
       {statusKind}
       peers={isWeb ? mobileTargets : peers}
       transfers={phoneTransfers}
+      failures={phoneFailures}
       {clipboard}
       bind:draft={clipboardDraft}
       history={clipboardHistory}
@@ -1678,6 +1860,8 @@
       onSaveToDirectory={savePhoneTransfer}
       onStartDownload={downloadPhoneItem}
       onConfirmDownload={confirmPhoneItem}
+      onRetryFailure={retryFailure}
+      onDismissFailure={dismissFailure}
       onPublish={publishClipboard}
       onReadLocal={readMobileClipboard}
       onWriteLocal={writeMobileClipboard}
@@ -1744,7 +1928,7 @@
         onOpenHistory={openClipboardHistory}
         onClearHistory={requestClearHistory}
       />
-      <TransferPanel {transfers} onAccept={acceptTransfer} onReject={rejectTransfer} />
+      <TransferPanel {transfers} {failures} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} />
     </main>
     <SettingsDialog
       open={settingsOpen}

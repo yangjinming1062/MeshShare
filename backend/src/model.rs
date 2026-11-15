@@ -294,6 +294,8 @@ pub enum TransferStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransferProgress {
     pub transfer_id: String,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retry_count: u32,
     pub status: TransferStatus,
     pub completed_bytes: u64,
     pub total_bytes: u64,
@@ -305,6 +307,10 @@ pub struct TransferProgress {
     pub offer: Option<TransferOffer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +346,8 @@ pub enum WireMessage {
         transfer_id: String,
         action: String,
         reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_count: Option<u32>,
     },
     TransferProgress {
         progress: TransferProgress,
@@ -423,6 +431,7 @@ mod tests {
                 serde_json::to_value(WireMessage::TransferProgress {
                     progress: TransferProgress {
                         transfer_id: "transfer-1".to_string(),
+                        retry_count: 0,
                         status: TransferStatus::Waiting,
                         completed_bytes: 0,
                         total_bytes: 5,

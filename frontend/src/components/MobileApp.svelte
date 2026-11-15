@@ -14,8 +14,9 @@
     transferItemKey,
     transferItemsLabel,
     transferStatusText,
+    isActiveTransferStatus,
   } from '../format';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferItem } from '../types';
+  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferItem } from '../types';
 
   export let mode: 'web' | 'android' = 'web';
   export let node: NodeInfo | null = null;
@@ -23,6 +24,7 @@
   export let statusKind: 'ok' | 'warn' | 'error' = 'warn';
   export let peers: PeerInfo[] = [];
   export let transfers: PhoneTransfer[] = [];
+  export let failures: TransferFailure[] = [];
   export let clipboard: ClipboardSnapshot | null = null;
   export let draft = '';
   export let history: ClipboardHistoryItem[] = [];
@@ -43,6 +45,8 @@
   export let onSaveToDirectory: (transfer: PhoneTransfer) => void = () => {};
   export let onStartDownload: (transfer: PhoneTransfer, item: TransferItem) => void = () => {};
   export let onConfirmDownload: (transfer: PhoneTransfer, item: TransferItem) => void = () => {};
+  export let onRetryFailure: (failure: TransferFailure) => void = () => {};
+  export let onDismissFailure: (failure: TransferFailure) => void = () => {};
   export let onPublish: () => void = () => {};
   export let onReadLocal: () => void = () => {};
   export let onWriteLocal: () => void = () => {};
@@ -63,7 +67,7 @@
   $: hiddenPending = pending.length - shownPending.length;
   $: pendingBytes = pending.reduce((sum, transfer) => sum + (transfer.offer?.total_bytes ?? transfer.total_bytes), 0);
   $: pendingItems = pending.reduce((sum, transfer) => sum + (transfer.offer?.items.length ?? transfer.total_items), 0);
-  $: activeTransfers = transfers.filter((transfer) => !pending.some((item) => item.transfer_id === transfer.transfer_id));
+  $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status) && !pending.some((item) => item.transfer_id === transfer.transfer_id));
   $: acceptLabel = mode === 'android' ? '接收' : canChooseDirectory && !receiveDirectoryName ? '选择目录并接收' : '开始接收';
   $: if (!transfersAutoOpened) autoOpenTransfers();
 
@@ -313,6 +317,27 @@
         {:else}
           <div class="empty">还没有传输任务。</div>
         {/each}
+      </div>
+    {/if}
+    {#if failures.length}
+      <div class="phone-failures">
+        <div class="phone-card-head phone-subhead"><h3>失败任务</h3><span class="chip chip--danger">{failures.length}</span></div>
+        <div class="phone-list">
+          {#each failures as failure (failure.progress.transfer_id)}
+            <article class="transfer-card transfer-card--failure">
+              <span class="transfer-icon transfer-icon--failure" aria-hidden="true"><Icon name="close" size={14} /></span>
+              <div class="transfer-copy">
+                <strong>{failure.progress.offer?.source_name ?? '文件传输'}</strong>
+                <span>{transferItemsLabel(failure.progress)} · {formatTime(failure.failed_at_ms)}</span>
+              </div>
+              <div class="transfer-progress"><span title={failure.progress.error ?? '传输失败'}>{failure.progress.error ?? '传输失败'}</span></div>
+              <div class="transfer-actions">
+                {#if failure.retryable}<button type="button" class="btn btn-primary btn-sm" on:click={() => onRetryFailure(failure)}>重试</button>{/if}
+                <button type="button" class="btn btn-ghost btn-sm" on:click={() => onDismissFailure(failure)}>移除</button>
+              </div>
+            </article>
+          {/each}
+        </div>
       </div>
     {/if}
   </section>

@@ -192,6 +192,7 @@ export type TransferStatus = 'waiting' | 'accepted' | 'uploading' | 'ready' | 'r
 
 export type TransferProgress = {
   transfer_id: string;
+  retry_count?: number;
   status: TransferStatus;
   completed_bytes: number;
   total_bytes: number;
@@ -201,6 +202,12 @@ export type TransferProgress = {
   error?: string;
   offer?: TransferOffer;
   direction?: 'send' | 'receive';
+};
+
+export type TransferFailure = {
+  progress: TransferProgress;
+  failed_at_ms: number;
+  retryable: boolean;
 };
 
 export type MobileTransferView = {
@@ -221,6 +228,6 @@ export type WireMessage =
   | { type: 'ClipboardUpdate'; payload: { event: unknown } }
   | { type: 'ClipboardSnapshot'; payload: { snapshot: ClipboardSnapshot } }
   | { type: 'TransferOffer'; payload: { offer: TransferOffer } }
-  | { type: 'TransferAction'; payload: { transfer_id: string; action: string; reason?: string } }
+  | { type: 'TransferAction'; payload: { transfer_id: string; action: string; reason?: string; retry_count?: number } }
   | { type: 'TransferProgress'; payload: { progress: TransferProgress } }
   | { type: 'MetricsUpdate'; payload: { metrics: HardwareMetrics } };
