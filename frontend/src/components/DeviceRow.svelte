@@ -26,13 +26,28 @@
   $: cpu = metrics?.cpu_usage_percent;
   $: memory = memoryPercent(metrics);
   $: gpu = gpuUtilization(metrics);
+
+  function isInsideRow(event: DragEvent): boolean {
+    const row = event.currentTarget;
+    const relatedTarget = event.relatedTarget;
+    return row instanceof Node && relatedTarget instanceof Node && row.contains(relatedTarget);
+  }
+
+  function handleDragEnter(event: DragEvent) {
+    if (!isInsideRow(event)) onDragOver();
+  }
+
+  function handleDragLeave(event: DragEvent) {
+    if (!isInsideRow(event)) onDragLeave();
+  }
 </script>
 
 <li
   class="device-row"
   class:dragging
+  on:dragenter|preventDefault={handleDragEnter}
   on:dragover|preventDefault={() => onDragOver()}
-  on:dragleave={() => onDragLeave()}
+  on:dragleave={handleDragLeave}
   on:drop|preventDefault={(event) => onDropFile(event)}
 >
   <span class="device-icon" aria-hidden="true">
@@ -78,6 +93,6 @@
     </button>
   </div>
   {#if dragging}
-    <div class="drop-hint">松开即可发送</div>
+    <div class="drop-hint" aria-hidden="true">松开即可发送</div>
   {/if}
 </li>

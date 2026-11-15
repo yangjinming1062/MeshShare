@@ -17,7 +17,7 @@
   export let onSendMobile: (session: MobileSession) => void = () => {};
   export let onSendMobileFolder: (session: MobileSession) => void = () => {};
   export let onDragEnter: (key: string) => void = () => {};
-  export let onDragLeave: () => void = () => {};
+  export let onDragLeave: (key: string) => void = () => {};
   export let onDropPeer: (peer: PeerInfo, event: DragEvent) => void = () => {};
   export let onDropMobile: (session: MobileSession, event: DragEvent) => void = () => {};
 
@@ -64,7 +64,7 @@
           onSendFolder={() => onSendPeerFolder(peer)}
           onDetails={() => onDetails(peer)}
           onDragOver={() => onDragEnter('peer:' + peer.node_id)}
-          onDragLeave={onDragLeave}
+          onDragLeave={() => onDragLeave('peer:' + peer.node_id)}
           onDropFile={(event) => onDropPeer(peer, event)}
         />
       {/each}
@@ -76,7 +76,7 @@
           onSend={() => onSendMobile(session)}
           onSendFolder={() => onSendMobileFolder(session)}
           onDragOver={() => onDragEnter('mobile:' + session.session_id)}
-          onDragLeave={onDragLeave}
+          onDragLeave={() => onDragLeave('mobile:' + session.session_id)}
           onDropFile={(event) => onDropMobile(session, event)}
         />
       {/each}

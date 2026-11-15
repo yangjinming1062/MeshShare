@@ -122,7 +122,7 @@ button.device-metrics:hover { background: var(--surface-2); }
 .device-metrics-empty[data-stale="true"] { color: var(--warning-ink); }
 .device-metrics--mobile { width: auto; justify-self: end; font-size: 12px; }
 .device-actions { display: flex; align-items: center; gap: 8px; }
-.drop-hint { position: absolute; inset: 0; display: grid; place-items: center; border-radius: inherit; background: rgba(239, 244, 255, .93); color: var(--primary-hover); font-size: 12px; font-weight: 600; }
+.drop-hint { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; border-radius: inherit; background: rgba(239, 244, 255, .93); color: var(--primary-hover); font-size: 12px; font-weight: 600; }
 
 .meter { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
 .meter-label { color: var(--muted); font-size: 11px; font-weight: 600; }

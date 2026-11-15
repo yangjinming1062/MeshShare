@@ -742,6 +742,7 @@
 
   async function onDropMobile(session: MobileSession, event: DragEvent) {
     event.preventDefault();
+    dragPeer = '';
     const files = event.dataTransfer ? await filesFromDataTransfer(event.dataTransfer) : [];
     if (files.length) await sendFilesToMobile(session, files);
   }
@@ -1442,7 +1443,7 @@
         onSendMobile={(session) => startChooseMobile(session)}
         onSendMobileFolder={(session) => startChooseMobile(session, true)}
         onDragEnter={(key) => (dragPeer = key)}
-        onDragLeave={() => (dragPeer = '')}
+        onDragLeave={(key) => { if (dragPeer === key) dragPeer = ''; }}
         onDropPeer={onDrop}
         onDropMobile={onDropMobile}
       />
