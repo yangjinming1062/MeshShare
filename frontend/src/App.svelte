@@ -7,7 +7,7 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { ApiError, apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
-  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
@@ -67,7 +67,10 @@
   let selectedMobileSession: MobileSession | null = null;
   let dragPeer = '';
   let notice = '';
+  let noticeDeadline = 0;
+  let noticeTimer = 0;
   let transfers: TransferProgress[] = [];
+  let prepares: TransferPrepare[] = [];
   let failures: TransferFailure[] = [];
   let mobileSessions: MobileSession[] = [];
   let mobileTransfers: MobileTransferView[] = [];
@@ -97,6 +100,7 @@
   const mobileUploadStopped = new Set<string>();
   const uploadAttempts = new Map<string, number>();
   const uploadStopped = new Set<string>();
+  const prepareControllers = new Map<string, AbortController>();
   const mobileDownloading = new Set<string>();
   let mobileBrowserDownloadStarted = new Set<string>();
   const MOBILE_UPLOAD_MAX_ATTEMPTS = 6;
@@ -203,7 +207,7 @@
     const mobile = mobileTransfers.some((view) => view.progress.transfer_id === id);
     failures = failures.filter((item) => item.progress.transfer_id !== id);
     dismissedFailures.set(id, Date.now());
-    if (failure.progress.error && notice === failure.progress.error) notice = '';
+    if (failure.progress.error && notice === failure.progress.error) clearNotice();
     try {
       await (mobile ? dismissMobileTransfer(id) : dismissTransfer(id));
       forgetPendingTransfer(id);
@@ -220,15 +224,45 @@
     }
   }
 
+  /**
+   * 提示只从这里进出：每条提示替换上一条的定时器并记录到期时间，
+   * 所以新提示不会被旧定时器清掉，也不存在永久停留的路径。
+   */
   function showTransientNotice(message: string, timeout = 2400) {
+    if (!message) {
+      clearNotice();
+      return;
+    }
     notice = message;
-    window.setTimeout(() => {
-      if (notice === message) notice = '';
-    }, timeout);
+    noticeDeadline = Date.now() + timeout;
+    scheduleNoticeClear(timeout);
+  }
+
+  function scheduleNoticeClear(delay: number) {
+    window.clearTimeout(noticeTimer);
+    noticeTimer = window.setTimeout(clearNotice, Math.max(0, delay));
+  }
+
+  function clearNotice() {
+    window.clearTimeout(noticeTimer);
+    notice = '';
+  }
+
+  /** 后台节流会让定时器延后，回到前台按剩余时间重排，避免过期提示还挂在界面上。 */
+  function resyncNotice() {
+    if (!notice) return;
+    const remaining = noticeDeadline - Date.now();
+    if (remaining > 0) scheduleNoticeClear(remaining);
+    else clearNotice();
   }
 
   onMount(() => {
     pageStopped = false;
+    const resumeNotice = () => {
+      if (document.visibilityState !== 'hidden') resyncNotice();
+    };
+    document.addEventListener('visibilitychange', resumeNotice);
+    window.addEventListener('focus', resumeNotice);
     try {
       const stored = window.localStorage.getItem('meshshare-saved-node-urls');
       const parsed = stored ? JSON.parse(stored) : [];
@@ -325,6 +359,9 @@
     return () => {
       stopped = true;
       pageStopped = true;
+      document.removeEventListener('visibilitychange', resumeNotice);
+      window.removeEventListener('focus', resumeNotice);
+      window.clearTimeout(noticeTimer);
       if (timer) window.clearInterval(timer);
       if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
       wsReconnectTimer = undefined;
@@ -704,16 +741,14 @@
       try {
         const settings = await patchSettings({ clipboard_sync_enabled: !syncEnabled });
         applyRemoteSettings(settings);
-        notice = syncEnabled ? '目标节点的剪贴板自动同步已恢复' : '目标节点的剪贴板自动同步已暂停';
+        showTransientNotice(syncEnabled ? '目标节点的剪贴板自动同步已恢复' : '目标节点的剪贴板自动同步已暂停');
       } catch (error) {
-        notice = error instanceof Error ? error.message : '无法更新目标节点同步设置';
+        showTransientNotice(error instanceof Error ? error.message : '无法更新目标节点同步设置', 6000);
       }
-      window.setTimeout(() => (notice = ''), 2400);
       return;
     }
     syncEnabled = await invoke<boolean>('toggle_clipboard_sync').catch(() => !syncEnabled);
-    notice = syncEnabled ? '剪贴板自动同步已恢复' : '剪贴板自动同步已暂停';
-    window.setTimeout(() => (notice = ''), 2200);
+    showTransientNotice(syncEnabled ? '剪贴板自动同步已恢复' : '剪贴板自动同步已暂停');
   }
 
   async function toggleAutostart() {
@@ -727,13 +762,12 @@
       } else {
         autostartEnabled = await invoke<boolean>('set_autostart_enabled', { enabled: next });
       }
-      notice = autostartEnabled ? '开机自启动已开启' : '开机自启动已关闭';
+      showTransientNotice(autostartEnabled ? '开机自启动已开启' : '开机自启动已关闭');
     } catch (error) {
-      notice = typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新开机自启动设置';
+      showTransientNotice(typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新开机自启动设置', 6000);
     } finally {
       autostartBusy = false;
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function setUpdateFrequency(next: UpdateFrequency) {
@@ -746,12 +780,11 @@
         updateFrequency = await invoke<UpdateFrequency>('set_update_frequency', { frequency: next });
         updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
       }
-      notice = next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`;
+      showTransientNotice(next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`);
     } catch (error) {
       updateFrequency = previous;
-      notice = error instanceof Error ? error.message : '无法更新自动更新设置';
+      showTransientNotice(error instanceof Error ? error.message : '无法更新自动更新设置', 6000);
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function setReceiveMode(mode: ReceiveMode) {
@@ -796,13 +829,12 @@
           defaultPath: defaultPath ?? receiveSettings.default_path ?? null,
         });
       }
-      notice = mode === 'auto' ? '已启用自动接收' : '已设为每次确认';
+      showTransientNotice(mode === 'auto' ? '已启用自动接收' : '已设为每次确认');
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法更新接收设置';
+      showTransientNotice(error instanceof Error ? error.message : '无法更新接收设置', 6000);
     } finally {
       receiveSettingsBusy = false;
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function setClipboardHistoryMode(mode: ClipboardHistoryMode) {
@@ -829,15 +861,14 @@
         clipboardHistorySettings = await invoke<ClipboardHistorySettings>('set_clipboard_history_settings', { mode, value });
       }
       await refreshClipboardHistory();
-      notice = mode === 'count'
+      showTransientNotice(mode === 'count'
         ? `已保留最近 ${clipboardHistorySettings.count} 条剪贴板内容`
-        : `已保留最近 ${clipboardHistorySettings.days} 天剪贴板内容`;
+        : `已保留最近 ${clipboardHistorySettings.days} 天剪贴板内容`);
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法更新剪贴板历史设置';
+      showTransientNotice(error instanceof Error ? error.message : '无法更新剪贴板历史设置', 6000);
     } finally {
       clipboardHistorySettingsBusy = false;
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function refreshClipboardHistory() {
@@ -859,13 +890,12 @@
         await invoke('check_for_updates');
         updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
       }
-      notice = '已发起更新检查';
+      showTransientNotice('已发起更新检查');
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法检查更新';
+      showTransientNotice(error instanceof Error ? error.message : '无法检查更新', 6000);
     } finally {
       updateBusy = false;
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   function selectMetricsPeer(peer: PeerInfo) {
@@ -897,11 +927,10 @@
       } else {
         monitorLocked = await invoke<boolean>('set_monitor_locked', { locked: !monitorLocked });
       }
-      notice = monitorLocked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动';
+      showTransientNotice(monitorLocked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动');
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法更新悬浮监控条状态';
+      showTransientNotice(error instanceof Error ? error.message : '无法更新悬浮监控条状态', 6000);
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function toggleMonitorVisibility() {
@@ -911,11 +940,10 @@
       } else {
         monitorVisible = await invoke<boolean>('set_monitor_visible', { visible: !monitorVisible });
       }
-      notice = monitorVisible ? '悬浮监控条已显示' : '悬浮监控条已隐藏';
+      showTransientNotice(monitorVisible ? '悬浮监控条已显示' : '悬浮监控条已隐藏');
     } catch (error) {
-      notice = typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新悬浮监控条可见性';
+      showTransientNotice(typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新悬浮监控条可见性', 6000);
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function openMonitorMenu(event: MouseEvent) {
@@ -935,11 +963,10 @@
         method: 'POST',
         body: JSON.stringify({ text: clipboardDraft, source_name: node?.node_name }),
       });
-      notice = '已同步到在线设备';
+      showTransientNotice('已同步到在线设备');
     } catch (error) {
-      notice = error instanceof Error ? error.message : '剪贴板同步失败';
+      showTransientNotice(error instanceof Error ? error.message : '剪贴板同步失败', 6000);
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function openClipboardHistory(item: ClipboardHistoryItem) {
@@ -948,8 +975,7 @@
       clipboardDraft = selectedClipboardHistory.snapshot.text ?? '';
       historyDetailOpen = true;
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法读取历史剪贴板内容';
-      window.setTimeout(() => (notice = ''), 2400);
+      showTransientNotice(error instanceof Error ? error.message : '无法读取历史剪贴板内容', 6000);
     }
   }
 
@@ -961,14 +987,13 @@
       clipboard = await restoreClipboardHistory(eventId);
       clipboardDraft = clipboard.text ?? '';
       await refreshClipboardHistory();
-      notice = '已恢复并同步剪贴板内容';
+      showTransientNotice('已恢复并同步剪贴板内容');
       closeHistoryDetail();
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法恢复剪贴板历史';
+      showTransientNotice(error instanceof Error ? error.message : '无法恢复剪贴板历史', 6000);
     } finally {
       clipboardHistoryBusy = false;
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function clearClipboardHistoryItems() {
@@ -979,13 +1004,12 @@
       clipboardHistory = [];
       selectedClipboardHistory = null;
       clearHistoryOpen = false;
-      notice = '已清空本机剪贴板历史';
+      showTransientNotice('已清空本机剪贴板历史');
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法清空剪贴板历史';
+      showTransientNotice(error instanceof Error ? error.message : '无法清空剪贴板历史', 6000);
     } finally {
       clipboardHistoryBusy = false;
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function connectManualPeer() {
@@ -1007,28 +1031,27 @@
       manualAddress = '';
       addDeviceOpen = false;
       await refresh();
-      notice = '已发起节点连接';
+      showTransientNotice('已发起节点连接');
     } catch (error) {
-      notice = error instanceof Error ? error.message : '无法连接节点';
+      showTransientNotice(error instanceof Error ? error.message : '无法连接节点', 6000);
     }
-    window.setTimeout(() => (notice = ''), 2400);
   }
 
   async function readMobileClipboard() {
     try {
       clipboardDraft = await navigator.clipboard.readText();
-      notice = '已读取本机剪贴板';
+      showTransientNotice('已读取本机剪贴板');
     } catch {
-      notice = '浏览器未授权读取剪贴板，请手动粘贴';
+      showTransientNotice('浏览器未授权读取剪贴板，请手动粘贴', 6000);
     }
   }
 
   async function writeMobileClipboard() {
     try {
       await navigator.clipboard.writeText(clipboardDraft);
-      notice = '已写入本机剪贴板';
+      showTransientNotice('已写入本机剪贴板');
     } catch {
-      notice = '浏览器拒绝写入，请手动选择并复制';
+      showTransientNotice('浏览器拒绝写入，请手动选择并复制', 6000);
     }
   }
 
@@ -1186,6 +1209,9 @@
     selectedMobileSession = null;
     clipboardHistory = [];
     transfers = [];
+    for (const controller of prepareControllers.values()) controller.abort();
+    prepareControllers.clear();
+    prepares = [];
     for (const failure of failures) forgetPendingTransfer(failure.progress.transfer_id);
     failures = [];
     dismissedFailures.clear();
@@ -1200,14 +1226,12 @@
   async function openRemotePeer(peer: PeerInfo) {
     if (isWeb || !peer.online) return;
     if (!peer.capabilities.includes(REMOTE_MANAGEMENT_CAPABILITY)) {
-      notice = '目标节点不支持远程管理，请先升级目标节点';
-      window.setTimeout(() => (notice = ''), 3000);
+      showTransientNotice('目标节点不支持远程管理，请先升级目标节点', 6000);
       return;
     }
     const target = targetBase(peer);
     if (!target) {
-      notice = '目标设备没有可访问地址';
-      window.setTimeout(() => (notice = ''), 2400);
+      showTransientNotice('目标设备没有可访问地址', 6000);
       return;
     }
     wsGeneration += 1;
@@ -1254,9 +1278,58 @@
     connectWebSocket();
   }
 
-  async function createItem(file: File, index: number): Promise<TransferItem> {
+  function updatePrepare(prepareId: string, hashedBytes: number) {
+    prepares = prepares.map((item) => (item.prepare_id === prepareId ? { ...item, hashed_bytes: hashedBytes } : item));
+  }
+
+  function finishPrepare(prepareId: string) {
+    prepareControllers.delete(prepareId);
+    prepares = prepares.filter((item) => item.prepare_id !== prepareId);
+  }
+
+  function cancelPrepare(prepareId: string) {
+    prepareControllers.get(prepareId)?.abort();
+    finishPrepare(prepareId);
+  }
+
+  function isPrepareCancelled(error: unknown): boolean {
+    return typeof error === 'object' && error !== null && (error as { name?: string }).name === 'AbortError';
+  }
+
+  /**
+   * 摘要期间在传输列表里显示准备行，支持按字节进度和取消；摘要结束或取消都立刻收起准备行，
+   * 所以调用方拿到的项目已经是算完摘要的，并发的取消只可能发生在算摘要过程中。
+   */
+  async function prepareItems(targetName: string, files: File[]): Promise<TransferItem[]> {
+    const controller = new AbortController();
+    const prepare: TransferPrepare = {
+      prepare_id: randomId(),
+      target_name: targetName,
+      item_count: files.length,
+      total_bytes: files.reduce((sum, file) => sum + file.size, 0),
+      hashed_bytes: 0,
+    };
+    prepareControllers.set(prepare.prepare_id, controller);
+    prepares = [prepare, ...prepares];
+    try {
+      const items: TransferItem[] = [];
+      let hashedBefore = 0;
+      for (const [index, file] of files.entries()) {
+        items.push(await createItem(file, index, controller.signal, (hashedBytes) => {
+          updatePrepare(prepare.prepare_id, Math.min(prepare.total_bytes, hashedBefore + hashedBytes));
+        }));
+        hashedBefore += file.size;
+        updatePrepare(prepare.prepare_id, hashedBefore);
+      }
+      return items;
+    } finally {
+      finishPrepare(prepare.prepare_id);
+    }
+  }
+
+  async function createItem(file: File, index: number, signal: AbortSignal, onProgress: (hashedBytes: number) => void): Promise<TransferItem> {
     const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
-    const sha256 = await digestFile(file);
+    const sha256 = await digestFile(file, { signal, onProgress });
     return {
       item_id: `${index}-${randomId()}`,
       name: file.name,
@@ -1318,9 +1391,8 @@
       return;
     }
     selectedPeer = null;
-    notice = `正在准备发送 ${files.length} 个项目…`;
     try {
-      const items = await Promise.all(files.map(createItem));
+      const items = await prepareItems(peer.node_name, files);
       const offer: TransferOffer = {
         transfer_id: randomId(),
         source_node_id: node.node_id,
@@ -1369,17 +1441,16 @@
         showTransientNotice(message, 6000);
       }
     } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法创建传输', 6000);
+      if (!isPrepareCancelled(error)) showTransientNotice(error instanceof Error ? error.message : '无法创建传输', 6000);
     }
   }
 
   async function sendFilesToMobile(session: MobileSession, files: File[]) {
     if (!node) return;
     selectedMobileSession = null;
-    notice = `正在准备发送 ${files.length} 个项目…`;
     let offerForFailure: TransferOffer | undefined;
     try {
-      const items = await Promise.all(files.map(createItem));
+      const items = await prepareItems(session.label, files);
       const offer: TransferOffer = {
         transfer_id: randomId(),
         source_node_id: node.node_id,
@@ -1399,6 +1470,7 @@
       void watchMobileTransfer(offer.transfer_id);
       showTransientNotice('已发送，等待网页端确认', 3600);
     } catch (error) {
+      if (isPrepareCancelled(error)) return;
       const message = error instanceof Error ? error.message : '无法发送到网页端';
       if (offerForFailure) {
         observeFailure({
@@ -1772,8 +1844,7 @@
 
   async function chooseMobileReceiveDirectory() {
     if (!mobileDirectoryPickerAvailable()) {
-      notice = window.isSecureContext ? '当前浏览器不支持选择存储目录，可使用浏览器默认下载' : '当前页面将使用浏览器默认下载，选择目录请打开 HTTPS 地址';
-      window.setTimeout(() => (notice = ''), 3000);
+      showTransientNotice(window.isSecureContext ? '当前浏览器不支持选择存储目录，可使用浏览器默认下载' : '当前页面将使用浏览器默认下载，选择目录请打开 HTTPS 地址', 6000);
       return false;
     }
     try {
@@ -1782,13 +1853,11 @@
       const directory = await picker({ mode: 'readwrite' });
       mobileReceiveDirectory = directory;
       mobileReceiveDirectoryName = directory.name;
-      notice = `已选择存储目录：${mobileReceiveDirectoryName}`;
-      window.setTimeout(() => (notice = ''), 2400);
+      showTransientNotice(`已选择存储目录：${mobileReceiveDirectoryName}`);
       return true;
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return false;
-      notice = error instanceof Error ? error.message : '无法选择接收目录';
-      window.setTimeout(() => (notice = ''), 3000);
+      showTransientNotice(error instanceof Error ? error.message : '无法选择接收目录', 6000);
       return false;
     }
   }
@@ -2009,6 +2078,7 @@
       {statusKind}
       peers={isWeb ? mobileTargets : peers}
       transfers={phoneTransfers}
+      prepares={prepares}
       failures={phoneFailures}
       {clipboard}
       bind:draft={clipboardDraft}
@@ -2026,6 +2096,7 @@
       onAcceptTransfer={acceptPhoneTransfer}
       onRejectTransfer={rejectPhoneTransfer}
       onCancelTransfer={cancelPhoneTransfer}
+      onCancelPrepare={cancelPrepare}
       onSaveToDirectory={savePhoneTransfer}
       onStartDownload={downloadPhoneItem}
       onRetryFailure={retryFailure}
@@ -2098,7 +2169,7 @@
         onOpenHistory={openClipboardHistory}
         onClearHistory={requestClearHistory}
       />
-      <TransferPanel {transfers} {failures} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} />
+      <TransferPanel {transfers} {prepares} {failures} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} />
     </main>
     <SettingsDialog
       open={settingsOpen}
@@ -2152,7 +2223,12 @@
       onCancel={cancelClearHistory}
     />
   {/if}
-  {#if notice}<div class="notice" role="status">{notice}</div>{/if}
+  {#if notice}
+    <div class="notice" role="status">
+      <span>{notice}</span>
+      <button type="button" class="notice-close" aria-label="关闭提示" on:click={clearNotice}>×</button>
+    </div>
+  {/if}
 </div>
 
 <input bind:this={fileInput} class="hidden-input" type="file" multiple on:change={onFileInput} />

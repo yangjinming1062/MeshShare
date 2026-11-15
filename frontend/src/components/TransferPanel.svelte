@@ -1,14 +1,16 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import { formatTime, isActiveTransferStatus, transferItemsLabel, transferStatusText } from '../format';
-  import type { TransferFailure, TransferProgress } from '../types';
+  import { formatTime, isActiveTransferStatus, prepareProgressRatio, prepareStatusText, transferItemsLabel, transferStatusText } from '../format';
+  import type { TransferFailure, TransferPrepare, TransferProgress } from '../types';
 
   export let transfers: TransferProgress[] = [];
+  export let prepares: TransferPrepare[] = [];
   export let failures: TransferFailure[] = [];
   export let onAccept: (transfer: TransferProgress) => void = () => {};
   export let onReject: (transfer: TransferProgress) => void = () => {};
   export let onRetry: (failure: TransferFailure) => void = () => {};
   export let onDismissFailure: (failure: TransferFailure) => void = () => {};
+  export let onCancelPrepare: (prepareId: string) => void = () => {};
 
   $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status));
   $: waiting = activeTransfers.some((transfer) => transfer.direction === 'receive' && transfer.status === 'waiting');
@@ -24,7 +26,7 @@
   <div class="surface-head">
     <div class="surface-title">
       <h2>传输任务</h2>
-      <span class="chip">{activeTransfers.length}</span>
+      <span class="chip">{activeTransfers.length + prepares.length}</span>
       {#if waiting}
         <span class="status-dot status-dot--warning" aria-hidden="true"></span>
       {/if}
@@ -35,6 +37,33 @@
   </div>
   <div class="surface-body">
     <div class="transfer-list">
+      {#each prepares as prepare (prepare.prepare_id)}
+        <article class="transfer-row">
+          <span class="transfer-icon" aria-hidden="true">
+            <Icon name="arrow-up" size={14} />
+          </span>
+          <div class="transfer-copy">
+            <strong title={prepare.target_name}>发送到 {prepare.target_name}</strong>
+            <span>{prepare.item_count} 个项目</span>
+          </div>
+          <div class="transfer-progress">
+            <div
+              class="progress"
+              role="progressbar"
+              aria-valuemin="0"
+              aria-valuemax="100"
+              aria-valuenow={Math.round(prepareProgressRatio(prepare) * 100)}
+              aria-label="准备进度"
+            >
+              <span class="progress-fill" style="--p:{prepareProgressRatio(prepare)}"></span>
+            </div>
+            <span>{prepareStatusText(prepare)}</span>
+          </div>
+          <div class="transfer-actions">
+            <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelPrepare(prepare.prepare_id)}>取消</button>
+          </div>
+        </article>
+      {/each}
       {#each activeTransfers as transfer (transfer.transfer_id)}
         <article class="transfer-row" class:waiting={transfer.direction === 'receive' && transfer.status === 'waiting'}>
           <span class="transfer-icon" aria-hidden="true">
@@ -64,9 +93,10 @@
             </div>
           {/if}
         </article>
-      {:else}
-        <div class="empty">当前没有待处理或进行中的传输任务。</div>
       {/each}
+      {#if !prepares.length && !activeTransfers.length}
+        <div class="empty">当前没有待处理或进行中的传输任务。</div>
+      {/if}
     </div>
     {#if failures.length}
       <div class="transfer-failures">

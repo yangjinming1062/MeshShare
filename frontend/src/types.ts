@@ -210,6 +210,15 @@ export type TransferFailure = {
   retryable: boolean;
 };
 
+/** 发送前的本地准备态：文件摘要未算完，任务还没有在节点上登记。 */
+export type TransferPrepare = {
+  prepare_id: string;
+  target_name: string;
+  item_count: number;
+  total_bytes: number;
+  hashed_bytes: number;
+};
+
 export type MobileTransferView = {
   session_id: string;
   progress: TransferProgress;

@@ -234,7 +234,9 @@ button.device-metrics:hover { background: var(--surface-2); }
 .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
 .confirm-text { font-size: 13px; line-height: 1.6; }
 
-.notice { position: fixed; z-index: 40; left: 50%; bottom: calc(18px + var(--phone-safe-bottom)); transform: translateX(-50%); max-width: calc(100vw - 32px); padding: 8px 14px; border-radius: 999px; background: rgba(15, 23, 42, .92); color: #fff; font-size: 12px; box-shadow: 0 10px 24px -12px rgba(15, 23, 42, .5); animation: toast-in 160ms var(--ease); }
+.notice { position: fixed; z-index: 40; left: 50%; bottom: calc(18px + var(--phone-safe-bottom)); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 8px; max-width: calc(100vw - 32px); padding: 8px 14px; border-radius: 999px; background: rgba(15, 23, 42, .92); color: #fff; font-size: 12px; box-shadow: 0 10px 24px -12px rgba(15, 23, 42, .5); animation: toast-in 160ms var(--ease); }
+.notice-close { display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 50%; background: rgba(255, 255, 255, .16); color: #fff; font-size: 12px; line-height: 1; cursor: pointer; }
+.notice-close:hover { background: rgba(255, 255, 255, .3); }
 .platform-notice { flex: 0 0 auto; margin: 0 var(--pad) 8px; padding: 8px 12px; border: 1px solid #fed7aa; border-radius: var(--r-md); background: #fff7ed; color: var(--warning-ink); font-size: 12px; line-height: 1.45; }
 
 /* 移动版式：浏览器临时加入页与 Android App 共用，按视口宽度自适应 */

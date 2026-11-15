@@ -108,20 +108,57 @@ export class Sha256 {
   }
 }
 
-export async function digestFile(file: File): Promise<string> {
+export type DigestOptions = {
+  signal?: AbortSignal;
+  onProgress?: (hashedBytes: number) => void;
+};
+
+/** 每累计这么多字节让出一次事件循环；纯 JS 摘要会占满主线程，定期让出才能重绘并响应取消。 */
+const DIGEST_YIELD_BYTES = 4 * 1024 * 1024;
+/** 进度上报间隔，避免逐块刷新界面。 */
+const DIGEST_PROGRESS_MS = 200;
+
+function abortIfCancelled(signal?: AbortSignal) {
+  if (signal?.aborted) throw new DOMException('已取消发送', 'AbortError');
+}
+
+export async function digestFile(file: File, options: DigestOptions = {}): Promise<string> {
   const hasher = new Sha256();
+  const { signal, onProgress } = options;
+  let hashedBytes = 0;
+  let yieldBudget = 0;
+  let reportedAt = 0;
+
+  async function consume(chunk: Uint8Array) {
+    hasher.update(chunk);
+    hashedBytes += chunk.byteLength;
+    yieldBudget += chunk.byteLength;
+    if (yieldBudget >= DIGEST_YIELD_BYTES) {
+      yieldBudget = 0;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      abortIfCancelled(signal);
+    }
+    if (onProgress && Date.now() - reportedAt >= DIGEST_PROGRESS_MS) {
+      reportedAt = Date.now();
+      onProgress(hashedBytes);
+    }
+  }
+
   if (typeof file.stream === 'function') {
     const reader = file.stream().getReader();
     while (true) {
+      abortIfCancelled(signal);
       const chunk = await reader.read();
       if (chunk.done) break;
-      hasher.update(chunk.value);
+      await consume(chunk.value);
     }
   } else {
     const chunkSize = 1024 * 1024;
     for (let offset = 0; offset < file.size; offset += chunkSize) {
-      hasher.update(new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer()));
+      abortIfCancelled(signal);
+      await consume(new Uint8Array(await file.slice(offset, offset + chunkSize).arrayBuffer()));
     }
   }
+  onProgress?.(hashedBytes);
   return hasher.digestHex();
 }

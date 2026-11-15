@@ -1,4 +1,4 @@
-import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
+import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, TransferPrepare, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
 
 export const METRICS_STALE_AFTER_MS = 5_000;
 
@@ -88,6 +88,16 @@ export function transferItemKey(transferId: string, itemId: string): string {
 
 export function isActiveTransferStatus(status: TransferStatus): boolean {
   return status === 'waiting' || status === 'accepted' || status === 'uploading' || status === 'ready';
+}
+
+export function prepareProgressRatio(prepare: TransferPrepare): number {
+  if (!prepare.total_bytes) return 0;
+  return Math.max(0, Math.min(1, prepare.hashed_bytes / prepare.total_bytes));
+}
+
+export function prepareStatusText(prepare: TransferPrepare): string {
+  if (!prepare.total_bytes) return '准备发送';
+  return '准备发送 · ' + Math.round(prepareProgressRatio(prepare) * 100) + '%';
 }
 
 export function transferStatusText(transfer: TransferProgress, surface: 'desktop' | 'web' | 'android'): string {

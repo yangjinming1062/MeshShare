@@ -11,12 +11,14 @@
     memoryPercent,
     peerSummary,
     platformLabel,
+    prepareProgressRatio,
+    prepareStatusText,
     transferItemKey,
     transferItemsLabel,
     transferStatusText,
     isActiveTransferStatus,
   } from '../format';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferItem } from '../types';
+  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferItem, TransferPrepare } from '../types';
 
   export let mode: 'web' | 'android' = 'web';
   export let node: NodeInfo | null = null;
@@ -24,6 +26,7 @@
   export let statusKind: 'ok' | 'warn' | 'error' = 'warn';
   export let peers: PeerInfo[] = [];
   export let transfers: PhoneTransfer[] = [];
+  export let prepares: TransferPrepare[] = [];
   export let failures: TransferFailure[] = [];
   export let clipboard: ClipboardSnapshot | null = null;
   export let draft = '';
@@ -42,6 +45,7 @@
   export let onAcceptTransfer: (transfer: PhoneTransfer) => void = () => {};
   export let onRejectTransfer: (transfer: PhoneTransfer) => void = () => {};
   export let onCancelTransfer: (transfer: PhoneTransfer) => void = () => {};
+  export let onCancelPrepare: (prepareId: string) => void = () => {};
   export let onSaveToDirectory: (transfer: PhoneTransfer) => void = () => {};
   export let onStartDownload: (transfer: PhoneTransfer, item: TransferItem) => void = () => {};
   export let onRetryFailure: (failure: TransferFailure) => void = () => {};
@@ -307,13 +311,40 @@
   <section class="phone-card">
     <div class="phone-card-head">
       <h2>传输记录</h2>
-      <span class="chip">{activeTransfers.length}</span>
+      <span class="chip">{activeTransfers.length + prepares.length}</span>
       <button type="button" class="btn btn-ghost btn-sm phone-toggle" aria-expanded={transfersOpen} on:click={() => (transfersOpen = !transfersOpen)}>
         {transfersOpen ? '收起' : '展开'}
       </button>
     </div>
     {#if transfersOpen}
       <div class="phone-list">
+        {#each prepares as prepare (prepare.prepare_id)}
+          <article class="transfer-card">
+            <span class="transfer-icon" aria-hidden="true">
+              <Icon name="arrow-up" size={14} />
+            </span>
+            <div class="transfer-copy">
+              <strong>发送到 {prepare.target_name}</strong>
+              <span>{prepare.item_count} 个项目</span>
+            </div>
+            <div class="transfer-progress">
+              <div
+                class="progress"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                aria-valuenow={Math.round(prepareProgressRatio(prepare) * 100)}
+                aria-label="准备进度"
+              >
+                <span class="progress-fill" style="--p:{prepareProgressRatio(prepare)}"></span>
+              </div>
+              <span>{prepareStatusText(prepare)}</span>
+            </div>
+            <div class="transfer-actions">
+              <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelPrepare(prepare.prepare_id)}>取消</button>
+            </div>
+          </article>
+        {/each}
         {#each activeTransfers as transfer (transfer.transfer_id)}
           <article class="transfer-card">
             <span class="transfer-icon" aria-hidden="true">
@@ -357,9 +388,10 @@
               {/if}
             </div>
           </article>
-        {:else}
-          <div class="empty">还没有传输任务。</div>
         {/each}
+        {#if !prepares.length && !activeTransfers.length}
+          <div class="empty">还没有传输任务。</div>
+        {/if}
       </div>
     {/if}
     {#if failures.length}
