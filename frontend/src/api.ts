@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferProgress, TransferStatus } from './types';
+import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, PeerInfo, TransferProgress, TransferStatus } from './types';
 
 let baseUrl = '';
 
@@ -11,6 +11,11 @@ export async function initApi(): Promise<string> {
     if (baseUrl === 'null' || baseUrl.startsWith('tauri:')) baseUrl = 'http://127.0.0.1:37880';
   }
   return baseUrl.replace(/\/$/, '');
+}
+
+export function setApiTarget(target: string): string {
+  baseUrl = target.replace(/\/$/, '');
+  return baseUrl;
 }
 
 export function apiUrl(path: string, target = baseUrl): string {
@@ -48,23 +53,27 @@ export async function request<T>(path: string, options: RequestInit = {}, target
   return payload as T;
 }
 
-async function requestList<T>(path: string): Promise<T[]> {
-  const payload = await request<unknown>(path);
+async function requestList<T>(path: string, target = baseUrl): Promise<T[]> {
+  const payload = await request<unknown>(path, {}, target);
   if (!Array.isArray(payload)) throw new Error(`节点返回的列表格式无效 (${path})`);
   return payload;
 }
 
-export const getInfo = () => request<NodeInfo>('/api/v1/info');
-export const getPeers = () => requestList<PeerInfo>('/api/v1/peers');
-export const getMetrics = () => request<HardwareMetrics | null>('/api/v1/metrics');
-export const getClipboard = () => request<ClipboardSnapshot | null>('/api/v1/clipboard');
-export const getClipboardHistory = () => request<ClipboardHistoryResponse>('/api/v1/clipboard/history');
-export const getClipboardHistoryDetail = (eventId: string) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`);
-export const restoreClipboardHistory = (eventId: string) => request<ClipboardSnapshot>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/restore`, { method: 'POST' });
-export const clearClipboardHistory = () => request<{ cleared: number }>('/api/v1/clipboard/history', { method: 'DELETE' });
-export const getTransfers = (status?: TransferStatus) => requestList<TransferProgress>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`);
-export const createMobileSession = (label?: string) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) });
-export const getMobileSessions = () => requestList<MobileSession>('/api/v1/mobile/sessions');
-export const getMobileTransfers = (sessionId?: string) => requestList<MobileTransferView>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`);
+export const getInfo = (target = baseUrl) => request<NodeInfo>('/api/v1/info', {}, target);
+export const getPeers = (target = baseUrl) => requestList<PeerInfo>('/api/v1/peers', target);
+export const getMetrics = (target = baseUrl) => request<HardwareMetrics | null>('/api/v1/metrics', {}, target);
+export const getClipboard = (target = baseUrl) => request<ClipboardSnapshot | null>('/api/v1/clipboard', {}, target);
+export const getClipboardStatus = (target = baseUrl) => request<ClipboardStatus>('/api/v1/clipboard/status', {}, target);
+export const getSettings = (target = baseUrl) => request<NodeSettings>('/api/v1/settings', {}, target);
+export const patchSettings = (patch: NodeSettingsPatch, target = baseUrl) => request<NodeSettings>('/api/v1/settings', { method: 'PATCH', body: JSON.stringify(patch) }, target);
+export const requestUpdateCheck = (target = baseUrl) => request<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target);
+export const getClipboardHistory = (target = baseUrl) => request<ClipboardHistoryResponse>('/api/v1/clipboard/history', {}, target);
+export const getClipboardHistoryDetail = (eventId: string, target = baseUrl) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`, {}, target);
+export const restoreClipboardHistory = (eventId: string, target = baseUrl) => request<ClipboardSnapshot>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/restore`, { method: 'POST' }, target);
+export const clearClipboardHistory = (target = baseUrl) => request<{ cleared: number }>('/api/v1/clipboard/history', { method: 'DELETE' }, target);
+export const getTransfers = (status?: TransferStatus, target = baseUrl) => requestList<TransferProgress>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`, target);
+export const createMobileSession = (label?: string, target = baseUrl) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) }, target);
+export const getMobileSessions = (target = baseUrl) => requestList<MobileSession>('/api/v1/mobile/sessions', target);
+export const getMobileTransfers = (sessionId?: string, target = baseUrl) => requestList<MobileTransferView>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, target);
 export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}`, target);
-export const completeMobileItem = (transferId: string, itemId: string, sessionId: string) => request<MobileTransferView>(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/complete`, { method: 'POST', body: JSON.stringify({ session_id: sessionId }) });
+export const completeMobileItem = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => request<MobileTransferView>(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/complete`, { method: 'POST', body: JSON.stringify({ session_id: sessionId }) }, target);

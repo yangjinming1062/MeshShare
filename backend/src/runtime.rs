@@ -8,6 +8,7 @@ use crate::model::{
     CLIPBOARD_TEXT_LIMIT, DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS,
     MAX_CLIPBOARD_HISTORY_COUNT, MAX_CLIPBOARD_HISTORY_DAYS, MAX_MOBILE_SESSIONS,
     MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    REMOTE_MANAGEMENT_CAPABILITY, TRANSFER_RELAY_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -17,6 +18,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
@@ -275,6 +277,8 @@ impl NodeRuntime {
                 "web.mobile".to_string(),
                 METRICS_SYSTEM_CAPABILITY.to_string(),
                 METRICS_GPU_CAPABILITY.to_string(),
+                REMOTE_MANAGEMENT_CAPABILITY.to_string(),
+                TRANSFER_RELAY_CAPABILITY.to_string(),
             ],
         };
         let (events, _) = broadcast::channel(256);
@@ -549,6 +553,27 @@ impl NodeRuntime {
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
         }
+    }
+
+    pub async fn send_to_peer_with_retry(&self, node_id: &str, message: WireMessage) -> bool {
+        const RETRY_DELAYS: [Duration; 4] = [
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+        ];
+        for (attempt, delay) in RETRY_DELAYS.iter().enumerate() {
+            if attempt > 0 {
+                tokio::time::sleep(*delay).await;
+            }
+            if self.send_to_peer(node_id, message.clone()) {
+                return true;
+            }
+            if !self.has_peer_channel(node_id) {
+                return false;
+            }
+        }
+        false
     }
 
     pub fn send_to_peers_except(&self, except: Option<&str>, message: WireMessage) {

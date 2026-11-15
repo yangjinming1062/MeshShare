@@ -426,8 +426,14 @@ async fn run_peer_session(
                             if is_hello && !received_hello {
                                 received_hello = true;
                                 if let Some(snapshot) = runtime.clipboard_snapshot() {
-                                    let _ = runtime.send_to_peer(node_id, WireMessage::ClipboardSnapshot { snapshot });
+                                    let _ = runtime
+                                        .send_to_peer_with_retry(
+                                            node_id,
+                                            WireMessage::ClipboardSnapshot { snapshot },
+                                        )
+                                        .await;
                                 }
+                                server::replay_active_offers(runtime, node_id).await;
                             }
                         }
                     }

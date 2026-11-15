@@ -10,16 +10,26 @@
   export let syncEnabled = true;
   export let autostartEnabled = true;
   export let autostartBusy = false;
+  export let remote = false;
+  export let remotePath = '';
+  export let onBack: () => void = () => {};
   export let onSync: () => void = () => {};
   export let onAutostart: () => void = () => {};
   export let onSettings: () => void = () => {};
 </script>
 
 <header class="app-header">
+  {#if remote}
+    <button type="button" class="btn-icon" aria-label="返回本机" title="返回本机" on:click={onBack}>
+      <Icon name="arrow-left" size={17} />
+    </button>
+  {/if}
   <span class="node-status" data-kind={statusKind} aria-hidden="true">
     <span class="status-dot"></span>
   </span>
   <h1 title={node?.node_name}>{node?.node_name ?? 'MeshShare 节点'}</h1>
+  {#if remote}<span class="chip remote-chip">远程管理</span>{/if}
+  {#if remote && remotePath}<span class="remote-path" title={remotePath}>{remotePath}</span>{/if}
   <span class="status-text" class:sr-only={statusKind === 'ok'} role="status" aria-live="polite">{status}</span>
   {#if node}
     <div class="header-chips">

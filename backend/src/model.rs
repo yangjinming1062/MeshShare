@@ -11,6 +11,8 @@ pub const MAX_TRANSFER_RECORDS: usize = 512;
 pub const MAX_MOBILE_SESSIONS: usize = 256;
 pub const METRICS_SYSTEM_CAPABILITY: &str = "metrics.system";
 pub const METRICS_GPU_CAPABILITY: &str = "metrics.gpu";
+pub const REMOTE_MANAGEMENT_CAPABILITY: &str = "management.remote.v1";
+pub const TRANSFER_RELAY_CAPABILITY: &str = "transfer.relay.v1";
 pub const METRICS_STALE_AFTER_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

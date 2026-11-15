@@ -7,6 +7,10 @@
 | `GET` | `/api/v1/info` | 节点身份、应用版本、能力、端口和访问地址 |
 | `GET` | `/api/v1/peers` | 当前在线设备 |
 | `GET` | `/api/v1/metrics` | 本机最新硬件指标快照 |
+| `GET` | `/api/v1/clipboard/status` | 本机系统剪贴板可用性和重试状态 |
+| `GET` | `/api/v1/settings` | 节点设置、更新状态、监控能力和剪贴板状态 |
+| `PATCH` | `/api/v1/settings` | 修改节点设置；目录路径由目标节点校验 |
+| `POST` | `/api/v1/settings/update-check` | 请求目标节点立即检查更新 |
 | `GET` | `/api/v1/mobile/access` | 网页引导地址、HTTPS 地址和 CA 指纹 |
 | `GET` | `/api/v1/mobile/ca` | 下载接入节点的本地 CA 证书 |
 | `POST` | `/api/v1/peers/connect` | 通过手动地址加入节点 |
@@ -18,10 +22,14 @@
 | `DELETE` | `/api/v1/clipboard/history` | 清空本机历史，保留当前共享快照 |
 | `POST` | `/api/v1/transfers` | 创建文件清单和接收确认任务 |
 | `GET` | `/api/v1/transfers` | 查询本节点的传输任务，可用 `status=waiting` 过滤 |
+| `POST` | `/api/v1/transfers/{id}/accept` | 用目标节点上的绝对路径接受任务 |
 | `POST` | `/api/v1/transfers/{id}/reject` | 拒绝任务 |
 | `POST` | `/api/v1/transfers/{id}/cancel` | 取消任务 |
 | `GET` | `/api/v1/transfers/{id}/status` | 查询进度 |
 | `PUT` | `/api/v1/transfers/{id}/items/{item_id}` | 直接写入单个文件流 |
+| `POST` | `/api/v1/relay/transfers` | 远程管理界面在目标节点创建由目标节点拥有的发送任务 |
+| `PUT` | `/api/v1/relay/transfers/{id}/items/{item_id}` | 远程管理界面把文件流交给目标节点，再由目标节点转发给其 peer |
+| `POST` | `/api/v1/relay/transfers/{id}/cancel` | 取消目标节点拥有的中继发送任务并通知目标 peer |
 | `POST` | `/api/v1/mobile/sessions` | 创建网页接收会话 |
 | `GET` | `/api/v1/mobile/sessions` | 查询本机活跃网页会话 |
 | `POST` | `/api/v1/mobile/transfers` | 为网页会话创建待下载清单 |
@@ -35,7 +43,11 @@
 | `POST` | `/api/v1/mobile/transfers/{id}/items/{item_id}/complete` | 网页端完成本地写入后确认单个项目 |
 | `POST/GET/PUT` | `/api/v1/mobile/peers/{peer_id}/api/v1/transfers/...` | HTTPS 网页通过接入节点代理访问其他桌面节点的传输接口，避免浏览器混合内容和跨节点证书问题 |
 
-接口业务错误使用 `{ "error": "..." }`。`GET /api/v1/clipboard` 查询返回最新快照；历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容，避免一次加载全部历史图片或大文本。历史接口只访问接入节点本机保存的记录，不修改节点间 WebSocket 的最新快照交换。文件接口按传输任务查询状态。桌面接收端目录只能由本机 Tauri `accept_transfer` 命令选择并确认；自动接收使用节点本地配置的目录。网页端选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径。
+接口业务错误使用 `{ "error": "..." }`。`GET /api/v1/clipboard` 查询返回最新快照；历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容，避免一次加载全部历史图片或大文本。历史接口只访问目标节点本机保存的记录，不修改节点间 WebSocket 的最新快照交换。`GET/PATCH /api/v1/settings` 供桌面管理界面读取和修改目标节点设置；自动更新、开机自启和监控操作在目标节点本机执行。`POST /api/v1/transfers/{id}/accept` 的 `destination` 必须是目标节点上已存在且通过目录校验的路径，管理端不会把本机文件选择器的路径当作远程路径。文件接口按传输任务查询状态。网页端选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径。
+
+桌面主窗口可以直接连接在线节点的 HTTP 和 WebSocket 地址，在同一窗口切换管理目标。目标节点通过 `NodeInfo.capabilities` 声明远程管理能力；缺少能力标记或返回接口不存在时，界面保留本机上下文并提示目标节点需要升级。远程管理继续沿用受信任私网和 Tailscale 网络的无账号模型，不应通过端口转发暴露到互联网。
+
+远程管理目标应声明 `management.remote.v1`；目标节点的远程文件中继还需声明 `transfer.relay.v1`。中继创建请求中的 `source_node_id` 必须是目标节点自身，`target_node_id` 必须是目标节点已连接的 peer；目标节点先通过现有 WebSocket 发送清单，目标设备接受后才转发文件流，并沿用普通传输的路径、哈希、状态和取消校验。
 
 ## WebSocket 消息
 

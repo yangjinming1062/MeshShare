@@ -12,6 +12,8 @@
   export let onSend: () => void = () => {};
   export let onSendFolder: () => void = () => {};
   export let onDetails: () => void = () => {};
+  export let onOpen: () => void = () => {};
+  export let allowOpen = false;
   export let onDragOver: () => void = () => {};
   export let onDragLeave: () => void = () => {};
   export let onDropFile: (event: DragEvent) => void = () => {};
@@ -27,6 +29,7 @@
   $: cpu = displayMetrics?.cpu_usage_percent;
   $: memory = memoryPercent(displayMetrics);
   $: gpu = gpuUtilization(displayMetrics);
+  $: openable = allowOpen && kind === 'peer' && !!peer?.addresses.length;
 
   function isInsideRow(event: DragEvent): boolean {
     const row = event.currentTarget;
@@ -51,13 +54,23 @@
   on:dragleave={handleDragLeave}
   on:drop|preventDefault={(event) => onDropFile(event)}
 >
-  <span class="device-icon" aria-hidden="true">
-    <Icon name={kind === 'mobile' ? 'phone' : 'monitor'} size={18} />
-  </span>
-  <div class="device-id">
-    <strong title={name}>{name}</strong>
-    <span class="device-meta" title={meta}>{meta}</span>
-  </div>
+  <button
+    type="button"
+    class="device-identity"
+    class:device-identity--openable={openable}
+    disabled={!openable}
+    aria-label={openable ? '管理 ' + name : name}
+    title={openable ? '进入 ' + name : name}
+    on:click|stopPropagation={onOpen}
+  >
+    <span class="device-icon" aria-hidden="true">
+      <Icon name={kind === 'mobile' ? 'phone' : 'monitor'} size={18} />
+    </span>
+    <span class="device-id">
+      <strong title={name}>{name}</strong>
+      <span class="device-meta" title={meta}>{meta}</span>
+    </span>
+  </button>
   {#if kind === 'mobile'}
     <div class="device-metrics device-metrics--mobile">
       <span class="muted">已连接 {formatConnectedSince(session?.created_at_ms ?? Date.now())}</span>

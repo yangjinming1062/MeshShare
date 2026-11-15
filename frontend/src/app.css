@@ -88,6 +88,7 @@ select.field { cursor: pointer; }
 .status-dot--warning { background: var(--warning); box-shadow: 0 0 0 3px rgba(217, 119, 6, .16); }
 .status-text { color: var(--muted); font-size: 11px; }
 .header-chips { display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.remote-chip { color: var(--primary); background: var(--primary-soft); }
 .header-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 
 .app-main { flex: 1; min-height: 0; display: grid; gap: var(--gap); padding: 0 var(--pad) var(--pad); grid-template-columns: minmax(0, 1fr) clamp(320px, 33%, 400px); grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "devices hardware" "devices clipboard" "transfers transfers"; }
@@ -108,9 +109,14 @@ select.field { cursor: pointer; }
 .add-device .field { flex: 1; height: 28px; background: var(--surface); }
 
 .device-list { flex: 1; min-height: 0; margin: 0; padding: 0; list-style: none; display: grid; gap: 8px; align-content: start; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
-.device-row { position: relative; display: grid; grid-template-columns: 40px minmax(0, 1fr) 268px auto; align-items: center; gap: 10px; min-height: var(--row-h); padding: 9px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); transition: border-color 120ms var(--ease), background 120ms var(--ease); }
+.device-row { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 268px auto; align-items: center; gap: 10px; min-height: var(--row-h); padding: 9px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); transition: border-color 120ms var(--ease), background 120ms var(--ease); }
 .device-row:hover { border-color: var(--line-strong); }
 .device-row.dragging { border-color: var(--primary); border-style: dashed; background: var(--primary-soft); }
+.device-identity { min-width: 0; display: flex; align-items: center; gap: 10px; padding: 0; border: 0; background: transparent; color: inherit; text-align: left; }
+.device-identity--openable { cursor: pointer; }
+.device-identity--openable:hover .device-id strong { color: var(--primary); }
+.device-identity:disabled { cursor: default; opacity: 1; }
+.remote-path { min-width: 0; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 12px; }
 .device-icon { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 12px; background: var(--primary-soft); color: var(--primary); }
 .device-id { min-width: 0; display: grid; gap: 2px; }
 .device-id strong { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -226,7 +232,7 @@ button.device-metrics:hover { background: var(--surface-2); }
 .mobile-main { max-width: 680px; margin: 0 auto; padding: 12px 14px 32px; display: grid; gap: 10px; }
 .mobile-shell .surface-body { gap: 8px; }
 .mobile-shell .device-list { overflow: visible; }
-.mobile-shell .device-list--stacked .device-row { grid-template-columns: 36px minmax(0, 1fr); gap: 8px 10px; }
+.mobile-shell .device-list--stacked .device-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px 10px; }
 .mobile-shell .device-list--stacked .device-icon { width: 36px; height: 36px; }
 .mobile-shell .device-list--stacked .device-metrics,
 .mobile-shell .device-list--stacked .device-actions { grid-column: 1 / -1; justify-self: stretch; }
@@ -279,7 +285,7 @@ html[data-window="monitor"], html[data-window="monitor"] body { background: tran
 }
 
 @media (max-width: 1080px) {
-  .device-row { grid-template-columns: 36px minmax(0, 1fr) 232px auto; gap: 8px; }
+  .device-row { grid-template-columns: minmax(0, 1fr) 232px auto; gap: 8px; }
   .device-icon { width: 36px; height: 36px; }
   .device-metrics { width: 232px; }
   .device-row .device-actions .btn-icon { display: none; }
@@ -287,7 +293,7 @@ html[data-window="monitor"], html[data-window="monitor"] body { background: tran
 
 @media (max-width: 900px) {
   .app-main { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto auto minmax(0, 1fr); grid-template-areas: "hardware" "devices" "clipboard" "transfers"; }
-  .device-row { grid-template-columns: 36px minmax(0, 1fr) auto; }
+  .device-row { grid-template-columns: minmax(0, 1fr) auto; }
   .device-metrics { grid-column: 2 / -1; width: auto; }
   .device-actions { grid-column: 2 / -1; justify-content: flex-end; }
 }

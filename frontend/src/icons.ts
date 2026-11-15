@@ -10,6 +10,7 @@ export type IconName =
   | 'unlock'
   | 'arrow-up'
   | 'arrow-down'
+  | 'arrow-left'
   | 'file'
   | 'check';
 
@@ -46,6 +47,7 @@ export const ICON_PATHS: Record<IconName, string[]> = {
   ],
   'arrow-up': ['M12 19V5', 'M6 11l6-6 6 6'],
   'arrow-down': ['M12 5v14', 'M6 13l6 6 6-6'],
+  'arrow-left': ['M19 12H5', 'M11 6l-6 6 6 6'],
   file: [
     'M13 3.5H8.5A1.5 1.5 0 0 0 7 5v14A1.5 1.5 0 0 0 8.5 20.5h9A1.5 1.5 0 0 0 19 19V9z',
     'M13 3.5V9h6',

@@ -1,4 +1,5 @@
 use crate::clipboard;
+use crate::control::{accept_transfer_at, ControlPlane, SettingsPatch, SettingsSnapshot};
 use crate::discovery;
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot,
@@ -83,6 +84,7 @@ fn available_disk_space(path: &Path) -> Option<u64> {
 #[derive(Clone)]
 pub struct AppState {
     pub runtime: Arc<NodeRuntime>,
+    pub control: Arc<ControlPlane>,
     pub static_root: PathBuf,
 }
 
@@ -129,6 +131,11 @@ pub struct MobileTransferCreateRequest {
     pub offer: TransferOffer,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TransferAcceptRequest {
+    pub destination: String,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -139,21 +146,35 @@ struct ClipboardHistoryCleared {
     cleared: usize,
 }
 
+#[allow(dead_code)]
 pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
+    let control = ControlPlane::runtime_only(runtime.clone());
+    router_with_control(runtime, static_root, control)
+}
+
+pub fn router_with_control(
+    runtime: Arc<NodeRuntime>,
+    static_root: PathBuf,
+    control: Arc<ControlPlane>,
+) -> Router {
     let index = static_root.join("index.html");
     let state = AppState {
         runtime,
+        control,
         static_root,
     };
     Router::new()
         .route("/api/v1/info", get(info))
         .route("/api/v1/peers", get(peers))
         .route("/api/v1/metrics", get(metrics))
+        .route("/api/v1/settings", get(settings).patch(patch_settings))
+        .route("/api/v1/settings/update-check", post(request_update_check))
         .route("/api/v1/peers/connect", post(connect_peer))
         .route(
             "/api/v1/clipboard",
             get(clipboard_state).post(post_clipboard),
         )
+        .route("/api/v1/clipboard/status", get(clipboard_status))
         .route(
             "/api/v1/clipboard/history",
             get(clipboard_history).delete(clear_clipboard_history),
@@ -229,8 +250,18 @@ pub fn router(runtime: Arc<NodeRuntime>, static_root: PathBuf) -> Router {
             "/api/v1/transfers",
             get(list_transfers).post(create_transfer),
         )
+        .route("/api/v1/relay/transfers", post(create_relay_transfer))
+        .route(
+            "/api/v1/relay/transfers/:id/items/:item_id",
+            put(upload_relay_item),
+        )
+        .route(
+            "/api/v1/relay/transfers/:id/cancel",
+            post(cancel_relay_transfer),
+        )
         .route("/api/v1/transfers/:id/reject", post(reject_transfer))
         .route("/api/v1/transfers/:id/cancel", post(cancel_transfer))
+        .route("/api/v1/transfers/:id/accept", post(accept_transfer))
         .route("/api/v1/transfers/:id/status", get(transfer_status))
         .route("/api/v1/transfers/:id/items/:item_id", put(upload_item))
         .route(
@@ -256,6 +287,35 @@ async fn peers(State(state): State<AppState>) -> Json<Vec<PeerInfo>> {
 
 async fn metrics(State(state): State<AppState>) -> Json<Option<HardwareMetrics>> {
     Json(state.runtime.local_metrics())
+}
+
+async fn settings(State(state): State<AppState>) -> Json<SettingsSnapshot> {
+    Json(state.control.snapshot())
+}
+
+async fn patch_settings(
+    State(state): State<AppState>,
+    Json(patch): Json<SettingsPatch>,
+) -> Result<Json<SettingsSnapshot>, ApiError> {
+    state
+        .control
+        .apply_patch(patch)
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
+async fn request_update_check(
+    State(state): State<AppState>,
+) -> Result<Json<SettingsSnapshot>, ApiError> {
+    state
+        .control
+        .request_update_check()
+        .map(Json)
+        .map_err(ApiError::conflict)
+}
+
+async fn clipboard_status(State(state): State<AppState>) -> Json<crate::model::ClipboardStatus> {
+    Json(state.runtime.clipboard_status())
 }
 
 async fn mobile_access(State(state): State<AppState>) -> Json<crate::model::MobileAccessInfo> {
@@ -303,7 +363,19 @@ async fn proxy_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<
             .get("error")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("目标设备请求失败");
-        return Err(ApiError::conflict(message));
+        let error = match status {
+            StatusCode::BAD_REQUEST => ApiError::bad_request(message),
+            StatusCode::FORBIDDEN => ApiError::forbidden(message),
+            StatusCode::NOT_FOUND => ApiError::not_found(message),
+            StatusCode::CONFLICT => ApiError::conflict(message),
+            StatusCode::TOO_EARLY => ApiError::too_early(message),
+            StatusCode::REQUEST_TIMEOUT => ApiError::request_timeout(message),
+            StatusCode::TOO_MANY_REQUESTS => ApiError::too_many_requests(message),
+            StatusCode::PAYLOAD_TOO_LARGE => ApiError::payload_too_large(message),
+            _ if status.is_server_error() => ApiError::internal(message),
+            _ => ApiError::conflict(message),
+        };
+        return Err(error);
     }
     serde_json::from_value(payload)
         .map(Json)
@@ -628,11 +700,17 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
                                             if !runtime.add_peer_channel(identified.clone(), outgoing_tx.clone()) {
                                                 break;
                                             }
-                                            peer_id = Some(identified);
+                                            peer_id = Some(identified.clone());
                                             owns_peer_channel = true;
                                             if let Some(snapshot) = runtime.clipboard_snapshot() {
-                                                let _ = outgoing_tx.try_send(WireMessage::ClipboardSnapshot { snapshot });
+                                                let _ = runtime
+                                                    .send_to_peer_with_retry(
+                                                        &identified,
+                                                        WireMessage::ClipboardSnapshot { snapshot },
+                                                    )
+                                                    .await;
                                             }
+                                            replay_active_offers(&runtime, &identified).await;
                                         }
                                         Some(current) if current == identified => {}
                                         Some(_) => break,
@@ -850,19 +928,33 @@ pub(crate) async fn handle_wire_message(
             }
             let transfer_id = offer.transfer_id.clone();
             let added = runtime.add_transfer(offer);
-            if added
-                && runtime
-                    .transfer(&transfer_id)
-                    .is_some_and(|record| record.progress.status == TransferStatus::Accepted)
-            {
-                let _ = runtime.send_to_peer(
-                    peer_id,
-                    WireMessage::TransferAction {
-                        transfer_id,
-                        action: "accept".to_string(),
-                        reason: None,
-                    },
-                );
+            if let Some(record) = runtime.transfer(&transfer_id) {
+                let progress = record.progress.clone();
+                let _ = runtime
+                    .send_to_peer_with_retry(
+                        peer_id,
+                        WireMessage::TransferProgress {
+                            progress: progress.clone(),
+                        },
+                    )
+                    .await;
+                if added
+                    && matches!(
+                        progress.status,
+                        TransferStatus::Accepted | TransferStatus::Uploading
+                    )
+                {
+                    let _ = runtime
+                        .send_to_peer_with_retry(
+                            peer_id,
+                            WireMessage::TransferAction {
+                                transfer_id,
+                                action: "accept".to_string(),
+                                reason: None,
+                            },
+                        )
+                        .await;
+                }
             }
             Some(peer_id.to_string())
         }
@@ -919,6 +1011,26 @@ pub(crate) async fn handle_wire_message(
     }
 }
 
+pub(crate) async fn replay_active_offers(runtime: &Arc<NodeRuntime>, peer_id: &str) {
+    for progress in runtime.transfers_snapshot(None) {
+        let Some(offer) = progress.offer else {
+            continue;
+        };
+        if offer.source_node_id != runtime.node_id()
+            || offer.target_node_id != peer_id
+            || !matches!(
+                progress.status,
+                TransferStatus::Waiting | TransferStatus::Accepted | TransferStatus::Uploading
+            )
+        {
+            continue;
+        }
+        let _ = runtime
+            .send_to_peer_with_retry(peer_id, WireMessage::TransferOffer { offer })
+            .await;
+    }
+}
+
 async fn create_transfer(
     State(state): State<AppState>,
     Json(mut offer): Json<TransferOffer>,
@@ -932,6 +1044,169 @@ async fn create_transfer(
         .transfer(&offer.transfer_id)
         .map(|record| record.progress)
         .ok_or_else(|| ApiError::internal("无法创建传输"))?;
+    Ok(Json(progress))
+}
+
+/// Create a transfer owned by this node while the control UI supplies the
+/// file bytes. The node remains the source of truth and sends the offer over
+/// its existing peer channel, so the remote UI can manage the same lifecycle
+/// as a local desktop window.
+async fn create_relay_transfer(
+    State(state): State<AppState>,
+    Json(mut offer): Json<TransferOffer>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    validate_offer(&offer)?;
+    if offer.source_node_id != state.runtime.node_id() {
+        return Err(ApiError::bad_request("中继传输来源必须是目标节点"));
+    }
+    if offer.target_node_id == state.runtime.node_id()
+        || state
+            .runtime
+            .peer_http_base(&offer.target_node_id)
+            .is_none()
+    {
+        return Err(ApiError::not_found("目标设备当前不可用"));
+    }
+    offer.created_at_ms = crate::clock::now_millis();
+    let transfer_id = offer.transfer_id.clone();
+    let target_node_id = offer.target_node_id.clone();
+    let progress = state.runtime.add_outgoing_transfer(offer.clone());
+    if progress.status == TransferStatus::Failed {
+        return Err(ApiError::conflict(
+            progress
+                .error
+                .unwrap_or_else(|| "无法创建中继传输".to_string()),
+        ));
+    }
+    if !state.runtime.has_peer_channel(&target_node_id) {
+        if let Some(failed) = state.runtime.fail_transfer(
+            &transfer_id,
+            "无法连接目标设备".to_string(),
+            TransferStatus::Failed,
+        ) {
+            state
+                .runtime
+                .publish_event(WireMessage::TransferProgress { progress: failed });
+        }
+        return Err(ApiError::conflict("无法连接目标设备"));
+    }
+    if !state
+        .runtime
+        .send_to_peer_with_retry(&target_node_id, WireMessage::TransferOffer { offer })
+        .await
+    {
+        if let Some(failed) = state.runtime.fail_transfer(
+            &transfer_id,
+            "目标设备暂时无法接收传输请求".to_string(),
+            TransferStatus::Failed,
+        ) {
+            state
+                .runtime
+                .publish_event(WireMessage::TransferProgress { progress: failed });
+        }
+        return Err(ApiError::conflict("目标设备暂时无法接收传输请求"));
+    }
+    Ok(Json(progress))
+}
+
+async fn upload_relay_item(
+    AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    body: Body,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let record = state
+        .runtime
+        .transfer(&transfer_id)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    if record.offer.source_node_id != state.runtime.node_id()
+        || !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading
+        )
+    {
+        return Err(ApiError::conflict("传输尚未被目标设备接受"));
+    }
+    let item = record
+        .offer
+        .items
+        .iter()
+        .find(|item| item.item_id == item_id)
+        .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
+    if item.directory || has_parent_component(&item.relative_path) || item.relative_path.is_empty()
+    {
+        return Err(ApiError::bad_request("传输路径无效"));
+    }
+    let target = state
+        .runtime
+        .peer_http_base(&record.offer.target_node_id)
+        .ok_or_else(|| ApiError::not_found("目标设备当前不可用"))?;
+    let progress = state
+        .runtime
+        .begin_transfer_upload(&transfer_id)
+        .ok_or_else(|| ApiError::conflict("传输已结束"))?;
+    state
+        .runtime
+        .publish_event(WireMessage::TransferProgress { progress });
+    let relay_runtime = state.runtime.clone();
+    let relay_transfer_id = transfer_id.clone();
+    let stream = body.into_data_stream().map(move |chunk| {
+        relay_runtime.touch_transfer_activity(&relay_transfer_id);
+        chunk.map_err(|error| std::io::Error::other(error.to_string()))
+    });
+    let response = state
+        .runtime
+        .proxy_http
+        .put(format!(
+            "{target}/api/v1/transfers/{}/items/{}",
+            encode_path_segment(&transfer_id),
+            encode_path_segment(&item_id),
+        ))
+        .header("content-type", item.media_type.clone())
+        .body(reqwest::Body::wrap_stream(stream))
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
+    let result = proxy_json::<TransferProgress>(response).await?;
+    state
+        .runtime
+        .update_transfer(&transfer_id, result.0.clone());
+    Ok(result)
+}
+
+async fn cancel_relay_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let (source_node_id, target_node_id) = state
+        .runtime
+        .transfer_peer_ids(&id)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    if source_node_id != state.runtime.node_id() {
+        return Err(ApiError::bad_request("目标传输不是本节点的中继任务"));
+    }
+    let progress = state
+        .runtime
+        .fail_transfer(&id, "传输已取消".to_string(), TransferStatus::Cancelled)
+        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
+    let _ = state
+        .runtime
+        .send_to_peer_with_retry(
+            &target_node_id,
+            WireMessage::TransferAction {
+                transfer_id: id.clone(),
+                action: "cancel".to_string(),
+                reason: progress.error.clone(),
+            },
+        )
+        .await;
+    state.runtime.publish_event(WireMessage::TransferAction {
+        transfer_id: id,
+        action: "cancel".to_string(),
+        reason: progress.error.clone(),
+    });
+    state.runtime.publish_event(WireMessage::TransferProgress {
+        progress: progress.clone(),
+    });
     Ok(Json(progress))
 }
 
@@ -1100,6 +1375,19 @@ fn normalize_relative_path(value: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn encode_path_segment(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -1688,14 +1976,17 @@ async fn reject_transfer(
         )
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
     if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
-        let _ = state.runtime.send_to_peer(
-            &source_node_id,
-            WireMessage::TransferAction {
-                transfer_id: id.clone(),
-                action: "reject".to_string(),
-                reason: progress.error.clone(),
-            },
-        );
+        let _ = state
+            .runtime
+            .send_to_peer_with_retry(
+                &source_node_id,
+                WireMessage::TransferAction {
+                    transfer_id: id.clone(),
+                    action: "reject".to_string(),
+                    reason: progress.error.clone(),
+                },
+            )
+            .await;
     }
     state.runtime.publish_event(WireMessage::TransferAction {
         transfer_id: id,
@@ -1708,6 +1999,19 @@ async fn reject_transfer(
     Ok(Json(progress))
 }
 
+async fn accept_transfer(
+    AxumPath(id): AxumPath<String>,
+    State(state): State<AppState>,
+    Json(payload): Json<TransferAcceptRequest>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    if payload.destination.trim().is_empty() || payload.destination.len() > 4_096 {
+        return Err(ApiError::bad_request("接收目录路径无效"));
+    }
+    accept_transfer_at(&state.runtime, id, PathBuf::from(payload.destination))
+        .map(Json)
+        .map_err(ApiError::bad_request)
+}
+
 async fn cancel_transfer(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
@@ -1717,14 +2021,17 @@ async fn cancel_transfer(
         .fail_transfer(&id, "传输已取消".to_string(), TransferStatus::Cancelled)
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
     if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
-        let _ = state.runtime.send_to_peer(
-            &source_node_id,
-            WireMessage::TransferAction {
-                transfer_id: id.clone(),
-                action: "cancel".to_string(),
-                reason: progress.error.clone(),
-            },
-        );
+        let _ = state
+            .runtime
+            .send_to_peer_with_retry(
+                &source_node_id,
+                WireMessage::TransferAction {
+                    transfer_id: id.clone(),
+                    action: "cancel".to_string(),
+                    reason: progress.error.clone(),
+                },
+            )
+            .await;
     }
     state.runtime.publish_event(WireMessage::TransferAction {
         transfer_id: id,
@@ -2156,8 +2463,8 @@ fn has_parent_component(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_wire_message, has_parent_component, validate_offer, MobileSessionRequest,
-        PEER_HANDSHAKE_TIMEOUT,
+        encode_path_segment, handle_wire_message, has_parent_component, validate_offer,
+        MobileSessionRequest, PEER_HANDSHAKE_TIMEOUT,
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, TransferItem,
@@ -2173,11 +2480,219 @@ mod tests {
     use tokio_tungstenite::connect_async;
     use uuid::Uuid;
 
+    #[tokio::test]
+    async fn settings_and_remote_accept_endpoints_update_runtime_state() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-settings-api-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        let destination = data_dir.join("received");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert!(runtime
+            .node_info()
+            .capabilities
+            .iter()
+            .any(|value| value == "management.remote.v1"));
+        assert!(runtime
+            .node_info()
+            .capabilities
+            .iter()
+            .any(|value| value == "transfer.relay.v1"));
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let settings = runtime
+            .http
+            .get(format!("http://{address}/api/v1/settings"))
+            .send()
+            .await
+            .expect("get settings")
+            .error_for_status()
+            .expect("settings response")
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode settings");
+        assert_eq!(settings["clipboard_sync_enabled"], true);
+        assert_eq!(settings["update_frequency"], "weekly");
+        assert_eq!(settings["monitor"]["capabilities"]["backend"], "unknown");
+
+        let patched = runtime
+            .http
+            .patch(format!("http://{address}/api/v1/settings"))
+            .json(&serde_json::json!({
+                "clipboard_sync_enabled": false,
+                "update_frequency": "daily",
+                "clipboard_history_settings": { "mode": "count", "value": 2 }
+            }))
+            .send()
+            .await
+            .expect("patch settings")
+            .error_for_status()
+            .expect("patched settings response")
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode patched settings");
+        assert_eq!(patched["clipboard_sync_enabled"], false);
+        assert_eq!(patched["update_frequency"], "daily");
+        assert_eq!(runtime.clipboard_history_settings().count, 2);
+
+        let offer = TransferOffer {
+            transfer_id: "remote-accept".to_string(),
+            source_node_id: "source".to_string(),
+            source_name: "source".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "file.txt".to_string(),
+                relative_path: "file.txt".to_string(),
+                size: 0,
+                sha256: "0".repeat(64),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: 0,
+        };
+        runtime.add_transfer(offer);
+        let accepted = runtime
+            .http
+            .post(format!(
+                "http://{address}/api/v1/transfers/remote-accept/accept"
+            ))
+            .json(&serde_json::json!({ "destination": destination.to_string_lossy() }))
+            .send()
+            .await
+            .expect("accept remote transfer")
+            .error_for_status()
+            .expect("accepted transfer response")
+            .json::<TransferProgress>()
+            .await
+            .expect("decode accepted transfer");
+        assert_eq!(accepted.status, TransferStatus::Accepted);
+        assert_eq!(
+            runtime
+                .transfer("remote-accept")
+                .expect("transfer")
+                .progress
+                .status,
+            TransferStatus::Accepted
+        );
+
+        let outgoing_offer = TransferOffer {
+            transfer_id: "relay-source-accept".to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "source".to_string(),
+            target_node_id: "peer".to_string(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "file.txt".to_string(),
+                relative_path: "file.txt".to_string(),
+                size: 0,
+                sha256: "0".repeat(64),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: 0,
+        };
+        runtime.add_outgoing_transfer(outgoing_offer);
+        let denied = runtime
+            .http
+            .post(format!(
+                "http://{address}/api/v1/transfers/relay-source-accept/accept"
+            ))
+            .json(&serde_json::json!({ "destination": destination.to_string_lossy() }))
+            .send()
+            .await
+            .expect("reject source-side accept")
+            .status();
+        assert_eq!(denied, reqwest::StatusCode::BAD_REQUEST);
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn duplicate_transfer_offer_replays_current_progress_to_source() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-offer-replay-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create data directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let (tx, mut rx) = mpsc::channel(8);
+        assert!(runtime.add_peer_channel("source".to_string(), tx));
+        let destination = data_dir.join("received");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let offer = TransferOffer {
+            transfer_id: "duplicate-offer".to_string(),
+            source_node_id: "source".to_string(),
+            source_name: "source".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "file.txt".to_string(),
+                relative_path: "file.txt".to_string(),
+                size: 0,
+                sha256: "0".repeat(64),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 0,
+            created_at_ms: 0,
+        };
+        let _ = handle_wire_message(
+            WireMessage::TransferOffer {
+                offer: offer.clone(),
+            },
+            &runtime,
+            Some("source"),
+        )
+        .await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(WireMessage::TransferProgress { .. })
+        ));
+        runtime
+            .set_transfer_acceptance("duplicate-offer", destination)
+            .expect("accept transfer");
+        let _ = handle_wire_message(
+            WireMessage::TransferOffer { offer },
+            &runtime,
+            Some("source"),
+        )
+        .await;
+        let Some(WireMessage::TransferProgress { progress }) = rx.recv().await else {
+            panic!("duplicate offer should replay progress");
+        };
+        assert_eq!(progress.status, TransferStatus::Accepted);
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     #[test]
     fn rejects_parent_and_absolute_paths() {
         assert!(has_parent_component("../secret.txt"));
         assert!(has_parent_component("/tmp/secret.txt"));
         assert!(!has_parent_component("folder/secret.txt"));
+    }
+
+    #[test]
+    fn relay_path_segments_are_percent_encoded() {
+        assert_eq!(encode_path_segment("a/b?c"), "a%2Fb%3Fc");
+        assert_eq!(encode_path_segment("uuid-like_1"), "uuid-like_1");
     }
 
     #[test]
@@ -3417,6 +3932,12 @@ impl ApiError {
     fn request_timeout(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::REQUEST_TIMEOUT,
+            message: message.into(),
+        }
+    }
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
         }
     }

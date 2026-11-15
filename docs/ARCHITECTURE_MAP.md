@@ -13,6 +13,26 @@ flowchart LR
 
 网页端通过可达的桌面节点进入网页，从该节点读取设备列表，也可以选择当前接入节点作为文件目标。网页端建立临时接收会话后，桌面端可把文件发送到接入节点的临时文件区；网页端先安装节点 CA、打开 HTTPS 页面并选择存储目录，确认后逐项流式写入本地目录；网页端发送文件仍使用分块哈希直传。
 
+## 远程管理上下文
+
+```mermaid
+sequenceDiagram
+  participant U as 管理端主窗口
+  participant A as 本机节点 A
+  participant B as 目标节点 B
+  U->>A: 点击设备图标/名称
+  U->>B: GET /api/v1/info、/settings、/peers、/metrics
+  U->>B: 连接 /api/v1/ws
+  B-->>U: 目标节点状态和事件
+  U->>B: PATCH /api/v1/settings 或执行目标传输操作
+  B->>B: 校验路径并持久化目标配置
+  B-->>U: 返回新状态；离线时按代次重连
+```
+
+远程窗口切换只改变 UI 的目标上下文，不转移状态权威；返回本机时重新使用 A 的本地 API 和 Tauri 命令。目标节点更新或重启后，窗口保留目标标识并恢复轮询和 WebSocket。
+
+远程发送文件时，管理端把清单和文件流提交给 B 的中继接口；B 以自身身份向选定 peer 发送清单，接受后把流转发到 peer，并由 B 保留传输状态。
+
 ## 硬件指标同步
 
 ```mermaid

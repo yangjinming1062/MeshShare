@@ -112,6 +112,32 @@ export type MonitorCapabilities = {
   can_keep_above: boolean;
 };
 
+export type NodeMonitorSettings = {
+  visible: boolean;
+  locked: boolean;
+  capabilities: MonitorCapabilities;
+};
+
+export type NodeSettings = {
+  clipboard_sync_enabled: boolean;
+  autostart_enabled: boolean;
+  update_frequency: UpdateFrequency;
+  update_status: UpdateStatus | null;
+  receive_settings: ReceiveSettings;
+  clipboard_history_settings: ClipboardHistorySettings;
+  clipboard_status: ClipboardStatus;
+  monitor: NodeMonitorSettings;
+};
+
+export type NodeSettingsPatch = {
+  clipboard_sync_enabled?: boolean;
+  autostart_enabled?: boolean;
+  update_frequency?: UpdateFrequency;
+  receive_settings?: ReceiveSettings;
+  clipboard_history_settings?: { mode: ClipboardHistoryMode; value: number };
+  monitor?: { visible?: boolean; locked?: boolean };
+};
+
 export type ClipboardHistoryMode = 'count' | 'days';
 
 export type ClipboardHistorySettings = {

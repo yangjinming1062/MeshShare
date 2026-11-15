@@ -1,6 +1,7 @@
 mod autostart;
 mod clipboard;
 mod clock;
+mod control;
 mod discovery;
 mod listeners;
 mod metrics;
@@ -13,11 +14,11 @@ mod updater;
 use anyhow::Context;
 use model::{
     ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, MonitorPosition, ReceiveMode,
-    ReceiveSettings, TransferProgress, WireMessage,
+    ReceiveSettings, TransferProgress,
 };
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-use runtime::{validate_receive_directory, NodeRuntime, UpdateFrequency};
+use runtime::{NodeRuntime, UpdateFrequency};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,6 +32,7 @@ use updater::{UpdateCoordinator, UpdateStatus};
 #[derive(Clone)]
 struct ManagedNode {
     runtime: Arc<NodeRuntime>,
+    control: Arc<control::ControlPlane>,
 }
 
 struct TrayHandles {
@@ -38,11 +40,6 @@ struct TrayHandles {
     monitor_toggle: MenuItem<tauri::Wry>,
     lock_toggle: MenuItem<tauri::Wry>,
     sync_toggle: MenuItem<tauri::Wry>,
-}
-
-#[derive(Clone)]
-struct ManagedUpdater {
-    coordinator: Arc<UpdateCoordinator>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -56,11 +53,11 @@ enum MonitorBackend {
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
-struct MonitorCapabilities {
-    backend: MonitorBackend,
-    can_persist_position: bool,
-    can_click_through: bool,
-    can_keep_above: bool,
+pub(crate) struct MonitorCapabilities {
+    pub(crate) backend: MonitorBackend,
+    pub(crate) can_persist_position: bool,
+    pub(crate) can_click_through: bool,
+    pub(crate) can_keep_above: bool,
 }
 
 fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilities {
@@ -103,13 +100,13 @@ fn monitor_backend<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> Monit
     }
 }
 
-fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabilities {
+pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabilities {
     app.get_webview_window("monitor")
         .map(|window| monitor_capabilities_for_backend(monitor_backend(&window)))
         .unwrap_or_else(|| monitor_capabilities_for_backend(MonitorBackend::Unknown))
 }
 
-fn effective_monitor_locked(app: &AppHandle, runtime: &NodeRuntime) -> bool {
+pub(crate) fn effective_monitor_locked(app: &AppHandle, runtime: &NodeRuntime) -> bool {
     current_monitor_capabilities(app).can_click_through && runtime.monitor_locked()
 }
 
@@ -119,17 +116,8 @@ fn node_base_url(state: State<'_, ManagedNode>) -> String {
 }
 
 #[tauri::command]
-fn toggle_clipboard_sync(app: AppHandle, state: State<'_, ManagedNode>) -> bool {
-    let enabled = !state
-        .runtime
-        .sync_enabled
-        .load(std::sync::atomic::Ordering::SeqCst);
-    state
-        .runtime
-        .sync_enabled
-        .store(enabled, std::sync::atomic::Ordering::SeqCst);
-    sync_tray_labels(&app);
-    enabled
+fn toggle_clipboard_sync(state: State<'_, ManagedNode>) -> bool {
+    state.control.toggle_clipboard_sync()
 }
 
 #[tauri::command]
@@ -158,35 +146,32 @@ fn set_clipboard_history_settings(
 ) -> Result<ClipboardHistorySettings, String> {
     let mode =
         ClipboardHistoryMode::parse(&mode).ok_or_else(|| "剪贴板历史模式无效".to_string())?;
-    state
-        .runtime
-        .set_clipboard_history_settings(mode, value)
-        .map_err(|error| error.to_string())
+    state.control.set_clipboard_history_settings(mode, value)
 }
 
 #[tauri::command]
-fn update_frequency(state: State<'_, ManagedUpdater>) -> String {
-    state.coordinator.frequency().as_str().to_string()
+fn update_frequency(state: State<'_, ManagedNode>) -> String {
+    state.control.update_frequency()
 }
 
 #[tauri::command]
 fn set_update_frequency(
-    state: State<'_, ManagedUpdater>,
+    state: State<'_, ManagedNode>,
     frequency: String,
 ) -> Result<String, String> {
     let frequency =
         UpdateFrequency::parse(&frequency).ok_or_else(|| "自动更新频率无效".to_string())?;
-    state.coordinator.set_frequency(frequency)
+    state.control.set_update_frequency(frequency)
 }
 
 #[tauri::command]
-fn check_for_updates(state: State<'_, ManagedUpdater>) -> Result<(), String> {
-    state.coordinator.request_manual_check()
+fn check_for_updates(state: State<'_, ManagedNode>) -> Result<(), String> {
+    state.control.request_update_check().map(|_| ())
 }
 
 #[tauri::command]
-fn update_status(state: State<'_, ManagedUpdater>) -> UpdateStatus {
-    state.coordinator.status()
+fn update_status(state: State<'_, ManagedNode>) -> Result<UpdateStatus, String> {
+    state.control.update_status()
 }
 
 #[tauri::command]
@@ -205,54 +190,7 @@ fn autostart_enabled(state: State<'_, ManagedNode>) -> Result<bool, String> {
 
 #[tauri::command]
 fn set_autostart_enabled(state: State<'_, ManagedNode>, enabled: bool) -> Result<bool, String> {
-    if cfg!(debug_assertions) {
-        return Err("开发构建不注册开机自启动".to_string());
-    }
-    let registration = autostart::Registration::current()
-        .map_err(|error| format!("无法准备开机自启动设置：{error}"))?;
-    let previous_registration = registration
-        .is_enabled()
-        .map_err(|error| format!("无法读取当前开机自启动状态：{error}"))?;
-    let previous_preference = state.runtime.autostart_enabled();
-    state
-        .runtime
-        .set_autostart_enabled(enabled)
-        .map_err(|error| format!("保存开机自启动设置失败：{error}"))?;
-    if let Err(error) = apply_autostart_registration(&registration, enabled) {
-        let restore_registration =
-            apply_autostart_registration(&registration, previous_registration);
-        let restore_preference = state.runtime.set_autostart_enabled(previous_preference);
-        return Err(format_registration_failure(
-            error,
-            restore_registration,
-            restore_preference,
-        ));
-    }
-    match registration.is_enabled() {
-        Ok(actual) if actual == enabled => Ok(enabled),
-        Ok(actual) => {
-            let error =
-                anyhow::anyhow!("系统报告的开机自启动状态为 {actual}，期望状态为 {enabled}");
-            let restore_registration =
-                apply_autostart_registration(&registration, previous_registration);
-            let restore_preference = state.runtime.set_autostart_enabled(previous_preference);
-            Err(format_registration_failure(
-                error,
-                restore_registration,
-                restore_preference,
-            ))
-        }
-        Err(error) => {
-            let restore_registration =
-                apply_autostart_registration(&registration, previous_registration);
-            let restore_preference = state.runtime.set_autostart_enabled(previous_preference);
-            Err(format_registration_failure(
-                error,
-                restore_registration,
-                restore_preference,
-            ))
-        }
-    }
+    state.control.set_autostart_enabled(enabled)
 }
 
 #[tauri::command]
@@ -268,10 +206,7 @@ fn set_receive_settings(
 ) -> Result<ReceiveSettings, String> {
     let mode = ReceiveMode::parse(&mode).ok_or_else(|| "接收模式无效".to_string())?;
     let directory = default_path.map(PathBuf::from);
-    state
-        .runtime
-        .set_receive_settings(mode, directory)
-        .map_err(|error| error.to_string())
+    state.control.set_receive_settings(mode, directory)
 }
 
 #[tauri::command]
@@ -280,26 +215,7 @@ fn accept_transfer(
     transfer_id: String,
     destination: String,
 ) -> Result<TransferProgress, String> {
-    let destination = validate_receive_directory(PathBuf::from(destination).as_path())
-        .map_err(|error| error.to_string())?;
-    let progress = state
-        .runtime
-        .set_transfer_acceptance(&transfer_id, destination)
-        .ok_or_else(|| "传输不存在".to_string())?;
-    state.runtime.publish_event(WireMessage::TransferProgress {
-        progress: progress.clone(),
-    });
-    if let Some(source_node_id) = state.runtime.transfer_source_id(&transfer_id) {
-        let _ = state.runtime.send_to_peer(
-            &source_node_id,
-            WireMessage::TransferAction {
-                transfer_id,
-                action: "accept".to_string(),
-                reason: None,
-            },
-        );
-    }
-    Ok(progress)
+    control::accept_transfer_at(&state.runtime, transfer_id, PathBuf::from(destination))
 }
 
 #[tauri::command]
@@ -326,7 +242,7 @@ fn monitor_locked(app: AppHandle, state: State<'_, ManagedNode>) -> bool {
     effective_monitor_locked(&app, state.runtime.as_ref())
 }
 
-fn apply_monitor_locked(
+pub(crate) fn apply_monitor_locked(
     app: &AppHandle,
     runtime: &NodeRuntime,
     locked: bool,
@@ -455,7 +371,7 @@ fn monitor_window_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
-fn sync_tray_labels(app: &AppHandle) {
+pub(crate) fn sync_tray_labels(app: &AppHandle) {
     let Some(tray) = app.try_state::<TrayHandles>() else {
         return;
     };
@@ -486,7 +402,7 @@ fn set_main_window_visible(app: &AppHandle, visible: bool) {
     sync_tray_labels(app);
 }
 
-fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked: bool) {
+pub(crate) fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked: bool) {
     let Some(window) = app.get_webview_window("monitor") else {
         return;
     };
@@ -513,21 +429,6 @@ fn apply_autostart_registration(
             .disable()
             .map_err(|error| anyhow::anyhow!("关闭开机自启动失败：{error}"))
     }
-}
-
-fn format_registration_failure(
-    error: anyhow::Error,
-    restore_registration: anyhow::Result<()>,
-    restore_preference: anyhow::Result<()>,
-) -> String {
-    let mut message = format!("更新开机自启动失败：{error}");
-    if let Err(restore_error) = restore_registration {
-        message.push_str(&format!("；恢复系统注册状态失败：{restore_error}"));
-    }
-    if let Err(restore_error) = restore_preference {
-        message.push_str(&format!("；恢复配置失败：{restore_error}"));
-    }
-    message
 }
 
 fn sync_autostart_registration(runtime: &NodeRuntime) {
@@ -674,12 +575,14 @@ async fn start_node(
     data_dir: PathBuf,
     static_root: PathBuf,
     version: String,
-) -> anyhow::Result<Arc<NodeRuntime>> {
+    app: AppHandle,
+) -> anyhow::Result<(Arc<NodeRuntime>, Arc<control::ControlPlane>)> {
     let preferred_port = std::env::var("MESHSHARE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(37880u16);
-    let runtime = listeners::start(data_dir, static_root, version, preferred_port).await?;
+    let (runtime, control) =
+        listeners::start_with_app(data_dir, static_root, version, preferred_port, app).await?;
     let cleanup_runtime = runtime.clone();
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -706,7 +609,7 @@ async fn start_node(
     clipboard::start_monitor(runtime.clone());
     metrics::start(runtime.clone());
     discovery::start(runtime.clone());
-    Ok(runtime)
+    Ok((runtime, control))
 }
 
 fn static_root(app: &AppHandle) -> PathBuf {
@@ -844,18 +747,18 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".meshshare"));
-            let runtime = tauri::async_runtime::block_on(start_node(
+            let (runtime, control) = tauri::async_runtime::block_on(start_node(
                 data_dir,
                 static_root(app.handle()),
                 app.package_info().version.to_string(),
+                app.handle().clone(),
             ))?;
             app.manage(ManagedNode {
                 runtime: runtime.clone(),
+                control: control.clone(),
             });
             let updater = UpdateCoordinator::new(app.handle().clone(), runtime.clone());
-            app.manage(ManagedUpdater {
-                coordinator: updater.clone(),
-            });
+            control.install_updater(updater.clone())?;
             updater.start();
             sync_autostart_registration(runtime.as_ref());
             setup_tray_menu(app.handle())?;

@@ -5,9 +5,9 @@
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getTransfers, initApi, mobileDownloadUrl, request, restoreClipboardHistory, websocketUrl } from './api';
+  import { apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
   import { Sha256, digestFile } from './sha256';
-  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, ReceiveMode, ReceiveSettings, TransferItem, TransferOffer, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { clipboardHistoryKind, clipboardHistoryPreview, formatPercent, formatRate, formatTime, gpuMemoryPercent, gpuUtilization, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
   import Icon from './components/Icon.svelte';
   import AppHeader from './components/AppHeader.svelte';
@@ -29,6 +29,9 @@
   const isWeb = !inTauri && !isMonitor;
   const isDesktopWindow = inTauri && !isMonitor;
   let node: NodeInfo | null = null;
+  let activeBaseUrl = '';
+  let remoteTarget: PeerInfo | null = null;
+  let targetHistory: Array<{ baseUrl: string; node: NodeInfo | null; peer: PeerInfo | null }> = [];
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
   let clipboardHistory: ClipboardHistoryItem[] = [];
@@ -73,7 +76,9 @@
   let clipboardTab: 'current' | 'history' = 'current';
   let historyDetailOpen = false;
   let metricsPeerOpen = false;
-  let clearHistoryOpen = false;  const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[] }>();
+  let clearHistoryOpen = false;  const pendingUploads = new Map<string, { target: string; files: File[]; items: TransferItem[]; relay?: boolean }>();
+  let remoteMode = false;
+  let remotePath = '';
   const uploading = new Set<string>();
   const watching = new Set<string>();
   const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[]; completedItemIds: Set<string> }>();
@@ -87,6 +92,8 @@
   const MOBILE_UPLOAD_MAX_ATTEMPTS = 6;
   const DESKTOP_UPLOAD_MAX_ATTEMPTS = 6;
   const FILE_UPLOAD_ATTEMPTS = 4;
+  const REMOTE_MANAGEMENT_CAPABILITY = 'management.remote.v1';
+  const TRANSFER_RELAY_CAPABILITY = 'transfer.relay.v1';
   const WS_RECONNECT_BASE_MS = 1500;
   const WS_RECONNECT_MAX_MS = 30000;
   let mobileReceiveDirectory: MobileDirectoryHandle | null = null;
@@ -96,11 +103,16 @@
   let wsReconnectAttempt = 0;
   let wsGeneration = 0;
   let wsPingTimer: number | undefined;
+  let targetGeneration = 0;
 
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
   $: secureMobileUrl = node?.mobile_addresses?.find((address) => address.address === mobileAddress?.address)?.url;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
+  $: remoteMode = !!remoteTarget;
+  $: remotePath = remoteMode
+    ? [...targetHistory.map((entry) => entry.node?.node_name ?? '本机'), node?.node_name ?? '目标节点'].join(' / ')
+    : '';
   $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
   $: mobileTargets = node ? [{
     node_id: node.node_id,
@@ -131,7 +143,7 @@
     let updateStatusUnlisten: (() => void) | undefined;
     if (isDesktopWindow) {
       void listen<UpdateStatus>('update-status', ({ payload }) => {
-        updateStatus = payload;
+        if (!remoteMode) updateStatus = payload;
       }).then((unlisten) => {
         if (stopped) unlisten();
         else updateStatusUnlisten = unlisten;
@@ -172,7 +184,8 @@
     const start = async () => {
       if (pageStopped) return;
       try {
-        await initApi();
+        const base = await initApi();
+        if (!activeBaseUrl) activeBaseUrl = base;
         if (inTauri && !isWeb) {
           monitorCapabilities = await invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities);
           monitorLocked = await invoke<boolean>('monitor_locked').catch(() => false);
@@ -225,9 +238,12 @@
   });
 
   async function refresh() {
-    if (inTauri && !isWeb) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
+    const generation = targetGeneration;
+    const target = activeBaseUrl;
+    if (inTauri && !isWeb && !remoteMode) monitorLocked = await invoke<boolean>('monitor_locked').catch(() => monitorLocked);
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
+      if (generation !== targetGeneration || target !== activeBaseUrl) return;
       node = nextNode;
       metrics = nextMetrics;
       status = '节点在线';
@@ -241,7 +257,11 @@
       getClipboard(),
       getMetrics(),
       getClipboardHistory(),
-      isDesktopWindow ? invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus) : Promise.resolve(clipboardStatus),
+      getClipboardStatus().catch(() => remoteMode
+        ? clipboardStatus
+        : isDesktopWindow
+          ? invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus)
+          : clipboardStatus),
     ]);
     const nextTransfers = isWeb ? [] : await getTransfers();
     if (isWeb) {
@@ -261,6 +281,7 @@
         }
       }
     }
+    if (generation !== targetGeneration || target !== activeBaseUrl) return;
     node = nextNode;
     peers = nextPeers.filter((peer) => peer.online);
     clipboard = nextClipboard;
@@ -273,10 +294,12 @@
     metrics = nextMetrics;
     transfers = [...nextTransfers, ...transfers.filter((item) => !nextTransfers.some((next) => next.transfer_id === item.transfer_id))];
     for (const transfer of nextTransfers) {
+      if (mobileTransfers.some((view) => view.progress.transfer_id === transfer.transfer_id)) continue;
       if (transfer.direction !== 'send' || !transfer.offer || ['completed', 'rejected', 'failed', 'cancelled'].includes(transfer.status) || watching.has(transfer.transfer_id)) continue;
+      const relayTransfer = remoteMode && transfer.direction === 'send';
       const targetPeer = peers.find((peer) => peer.node_id === transfer.offer?.target_node_id);
-      const target = targetPeer ? targetBase(targetPeer) : null;
-      if (target) void watchTransfer(transfer.transfer_id, target);
+      const target = relayTransfer ? activeBaseUrl : (targetPeer ? targetBase(targetPeer) : null);
+      if (target) void watchTransfer(transfer.transfer_id, target, relayTransfer);
     }
     if (selectedMetricsPeer) {
       selectedMetricsPeer = peers.find((peer) => peer.node_id === selectedMetricsPeer?.node_id) ?? null;
@@ -289,6 +312,53 @@
     }
     status = '节点在线';
     statusKind = 'ok';
+    if (remoteMode) await refreshRemoteSettings(generation, target);
+  }
+
+  async function refreshRemoteSettings(generation = targetGeneration, target = activeBaseUrl) {
+    if (!remoteMode) return;
+    try {
+      const settings = await getSettings();
+      if (generation !== targetGeneration || target !== activeBaseUrl) return;
+      applyRemoteSettings(settings);
+    } catch (error) {
+      if (error instanceof Error && !error.message.includes('404')) {
+        status = error.message;
+        statusKind = 'warn';
+      }
+    }
+  }
+
+  function applyRemoteSettings(settings: NodeSettings) {
+    syncEnabled = settings.clipboard_sync_enabled;
+    autostartEnabled = settings.autostart_enabled;
+    updateFrequency = settings.update_frequency;
+    updateStatus = settings.update_status;
+    receiveSettings = settings.receive_settings;
+    clipboardHistorySettings = settings.clipboard_history_settings;
+    clipboardStatus = settings.clipboard_status;
+    monitorLocked = settings.monitor.locked;
+    monitorCapabilities = settings.monitor.capabilities;
+  }
+
+  async function refreshLocalSettings() {
+    if (!isDesktopWindow || remoteMode) return;
+    const [nextFrequency, nextStatus, nextHistory, nextReceive, nextClipboard, nextSync, nextAutostart] = await Promise.all([
+      invoke<UpdateFrequency>('update_frequency').catch(() => updateFrequency),
+      invoke<UpdateStatus>('update_status').catch(() => updateStatus),
+      invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings),
+      invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings),
+      invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus),
+      invoke<boolean>('clipboard_sync_enabled').catch(() => syncEnabled),
+      invoke<boolean>('autostart_enabled').catch(() => true),
+    ]);
+    updateFrequency = nextFrequency;
+    updateStatus = nextStatus;
+    clipboardHistorySettings = nextHistory;
+    receiveSettings = nextReceive;
+    clipboardStatus = nextClipboard;
+    syncEnabled = nextSync;
+    autostartEnabled = nextAutostart;
   }
 
   async function ensureMobileSession() {
@@ -454,6 +524,17 @@
   }
 
   async function toggleSync() {
+    if (remoteMode) {
+      try {
+        const settings = await patchSettings({ clipboard_sync_enabled: !syncEnabled });
+        applyRemoteSettings(settings);
+        notice = syncEnabled ? '目标节点的剪贴板自动同步已恢复' : '目标节点的剪贴板自动同步已暂停';
+      } catch (error) {
+        notice = error instanceof Error ? error.message : '无法更新目标节点同步设置';
+      }
+      window.setTimeout(() => (notice = ''), 2400);
+      return;
+    }
     syncEnabled = await invoke<boolean>('toggle_clipboard_sync').catch(() => !syncEnabled);
     notice = syncEnabled ? '剪贴板自动同步已恢复' : '剪贴板自动同步已暂停';
     window.setTimeout(() => (notice = ''), 2200);
@@ -464,7 +545,12 @@
     const next = !autostartEnabled;
     autostartBusy = true;
     try {
-      autostartEnabled = await invoke<boolean>('set_autostart_enabled', { enabled: next });
+      if (remoteMode) {
+        const settings = await patchSettings({ autostart_enabled: next });
+        applyRemoteSettings(settings);
+      } else {
+        autostartEnabled = await invoke<boolean>('set_autostart_enabled', { enabled: next });
+      }
       notice = autostartEnabled ? '开机自启动已开启' : '开机自启动已关闭';
     } catch (error) {
       notice = typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新开机自启动设置';
@@ -477,8 +563,13 @@
   async function setUpdateFrequency(next: UpdateFrequency) {
     const previous = updateFrequency;
     try {
-      updateFrequency = await invoke<UpdateFrequency>('set_update_frequency', { frequency: next });
-      updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
+      if (remoteMode) {
+        const settings = await patchSettings({ update_frequency: next });
+        applyRemoteSettings(settings);
+      } else {
+        updateFrequency = await invoke<UpdateFrequency>('set_update_frequency', { frequency: next });
+        updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
+      }
       notice = next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`;
     } catch (error) {
       updateFrequency = previous;
@@ -496,6 +587,12 @@
   }
 
   async function chooseReceiveDirectory() {
+    if (remoteMode) {
+      const path = window.prompt('输入目标节点上的默认接收目录', receiveSettings.default_path ?? '');
+      if (path === null) return;
+      await saveReceiveSettings(receiveSettings.mode, path.trim() || null);
+      return;
+    }
     let destination: string | string[] | null = null;
     try {
       destination = await open({ directory: true, multiple: false, title: '选择默认接收目录' });
@@ -511,10 +608,18 @@
     if (receiveSettingsBusy) return;
     receiveSettingsBusy = true;
     try {
-      receiveSettings = await invoke<ReceiveSettings>('set_receive_settings', {
-        mode,
-        defaultPath: defaultPath ?? receiveSettings.default_path ?? null,
-      });
+      if (remoteMode) {
+        const settings = await patchSettings({ receive_settings: {
+          mode,
+          default_path: defaultPath ?? receiveSettings.default_path ?? null,
+        } });
+        applyRemoteSettings(settings);
+      } else {
+        receiveSettings = await invoke<ReceiveSettings>('set_receive_settings', {
+          mode,
+          defaultPath: defaultPath ?? receiveSettings.default_path ?? null,
+        });
+      }
       notice = mode === 'auto' ? '已启用自动接收' : '已设为每次确认';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法更新接收设置';
@@ -541,7 +646,12 @@
     if (clipboardHistorySettingsBusy) return;
     clipboardHistorySettingsBusy = true;
     try {
-      clipboardHistorySettings = await invoke<ClipboardHistorySettings>('set_clipboard_history_settings', { mode, value });
+      if (remoteMode) {
+        const settings = await patchSettings({ clipboard_history_settings: { mode, value } });
+        applyRemoteSettings(settings);
+      } else {
+        clipboardHistorySettings = await invoke<ClipboardHistorySettings>('set_clipboard_history_settings', { mode, value });
+      }
       await refreshClipboardHistory();
       notice = mode === 'count'
         ? `已保留最近 ${clipboardHistorySettings.count} 条剪贴板内容`
@@ -567,8 +677,12 @@
     if (updateBusy) return;
     updateBusy = true;
     try {
-      await invoke('check_for_updates');
-      updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
+      if (remoteMode) {
+        applyRemoteSettings(await requestUpdateCheck());
+      } else {
+        await invoke('check_for_updates');
+        updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
+      }
       notice = '已发起更新检查';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法检查更新';
@@ -602,7 +716,11 @@
 
   async function toggleMonitorLock() {
     try {
-      monitorLocked = await invoke<boolean>('set_monitor_locked', { locked: !monitorLocked });
+      if (remoteMode) {
+        applyRemoteSettings(await patchSettings({ monitor: { locked: !monitorLocked } }));
+      } else {
+        monitorLocked = await invoke<boolean>('set_monitor_locked', { locked: !monitorLocked });
+      }
       notice = monitorLocked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法更新悬浮监控条状态';
@@ -788,6 +906,80 @@
     return url ?? (peer.endpoint ? peer.endpoint.replace(/\/api\/v1\/ws$/, '') : null);
   }
 
+  function resetTargetUi() {
+    targetGeneration += 1;
+    selectedClipboardHistory = null;
+    historyDetailOpen = false;
+    metricsPeerOpen = false;
+    selectedMetricsPeer = null;
+    selectedPeer = null;
+    selectedMobileSession = null;
+    clipboardHistory = [];
+    transfers = [];
+    mobileSessions = [];
+    mobileTransfers = [];
+    mobileAddresses = [];
+    selectedAddress = '';
+    mobileQr = null;
+  }
+
+  async function openRemotePeer(peer: PeerInfo) {
+    if (isWeb || !peer.online) return;
+    if (!peer.capabilities.includes(REMOTE_MANAGEMENT_CAPABILITY)) {
+      notice = '目标节点不支持远程管理，请先升级目标节点';
+      window.setTimeout(() => (notice = ''), 3000);
+      return;
+    }
+    const target = targetBase(peer);
+    if (!target) {
+      notice = '目标设备没有可访问地址';
+      window.setTimeout(() => (notice = ''), 2400);
+      return;
+    }
+    wsGeneration += 1;
+    ws?.close();
+    ws = null;
+    if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = undefined;
+    if (wsPingTimer) window.clearInterval(wsPingTimer);
+    wsPingTimer = undefined;
+    targetHistory = [...targetHistory, { baseUrl: activeBaseUrl, node, peer: remoteTarget }];
+    remoteTarget = peer;
+    activeBaseUrl = target;
+    setApiTarget(target);
+    resetTargetUi();
+    wsReconnectAttempt = 0;
+    await refresh().catch((error) => {
+      status = error instanceof Error ? error.message : '无法连接目标节点';
+      statusKind = 'error';
+    });
+    connectWebSocket();
+  }
+
+  async function returnToPreviousTarget() {
+    const previous = targetHistory.pop();
+    if (!previous) return;
+    wsGeneration += 1;
+    ws?.close();
+    ws = null;
+    if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = undefined;
+    if (wsPingTimer) window.clearInterval(wsPingTimer);
+    wsPingTimer = undefined;
+    targetHistory = targetHistory;
+    remoteTarget = previous.peer;
+    activeBaseUrl = previous.baseUrl;
+    setApiTarget(activeBaseUrl);
+    resetTargetUi();
+    wsReconnectAttempt = 0;
+    await refresh().catch((error) => {
+      status = error instanceof Error ? error.message : '无法返回上一级节点';
+      statusKind = 'error';
+    });
+    await refreshLocalSettings();
+    connectWebSocket();
+  }
+
   async function createItem(file: File, index: number): Promise<TransferItem> {
     const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
     const sha256 = await digestFile(file);
@@ -842,6 +1034,10 @@
   }
 
   async function sendFiles(peer: PeerInfo, files: File[]) {
+    if (remoteMode && !peer.capabilities.includes(TRANSFER_RELAY_CAPABILITY)) {
+      notice = '目标节点不支持远程文件中继，请先升级目标节点';
+      return;
+    }
     const target = targetBase(peer);
     if (!target || !node) {
       notice = '目标设备没有可访问地址';
@@ -860,12 +1056,20 @@
         total_bytes: items.reduce((sum, item) => sum + item.size, 0),
         created_at_ms: Date.now(),
       };
-      const localProgress = await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
+      const localProgress = remoteMode
+        ? undefined
+        : await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
       if (localProgress?.status === 'failed') {
         throw new Error(localProgress.error ?? '传输任务数量已达到上限');
       }
       try {
-        await request<TransferProgress>('/api/v1/transfers', { method: 'POST', body: JSON.stringify(offer) }, target);
+        const created = await request<TransferProgress>(remoteMode ? '/api/v1/relay/transfers' : '/api/v1/transfers', {
+          method: 'POST',
+          body: JSON.stringify(offer),
+        }, remoteMode ? activeBaseUrl : target);
+        if (created.status === 'failed') {
+          throw new Error(created.error ?? '无法创建传输');
+        }
       } catch (error) {
         if (localProgress) {
           await invoke('update_transfer_progress', {
@@ -874,9 +1078,9 @@
         }
         throw error;
       }
-      pendingUploads.set(offer.transfer_id, { target, files, items });
+      pendingUploads.set(offer.transfer_id, { target: remoteMode ? activeBaseUrl : target, files, items, relay: remoteMode });
       transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
-      void watchTransfer(offer.transfer_id, target);
+      void watchTransfer(offer.transfer_id, remoteMode ? activeBaseUrl : target, remoteMode);
       notice = '已发送传输请求，等待接收端确认';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法创建传输';
@@ -913,10 +1117,19 @@
 
   async function watchMobileTransfer(id: string) {
     if (mobileWatching.has(id)) return;
+    const generation = targetGeneration;
     mobileWatching.add(id);
     for (let attempt = 0; attempt < 360; attempt += 1) {
+      if (generation !== targetGeneration) {
+        mobileWatching.delete(id);
+        return;
+      }
       try {
         const view = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
+        if (generation !== targetGeneration) {
+          mobileWatching.delete(id);
+          return;
+        }
         if (!view) throw new Error('网页端传输任务不存在');
         const progress = view.progress;
         const existing = transfers.find((item) => item.transfer_id === id);
@@ -1008,16 +1221,25 @@
     await refresh();
   }
 
-  async function watchTransfer(id: string, target: string) {
+  async function watchTransfer(id: string, target: string, relay = false) {
     if (watching.has(id)) return;
+    const generation = targetGeneration;
     watching.add(id);
     for (let attempt = 0; attempt < 360; attempt += 1) {
+      if (generation !== targetGeneration) {
+        watching.delete(id);
+        return;
+      }
       try {
         const progress = await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, target);
-        void invoke('update_transfer_progress', { progress }).catch(() => undefined);
+        if (generation !== targetGeneration) {
+          watching.delete(id);
+          return;
+        }
+        if (!remoteMode) void invoke('update_transfer_progress', { progress }).catch(() => undefined);
         const existing = transfers.find((item) => item.transfer_id === id);
         transfers = [{ ...existing, ...progress, direction: existing?.direction ?? progress.direction }, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (['accepted', 'uploading'].includes(progress.status) && !uploading.has(id) && !uploadStopped.has(id)) await uploadTransfer(id, target);
+        if (['accepted', 'uploading'].includes(progress.status) && !uploading.has(id) && !uploadStopped.has(id)) await uploadTransfer(id, target, relay);
         if (['completed', 'rejected', 'failed', 'cancelled'].includes(progress.status)) {
           pendingUploads.delete(id);
           uploadAttempts.delete(id);
@@ -1033,7 +1255,7 @@
     watching.delete(id);
   }
 
-  async function uploadTransfer(id: string, target: string) {
+  async function uploadTransfer(id: string, target: string, relay = false) {
     const pending = pendingUploads.get(id);
     if (!pending || uploadStopped.has(id)) return;
     uploading.add(id);
@@ -1042,7 +1264,7 @@
         const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
         await uploadFileWithRetry(
-          `${target}/api/v1/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
+          `${target}${relay ? '/api/v1/relay/transfers' : '/api/v1/transfers'}/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
           file,
           item.media_type,
         );
@@ -1055,7 +1277,10 @@
       uploadAttempts.set(id, attempts);
       if (attempts >= DESKTOP_UPLOAD_MAX_ATTEMPTS) {
         uploadStopped.add(id);
-        await request(`/api/v1/transfers/${encodeURIComponent(id)}/cancel`, { method: 'POST' }, target).catch(() => undefined);
+        const cancelPath = relay
+          ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/cancel`
+          : `/api/v1/transfers/${encodeURIComponent(id)}/cancel`;
+        await request(cancelPath, { method: 'POST' }, target).catch(() => undefined);
         notice = `${notice}，已停止重试`;
       } else {
         // Keep the accepted task alive. watchTransfer will retry the current
@@ -1201,18 +1426,31 @@
   async function acceptTransfer(transfer: TransferProgress) {
     if (!transfer.offer) return;
     let destination: string | string[] | null = null;
-    try {
-      destination = await open({ directory: true, multiple: false, title: '选择接收目录' });
-    } catch {
-      destination = null;
+    let path: string | undefined;
+    if (remoteMode) {
+      const remotePath = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
+      path = remotePath?.trim() || undefined;
+    } else {
+      try {
+        destination = await open({ directory: true, multiple: false, title: '选择接收目录' });
+      } catch {
+        destination = null;
+      }
+      path = Array.isArray(destination) ? destination[0] : destination ?? undefined;
     }
-    const path = Array.isArray(destination) ? destination[0] : destination;
     if (!path) {
-      notice = '当前环境无法选择接收目录';
+      notice = remoteMode ? '需要输入目标节点上的接收目录' : '当前环境无法选择接收目录';
       return;
     }
     try {
-      await invoke<TransferProgress>('accept_transfer', { transferId: transfer.transfer_id, destination: path });
+      if (remoteMode) {
+        await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/accept`, {
+          method: 'POST',
+          body: JSON.stringify({ destination: path }),
+        });
+      } else {
+        await invoke<TransferProgress>('accept_transfer', { transferId: transfer.transfer_id, destination: path });
+      }
       notice = '已接受，等待文件直传';
     } catch (error) {
       notice = error instanceof Error ? error.message : '无法接受传输';
@@ -1415,6 +1653,8 @@
   {:else}
     <AppHeader
       {node}
+      remote={remoteMode}
+      {remotePath}
       {status}
       {statusKind}
       {syncEnabled}
@@ -1423,6 +1663,7 @@
       onSync={toggleSync}
       onAutostart={toggleAutostart}
       onSettings={() => (settingsOpen = true)}
+      onBack={returnToPreviousTarget}
     />
     {#if notice}<div class="notice" role="status">{notice}</div>{/if}
     {#if isDesktopWindow && node && !clipboardStatus.available}
@@ -1437,6 +1678,7 @@
         bind:manualAddress
         onToggleAdd={() => (addDeviceOpen = !addDeviceOpen)}
         onConnect={connectManualPeer}
+        onOpenPeer={openRemotePeer}
         onMobileAccess={() => (mobileAccessOpen = true)}
         onSendPeer={(peer) => startChoose(peer)}
         onSendPeerFolder={(peer) => startChoose(peer, true)}
