@@ -338,7 +338,9 @@ impl NodeRuntime {
         }
         let desktop_temp_files = load_and_cleanup_desktop_temp_files(&data_dir)?;
         cleanup_clipboard_temp_files(&data_dir)?;
-        let mut config = load_or_create_config(&data_dir, profile)?;
+        let config = load_or_create_config(&data_dir, profile)?;
+        #[cfg(target_os = "macos")]
+        let mut config = config;
         #[cfg(target_os = "macos")]
         {
             // Configurations written before bookmark support only contain a
