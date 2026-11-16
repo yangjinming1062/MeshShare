@@ -239,6 +239,19 @@ button.device-metrics:hover { background: var(--surface-2); }
 .install-guide summary { color: var(--primary-hover); font-weight: 600; cursor: pointer; }
 .install-guide ol { display: grid; gap: 3px; margin: 6px 0 0; padding-left: 17px; line-height: 1.5; }
 .kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; font-size: 12px; font-variant-numeric: tabular-nums; }
+.metrics-section { display: grid; gap: 7px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+.metrics-section:last-of-type { padding-bottom: 0; border-bottom: 0; }
+.metrics-section h3 { margin: 0; color: var(--ink-2); font-size: 12px; font-weight: 700; }
+.metrics-value { min-width: 0; max-width: 72%; overflow-wrap: anywhere; text-align: right; }
+.metrics-list { display: grid; gap: 8px; }
+.metrics-disk, .metrics-gpu { display: grid; gap: 5px; padding: 8px 10px; border-radius: var(--r-md); background: var(--surface-2); }
+.metrics-disk-head, .metrics-gpu-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; min-width: 0; font-size: 11px; }
+.metrics-disk-head > span, .metrics-gpu-head > span { flex: 0 0 auto; color: var(--muted); }
+.metrics-subvalue { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.metrics-note { color: var(--warning-ink); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.metrics-empty, .metrics-status { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.metrics-status--warning { color: var(--warning-ink); }
+.metrics-sampled { color: var(--muted); font-size: 11px; text-align: right; }
 .confirm-text { font-size: 13px; line-height: 1.6; }
 
 .notice { position: fixed; z-index: 40; left: 50%; bottom: calc(18px + var(--phone-safe-bottom)); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 8px; max-width: calc(100vw - 32px); padding: 8px 14px; border-radius: 999px; background: rgba(15, 23, 42, .92); color: #fff; font-size: 12px; box-shadow: 0 10px 24px -12px rgba(15, 23, 42, .5); animation: toast-in 160ms var(--ease); }

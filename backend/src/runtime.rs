@@ -634,8 +634,18 @@ impl NodeRuntime {
                 let mut outgoing = metrics.clone();
                 if !*supports_system {
                     outgoing.cpu_usage_percent = None;
+                    outgoing.cpu_model = None;
+                    outgoing.cpu_logical_cores = None;
+                    outgoing.cpu_physical_cores = None;
+                    outgoing.cpu_frequency_mhz = None;
                     outgoing.memory_used_bytes = None;
                     outgoing.memory_total_bytes = None;
+                    outgoing.memory_available_bytes = None;
+                    outgoing.swap_used_bytes = None;
+                    outgoing.swap_total_bytes = None;
+                    outgoing.load_average = None;
+                    outgoing.uptime_seconds = None;
+                    outgoing.disks.clear();
                 }
                 if !*supports_gpu {
                     outgoing.gpus.clear();
@@ -3266,11 +3276,11 @@ mod tests {
         TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
-        AddressInfo, ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics,
-        HardwareMetrics, Hlc, PeerInfo, ReceiveMode, TransferItem, TransferOffer, TransferStatus,
-        WireMessage, CLIPBOARD_VIEW_CAPABILITY, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
-        METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
-        METRICS_SYSTEM_VIEW_CAPABILITY,
+        AddressInfo, ClipboardEvent, ClipboardHistoryMode, DiskMetrics, GpuMemoryKind, GpuMetrics,
+        HardwareMetrics, Hlc, LoadAverage, PeerInfo, ReceiveMode, TransferItem, TransferOffer,
+        TransferStatus, WireMessage, CLIPBOARD_VIEW_CAPABILITY, MAX_MOBILE_SESSIONS,
+        MAX_TRANSFER_RECORDS, METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY,
+        METRICS_SYSTEM_CAPABILITY, METRICS_SYSTEM_VIEW_CAPABILITY,
     };
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
@@ -4023,6 +4033,7 @@ mod tests {
                 memory_kind: GpuMemoryKind::Dedicated,
                 unavailable_reason: None,
             }],
+            ..Default::default()
         });
         let message = rx.try_recv().expect("capable peer receives metrics");
         match message {
@@ -4053,8 +4064,18 @@ mod tests {
             node_id: runtime.node_id(),
             sampled_at_ms: 1,
             cpu_usage_percent: Some(12.0),
+            cpu_model: Some("CPU".to_string()),
             memory_used_bytes: Some(10),
             memory_total_bytes: Some(20),
+            memory_available_bytes: Some(10),
+            swap_used_bytes: Some(1),
+            swap_total_bytes: Some(2),
+            load_average: Some(LoadAverage {
+                one: 1.0,
+                five: 0.8,
+                fifteen: 0.6,
+            }),
+            uptime_seconds: Some(100),
             network_down_bytes_per_sec: Some(30),
             network_up_bytes_per_sec: Some(40),
             gpus: vec![GpuMetrics {
@@ -4065,12 +4086,27 @@ mod tests {
                 memory_kind: GpuMemoryKind::Dedicated,
                 unavailable_reason: None,
             }],
+            disks: vec![DiskMetrics {
+                name: "System".to_string(),
+                mount_point: "/".to_string(),
+                file_system: "ext4".to_string(),
+                total_bytes: 100,
+                available_bytes: 40,
+                removable: false,
+            }],
+            ..Default::default()
         });
         let message = rx.try_recv().expect("network peer receives metrics");
         match message {
             WireMessage::MetricsUpdate { metrics } => {
                 assert_eq!(metrics.cpu_usage_percent, None);
+                assert_eq!(metrics.cpu_model, None);
                 assert_eq!(metrics.memory_used_bytes, None);
+                assert_eq!(metrics.memory_available_bytes, None);
+                assert_eq!(metrics.swap_total_bytes, None);
+                assert_eq!(metrics.load_average, None);
+                assert_eq!(metrics.uptime_seconds, None);
+                assert!(metrics.disks.is_empty());
                 assert_eq!(metrics.network_down_bytes_per_sec, Some(30));
                 assert_eq!(metrics.network_up_bytes_per_sec, Some(40));
                 assert!(metrics.gpus.is_empty());
@@ -4111,6 +4147,7 @@ mod tests {
                 memory_kind: GpuMemoryKind::Dedicated,
                 unavailable_reason: None,
             }],
+            ..Default::default()
         });
         match rx.try_recv().expect("Android view peer receives metrics") {
             WireMessage::MetricsUpdate { metrics } => {
@@ -4262,6 +4299,7 @@ mod tests {
             network_down_bytes_per_sec: None,
             network_up_bytes_per_sec: None,
             gpus: Vec::new(),
+            ..Default::default()
         });
         peer.metrics_received_at_ms = Some(crate::clock::now_millis() - 6_000);
         runtime.set_peer(peer);

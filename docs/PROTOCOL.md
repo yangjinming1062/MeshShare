@@ -82,13 +82,15 @@
 
 ## 硬件指标
 
-`HardwareMetrics` 只包含当前快照：`node_id`、`sampled_at_ms`、系统 CPU 使用率、内存已用/总量、网络下行/上行字节速率和逐 GPU 的利用率、显存已用/总量。显存只统计独立显存，共享显存与统一内存不折算进去，没有独立显存的核显因此字段为空：Windows 读取 GPU 性能计数器的独立占用并用注册表记录的独立容量，Linux 逐卡读取 sysfs 的 VRAM，并通过 PCI 设备信息填充人类可读型号；PCI 数据库把多个 AMD Navi 31 变体合并命名时，在显存容量能唯一对应型号的情况下进一步细化名称，缺少 `lspci` 时回退到驱动名；macOS 读取 `spdisplays_vram`。Windows 的性能计数器只有适配器 LUID 维度、没有每卡容量，因此聚合成一条记录；Linux 与 macOS 按卡分别上报。`memory_kind` 只是平台内存类型提示；平台没有对应能力时字段为空并附带 `unavailable_reason`。Android 节点只填充网络上下行速率，CPU、内存和 GPU 字段为空。
+`HardwareMetrics` 只包含当前快照：`node_id`、`sampled_at_ms`、CPU 使用率与型号、逻辑/物理核心数、频率、内存已用/可用/总量、交换分区、系统负载、运行时间、网络下行/上行字节速率、磁盘分区容量和可用空间，以及逐 GPU 的利用率、显存已用/总量和显存类型。磁盘条目包含名称、挂载点、文件系统和可移动标记；Linux 的网络文件系统和临时文件系统是否出现由 `sysinfo` 平台实现决定。新增字段都带默认值，旧节点发送的缺失字段按空值或空列表处理，旧节点收到新增字段时忽略未知字段，因此协议版本保持不变。
+
+显存只统计独立显存，共享显存与统一内存不折算进去，没有独立显存的核显因此字段为空：Windows 读取 GPU 性能计数器的独立占用并用注册表记录的独立容量，Linux 逐卡读取 sysfs 的 VRAM，并通过 PCI 设备信息填充人类可读型号；PCI 数据库把多个 AMD Navi 31 变体合并命名时，在显存容量能唯一对应型号的情况下进一步细化名称，缺少 `lspci` 时回退到驱动名；macOS 读取 `spdisplays_vram`。Windows 的性能计数器只有适配器 LUID 维度、没有每卡容量，因此聚合成一条记录；Linux 与 macOS 按卡分别上报。`memory_kind` 只是平台内存类型提示；平台没有对应能力时字段为空并附带 `unavailable_reason`。Windows 不提供系统负载均值时该字段为空。Android 节点只填充网络上下行速率，新增系统和磁盘字段为空。
 
 `PeerInfo.metrics_received_at_ms` 是本地收到远端快照的时间。`metrics_stale` 由服务端按 5 秒阈值计算，供 UI 区分尚未采集和已过期状态。
 
-节点通过 `Hello` 中的 `payload.node.capabilities` 声明本机指标和查看对端指标的能力：`metrics.system`、`metrics.network`、`metrics.gpu` 表示可提供对应本机字段，`metrics.view.system`、`metrics.view.gpu` 表示希望接收对应对端字段。发送端仅向声明 `metrics.system` 或 `metrics.network`，或声明相应 `metrics.view.*` 的在线对端发送 `MetricsUpdate`；对端未声明系统指标能力时，CPU 和内存字段为空；未声明 GPU 指标能力时，GPU 列表为空；未声明 `metrics.network` 时，上下行速率为空。接收端校验快照中的 `node_id` 与当前 WebSocket 对端一致，然后更新本地 `PeerInfo.metrics` 并通知本地界面。Android 只发布网络字段，但通过 `metrics.view.system` 和 `metrics.view.gpu` 接收桌面完整快照。
+节点通过 `Hello` 中的 `payload.node.capabilities` 声明本机指标和查看对端指标的能力：`metrics.system`、`metrics.network`、`metrics.gpu` 表示可提供对应本机字段，`metrics.view.system`、`metrics.view.gpu` 表示希望接收对应对端字段。发送端仅向声明 `metrics.system` 或 `metrics.network`，或声明相应 `metrics.view.*` 的在线对端发送 `MetricsUpdate`；对端未声明系统指标能力时，CPU、内存、交换分区、负载、运行时间和磁盘字段为空；未声明 GPU 指标能力时，GPU 列表为空；未声明 `metrics.network` 时，上下行速率为空。接收端校验快照中的 `node_id` 与当前 WebSocket 对端一致，然后更新本地 `PeerInfo.metrics` 并通知本地界面。Android 只发布网络字段，但通过 `metrics.view.system` 和 `metrics.view.gpu` 接收桌面完整快照。
 
-节点以约一秒的周期生成硬件快照；GPU 采集需要调用系统性能计数器，实际间隔可能略长。
+节点以约一秒的周期生成硬件快照；磁盘容量每个采样周期刷新，磁盘列表约每十秒刷新一次；GPU 采集需要调用系统性能计数器，实际间隔可能略长。
 
 剪贴板文字和 PNG 图片单项均不超过 16 MiB，图片解码还限制为不超过 8192×8192 像素和 128 MiB 解码分配；历史默认最多保留 50 条或 30 天，桌面端可分别配置到 1–500 条或 1–365 天，当前版本不设置额外总容量上限。事件 ID、来源节点 ID 和来源名称也有长度上限，接收端会在写入当前快照、历史索引或去重表前校验这些边界。
 

@@ -41,14 +41,14 @@ sequenceDiagram
   participant A as 节点 A
   participant B as 支持 metrics 的节点 B
   participant U as 本机 UI/悬浮条
-  C->>A: 每秒采集 CPU、内存、GPU、显存、网络快照
+  C->>A: 每秒采集 CPU、内存、交换分区、磁盘、GPU、显存、网络快照
   A->>U: 本机 MetricsUpdate
   A->>B: 能力过滤后的 MetricsUpdate
   B->>B: 校验来源节点并更新 PeerInfo.metrics
   B-->>U: 仅在本地事件流显示远端指标
 ```
 
-指标只保留最新快照。远端超过 5 秒没有更新时标记为过期；GPU/显存读取失败不会影响 CPU、内存和网络指标。
+指标只保留最新快照。远端超过 5 秒没有更新时标记为过期；GPU/显存或平台不支持的扩展系统指标读取失败不会影响 CPU、内存和网络指标。
 
 ## 剪贴板同步
 

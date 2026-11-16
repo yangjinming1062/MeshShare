@@ -73,15 +73,40 @@ export type GpuMetrics = {
   unavailable_reason?: string;
 };
 
+export type LoadAverage = {
+  one: number;
+  five: number;
+  fifteen: number;
+};
+
+export type DiskMetrics = {
+  name: string;
+  mount_point: string;
+  file_system: string;
+  total_bytes: number;
+  available_bytes: number;
+  removable: boolean;
+};
+
 export type HardwareMetrics = {
   node_id: string;
   sampled_at_ms: number;
   cpu_usage_percent?: number;
+  cpu_model?: string;
+  cpu_logical_cores?: number;
+  cpu_physical_cores?: number;
+  cpu_frequency_mhz?: number;
   memory_used_bytes?: number;
   memory_total_bytes?: number;
+  memory_available_bytes?: number;
+  swap_used_bytes?: number;
+  swap_total_bytes?: number;
+  load_average?: LoadAverage;
+  uptime_seconds?: number;
   network_down_bytes_per_sec?: number;
   network_up_bytes_per_sec?: number;
   gpus: GpuMetrics[];
+  disks?: DiskMetrics[];
 };
 
 export type ClipboardSnapshot = {

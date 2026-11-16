@@ -43,6 +43,11 @@ const MAX_WIRE_ERROR_LENGTH: usize = 4_096;
 const MAX_METRIC_GPU_COUNT: usize = 64;
 const MAX_METRIC_GPU_NAME_LENGTH: usize = 256;
 const MAX_METRIC_REASON_LENGTH: usize = 512;
+const MAX_METRIC_CPU_MODEL_LENGTH: usize = 256;
+const MAX_METRIC_DISK_COUNT: usize = 128;
+const MAX_METRIC_DISK_NAME_LENGTH: usize = 256;
+const MAX_METRIC_DISK_PATH_LENGTH: usize = 1_024;
+const MAX_METRIC_FILESYSTEM_LENGTH: usize = 128;
 const MAX_MEDIA_TYPE_LENGTH: usize = 256;
 const MIN_FREE_DISK_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -1640,6 +1645,31 @@ fn validate_transfer_progress_payload(progress: &TransferProgress) -> bool {
 fn validate_metrics(metrics: &HardwareMetrics) -> bool {
     !metrics.node_id.trim().is_empty()
         && metrics.node_id.len() <= 256
+        && metrics.cpu_model.as_ref().is_none_or(|value| {
+            !value.trim().is_empty() && value.len() <= MAX_METRIC_CPU_MODEL_LENGTH
+        })
+        && metrics
+            .cpu_logical_cores
+            .is_none_or(|value| (1..=4096).contains(&value))
+        && metrics
+            .cpu_physical_cores
+            .is_none_or(|value| (1..=4096).contains(&value))
+        && metrics
+            .cpu_frequency_mhz
+            .is_none_or(|value| (1..=100_000).contains(&value))
+        && metrics.memory_available_bytes.is_none_or(|value| {
+            metrics
+                .memory_total_bytes
+                .is_none_or(|total| value <= total)
+        })
+        && metrics
+            .swap_used_bytes
+            .is_none_or(|value| metrics.swap_total_bytes.is_none_or(|total| value <= total))
+        && metrics.load_average.as_ref().is_none_or(|value| {
+            [value.one, value.five, value.fifteen]
+                .iter()
+                .all(|item| item.is_finite() && *item >= 0.0)
+        })
         && metrics.gpus.len() <= MAX_METRIC_GPU_COUNT
         && metrics.gpus.iter().all(|gpu| {
             !gpu.name.trim().is_empty()
@@ -1651,6 +1681,14 @@ fn validate_metrics(metrics: &HardwareMetrics) -> bool {
                 && gpu
                     .utilization_percent
                     .is_none_or(|value| value.is_finite() && (0.0..=100.0).contains(&value))
+        })
+        && metrics.disks.len() <= MAX_METRIC_DISK_COUNT
+        && metrics.disks.iter().all(|disk| {
+            !disk.name.trim().is_empty()
+                && disk.name.len() <= MAX_METRIC_DISK_NAME_LENGTH
+                && disk.mount_point.len() <= MAX_METRIC_DISK_PATH_LENGTH
+                && disk.file_system.len() <= MAX_METRIC_FILESYSTEM_LENGTH
+                && disk.available_bytes <= disk.total_bytes
         })
 }
 
@@ -3230,13 +3268,13 @@ fn content_disposition_filename(raw: &str) -> (String, String) {
 mod tests {
     use super::{
         content_disposition_filename, encode_path_segment, handle_wire_message,
-        handle_wire_message_with_endpoint, has_parent_component, is_allowed_origin, validate_offer,
-        MobileSessionRequest, PEER_HANDSHAKE_TIMEOUT,
+        handle_wire_message_with_endpoint, has_parent_component, is_allowed_origin,
+        validate_metrics, validate_offer, MobileSessionRequest, PEER_HANDSHAKE_TIMEOUT,
     };
     use crate::model::{
-        ClipboardEvent, ClipboardSnapshot, HardwareMetrics, Hlc, NodeInfo, PeerInfo, TransferItem,
-        TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_TEXT_LIMIT,
-        METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
+        ClipboardEvent, ClipboardSnapshot, DiskMetrics, HardwareMetrics, Hlc, NodeInfo, PeerInfo,
+        TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
+        CLIPBOARD_TEXT_LIMIT, METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
     };
     use crate::runtime::{NodeProfile, NodeRuntime};
     use axum::http::{HeaderValue, Request};
@@ -3755,6 +3793,7 @@ mod tests {
                 memory_kind: crate::model::GpuMemoryKind::Unknown,
                 unavailable_reason: None,
             }],
+            ..Default::default()
         };
         handle_wire_message(
             WireMessage::MetricsUpdate { metrics },
@@ -3764,6 +3803,26 @@ mod tests {
         .await;
         assert!(runtime.peers_snapshot()[0].metrics.is_none());
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn invalid_extended_metrics_values_are_rejected() {
+        let metrics = HardwareMetrics {
+            node_id: "peer".to_string(),
+            sampled_at_ms: 1,
+            memory_total_bytes: Some(10),
+            memory_available_bytes: Some(11),
+            disks: vec![DiskMetrics {
+                name: "System".to_string(),
+                mount_point: "/".to_string(),
+                file_system: "ext4".to_string(),
+                total_bytes: 100,
+                available_bytes: 101,
+                removable: false,
+            }],
+            ..Default::default()
+        };
+        assert!(!validate_metrics(&metrics));
     }
 
     #[tokio::test]
@@ -4743,6 +4802,7 @@ mod tests {
             network_down_bytes_per_sec: None,
             network_up_bytes_per_sec: None,
             gpus: Vec::new(),
+            ..Default::default()
         };
         let result = handle_wire_message(
             WireMessage::MetricsUpdate { metrics },
@@ -4970,6 +5030,7 @@ mod tests {
                         network_down_bytes_per_sec: None,
                         network_up_bytes_per_sec: None,
                         gpus: Vec::new(),
+                        ..Default::default()
                     },
                 })
                 .expect("metrics update"),

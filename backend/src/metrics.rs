@@ -1,5 +1,5 @@
 use crate::clock::now_millis;
-use crate::model::{GpuMemoryKind, GpuMetrics, HardwareMetrics};
+use crate::model::{DiskMetrics, GpuMemoryKind, GpuMetrics, HardwareMetrics, LoadAverage};
 use crate::runtime::NodeRuntime;
 #[cfg(target_os = "linux")]
 use std::path::Path;
@@ -7,9 +7,10 @@ use std::process::Command;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use sysinfo::{CpuRefreshKind, MemoryRefreshKind, Networks, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+const DISK_LIST_REFRESH_INTERVAL: u32 = 10;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -31,8 +32,8 @@ pub fn start(runtime: Arc<NodeRuntime>) {
     thread::Builder::new()
         .name("meshshare-metrics".to_string())
         .spawn(move || {
-            let mut collector = Collector::new(&runtime.node_id());
             let network_only = runtime.is_android_profile();
+            let mut collector = Collector::new(&runtime.node_id(), network_only);
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 let started = Instant::now();
                 let snapshot = collector.sample(network_only);
@@ -51,13 +52,15 @@ struct Collector {
     node_id: String,
     system: System,
     networks: Networks,
+    disks: Disks,
+    disk_samples_since_refresh: u32,
     previous_network: Option<(Instant, u64, u64)>,
     cpu_ready: bool,
     gpus: GpuProbe,
 }
 
 impl Collector {
-    fn new(node_id: &str) -> Self {
+    fn new(node_id: &str, network_only: bool) -> Self {
         let system = System::new_with_specifics(
             RefreshKind::new()
                 .with_cpu(CpuRefreshKind::everything())
@@ -67,6 +70,12 @@ impl Collector {
             node_id: node_id.to_string(),
             system,
             networks: Networks::new_with_refreshed_list(),
+            disks: if network_only {
+                Disks::new()
+            } else {
+                Disks::new_with_refreshed_list()
+            },
+            disk_samples_since_refresh: 0,
             previous_network: None,
             cpu_ready: false,
             gpus: GpuProbe::new(),
@@ -112,18 +121,139 @@ impl Collector {
                 self.gpus.sample(),
             )
         };
+        let (
+            cpu_model,
+            cpu_logical_cores,
+            cpu_physical_cores,
+            cpu_frequency_mhz,
+            memory_available_bytes,
+            swap_used_bytes,
+            swap_total_bytes,
+            load_average,
+            uptime_seconds,
+            disks,
+        ) = if network_only {
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+            )
+        } else {
+            self.refresh_disks();
+            (
+                cpu_model(&self.system),
+                u32::try_from(self.system.cpus().len()).ok(),
+                self.system
+                    .physical_core_count()
+                    .and_then(|value| u32::try_from(value).ok()),
+                self.system
+                    .cpus()
+                    .iter()
+                    .map(|cpu| cpu.frequency())
+                    .max()
+                    .filter(|value| *value > 0),
+                Some(self.system.available_memory()),
+                Some(self.system.used_swap()),
+                Some(self.system.total_swap()),
+                system_load_average(),
+                Some(System::uptime()),
+                collect_disks(&self.disks),
+            )
+        };
 
         HardwareMetrics {
             node_id: self.node_id.clone(),
             sampled_at_ms: now_millis(),
             cpu_usage_percent,
+            cpu_model,
+            cpu_logical_cores,
+            cpu_physical_cores,
+            cpu_frequency_mhz,
             memory_used_bytes,
             memory_total_bytes,
+            memory_available_bytes,
+            swap_used_bytes,
+            swap_total_bytes,
+            load_average,
+            uptime_seconds,
             network_down_bytes_per_sec: network_down,
             network_up_bytes_per_sec: network_up,
             gpus,
+            disks,
         }
     }
+
+    fn refresh_disks(&mut self) {
+        if self.disk_samples_since_refresh == 0 {
+            self.disks.refresh_list();
+        } else {
+            self.disks.refresh();
+        }
+        self.disk_samples_since_refresh =
+            (self.disk_samples_since_refresh + 1) % DISK_LIST_REFRESH_INTERVAL;
+    }
+}
+
+fn cpu_model(system: &System) -> Option<String> {
+    system.cpus().iter().find_map(|cpu| {
+        let value = if cpu.brand().trim().is_empty() {
+            cpu.name().trim()
+        } else {
+            cpu.brand().trim()
+        };
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn system_load_average() -> Option<LoadAverage> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn system_load_average() -> Option<LoadAverage> {
+    let value = System::load_average();
+    [value.one, value.five, value.fifteen]
+        .iter()
+        .all(|item| item.is_finite() && *item >= 0.0)
+        .then_some(LoadAverage {
+            one: value.one,
+            five: value.five,
+            fifteen: value.fifteen,
+        })
+}
+
+fn collect_disks(disks: &Disks) -> Vec<DiskMetrics> {
+    disks
+        .iter()
+        .filter_map(|disk| {
+            let total_bytes = disk.total_space();
+            if total_bytes == 0 {
+                return None;
+            }
+            let mount_point = disk.mount_point().to_string_lossy().trim().to_string();
+            let name = disk.name().to_string_lossy().trim().to_string();
+            Some(DiskMetrics {
+                name: if name.is_empty() {
+                    mount_point.clone()
+                } else {
+                    name
+                },
+                mount_point,
+                file_system: disk.file_system().to_string_lossy().trim().to_string(),
+                total_bytes,
+                available_bytes: disk.available_space().min(total_bytes),
+                removable: disk.is_removable(),
+            })
+        })
+        .collect()
 }
 
 fn rate(previous: u64, current: u64, elapsed_seconds: f64) -> Option<u64> {
@@ -698,6 +828,19 @@ mod tests {
     fn network_totals_are_empty_for_new_collection() {
         let networks = Networks::new();
         assert_eq!(network_totals(&networks), (0, 0));
+    }
+
+    #[test]
+    fn network_only_collection_does_not_publish_system_metrics() {
+        let mut collector = super::Collector::new("android", true);
+        let metrics = collector.sample(true);
+        assert_eq!(metrics.cpu_model, None);
+        assert_eq!(metrics.memory_available_bytes, None);
+        assert_eq!(metrics.swap_total_bytes, None);
+        assert_eq!(metrics.load_average, None);
+        assert_eq!(metrics.uptime_seconds, None);
+        assert!(metrics.disks.is_empty());
+        assert!(metrics.gpus.is_empty());
     }
 
     #[cfg(target_os = "windows")]

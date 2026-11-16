@@ -99,15 +99,52 @@ pub struct GpuMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoadAverage {
+    pub one: f64,
+    pub five: f64,
+    pub fifteen: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskMetrics {
+    pub name: String,
+    pub mount_point: String,
+    pub file_system: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    pub removable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct HardwareMetrics {
     pub node_id: String,
     pub sampled_at_ms: i64,
     pub cpu_usage_percent: Option<f32>,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub cpu_logical_cores: Option<u32>,
+    #[serde(default)]
+    pub cpu_physical_cores: Option<u32>,
+    #[serde(default)]
+    pub cpu_frequency_mhz: Option<u64>,
     pub memory_used_bytes: Option<u64>,
     pub memory_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_available_bytes: Option<u64>,
+    #[serde(default)]
+    pub swap_used_bytes: Option<u64>,
+    #[serde(default)]
+    pub swap_total_bytes: Option<u64>,
+    #[serde(default)]
+    pub load_average: Option<LoadAverage>,
+    #[serde(default)]
+    pub uptime_seconds: Option<u64>,
     pub network_down_bytes_per_sec: Option<u64>,
     pub network_up_bytes_per_sec: Option<u64>,
     pub gpus: Vec<GpuMetrics>,
+    #[serde(default)]
+    pub disks: Vec<DiskMetrics>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -362,8 +399,8 @@ pub enum WireMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuMemoryKind, GpuMetrics, HardwareMetrics, TransferItem, TransferOffer, TransferProgress,
-        TransferStatus, WireMessage,
+        DiskMetrics, GpuMemoryKind, GpuMetrics, HardwareMetrics, LoadAverage, TransferItem,
+        TransferOffer, TransferProgress, TransferStatus, WireMessage,
     };
     use serde_json::Value;
 
@@ -374,8 +411,21 @@ mod tests {
                 node_id: "node-a".to_string(),
                 sampled_at_ms: 42,
                 cpu_usage_percent: Some(12.5),
+                cpu_model: Some("Example CPU".to_string()),
+                cpu_logical_cores: Some(16),
+                cpu_physical_cores: Some(8),
+                cpu_frequency_mhz: Some(4_200),
                 memory_used_bytes: Some(10),
                 memory_total_bytes: Some(20),
+                memory_available_bytes: Some(10),
+                swap_used_bytes: Some(2),
+                swap_total_bytes: Some(8),
+                load_average: Some(LoadAverage {
+                    one: 0.5,
+                    five: 0.4,
+                    fifteen: 0.3,
+                }),
+                uptime_seconds: Some(123),
                 network_down_bytes_per_sec: Some(30),
                 network_up_bytes_per_sec: Some(40),
                 gpus: vec![GpuMetrics {
@@ -385,6 +435,14 @@ mod tests {
                     memory_total_bytes: None,
                     memory_kind: GpuMemoryKind::Unknown,
                     unavailable_reason: Some("unavailable".to_string()),
+                }],
+                disks: vec![DiskMetrics {
+                    name: "System".to_string(),
+                    mount_point: "/".to_string(),
+                    file_system: "ext4".to_string(),
+                    total_bytes: 100,
+                    available_bytes: 40,
+                    removable: false,
                 }],
             },
         };
@@ -397,6 +455,34 @@ mod tests {
                     metrics.gpus[0].unavailable_reason.as_deref(),
                     Some("unavailable")
                 );
+            }
+            _ => panic!("unexpected wire message"),
+        }
+    }
+
+    #[test]
+    fn legacy_metrics_payload_defaults_new_fields() {
+        let value = serde_json::json!({
+            "type": "MetricsUpdate",
+            "payload": {
+                "metrics": {
+                    "node_id": "old-node",
+                    "sampled_at_ms": 1,
+                    "cpu_usage_percent": 10.0,
+                    "memory_used_bytes": 1,
+                    "memory_total_bytes": 2,
+                    "network_down_bytes_per_sec": 3,
+                    "network_up_bytes_per_sec": 4,
+                    "gpus": []
+                }
+            }
+        });
+        let decoded: WireMessage = serde_json::from_value(value).expect("decode legacy metrics");
+        match decoded {
+            WireMessage::MetricsUpdate { metrics } => {
+                assert_eq!(metrics.cpu_model, None);
+                assert_eq!(metrics.swap_total_bytes, None);
+                assert!(metrics.disks.is_empty());
             }
             _ => panic!("unexpected wire message"),
         }
@@ -459,6 +545,7 @@ mod tests {
                         network_down_bytes_per_sec: None,
                         network_up_bytes_per_sec: None,
                         gpus: Vec::new(),
+                        ..Default::default()
                     },
                 })
                 .expect("serialize metrics"),

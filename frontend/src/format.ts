@@ -1,4 +1,4 @@
-import type { ClipboardHistoryItem, ClipboardHistorySettings, HardwareMetrics, PeerInfo, TransferPrepare, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
+import type { ClipboardHistoryItem, ClipboardHistorySettings, DiskMetrics, HardwareMetrics, LoadAverage, PeerInfo, TransferPrepare, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
 
 export const METRICS_STALE_AFTER_MS = 5_000;
 
@@ -29,6 +29,43 @@ export function formatPercent(value: number | null | undefined): string {
 
 export function formatMemory(value: number | null | undefined): string {
   return value == null ? '—' : formatSize(value);
+}
+
+export function formatFrequency(value: number | null | undefined): string {
+  if (value == null) return '—';
+  if (value >= 1000) return (value / 1000).toFixed(2) + ' GHz';
+  return Math.round(value) + ' MHz';
+}
+
+export function formatDuration(value: number | null | undefined): string {
+  if (value == null) return '—';
+  let remaining = Math.max(0, Math.floor(value));
+  const days = Math.floor(remaining / 86_400);
+  remaining %= 86_400;
+  const hours = Math.floor(remaining / 3_600);
+  remaining %= 3_600;
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+  const parts: string[] = [];
+  if (days) parts.push(days + ' 天');
+  if (hours || days) parts.push(hours + ' 小时');
+  if (minutes || hours || days) parts.push(minutes + ' 分钟');
+  if (!parts.length || seconds) parts.push(seconds + ' 秒');
+  return parts.join(' ');
+}
+
+export function formatLoadAverage(value: LoadAverage | null | undefined): string {
+  if (!value) return '—';
+  return [value.one, value.five, value.fifteen].map((item) => Number.isFinite(item) ? item.toFixed(2) : '—').join(' / ');
+}
+
+export function diskUsedBytes(value: DiskMetrics): number {
+  return Math.max(0, value.total_bytes - Math.min(value.total_bytes, value.available_bytes));
+}
+
+export function diskUsedPercent(value: DiskMetrics | null | undefined): number | undefined {
+  if (!value || value.total_bytes <= 0) return undefined;
+  return diskUsedBytes(value) / value.total_bytes * 100;
 }
 
 export function memoryPercent(value: HardwareMetrics | null | undefined): number | undefined {
