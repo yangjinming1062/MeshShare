@@ -128,6 +128,23 @@ def install_android_updater(root: Path, manifest: Path) -> None:
     )
 
 
+def install_android_network(root: Path, manifest: Path) -> None:
+    """Install the native LAN/VPN network adapter used by the Android node."""
+
+    source = root / "backend" / "android" / "NetworkPlugin.kt"
+    target = (
+        manifest.parent
+        / "java"
+        / "com"
+        / "meshshare"
+        / "android"
+        / "network"
+        / "NetworkPlugin.kt"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
     android = root / "backend" / "gen" / "android"
@@ -157,6 +174,7 @@ def main() -> None:
     gradle_text = re.sub(r"        targetSdk = \d+", "        targetSdk = 35", gradle_text, count=1)
     gradle.write_text(gradle_text, encoding="utf-8")
     configure_signing(gradle)
+    install_android_network(root, manifest)
     install_android_icons(root, android)
     install_android_updater(root, manifest)
 

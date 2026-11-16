@@ -1,3 +1,5 @@
+#[cfg(target_os = "android")]
+mod android_network;
 #[cfg(any(target_os = "android", test))]
 mod android_update;
 mod autostart;
@@ -1071,6 +1073,7 @@ pub fn run() {
 #[tauri::mobile_entry_point]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(android_network::plugin())
         .plugin(tauri_plugin_dialog::init())
         .plugin(android_update::app::plugin())
         .setup(|app| {

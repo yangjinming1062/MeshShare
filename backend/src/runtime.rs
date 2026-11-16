@@ -3138,6 +3138,9 @@ fn interface_rank(name: &str) -> u8 {
         "tun",
         "tap",
         "wg",
+        "wireguard",
+        "vpn",
+        "ipsec",
         "tailscale",
         "zt",
         "dummy",
@@ -3488,6 +3491,9 @@ mod tests {
         assert_eq!(interface_rank("vEthernet (WSL)"), 2);
         assert_eq!(interface_rank("docker0"), 2);
         assert_eq!(interface_rank("utun4"), 2);
+        assert_eq!(interface_rank("vpn0"), 2);
+        assert_eq!(interface_rank("ipsec0"), 2);
+        assert_eq!(interface_rank("wireguard0"), 2);
         assert_eq!(interface_rank("unknown0"), 1);
     }
 

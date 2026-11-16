@@ -15,70 +15,94 @@ const SERVICE_TYPE: &str = "_meshshare._tcp.local.";
 
 pub fn start(runtime: Arc<NodeRuntime>) {
     let handle = tokio::runtime::Handle::current();
-    let node = runtime.node_info();
     thread::Builder::new()
         .name("meshshare-mdns".to_string())
         .spawn(move || {
-            let Ok(daemon) = ServiceDaemon::new() else {
-                return;
-            };
-            let mut registered_address = register_service(&daemon, &node);
-            let Ok(receiver) = daemon.browse(SERVICE_TYPE) else {
-                return;
-            };
+            let mut observed_addresses = crate::runtime::bind_addresses();
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                let event = receiver.recv_timeout(Duration::from_secs(1));
-                let current_node = runtime.node_info();
-                let current_address = service_address(&current_node);
-                if current_address != registered_address {
-                    if registered_address.is_some() {
-                        let fullname = format!("{}{}", current_node.node_id, SERVICE_TYPE);
-                        let _ = daemon.unregister(&fullname);
+                let Ok(daemon) = ServiceDaemon::new() else {
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                };
+                let node = runtime.node_info();
+                let mut registered_address = register_service(&daemon, &node);
+                let Ok(receiver) = daemon.browse(SERVICE_TYPE) else {
+                    if let Ok(status) = daemon.shutdown() {
+                        let _ = status.recv_timeout(Duration::from_secs(1));
                     }
-                    registered_address = register_service(&daemon, &current_node);
-                }
-                if let Ok(ServiceEvent::ServiceResolved(info)) = event {
-                    let properties = info.get_properties();
-                    let Some(node_id) = properties.iter().find_map(|item| {
-                        (item.key() == "node_id").then(|| item.val_str().to_string())
-                    }) else {
-                        continue;
-                    };
-                    let protocol = properties
-                        .iter()
-                        .find_map(|item| (item.key() == "protocol").then(|| item.val_str()))
-                        .and_then(|value| value.parse::<u32>().ok());
-                    if protocol != Some(PROTOCOL_VERSION) {
-                        continue;
+                    thread::sleep(Duration::from_secs(1));
+                    continue;
+                };
+                let mut restart = false;
+                while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                    // mdns-sd owns one socket per interface. Recreate the daemon
+                    // after a VPN/Wi-Fi change so its existing physical socket is
+                    // not left on the old process network.
+                    let current_addresses = crate::runtime::bind_addresses();
+                    if current_addresses != observed_addresses {
+                        restart = true;
+                        break;
                     }
-                    // mDNS visibility can be asymmetric across Wi-Fi, VPN and guest networks.
-                    // Let either side dial; add_peer_channel rejects the duplicate session so
-                    // simultaneous discovery still settles on one stable WebSocket channel.
-                    if node_id == node.node_id {
-                        continue;
+                    let event = receiver.recv_timeout(Duration::from_secs(1));
+                    let current_node = runtime.node_info();
+                    let current_address = service_address(&current_node);
+                    if current_address != registered_address {
+                        if registered_address.is_some() {
+                            let fullname = format!("{}{}", current_node.node_id, SERVICE_TYPE);
+                            let _ = daemon.unregister(&fullname);
+                        }
+                        registered_address = register_service(&daemon, &current_node);
                     }
-                    let Some(address) = info.get_addresses().iter().find_map(|address| {
-                        let IpAddr::V4(address) = address else {
-                            return None;
+                    if let Ok(ServiceEvent::ServiceResolved(info)) = event {
+                        let properties = info.get_properties();
+                        let Some(node_id) = properties.iter().find_map(|item| {
+                            (item.key() == "node_id").then(|| item.val_str().to_string())
+                        }) else {
+                            continue;
                         };
-                        is_allowed_ipv4(*address).then_some(*address)
-                    }) else {
-                        continue;
-                    };
-                    let endpoint = format!("ws://{}:{}/api/v1/ws", address, info.get_port());
-                    let remote_name = properties
-                        .iter()
-                        .find_map(|item| {
-                            (item.key() == "node_name").then(|| item.val_str().to_string())
-                        })
-                        .unwrap_or_else(|| node_id.clone());
-                    let runtime = runtime.clone();
-                    handle.spawn(async move {
-                        connect_peer(runtime, node_id, remote_name, endpoint).await;
-                    });
+                        let protocol = properties
+                            .iter()
+                            .find_map(|item| (item.key() == "protocol").then(|| item.val_str()))
+                            .and_then(|value| value.parse::<u32>().ok());
+                        if protocol != Some(PROTOCOL_VERSION) {
+                            continue;
+                        }
+                        // mDNS visibility can be asymmetric across Wi-Fi, VPN and guest networks.
+                        // Let either side dial; add_peer_channel rejects the duplicate session so
+                        // simultaneous discovery still settles on one stable WebSocket channel.
+                        if node_id == node.node_id {
+                            continue;
+                        }
+                        let Some(address) = info.get_addresses().iter().find_map(|address| {
+                            let IpAddr::V4(address) = address else {
+                                return None;
+                            };
+                            is_allowed_ipv4(*address).then_some(*address)
+                        }) else {
+                            continue;
+                        };
+                        let endpoint = format!("ws://{}:{}/api/v1/ws", address, info.get_port());
+                        let remote_name = properties
+                            .iter()
+                            .find_map(|item| {
+                                (item.key() == "node_name").then(|| item.val_str().to_string())
+                            })
+                            .unwrap_or_else(|| node_id.clone());
+                        let runtime = runtime.clone();
+                        handle.spawn(async move {
+                            connect_peer(runtime, node_id, remote_name, endpoint).await;
+                        });
+                    }
                 }
+                if let Ok(status) = daemon.shutdown() {
+                    let _ = status.recv_timeout(Duration::from_secs(1));
+                }
+                if !restart {
+                    break;
+                }
+                observed_addresses = crate::runtime::bind_addresses();
+                thread::sleep(Duration::from_millis(100));
             }
-            let _ = daemon.shutdown();
         })
         .expect("mDNS discovery thread");
 }

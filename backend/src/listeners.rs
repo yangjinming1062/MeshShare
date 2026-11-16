@@ -19,7 +19,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Listener {
     handle: axum_server::Handle<SocketAddr>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Drop for Listener {
@@ -32,6 +32,7 @@ struct Listeners {
     http: BTreeMap<Ipv4Addr, Listener>,
     https: BTreeMap<Ipv4Addr, Listener>,
     failed_binds: BTreeSet<(Ipv4Addr, u16)>,
+    last_candidates: BTreeSet<Ipv4Addr>,
     http_port: u16,
     https_port: u16,
     tls: RustlsConfig,
@@ -108,6 +109,7 @@ impl Listeners {
             http: BTreeMap::from([(local, serve_http(http, app.clone())?)]),
             https: BTreeMap::from([(local, serve_https(https, app.clone(), config.clone())?)]),
             failed_binds: BTreeSet::new(),
+            last_candidates: addresses.clone(),
             http_port,
             https_port,
             tls: config,
@@ -119,8 +121,19 @@ impl Listeners {
     }
 
     async fn reconcile(&mut self, runtime: &runtime::NodeRuntime, candidates: &BTreeSet<Ipv4Addr>) {
-        self.http
-            .retain(|ip, listener| candidates.contains(ip) && !listener.task.is_finished());
+        let network_changed =
+            needs_network_listener_restart(runtime, &self.last_candidates, candidates);
+        if network_changed {
+            self.restart_network_listeners().await;
+        }
+        self.last_candidates = candidates.clone();
+        self.http.retain(|ip, listener| {
+            candidates.contains(ip)
+                && listener
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+        });
         self.failed_binds.retain(|(ip, _)| candidates.contains(ip));
         for &ip in candidates {
             if self.http.contains_key(&ip) {
@@ -136,8 +149,13 @@ impl Listeners {
         }
 
         let active = self.http.keys().copied().collect::<BTreeSet<_>>();
-        self.https
-            .retain(|ip, listener| active.contains(ip) && !listener.task.is_finished());
+        self.https.retain(|ip, listener| {
+            active.contains(ip)
+                && listener
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| !task.is_finished())
+        });
         if !active.is_subset(&self.certificate_addresses) {
             match self.reload_certificate(&active).await {
                 Ok(()) => self.certificate_addresses = active.clone(),
@@ -157,6 +175,38 @@ impl Listeners {
             }
         }
         runtime.set_listening_addresses(&active, self.https.keys().copied(), self.https_port);
+    }
+
+    /// Android's process network binding only affects sockets created after
+    /// the binding changes. Recreate non-loopback listeners when a VPN or LAN
+    /// interface appears/disappears so inbound HTTP/WS traffic follows the
+    /// newly selected physical network.
+    async fn restart_network_listeners(&mut self) {
+        let local = Ipv4Addr::LOCALHOST;
+        let mut stopping = Vec::new();
+        let http = std::mem::take(&mut self.http);
+        for (ip, listener) in http {
+            if ip == local {
+                self.http.insert(ip, listener);
+            } else {
+                stopping.push(listener);
+            }
+        }
+        let https = std::mem::take(&mut self.https);
+        for (ip, listener) in https {
+            if ip == local {
+                self.https.insert(ip, listener);
+            } else {
+                stopping.push(listener);
+            }
+        }
+        self.failed_binds.retain(|(ip, _)| *ip == local);
+        for mut listener in stopping {
+            listener.handle.graceful_shutdown(Some(SHUTDOWN_TIMEOUT));
+            if let Some(task) = listener.task.take() {
+                let _ = task.await;
+            }
+        }
     }
 
     fn track_bind(
@@ -192,6 +242,14 @@ impl Listeners {
     }
 }
 
+fn needs_network_listener_restart(
+    runtime: &runtime::NodeRuntime,
+    previous: &BTreeSet<Ipv4Addr>,
+    current: &BTreeSet<Ipv4Addr>,
+) -> bool {
+    runtime.is_android_profile() && previous != current
+}
+
 fn serve_http(listener: TcpListener, app: Router) -> io::Result<Listener> {
     let address = listener.local_addr()?;
     let server = axum_server::from_tcp(listener.into_std()?)?;
@@ -222,13 +280,17 @@ fn serve(
             eprintln!("监听 {address} 已停止：{error}");
         }
     });
-    Listener { handle, task }
+    Listener {
+        handle,
+        task: Some(task),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::NodeInfo;
+    use crate::runtime::NodeProfile;
 
     #[tokio::test]
     async fn new_interface_is_retried_served_and_removed_without_restarting() {
@@ -307,6 +369,26 @@ mod tests {
             .error_for_status()
             .expect("local node is still serving");
         drop(listeners);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn android_network_changes_request_listener_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "meshshare-listener-network-change-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let runtime = runtime::NodeRuntime::new_with_profile(
+            path.clone(),
+            0,
+            "test".into(),
+            NodeProfile::Android,
+        )
+        .expect("create Android runtime");
+        let local = BTreeSet::from([Ipv4Addr::LOCALHOST]);
+        let wifi = BTreeSet::from([Ipv4Addr::LOCALHOST, Ipv4Addr::new(192, 168, 1, 20)]);
+        assert!(!needs_network_listener_restart(&runtime, &local, &local));
+        assert!(needs_network_listener_restart(&runtime, &local, &wifi));
         let _ = std::fs::remove_dir_all(path);
     }
 }
