@@ -62,6 +62,25 @@ struct TrayHandles {
     sync_toggle: MenuItem<tauri::Wry>,
 }
 
+// Linux 下 show/hide 由 GTK 主循环异步执行，is_visible() 会读到变更前的状态，因此托盘文字以命令意图为准。
+#[cfg(not(target_os = "android"))]
+struct MainWindowVisibility(std::sync::atomic::AtomicBool);
+
+#[cfg(not(target_os = "android"))]
+impl MainWindowVisibility {
+    fn new(visible: bool) -> Self {
+        Self(std::sync::atomic::AtomicBool::new(visible))
+    }
+
+    fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn set(&self, visible: bool) {
+        self.0.store(visible, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -490,16 +509,14 @@ fn tray_sync_enabled(app: &AppHandle) -> bool {
 
 #[cfg(not(target_os = "android"))]
 fn main_window_visible(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
-        .and_then(|window| window.is_visible().ok())
-        .unwrap_or(false)
+    app.try_state::<MainWindowVisibility>()
+        .is_some_and(|state| state.get())
 }
 
 #[cfg(not(target_os = "android"))]
 fn monitor_window_visible(app: &AppHandle) -> bool {
-    app.get_webview_window("monitor")
-        .and_then(|window| window.is_visible().ok())
-        .unwrap_or(false)
+    app.try_state::<ManagedNode>()
+        .is_some_and(|state| state.runtime.monitor_visible())
 }
 
 #[cfg(not(target_os = "android"))]
@@ -523,6 +540,9 @@ pub(crate) fn sync_tray_labels(app: &AppHandle) {
 
 #[cfg(not(target_os = "android"))]
 fn set_main_window_visible(app: &AppHandle, visible: bool) {
+    if let Some(state) = app.try_state::<MainWindowVisibility>() {
+        state.set(visible);
+    }
     if let Some(window) = app.get_webview_window("main") {
         if visible {
             let _ = window.show();
@@ -965,6 +985,11 @@ fn run_desktop() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let autostart_launch = is_autostart_launch();
+            app.manage(MainWindowVisibility::new(
+                app.get_webview_window("main")
+                    .and_then(|window| window.is_visible().ok())
+                    .unwrap_or(false),
+            ));
             let data_dir = app
                 .path()
                 .app_data_dir()
@@ -1135,7 +1160,8 @@ pub fn cleanup_autostart() {
 mod tests {
     use super::{
         clamp_position_to_work_area, clipboard_sync_toggle_label, monitor_capabilities_for_backend,
-        monitor_lock_toggle_label, monitor_toggle_label, window_toggle_label, MonitorBackend,
+        monitor_lock_toggle_label, monitor_toggle_label, window_toggle_label, MainWindowVisibility,
+        MonitorBackend,
     };
     use crate::autostart::launched_from_args;
     use crate::model::MonitorPosition;
@@ -1202,5 +1228,15 @@ mod tests {
         assert_eq!(clipboard_sync_toggle_label(false), "恢复剪贴板同步");
         assert_eq!(monitor_lock_toggle_label(true), "解锁悬浮条");
         assert_eq!(monitor_lock_toggle_label(false), "锁定悬浮条");
+    }
+
+    #[test]
+    fn main_window_visibility_keeps_last_command() {
+        let state = MainWindowVisibility::new(false);
+        assert!(!state.get());
+        state.set(true);
+        assert!(state.get());
+        state.set(false);
+        assert!(!state.get());
     }
 }
