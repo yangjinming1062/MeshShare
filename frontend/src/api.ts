@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, PeerInfo, TransferProgress, TransferStatus } from './types';
+import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferOffer, TransferProgress, TransferStatus } from './types';
 
 let baseUrl = '';
 
@@ -89,4 +89,11 @@ export const createMobileSession = (label?: string, target = baseUrl) => request
 export const getMobileSessions = (target = baseUrl) => requestList<MobileSession>('/api/v1/mobile/sessions', target);
 export const getMobileTransfers = (sessionId?: string, target = baseUrl) => requestList<MobileTransferView>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, target);
 export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, target = baseUrl, options: { autoComplete?: boolean } = {}) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}${options.autoComplete ? '&auto_complete=true' : ''}`, target);
+/** 原生发送：先把清单和源文件交给本机节点，之后的上传由节点负责。 */
+export const createOutgoingStaging = (offer: TransferOffer, target = baseUrl) => request<OutgoingStagingView>('/api/v1/outgoing', { method: 'POST', body: JSON.stringify(offer) }, target);
+/** 桌面端按原路径直传：节点枚举、计算摘要后自己发送清单。 */
+export const createOutgoingPaths = (targetNodeId: string, paths: string[], target = baseUrl) => request<OutgoingPrepareView>('/api/v1/outgoing/paths', { method: 'POST', body: JSON.stringify({ target_node_id: targetNodeId, paths }) }, target);
+export const getOutgoingPrepare = (transferId: string, target = baseUrl) => request<OutgoingPrepareView>(`/api/v1/outgoing/${encodeURIComponent(transferId)}`, {}, target);
+export const startOutgoingStaging = (transferId: string, target = baseUrl) => request<TransferProgress>(`/api/v1/outgoing/${encodeURIComponent(transferId)}/start`, { method: 'POST' }, target);
+export const cancelOutgoingStaging = (transferId: string, target = baseUrl) => request<unknown>(`/api/v1/outgoing/${encodeURIComponent(transferId)}/cancel`, { method: 'POST' }, target);
 export const completeMobileItem = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => request<MobileTransferView>(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/complete`, { method: 'POST', body: JSON.stringify({ session_id: sessionId }) }, target);

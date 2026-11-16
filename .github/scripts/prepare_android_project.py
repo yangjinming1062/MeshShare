@@ -145,6 +145,46 @@ def install_android_network(root: Path, manifest: Path) -> None:
     shutil.copyfile(source, target)
 
 
+def install_android_storage(root: Path, manifest: Path) -> None:
+    """Install the storage plugin that writes received files to public Downloads."""
+
+    source = root / "backend" / "android" / "StoragePlugin.kt"
+    target = (
+        manifest.parent
+        / "java"
+        / "com"
+        / "meshshare"
+        / "android"
+        / "storage"
+        / "StoragePlugin.kt"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+    text = manifest.read_text(encoding="utf-8")
+    if "android.permission.MANAGE_EXTERNAL_STORAGE" not in text:
+        text = text.replace(
+            '    <uses-permission android:name="android.permission.INTERNET" />\n',
+            '    <uses-permission android:name="android.permission.INTERNET" />\n'
+            '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n',
+            1,
+        )
+    if "requestLegacyExternalStorage" not in text:
+        text = text.replace(
+            '        android:label="@string/app_name"\n',
+            '        android:label="@string/app_name"\n'
+            '        android:requestLegacyExternalStorage="true"\n',
+            1,
+        )
+    if "requestLegacyExternalStorage" not in text:
+        text = re.sub(
+            r"(<application\b)",
+            r'\1\n        android:requestLegacyExternalStorage="true"',
+            text,
+            count=1,
+        )
+    manifest.write_text(text, encoding="utf-8")
+
+
 def main() -> None:
     root = Path(__file__).resolve().parents[2]
     android = root / "backend" / "gen" / "android"
@@ -177,6 +217,7 @@ def main() -> None:
     install_android_network(root, manifest)
     install_android_icons(root, android)
     install_android_updater(root, manifest)
+    install_android_storage(root, manifest)
 
     manifest_lines = manifest.read_text(encoding="utf-8").splitlines(keepends=True)
     seen_permissions: set[str] = set()

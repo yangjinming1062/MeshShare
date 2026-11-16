@@ -60,6 +60,7 @@ pub async fn start_with_app(
     )
     .await?;
     listeners.reconcile(&runtime, &addresses).await;
+    runtime.spawn_outgoing_upload_supervisor();
     let owner = runtime.clone();
     tokio::spawn(async move {
         loop {

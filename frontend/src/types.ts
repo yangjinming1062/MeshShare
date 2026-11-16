@@ -235,13 +235,31 @@ export type TransferFailure = {
   retryable: boolean;
 };
 
-/** 发送前的本地准备态：文件摘要未算完，任务还没有在节点上登记。 */
+/** 发送前的本地准备态：先算摘要，再把源文件交给本机节点暂存。 */
 export type TransferPrepare = {
   prepare_id: string;
   target_name: string;
   item_count: number;
   total_bytes: number;
   hashed_bytes: number;
+  phase?: 'hash' | 'stage';
+};
+
+export type OutgoingStagingView = {
+  transfer_id: string;
+  staged_items: number;
+  total_items: number;
+};
+
+/** 桌面端按原路径直传的准备进度：节点枚举并计算摘要，不复制源文件。 */
+export type OutgoingPrepareView = {
+  transfer_id: string;
+  state: 'preparing' | 'failed';
+  error?: string | null;
+  hashed_bytes: number;
+  total_bytes: number;
+  items_ready: number;
+  total_items: number;
 };
 
 export type MobileTransferView = {

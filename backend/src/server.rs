@@ -8,7 +8,8 @@ use crate::model::{
     CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::{
-    validate_receive_directory, NodeRuntime, TransferRetryError, UPDATE_INSTALLING_MESSAGE,
+    validate_receive_directory, NodeRuntime, OutgoingPrepareView, TransferRetryError,
+    UPDATE_INSTALLING_MESSAGE,
 };
 use axum::body::Body;
 use axum::extract::{
@@ -150,6 +151,24 @@ pub struct MobileTransferCreateRequest {
 #[derive(Debug, Deserialize)]
 pub struct TransferAcceptRequest {
     pub destination: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutgoingStagingView {
+    pub transfer_id: String,
+    pub staged_items: usize,
+    pub total_items: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OutgoingStagingCancelled {
+    pub transfer_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OutgoingPathRequest {
+    pub target_node_id: String,
+    pub paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,6 +326,15 @@ pub fn router_with_control(
         .route("/api/v1/transfers/:id/accept", post(accept_transfer))
         .route("/api/v1/transfers/:id/status", get(transfer_status))
         .route("/api/v1/transfers/:id/items/:item_id", put(upload_item))
+        .route("/api/v1/outgoing", post(create_outgoing_staging))
+        .route(
+            "/api/v1/outgoing/:id/items/:item_id",
+            put(upload_outgoing_item),
+        )
+        .route("/api/v1/outgoing/paths", post(create_outgoing_paths))
+        .route("/api/v1/outgoing/:id/start", post(start_outgoing_staging))
+        .route("/api/v1/outgoing/:id/cancel", post(cancel_outgoing_staging))
+        .route("/api/v1/outgoing/:id", get(outgoing_prepare_status))
         .route(
             "/api/*path",
             get(api_not_found)
@@ -1760,7 +1788,7 @@ fn normalize_relative_path(value: &str) -> String {
         .join("/")
 }
 
-fn encode_path_segment(value: &str) -> String {
+pub(crate) fn encode_path_segment(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -2585,6 +2613,7 @@ async fn dismiss_transfer(
         .runtime
         .remove_failed_transfer(&id)
         .ok_or_else(|| ApiError::conflict("传输任务已被移除"))?;
+    state.runtime.remove_outgoing_staging(&id);
     Ok(Json(progress))
 }
 
@@ -2654,6 +2683,232 @@ async fn transfer_status(
         .transfer(&id)
         .map(|record| Json(record.progress))
         .ok_or_else(|| ApiError::not_found("传输不存在"))
+}
+
+fn is_loopback_request(connect_info: Option<&ConnectInfo<SocketAddr>>) -> bool {
+    connect_info.is_some_and(|ConnectInfo(address)| address.ip().is_loopback())
+}
+
+/// 运行时在后台准备清单时复用与 HTTP 建单一致的清单校验。
+pub(crate) fn validate_outgoing_offer(offer: &TransferOffer) -> Result<(), String> {
+    validate_offer(offer).map_err(|error| error.message)
+}
+
+/// 桌面端按原路径直传：节点后台枚举、算摘要后自己发送清单，不再复制源文件。
+async fn create_outgoing_paths(
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    Json(payload): Json<OutgoingPathRequest>,
+) -> Result<Json<OutgoingPrepareView>, ApiError> {
+    if !is_loopback_request(connect_info.as_ref()) {
+        return Err(ApiError::forbidden("暂存接口只允许本机调用"));
+    }
+    if payload.target_node_id == state.runtime.node_id()
+        || state
+            .runtime
+            .peer_http_base(&payload.target_node_id)
+            .is_none()
+    {
+        return Err(ApiError::not_found("目标设备当前不可用"));
+    }
+    let view = state
+        .runtime
+        .begin_outgoing_paths(payload.target_node_id, payload.paths)
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(view))
+}
+
+async fn outgoing_prepare_status(
+    AxumPath(transfer_id): AxumPath<String>,
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+) -> Result<Json<OutgoingPrepareView>, ApiError> {
+    if !is_loopback_request(connect_info.as_ref()) {
+        return Err(ApiError::forbidden("暂存接口只允许本机调用"));
+    }
+    state
+        .runtime
+        .outgoing_prepare_view(&transfer_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("准备任务已结束"))
+}
+
+/// 原生界面把待发送文件交给本机节点，此后的上传不再依赖页面状态。
+async fn create_outgoing_staging(
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    Json(mut offer): Json<TransferOffer>,
+) -> Result<Json<OutgoingStagingView>, ApiError> {
+    if !is_loopback_request(connect_info.as_ref()) {
+        return Err(ApiError::forbidden("暂存接口只允许本机调用"));
+    }
+    validate_offer(&offer)?;
+    if offer.source_node_id != state.runtime.node_id() {
+        return Err(ApiError::bad_request("暂存来源必须是本机节点"));
+    }
+    if offer.target_node_id == state.runtime.node_id()
+        || state
+            .runtime
+            .peer_http_base(&offer.target_node_id)
+            .is_none()
+    {
+        return Err(ApiError::not_found("目标设备当前不可用"));
+    }
+    offer.created_at_ms = crate::clock::now_millis();
+    let total_items = offer.items.len();
+    let transfer_id = offer.transfer_id.clone();
+    state
+        .runtime
+        .begin_outgoing_staging(offer)
+        .map_err(ApiError::conflict)?;
+    Ok(Json(OutgoingStagingView {
+        transfer_id,
+        staged_items: 0,
+        total_items,
+    }))
+}
+
+async fn upload_outgoing_item(
+    AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    body: Body,
+) -> Result<Json<OutgoingStagingView>, ApiError> {
+    if !is_loopback_request(connect_info.as_ref()) {
+        return Err(ApiError::forbidden("暂存接口只允许本机调用"));
+    }
+    let item = state
+        .runtime
+        .outgoing_item(&transfer_id, &item_id)
+        .ok_or_else(|| ApiError::not_found("暂存项目不存在"))?;
+    if !state.runtime.is_outgoing_item_ready(&transfer_id, &item_id) {
+        let target = state
+            .runtime
+            .outgoing_staged_target(&transfer_id, &item_id)
+            .ok_or_else(|| ApiError::not_found("暂存项目不存在"))?;
+        let directory = target
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| ApiError::internal("暂存路径无效"))?;
+        let temp = target.with_extension("part");
+        let mut disk_guard = DiskSpaceGuard::new(directory);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)
+            .await
+            .map_err(|error| ApiError::internal(format!("无法创建暂存文件：{error}")))?;
+        let mut stream = body.into_data_stream();
+        let mut hasher = Sha256::new();
+        let mut total = 0u64;
+        let stream_result: Result<(), ApiError> = async {
+            while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next())
+                .await
+                .map_err(|_| ApiError::request_timeout("暂存写入长时间没有数据"))?
+            {
+                let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
+                total = total
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| ApiError::payload_too_large("源文件大小溢出"))?;
+                if total > item.size {
+                    return Err(ApiError::payload_too_large("源文件超过清单大小"));
+                }
+                if !disk_guard.has_headroom(chunk.len() as u64) {
+                    return Err(ApiError::conflict("暂存磁盘可用空间不足"));
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| ApiError::internal(format!("写入暂存文件失败：{error}")))?;
+            }
+            file.flush()
+                .await
+                .map_err(|error| ApiError::internal(format!("写入暂存文件失败：{error}")))?;
+            Ok(())
+        }
+        .await;
+        drop(file);
+        if let Err(error) = stream_result {
+            let _ = fs::remove_file(&temp).await;
+            return Err(error);
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
+            let _ = fs::remove_file(&temp).await;
+            return Err(ApiError::bad_request("源文件校验失败"));
+        }
+        fs::rename(&temp, &target)
+            .await
+            .map_err(|error| ApiError::internal(format!("提交暂存文件失败：{error}")))?;
+        state
+            .runtime
+            .mark_outgoing_item_staged(&transfer_id, &item_id);
+    }
+    let (staged_items, total_items) = state
+        .runtime
+        .outgoing_staging_counts(&transfer_id)
+        .ok_or_else(|| ApiError::not_found("暂存任务不存在"))?;
+    Ok(Json(OutgoingStagingView {
+        transfer_id,
+        staged_items,
+        total_items,
+    }))
+}
+
+async fn start_outgoing_staging(
+    AxumPath(transfer_id): AxumPath<String>,
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+) -> Result<Json<TransferProgress>, ApiError> {
+    if !is_loopback_request(connect_info.as_ref()) {
+        return Err(ApiError::forbidden("暂存接口只允许本机调用"));
+    }
+    let offer = state
+        .runtime
+        .outgoing_offer_if_ready(&transfer_id)
+        .map_err(ApiError::conflict)?;
+    let target_node_id = offer.target_node_id.clone();
+    let progress = state.runtime.add_outgoing_transfer(offer.clone());
+    if progress.status == TransferStatus::Failed {
+        return Err(ApiError::conflict(
+            progress
+                .error
+                .clone()
+                .unwrap_or_else(|| "无法创建传输".to_string()),
+        ));
+    }
+    if !state.runtime.has_peer_channel(&target_node_id)
+        || !state
+            .runtime
+            .send_to_peer_with_retry(&target_node_id, WireMessage::TransferOffer { offer })
+            .await
+    {
+        if let Some(failed) = state.runtime.fail_transfer(
+            &transfer_id,
+            "目标设备暂时无法接收传输请求".to_string(),
+            TransferStatus::Failed,
+        ) {
+            state
+                .runtime
+                .publish_event(WireMessage::TransferProgress { progress: failed });
+        }
+        return Err(ApiError::conflict("目标设备暂时无法接收传输请求"));
+    }
+    Ok(Json(progress))
+}
+
+async fn cancel_outgoing_staging(
+    AxumPath(transfer_id): AxumPath<String>,
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+) -> Result<Json<OutgoingStagingCancelled>, ApiError> {
+    if !is_loopback_request(connect_info.as_ref()) {
+        return Err(ApiError::forbidden("暂存接口只允许本机调用"));
+    }
+    state.runtime.cancel_outgoing_prepare(&transfer_id);
+    state.runtime.remove_outgoing_staging(&transfer_id);
+    Ok(Json(OutgoingStagingCancelled { transfer_id }))
 }
 
 async fn upload_item(
@@ -3506,6 +3761,17 @@ mod tests {
             Some("http://100.64.0.8:37880/api/v1/ws".to_string())
         );
         let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn outgoing_staging_rejects_non_loopback_peers() {
+        let loopback = "127.0.0.1:5000".parse().expect("loopback address");
+        let lan = "192.168.1.5:5000".parse().expect("lan address");
+        assert!(super::is_loopback_request(Some(&super::ConnectInfo(
+            loopback
+        ))));
+        assert!(!super::is_loopback_request(Some(&super::ConnectInfo(lan))));
+        assert!(!super::is_loopback_request(None));
     }
 
     #[tokio::test]

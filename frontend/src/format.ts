@@ -133,8 +133,9 @@ export function prepareProgressRatio(prepare: TransferPrepare): number {
 }
 
 export function prepareStatusText(prepare: TransferPrepare): string {
-  if (!prepare.total_bytes) return '准备发送';
-  return '准备发送 · ' + Math.round(prepareProgressRatio(prepare) * 100) + '%';
+  const label = prepare.phase === 'stage' ? '上传到本机' : '准备发送';
+  if (!prepare.total_bytes) return label;
+  return label + ' · ' + Math.round(prepareProgressRatio(prepare) * 100) + '%';
 }
 
 export function transferStatusText(transfer: TransferProgress, surface: 'desktop' | 'web' | 'android'): string {
@@ -142,7 +143,9 @@ export function transferStatusText(transfer: TransferProgress, surface: 'desktop
     ? Math.max(0, Math.min(1, transfer.completed_bytes / transfer.total_bytes))
     : 0;
   if (transfer.status === 'waiting') return '等待确认';
-  if (transfer.status === 'accepted') return '准备接收';
+  if (transfer.status === 'accepted') {
+    return transfer.direction === 'send' ? '等待发送' : '准备接收';
+  }
   if (transfer.status === 'ready') {
     if (surface === 'desktop') return '等待网页端保存';
     return surface === 'android' ? '正在写入应用目录' : '等待保存';

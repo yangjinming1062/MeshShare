@@ -1,5 +1,7 @@
 #[cfg(target_os = "android")]
 mod android_network;
+#[cfg(target_os = "android")]
+mod android_storage;
 #[cfg(any(target_os = "android", test))]
 mod android_update;
 mod autostart;
@@ -338,8 +340,25 @@ fn accept_transfer(
 }
 
 #[cfg(target_os = "android")]
-#[tauri::command]
-fn android_receive_directory(app: AppHandle) -> Result<String, String> {
+const ANDROID_PUBLIC_DOWNLOAD_DIR: &str = "/storage/emulated/0/Download";
+
+/// 公共下载目录只有在授予「所有文件访问权限」后才可写，用一次真实写入判断。
+#[cfg(target_os = "android")]
+fn android_public_download_directory() -> Option<PathBuf> {
+    let directory = PathBuf::from(ANDROID_PUBLIC_DOWNLOAD_DIR).join("MeshShare");
+    std::fs::create_dir_all(&directory).ok()?;
+    let probe = directory.join(".meshshare-write-probe");
+    match std::fs::write(&probe, []) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Some(directory)
+        }
+        Err(_) => None,
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_private_download_directory(app: &AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
         .download_dir()
@@ -347,6 +366,47 @@ fn android_receive_directory(app: AppHandle) -> Result<String, String> {
         .join("MeshShare");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("无法创建 Android 接收目录：{error}"))?;
+    Ok(directory)
+}
+
+#[cfg(target_os = "android")]
+fn android_receive_target(app: &AppHandle) -> Result<(PathBuf, bool), String> {
+    if let Some(directory) = android_public_download_directory() {
+        return Ok((directory, true));
+    }
+    Ok((android_private_download_directory(app)?, false))
+}
+
+#[cfg(target_os = "android")]
+#[derive(Serialize)]
+struct AndroidReceiveStorage {
+    directory: String,
+    public_download: bool,
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn android_receive_storage(app: AppHandle) -> Result<AndroidReceiveStorage, String> {
+    let (directory, public_download) = android_receive_target(&app)?;
+    Ok(AndroidReceiveStorage {
+        directory: directory.to_string_lossy().into_owned(),
+        public_download,
+    })
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn android_request_receive_storage(app: AppHandle) -> Result<(), String> {
+    app.state::<android_storage::AndroidStoragePluginHandle>()
+        .0
+        .run_mobile_plugin::<()>("requestAllFilesAccess", ())
+        .map_err(|error| format!("无法打开存储授权页面：{error}"))
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn android_receive_directory(app: AppHandle) -> Result<String, String> {
+    let (directory, _) = android_receive_target(&app)?;
     Ok(directory.to_string_lossy().into_owned())
 }
 
@@ -1121,6 +1181,7 @@ pub fn run() {
 pub fn run() {
     tauri::Builder::default()
         .plugin(android_network::plugin())
+        .plugin(android_storage::plugin())
         .plugin(tauri_plugin_dialog::init())
         .plugin(android_update::app::plugin())
         .setup(|app| {
@@ -1151,6 +1212,8 @@ pub fn run() {
             set_receive_settings,
             accept_transfer,
             android_receive_directory,
+            android_receive_storage,
+            android_request_receive_storage,
             register_outgoing_transfer,
             update_transfer_progress,
             android_update::app::android_update_status,

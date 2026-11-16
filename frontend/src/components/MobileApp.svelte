@@ -38,6 +38,8 @@
   export let selectedHistory: ClipboardHistoryDetail | null = null;
   export let metrics: HardwareMetrics | null = null;
   export let canChooseDirectory = false;
+  export let receiveStorage: { directory: string; public_download: boolean } | null = null;
+  export let onRequestReceiveStorage: () => void = () => {};
   export let receiveDirectoryName = '';
   export let actionBusyId = '';
   export let downloadingIds: string[] = [];
@@ -204,8 +206,10 @@
                 {/each}
               {/if}
             {/if}
-            {#if mode === 'web' && (inbox.status === 'accepted' || inbox.status === 'uploading' || inbox.status === 'ready')}
-              <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(inbox)}>取消</button>
+            {#if inbox.status === 'accepted' || inbox.status === 'uploading' || (mode === 'web' && inbox.status === 'ready')}
+              <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(inbox)}>
+                {mode === 'android' ? '取消接收' : '取消'}
+              </button>
             {/if}
           </div>
         </article>
@@ -394,8 +398,10 @@
                   {/each}
                 {/if}
               {/if}
-              {#if mode === 'web' && (transfer.status === 'accepted' || transfer.status === 'uploading' || transfer.status === 'ready')}
-                <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(transfer)}>取消</button>
+              {#if transfer.status === 'accepted' || transfer.status === 'uploading' || (mode === 'web' && transfer.status === 'ready')}
+                <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(transfer)}>
+                  {mode === 'android' ? '取消接收' : '取消'}
+                </button>
               {/if}
             </div>
           </article>
@@ -469,6 +475,20 @@
         <div class="phone-actions">
           <button type="button" class="btn" on:click={onChooseDirectory}>{receiveDirectoryName ? '更换接收目录：' + receiveDirectoryName : '选择接收目录'}</button>
         </div>
+      {/if}
+    {/if}
+    {#if mode === 'android'}
+      <div class="meta-rows">
+        <span class="muted">保存位置</span>
+        <strong class="mono" title={receiveStorage?.directory ?? ''}>
+          {receiveStorage?.public_download ? 'Download/MeshShare' : receiveStorage ? '应用私有目录' : '—'}
+        </strong>
+      </div>
+      {#if receiveStorage && !receiveStorage.public_download}
+        <div class="phone-actions">
+          <button type="button" class="btn" on:click={onRequestReceiveStorage}>保存到手机下载目录</button>
+        </div>
+        <p class="hint">未授权「所有文件访问」时文件写在应用私有目录，文件管理器里不容易找到。</p>
       {/if}
     {/if}
     <div class="meta-rows">
