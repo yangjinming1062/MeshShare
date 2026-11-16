@@ -225,5 +225,9 @@ export function updateStatusLabel(value: UpdateStatus | null): string {
   }
   if (value.state === 'installing') return value.error ?? '正在安装更新，应用即将重启';
   if (value.state === 'up_to_date') return '已是最新版本';
-  return value.error ? '更新失败：' + value.error : '更新失败';
+  if (value.state === 'needs_authorization') {
+    return '待安装 v' + (value.available_version ?? '新版本') + '：' + (value.error ?? '需要在本机确认系统授权');
+  }
+  if (value.state === 'error') return value.error ? '更新失败：' + value.error : '更新失败';
+  return value.error ?? '更新状态：' + value.state;
 }

@@ -19,7 +19,7 @@ export type NodeInfo = {
 
 export type UpdateFrequency = 'daily' | 'weekly' | 'disabled';
 
-export type UpdateState = 'unavailable' | 'disabled' | 'idle' | 'checking' | 'available' | 'deferred' | 'downloading' | 'installing' | 'up_to_date' | 'error';
+export type UpdateState = 'unavailable' | 'disabled' | 'idle' | 'checking' | 'available' | 'deferred' | 'downloading' | 'installing' | 'up_to_date' | 'needs_authorization' | 'error';
 
 export type UpdateStatus = {
   state: UpdateState;

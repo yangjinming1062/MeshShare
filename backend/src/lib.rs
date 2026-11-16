@@ -7,6 +7,7 @@ mod clipboard;
 mod clock;
 mod control;
 mod discovery;
+mod linux_update;
 mod listeners;
 #[cfg(target_os = "macos")]
 mod macos_security_scope;

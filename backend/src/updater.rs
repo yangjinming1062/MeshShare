@@ -5,8 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(target_os = "linux")]
-use tauri::utils::{config::BundleType, platform::bundle_type};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::Notify;
@@ -14,7 +12,7 @@ use tokio::sync::Notify;
 const UPDATE_STATUS_EVENT: &str = "update-status";
 const CHECK_RETRY_MS: i64 = 60 * 60 * 1000;
 const ACTIVE_TRANSFER_RETRY_MS: i64 = 15 * 60 * 1000;
-const LOCAL_AUTH_RETRY_MS: i64 = 24 * 60 * 60 * 1000;
+const AUTHORIZATION_RETRY_MS: i64 = 24 * 60 * 60 * 1000;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -29,6 +27,7 @@ pub enum UpdateState {
     Downloading,
     Installing,
     UpToDate,
+    NeedsAuthorization,
     Error,
 }
 
@@ -147,8 +146,8 @@ impl UpdateCoordinator {
                     CheckResult::Deferred => {
                         retry_at_ms = Some(now_millis().saturating_add(ACTIVE_TRANSFER_RETRY_MS));
                     }
-                    CheckResult::NeedsLocalAuthorization => {
-                        retry_at_ms = Some(now_millis().saturating_add(LOCAL_AUTH_RETRY_MS));
+                    CheckResult::NeedsAuthorization => {
+                        retry_at_ms = Some(now_millis().saturating_add(AUTHORIZATION_RETRY_MS));
                     }
                     CheckResult::Completed => {
                         retry_at_ms = None;
@@ -157,8 +156,11 @@ impl UpdateCoordinator {
                 continue;
             }
 
-            let keep_error = self.status.lock().state == UpdateState::Error;
-            if frequency == UpdateFrequency::Disabled && !keep_error {
+            let keep_status = matches!(
+                self.status.lock().state,
+                UpdateState::Error | UpdateState::NeedsAuthorization
+            );
+            if frequency == UpdateFrequency::Disabled && !keep_status {
                 self.set_status(UpdateState::Disabled, None, 0, None, None);
             }
             self.wait_until_next_check(frequency, last_checked_at_ms, pending, retry_at_ms)
@@ -303,20 +305,6 @@ impl UpdateCoordinator {
             return CheckResult::Completed;
         }
 
-        if linux_system_package_requires_local_authorization() {
-            self.set_status(
-                UpdateState::Error,
-                Some(update.version),
-                0,
-                None,
-                Some(
-                    "Linux .deb/.rpm 更新需要本机授权；为避免后台弹出密码框，请在 Ubuntu 本机手动安装，或改用 AppImage。"
-                        .to_string(),
-                ),
-            );
-            return CheckResult::NeedsLocalAuthorization;
-        }
-
         let coordinator = self;
         self.set_status(
             UpdateState::Downloading,
@@ -370,25 +358,67 @@ impl UpdateCoordinator {
             None,
             None,
         );
-        let result = update.install(&bytes);
-        match result {
-            Ok(()) => {
+        let version = update.version.clone();
+        match self.perform_install(&update, bytes).await {
+            InstallStep::Installed => {
                 let _ = self
                     .runtime
                     .set_update_check_state(Some(checked_at_ms), None);
                 self.set_status(
                     UpdateState::Installing,
-                    Some(update.version),
+                    Some(version),
                     0,
                     None,
                     Some("更新已安装，正在重启".to_string()),
                 );
-                self.app.restart();
+                self.app.restart()
             }
-            Err(error) => {
+            InstallStep::NeedsAuthorization(reason) => {
                 drop(install_guard);
-                self.handle_install_error(error, checked_at_ms, &update.version)
+                self.set_status(
+                    UpdateState::NeedsAuthorization,
+                    Some(version),
+                    0,
+                    None,
+                    Some(reason),
+                );
+                CheckResult::NeedsAuthorization
             }
+            InstallStep::UpdaterError(error) => {
+                drop(install_guard);
+                self.handle_install_error(error, checked_at_ms, &version)
+            }
+            InstallStep::Failed(message) => {
+                drop(install_guard);
+                self.record_install_failure(message, checked_at_ms)
+            }
+        }
+    }
+
+    async fn perform_install(
+        &self,
+        update: &tauri_plugin_updater::Update,
+        bytes: Vec<u8>,
+    ) -> InstallStep {
+        if crate::linux_update::system_package_available() {
+            self.set_status(
+                UpdateState::Installing,
+                Some(update.version.clone()),
+                0,
+                None,
+                Some("请在系统授权对话框中确认安装更新".to_string()),
+            );
+            return match crate::linux_update::install(bytes).await {
+                crate::linux_update::Outcome::Installed => InstallStep::Installed,
+                crate::linux_update::Outcome::NeedsAuthorization(reason) => {
+                    InstallStep::NeedsAuthorization(reason.to_string())
+                }
+                crate::linux_update::Outcome::Failed(message) => InstallStep::Failed(message),
+            };
+        }
+        match update.install(&bytes) {
+            Ok(()) => InstallStep::Installed,
+            Err(error) => InstallStep::UpdaterError(error),
         }
     }
 
@@ -443,6 +473,18 @@ impl UpdateCoordinator {
         }
     }
 
+    fn record_install_failure(&self, message: String, checked_at_ms: i64) -> CheckResult {
+        if let Err(state_error) = self
+            .runtime
+            .set_update_check_state(Some(checked_at_ms), None)
+        {
+            self.set_error(format!("{message}；保存失败状态失败：{state_error}"));
+        } else {
+            self.set_error(message);
+        }
+        CheckResult::Completed
+    }
+
     fn set_status(
         &self,
         state: UpdateState,
@@ -485,22 +527,14 @@ enum CheckResult {
     Completed,
     RetryLater,
     Deferred,
-    NeedsLocalAuthorization,
+    NeedsAuthorization,
 }
 
-#[cfg(target_os = "linux")]
-fn linux_system_package_requires_local_authorization() -> bool {
-    linux_bundle_requires_local_authorization(bundle_type())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn linux_system_package_requires_local_authorization() -> bool {
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn linux_bundle_requires_local_authorization(bundle: Option<BundleType>) -> bool {
-    matches!(bundle, Some(BundleType::Deb) | Some(BundleType::Rpm))
+enum InstallStep {
+    Installed,
+    NeedsAuthorization(String),
+    UpdaterError(tauri_plugin_updater::Error),
+    Failed(String),
 }
 
 pub(crate) struct UpdateInstallGuard<'a> {
@@ -543,36 +577,10 @@ fn is_due(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(not(target_os = "linux"))]
-    use super::linux_system_package_requires_local_authorization;
     use super::{
-        is_due, should_retry_check_error, should_retry_install_error, LOCAL_AUTH_RETRY_MS,
+        is_due, should_retry_check_error, should_retry_install_error, AUTHORIZATION_RETRY_MS,
     };
     use crate::runtime::UpdateFrequency;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn system_package_updates_require_local_authorization() {
-        use super::linux_bundle_requires_local_authorization;
-        use tauri::utils::config::BundleType;
-
-        assert!(linux_bundle_requires_local_authorization(Some(
-            BundleType::Deb
-        )));
-        assert!(linux_bundle_requires_local_authorization(Some(
-            BundleType::Rpm
-        )));
-        assert!(!linux_bundle_requires_local_authorization(Some(
-            BundleType::AppImage
-        )));
-        assert!(!linux_bundle_requires_local_authorization(None));
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[test]
-    fn non_linux_updates_do_not_require_linux_authorization() {
-        assert!(!linux_system_package_requires_local_authorization());
-    }
 
     #[test]
     fn update_schedule_uses_daily_and_weekly_boundaries() {
@@ -665,8 +673,8 @@ mod tests {
             UpdateFrequency::Weekly,
             Some(10),
             true,
-            Some(LOCAL_AUTH_RETRY_MS),
-            LOCAL_AUTH_RETRY_MS - 1,
+            Some(AUTHORIZATION_RETRY_MS),
+            AUTHORIZATION_RETRY_MS - 1,
             false
         ));
     }

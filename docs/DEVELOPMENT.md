@@ -92,6 +92,8 @@ Android 构建先用 `apksigner` 校验，再用 `aapt2 dump badging` 读取 APK
 
 开发构建不会执行 GitHub 更新检查。
 
+Linux 系统包更新的安装动作由 `pkexec` 调用 `dpkg -i` 或 `rpm -U`，授权对话框由 polkit 在当前桌面会话弹出。在 Ubuntu 上验收时确认：授权通过后完成安装并重启到新版本；取消授权或没有可用授权代理时显示「待安装」而不是更新失败，24 小时内不重复请求，点「立即检查」可以立即重试；有活动传输时仍然先等传输完成，安装窗口内新的传输请求提示稍后重试。AppImage 首次运行前需要 `chmod +x`，如果系统包版本正在运行要先从托盘退出，否则只会激活已有窗口。端到端授权更新要求已安装的版本包含该实现，因此需要两个连续的签名版本，不能在本机用未签名测试包替代。
+
 ### Wayland 运行验收
 
 在 Ubuntu GNOME Wayland 会话中，确认 `loginctl show-session <id> -p Type` 返回 `Type=wayland`，并记录是否存在 `WAYLAND_DISPLAY`、`DISPLAY` 和 `Xwayland` 进程。重点验证文字和 PNG 剪贴板的自动读取、远端写入、历史恢复、手动同步以及悬浮监控条的拖动、隐藏和托盘恢复。

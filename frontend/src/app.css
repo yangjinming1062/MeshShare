@@ -219,6 +219,7 @@ button.device-metrics:hover { background: var(--surface-2); }
 .segmented label:has(input:disabled) { opacity: .5; cursor: not-allowed; }
 .update-status { color: var(--muted); font-size: 11px; }
 .update-status[data-state="error"] { color: var(--danger); }
+.update-status[data-state="needs_authorization"] { color: var(--warning-ink); }
 .update-status[data-state="downloading"], .update-status[data-state="installing"] { color: var(--primary-hover); }
 .update-status[data-state="up_to_date"] { color: var(--success-ink); }
 

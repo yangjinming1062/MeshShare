@@ -39,7 +39,7 @@
     <div class="setting">
       <div class="setting-copy">
         <strong>自动更新</strong>
-        <span>只获取 GitHub 稳定版 Release；安装会等待当前文件传输完成。</span>
+        <span>只获取 GitHub 稳定版 Release；安装会等待当前文件传输完成，系统包需要本机授权。</span>
       </div>
       <div class="setting-actions">
         <div class="segmented" role="radiogroup" aria-label="自动更新检查频率">
