@@ -3247,6 +3247,19 @@ fn evict_terminal_transfer_if_needed(transfers: &mut HashMap<String, TransferRec
 
 const ANDROID_DEFAULT_NODE_NAME: &str = "移动设备";
 const DESKTOP_DEFAULT_NODE_NAME: &str = "MeshShare 节点";
+/// 与对端 `validate_node_info` 的名称上限一致：超长名称会让整个握手消息被丢弃。
+const MAX_NODE_NAME_BYTES: usize = 256;
+
+fn truncate_node_name(name: &str) -> String {
+    if name.len() <= MAX_NODE_NAME_BYTES {
+        return name.to_string();
+    }
+    let mut end = MAX_NODE_NAME_BYTES;
+    while end > 0 && !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].to_string()
+}
 
 fn system_hostname() -> Option<String> {
     hostname::get()
@@ -3267,7 +3280,7 @@ fn is_placeholder_node_name(name: &str) -> bool {
 
 fn default_node_name(profile: NodeProfile, hostname: Option<String>) -> String {
     if let Some(name) = hostname.filter(|value| !is_placeholder_node_name(value)) {
-        return name.trim().to_string();
+        return truncate_node_name(name.trim());
     }
     if profile.is_android() {
         ANDROID_DEFAULT_NODE_NAME.to_string()
@@ -3276,16 +3289,30 @@ fn default_node_name(profile: NodeProfile, hostname: Option<String>) -> String {
     }
 }
 
+/// 节点名称以系统设备名为权威：系统名可用时覆盖已保存名称，不可用时保留有效的旧名。
 /// 返回是否改写了名称；调用方负责把结果落盘。
-fn normalize_node_name(name: &mut String, profile: NodeProfile, hostname: Option<String>) -> bool {
-    if !is_placeholder_node_name(name) {
+fn sync_node_name(name: &mut String, profile: NodeProfile, hostname: Option<String>) -> bool {
+    let resolved = match hostname.filter(|value| !is_placeholder_node_name(value)) {
+        Some(hostname) => truncate_node_name(hostname.trim()),
+        None if is_placeholder_node_name(name) => default_node_name(profile, None),
+        None => return false,
+    };
+    if name == &resolved {
         return false;
     }
-    *name = default_node_name(profile, hostname);
+    *name = resolved;
     true
 }
 
 fn load_or_create_config(data_dir: &Path, profile: NodeProfile) -> anyhow::Result<PersistedConfig> {
+    load_or_create_config_with_hostname(data_dir, profile, system_hostname())
+}
+
+fn load_or_create_config_with_hostname(
+    data_dir: &Path,
+    profile: NodeProfile,
+    hostname: Option<String>,
+) -> anyhow::Result<PersistedConfig> {
     let path = data_dir.join("node.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
@@ -3305,7 +3332,7 @@ fn load_or_create_config(data_dir: &Path, profile: NodeProfile) -> anyhow::Resul
             config.clipboard_history_days = config
                 .clipboard_history_days
                 .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
-            if normalize_node_name(&mut config.node_name, profile, system_hostname()) {
+            if sync_node_name(&mut config.node_name, profile, hostname.clone()) {
                 if let Err(error) = persist_config(data_dir, &config) {
                     eprintln!("保存节点名称失败：{error}");
                 }
@@ -3317,7 +3344,7 @@ fn load_or_create_config(data_dir: &Path, profile: NodeProfile) -> anyhow::Resul
     }
     let config = PersistedConfig {
         node_id: Uuid::new_v4().to_string(),
-        node_name: default_node_name(profile, system_hostname()),
+        node_name: default_node_name(profile, hostname),
         monitor_visible: true,
         monitor_position: None,
         monitor_locked: false,
@@ -4267,11 +4294,13 @@ fn bindable_addresses(
 mod tests {
     use super::{
         bind_addresses, bindable_addresses, default_node_name, interface_rank,
-        is_cellular_interface, is_placeholder_node_name, load_or_create_config, mobile_ca_url,
-        network_addresses, network_addresses_for_bound, normalize_node_name, parse_update_proxy,
-        prune_clipboard_history_records_with_limit, NodeProfile, NodeRuntime, UpdateFrequency,
-        CLIPBOARD_HISTORY_FILE, DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS,
-        TRANSFER_ACCEPTED_IDLE_TIMEOUT_MS, TRANSFER_ACTIVITY_TIMEOUT_MS,
+        is_cellular_interface, is_placeholder_node_name, load_or_create_config,
+        load_or_create_config_with_hostname, mobile_ca_url, network_addresses,
+        network_addresses_for_bound, parse_update_proxy,
+        prune_clipboard_history_records_with_limit, sync_node_name, NodeProfile, NodeRuntime,
+        UpdateFrequency, CLIPBOARD_HISTORY_FILE, DESKTOP_TEMP_REGISTRY_FILE,
+        MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACCEPTED_IDLE_TIMEOUT_MS,
+        TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
         AddressInfo, ClipboardEvent, ClipboardHistoryMode, DiskMetrics, GpuMemoryKind, GpuMetrics,
@@ -4615,9 +4644,47 @@ mod tests {
     }
 
     #[test]
+    fn hostname_change_replaces_saved_node_name() {
+        let path = temp_data_dir();
+        std::fs::write(
+            path.join("node.json"),
+            r#"{"node_id":"node-a","node_name":"OLD-PC"}"#,
+        )
+        .expect("write named config");
+        let config = load_or_create_config_with_hostname(
+            &path,
+            NodeProfile::Desktop,
+            Some("NEW-PC".to_string()),
+        )
+        .expect("load config");
+        assert_eq!(config.node_name, "NEW-PC");
+        let persisted: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path.join("node.json")).expect("read config file"),
+        )
+        .expect("parse config file");
+        assert_eq!(persisted["node_name"], "NEW-PC");
+        assert_eq!(persisted["node_id"], "node-a");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn saved_node_name_survives_missing_hostname() {
+        let path = temp_data_dir();
+        std::fs::write(
+            path.join("node.json"),
+            r#"{"node_id":"node-a","node_name":"手动名称"}"#,
+        )
+        .expect("write named config");
+        let config = load_or_create_config_with_hostname(&path, NodeProfile::Desktop, None)
+            .expect("load config");
+        assert_eq!(config.node_name, "手动名称");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn placeholder_name_migration_uses_platform_default() {
         let mut name = "localhost".to_string();
-        assert!(normalize_node_name(
+        assert!(sync_node_name(
             &mut name,
             NodeProfile::Android,
             Some("localhost".to_string())
@@ -4625,12 +4692,37 @@ mod tests {
         assert_eq!(name, "移动设备");
 
         let mut kept = "Redmi-K70".to_string();
-        assert!(!normalize_node_name(
+        assert!(!sync_node_name(
             &mut kept,
             NodeProfile::Android,
             Some("localhost".to_string())
         ));
         assert_eq!(kept, "Redmi-K70");
+
+        let mut blank = String::new();
+        assert!(sync_node_name(&mut blank, NodeProfile::Desktop, None));
+        assert_eq!(blank, "MeshShare 节点");
+    }
+
+    #[test]
+    fn long_hostname_is_truncated_on_char_boundary() {
+        let mut ascii = "a".repeat(300);
+        assert!(sync_node_name(
+            &mut ascii,
+            NodeProfile::Desktop,
+            Some("b".repeat(300))
+        ));
+        assert_eq!(ascii.len(), 256);
+
+        let long_name = format!("{}{}", "a".repeat(255), "中");
+        let mut names = long_name.clone();
+        assert!(sync_node_name(
+            &mut names,
+            NodeProfile::Desktop,
+            Some(long_name)
+        ));
+        assert_eq!(names.len(), 255);
+        assert!(names.is_char_boundary(names.len()));
     }
 
     #[test]
@@ -4641,7 +4733,12 @@ mod tests {
             r#"{"node_id":"node-a","node_name":"localhost"}"#,
         )
         .expect("write placeholder config");
-        let config = load_or_create_config(&path, NodeProfile::Android).expect("load config");
+        let config = load_or_create_config_with_hostname(
+            &path,
+            NodeProfile::Android,
+            Some("Redmi-K70".to_string()),
+        )
+        .expect("load config");
         assert!(!is_placeholder_node_name(&config.node_name));
         let persisted: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(path.join("node.json")).expect("read config file"),
@@ -4655,7 +4752,12 @@ mod tests {
             r#"{"node_id":"node-b","node_name":"Redmi-K70"}"#,
         )
         .expect("write named config");
-        let named = load_or_create_config(&path, NodeProfile::Android).expect("reload config");
+        let named = load_or_create_config_with_hostname(
+            &path,
+            NodeProfile::Android,
+            Some("Redmi-K70".to_string()),
+        )
+        .expect("reload config");
         assert_eq!(named.node_name, "Redmi-K70");
         let _ = std::fs::remove_dir_all(path);
     }
