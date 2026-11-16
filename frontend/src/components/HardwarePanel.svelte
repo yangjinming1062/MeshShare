@@ -7,6 +7,7 @@
   export let monitorLocked = false;
   export let monitorVisible = true;
   export let canClickThrough = false;
+  export let settingsDisabled = false;
   export let onToggleLock: () => void = () => {};
   export let onToggleVisible: () => void = () => {};
 
@@ -42,6 +43,7 @@
         type="button"
         class="btn btn-ghost btn-sm"
         aria-pressed={monitorVisible}
+        disabled={settingsDisabled}
         title="显示或隐藏悬浮监控条"
         on:click={onToggleVisible}
       >{monitorVisible ? '隐藏悬浮条' : '显示悬浮条'}</button>
@@ -49,7 +51,7 @@
         type="button"
         class="btn btn-ghost btn-sm monitor-lock-toggle"
         aria-pressed={monitorLocked}
-        disabled={!canClickThrough}
+        disabled={!canClickThrough || settingsDisabled}
         title={canClickThrough ? '锁定或解锁悬浮监控条' : '当前桌面环境不支持点击穿透，可从托盘隐藏悬浮条'}
         on:click={onToggleLock}
       >{monitorLocked ? '解锁悬浮条' : '锁定悬浮条'}</button>

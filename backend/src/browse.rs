@@ -108,11 +108,18 @@ fn collect_entries(directory: &Path) -> Result<(Vec<BrowseEntry>, bool), BrowseE
             .map(|kind| kind.is_symlink())
             .unwrap_or(false);
         let path = item.path();
+        // 非 UTF-8 名称无法在 JSON 里往返寻址，跳过而不是返回占位字符。
+        let (Some(name), Some(path_text)) = (
+            item.file_name().to_str().map(str::to_string),
+            path.to_str().map(str::to_string),
+        ) else {
+            continue;
+        };
         // 跟随符号链接取目标类型，指向目录的链接才能被进入；断链按普通文件处理。
         let metadata = std::fs::metadata(&path).ok();
         entries.push(BrowseEntry {
-            name: item.file_name().to_string_lossy().into_owned(),
-            path: path.to_string_lossy().into_owned(),
+            name,
+            path: path_text,
             directory: metadata.as_ref().is_some_and(|value| value.is_dir()),
             symlink,
             size: metadata

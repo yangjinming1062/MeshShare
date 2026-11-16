@@ -155,7 +155,11 @@ pub(crate) fn plugin() -> TauriPlugin<Wry> {
 pub(crate) fn start(app: &AppHandle, runtime: Arc<NodeRuntime>, data_dir: &Path) -> Result<()> {
     let config_path = data_dir.join("android-update.json");
     let prefs = match std::fs::read(&config_path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).context("读取 Android 更新设置失败")?,
+        // 一个坏字节不该让整块更新功能不可用：损坏时按默认设置启动。
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+            eprintln!("Android 更新设置损坏，已使用默认值：{error}");
+            Preferences::default()
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Preferences::default(),
         Err(error) => return Err(error).context("打开 Android 更新设置失败"),
     };
@@ -284,13 +288,13 @@ impl AndroidUpdater {
         let mut shared = self.shared.lock();
         let mut next = shared.prefs.clone();
         change(&mut next);
-        let temporary = self.config_path.with_extension("tmp");
-        std::fs::write(&temporary, serde_json::to_vec(&next)?)
-            .context("写入 Android 更新设置失败")?;
-        std::fs::rename(temporary, &self.config_path).context("保存 Android 更新设置失败")?;
+        crate::fsutil::atomic_write(&self.config_path, &serde_json::to_vec(&next)?)
+            .context("保存 Android 更新设置失败")?;
         shared.status.frequency = next.frequency;
         shared.prefs = next;
-        let _ = self.app.emit(STATUS_EVENT, &shared.status);
+        let status = shared.status.clone();
+        drop(shared);
+        let _ = self.app.emit(STATUS_EVENT, &status);
         Ok(())
     }
 
@@ -306,10 +310,14 @@ impl AndroidUpdater {
             content_length: pending.map(|release| release.apk.size),
             error,
         };
-        if shared.status != status {
-            shared.status = status;
-            let _ = self.app.emit(STATUS_EVENT, &shared.status);
+        if shared.status == status {
+            return;
         }
+        shared.status = status;
+        let status = shared.status.clone();
+        // 事件在锁外发出，监听器同步回调命令时不会自锁。
+        drop(shared);
+        let _ = self.app.emit(STATUS_EVENT, &status);
     }
 
     fn phase(&self, state: Phase) {

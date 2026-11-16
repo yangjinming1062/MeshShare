@@ -1,9 +1,7 @@
 use tauri::{plugin::Builder, Wry};
 
-/// Register the Android network adapter before the Rust node opens any
-/// listeners. The native plugin binds future sockets to a physical LAN when a
-/// full-tunnel VPN is the process default network, and keeps that decision
-/// current while the app remains open.
+/// 在节点打开任何监听之前注册 Android 网络适配器。全隧道 VPN 成为进程默认网络时，
+/// 原生插件把后续 socket 绑定到局域网物理网卡，并在 App 运行期间持续更新这一选择。
 pub(crate) fn plugin() -> tauri::plugin::TauriPlugin<Wry> {
     Builder::new("android-network")
         .setup(|_app, api| {

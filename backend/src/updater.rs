@@ -242,9 +242,9 @@ impl UpdateCoordinator {
             return CheckResult::Completed;
         };
 
-        // Keep the short timeout for the manifest request, but let the package
-        // download use the updater's normal streaming request without that
-        // timeout. Large installers may legitimately take longer to download.
+        // 清单请求沿用短超时，安装包下载则改用 updater 的普通流式请求，
+        // 使其不受该超时约束。
+        // 大安装包下载耗时更长属于正常情况。
         let mut builder = self.app.updater_builder();
         if let Some(proxy) = proxy {
             builder = builder.proxy(proxy);
@@ -270,9 +270,9 @@ impl UpdateCoordinator {
             }
         };
 
-        // A frequency change can happen while the manifest request is in
-        // flight. Re-read it before an automatic install so turning updates
-        // off takes effect before any package bytes are downloaded.
+        // 清单请求进行期间，更新频率可能被改掉。
+        // 自动安装前重新读取频率，
+        // 让关闭更新在下载任何安装包字节之前就生效。
         if self.frequency() == UpdateFrequency::Disabled && !manual {
             self.set_status(UpdateState::Disabled, None, 0, None, None);
             return CheckResult::Completed;
@@ -405,7 +405,7 @@ impl UpdateCoordinator {
         update: &tauri_plugin_updater::Update,
         bytes: Vec<u8>,
     ) -> InstallStep {
-        if crate::linux_update::system_package_available() {
+        if let Some(kind) = crate::linux::update::system_package() {
             self.set_status(
                 UpdateState::Installing,
                 Some(update.version.clone()),
@@ -413,12 +413,12 @@ impl UpdateCoordinator {
                 None,
                 Some("请在系统授权对话框中确认安装更新".to_string()),
             );
-            return match crate::linux_update::install(bytes).await {
-                crate::linux_update::Outcome::Installed => InstallStep::Installed,
-                crate::linux_update::Outcome::NeedsAuthorization(reason) => {
+            return match crate::linux::update::install(kind, bytes).await {
+                crate::linux::update::Outcome::Installed => InstallStep::Installed,
+                crate::linux::update::Outcome::NeedsAuthorization(reason) => {
                     InstallStep::NeedsAuthorization(reason.to_string())
                 }
-                crate::linux_update::Outcome::Failed(message) => InstallStep::Failed(message),
+                crate::linux::update::Outcome::Failed(message) => InstallStep::Failed(message),
             };
         }
         match update.install(&bytes) {

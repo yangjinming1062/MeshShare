@@ -108,8 +108,11 @@ impl Listeners {
             .unwrap_or_else(|| ControlPlane::runtime_only(runtime.clone()));
         let app = server::router_with_control(runtime.clone(), static_root, control.clone());
         let listeners = Self {
-            http: BTreeMap::from([(local, serve_http(http, app.clone())?)]),
-            https: BTreeMap::from([(local, serve_https(https, app.clone(), config.clone())?)]),
+            http: BTreeMap::from([(local, serve_listener(http, app.clone(), None)?)]),
+            https: BTreeMap::from([(
+                local,
+                serve_listener(https, app.clone(), Some(config.clone()))?,
+            )]),
             failed_binds: BTreeSet::new(),
             last_candidates: addresses.clone(),
             last_network_rebind_generation: runtime.network_rebind_generation(),
@@ -148,7 +151,7 @@ impl Listeners {
                 continue;
             }
             let result = match TcpListener::bind((ip, self.http_port)).await {
-                Ok(listener) => serve_http(listener, self.app.clone()),
+                Ok(listener) => serve_listener(listener, self.app.clone(), None),
                 Err(error) => Err(error),
             };
             if let Some(listener) = self.track_bind(ip, self.http_port, result) {
@@ -175,7 +178,7 @@ impl Listeners {
                 continue;
             }
             let result = match TcpListener::bind((ip, self.https_port)).await {
-                Ok(listener) => serve_https(listener, self.app.clone(), self.tls.clone()),
+                Ok(listener) => serve_listener(listener, self.app.clone(), Some(self.tls.clone())),
                 Err(error) => Err(error),
             };
             if let Some(listener) = self.track_bind(ip, self.https_port, result) {
@@ -185,10 +188,10 @@ impl Listeners {
         runtime.set_listening_addresses(&active, self.https.keys().copied(), self.https_port);
     }
 
-    /// Android's process network binding only affects sockets created after
-    /// the binding changes. Recreate non-loopback listeners when a VPN or LAN
-    /// interface appears/disappears so inbound HTTP/WS traffic follows the
-    /// newly selected physical network.
+    /// Android 的进程网络绑定只对绑定变化之后创建的 socket 生效。
+    /// 当 VPN 或局域网接口出现/消失时重建非回环监听，
+    /// 让入站 HTTP/WS 流量跟随
+    /// 新选中的物理网络。
     async fn restart_network_listeners(&mut self) {
         let local = Ipv4Addr::LOCALHOST;
         let mut stopping = Vec::new();
@@ -261,24 +264,29 @@ fn needs_network_listener_restart(
             || runtime.network_rebind_generation() != last_network_rebind_generation)
 }
 
-fn serve_http(listener: TcpListener, app: Router) -> io::Result<Listener> {
+fn serve_listener(
+    listener: TcpListener,
+    app: Router,
+    tls: Option<RustlsConfig>,
+) -> io::Result<Listener> {
     let address = listener.local_addr()?;
-    let server = axum_server::from_tcp(listener.into_std()?)?;
+    let listener = listener.into_std()?;
     let handle = axum_server::Handle::new();
-    let future = server
-        .handle(handle.clone())
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
-    Ok(serve(address, handle, future))
-}
-
-fn serve_https(listener: TcpListener, app: Router, config: RustlsConfig) -> io::Result<Listener> {
-    let address = listener.local_addr()?;
-    let server = axum_server::from_tcp_rustls(listener.into_std()?, config)?;
-    let handle = axum_server::Handle::new();
-    let future = server
-        .handle(handle.clone())
-        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
-    Ok(serve(address, handle, future))
+    // 明文与 TLS 的 axum-server 类型不同，只有 server 构造与 future 类型分叉。
+    match tls {
+        Some(config) => {
+            let future = axum_server::from_tcp_rustls(listener, config)?
+                .handle(handle.clone())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+            Ok(serve(address, handle, future))
+        }
+        None => {
+            let future = axum_server::from_tcp(listener)?
+                .handle(handle.clone())
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>());
+            Ok(serve(address, handle, future))
+        }
+    }
 }
 
 fn serve(

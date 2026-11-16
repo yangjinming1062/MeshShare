@@ -16,7 +16,7 @@ pub(crate) enum Outcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SystemPackageKind {
+pub(crate) enum SystemPackageKind {
     Deb,
     Rpm,
 }
@@ -76,15 +76,12 @@ fn classify_exit_code(code: Option<i32>) -> PackageStatus {
     }
 }
 
-pub(crate) fn system_package_available() -> bool {
-    SystemPackageKind::from_bundle(bundle_type()).is_some()
+pub(crate) fn system_package() -> Option<SystemPackageKind> {
+    SystemPackageKind::from_bundle(bundle_type())
 }
 
 /// 请求系统授权并安装更新包；授权未完成时返回待授权而不是安装失败。
-pub(crate) async fn install(bytes: Vec<u8>) -> Outcome {
-    let Some(kind) = SystemPackageKind::from_bundle(bundle_type()) else {
-        return Outcome::Failed("当前安装介质不支持系统包更新".to_string());
-    };
+pub(crate) async fn install(kind: SystemPackageKind, bytes: Vec<u8>) -> Outcome {
     tokio::task::spawn_blocking(move || install_blocking(kind, bytes))
         .await
         .unwrap_or_else(|error| Outcome::Failed(format!("系统包安装任务失败：{error}")))

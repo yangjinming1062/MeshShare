@@ -12,18 +12,10 @@ use std::sync::{Arc, OnceLock};
 use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize)]
-pub struct MonitorCapabilitiesSnapshot {
-    pub backend: String,
-    pub can_persist_position: bool,
-    pub can_click_through: bool,
-    pub can_keep_above: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct MonitorSettingsSnapshot {
     pub visible: bool,
     pub locked: bool,
-    pub capabilities: MonitorCapabilitiesSnapshot,
+    pub capabilities: crate::MonitorCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,7 +52,7 @@ pub struct SettingsPatch {
     pub monitor: Option<MonitorSettingsPatch>,
 }
 
-/// Shared control plane used by both Tauri commands and the remote HTTP API.
+/// Tauri 命令与远程 HTTP API 共用的控制面。
 pub struct ControlPlane {
     runtime: Arc<NodeRuntime>,
     app: Option<AppHandle>,
@@ -94,21 +86,7 @@ impl ControlPlane {
         self.updater.get()
     }
 
-    pub fn toggle_clipboard_sync(&self) -> bool {
-        let enabled = !self
-            .runtime
-            .sync_enabled
-            .load(std::sync::atomic::Ordering::SeqCst);
-        self.runtime
-            .sync_enabled
-            .store(enabled, std::sync::atomic::Ordering::SeqCst);
-        if let Some(app) = self.app.as_ref() {
-            crate::sync_tray_labels(app);
-        }
-        enabled
-    }
-
-    pub fn set_clipboard_history_settings(
+    fn set_clipboard_history_settings(
         &self,
         mode: ClipboardHistoryMode,
         value: u64,
@@ -118,7 +96,7 @@ impl ControlPlane {
             .map_err(|error| error.to_string())
     }
 
-    pub fn set_update_frequency(&self, frequency: UpdateFrequency) -> Result<String, String> {
+    fn set_update_frequency(&self, frequency: UpdateFrequency) -> Result<String, String> {
         if let Some(updater) = self.updater() {
             updater.set_frequency(frequency)
         } else {
@@ -129,7 +107,7 @@ impl ControlPlane {
         }
     }
 
-    pub fn set_receive_settings(
+    fn set_receive_settings(
         &self,
         mode: crate::model::ReceiveMode,
         directory: Option<PathBuf>,
@@ -139,19 +117,10 @@ impl ControlPlane {
             .map_err(|error| error.to_string())
     }
 
-    pub fn set_autostart_enabled(&self, enabled: bool) -> Result<bool, String> {
-        self.set_autostart(enabled)?;
-        Ok(enabled)
-    }
-
-    pub fn update_frequency(&self) -> String {
-        self.snapshot().update_frequency
-    }
-
-    pub fn update_status(&self) -> Result<UpdateStatus, String> {
+    fn current_update_frequency(&self) -> String {
         self.updater()
-            .map(|updater| updater.status())
-            .ok_or_else(|| "更新服务尚未初始化".to_string())
+            .map(|updater| updater.frequency().as_str().to_string())
+            .unwrap_or_else(|| self.runtime.update_settings().0.as_str().to_string())
     }
 
     pub fn update_proxy(&self) -> Option<String> {
@@ -164,26 +133,14 @@ impl ControlPlane {
             .map_err(|error| error.to_string())
     }
 
-    fn monitor_capabilities(&self) -> MonitorCapabilitiesSnapshot {
-        let Some(app) = self.app.as_ref() else {
-            return MonitorCapabilitiesSnapshot {
-                backend: "unknown".to_string(),
-                can_persist_position: false,
-                can_click_through: false,
-                can_keep_above: false,
-            };
-        };
-        let capabilities = crate::current_monitor_capabilities(app);
-        MonitorCapabilitiesSnapshot {
-            backend: format!("{:?}", capabilities.backend).to_lowercase(),
-            can_persist_position: capabilities.can_persist_position,
-            can_click_through: capabilities.can_click_through,
-            can_keep_above: capabilities.can_keep_above,
-        }
+    fn monitor_capabilities(&self) -> crate::MonitorCapabilities {
+        self.app.as_ref().map_or_else(
+            crate::MonitorCapabilities::unknown,
+            crate::current_monitor_capabilities,
+        )
     }
 
     pub fn snapshot(&self) -> SettingsSnapshot {
-        let (frequency, _, _) = self.runtime.update_settings();
         let monitor_capabilities = self.monitor_capabilities();
         let locked = self.app.as_ref().map_or_else(
             || self.runtime.monitor_locked(),
@@ -195,10 +152,7 @@ impl ControlPlane {
                 .sync_enabled
                 .load(std::sync::atomic::Ordering::SeqCst),
             autostart_enabled: self.runtime.autostart_enabled(),
-            update_frequency: self
-                .updater()
-                .map(|updater| updater.frequency().as_str().to_string())
-                .unwrap_or_else(|| frequency.as_str().to_string()),
+            update_frequency: self.current_update_frequency(),
             update_status: self.updater().map(|updater| updater.status()),
             receive_settings: self.runtime.receive_settings(),
             clipboard_history_settings: self.runtime.clipboard_history_settings(),
@@ -279,40 +233,26 @@ impl ControlPlane {
         self.runtime
             .set_autostart_enabled(enabled)
             .map_err(|error| format!("保存开机自启动设置失败：{error}"))?;
-        if let Err(error) = apply_autostart_registration(&registration, enabled) {
-            let restore_registration =
-                apply_autostart_registration(&registration, previous_registration);
-            let restore_preference = self.runtime.set_autostart_enabled(previous_preference);
-            return Err(format_registration_failure(
-                error,
-                restore_registration,
-                restore_preference,
-            ));
+        // 任一失败都同时恢复系统注册与配置，避免界面与真实状态分叉。
+        let failure = |error: anyhow::Error| {
+            let mut message = format!("更新开机自启动失败：{error}");
+            if let Err(restore) = registration.set_enabled(previous_registration) {
+                message.push_str(&format!("；恢复系统注册状态失败：{restore}"));
+            }
+            if let Err(restore) = self.runtime.set_autostart_enabled(previous_preference) {
+                message.push_str(&format!("；恢复配置失败：{restore}"));
+            }
+            message
+        };
+        if let Err(error) = registration.set_enabled(enabled) {
+            return Err(failure(error));
         }
         match registration.is_enabled() {
             Ok(actual) if actual == enabled => Ok(()),
-            Ok(actual) => {
-                let error =
-                    anyhow::anyhow!("系统报告的开机自启动状态为 {actual}，期望状态为 {enabled}");
-                let restore_registration =
-                    apply_autostart_registration(&registration, previous_registration);
-                let restore_preference = self.runtime.set_autostart_enabled(previous_preference);
-                Err(format_registration_failure(
-                    error,
-                    restore_registration,
-                    restore_preference,
-                ))
-            }
-            Err(error) => {
-                let restore_registration =
-                    apply_autostart_registration(&registration, previous_registration);
-                let restore_preference = self.runtime.set_autostart_enabled(previous_preference);
-                Err(format_registration_failure(
-                    error,
-                    restore_registration,
-                    restore_preference,
-                ))
-            }
+            Ok(actual) => Err(failure(anyhow::anyhow!(
+                "系统报告的开机自启动状态为 {actual}，期望状态为 {enabled}"
+            ))),
+            Err(error) => Err(failure(error)),
         }
     }
 
@@ -374,34 +314,4 @@ pub fn accept_transfer_at(
         }
     }
     Ok(progress)
-}
-
-fn apply_autostart_registration(
-    registration: &autostart::Registration,
-    enabled: bool,
-) -> anyhow::Result<()> {
-    if enabled {
-        registration
-            .enable()
-            .map_err(|error| anyhow::anyhow!("启用开机自启动失败：{error}"))
-    } else {
-        registration
-            .disable()
-            .map_err(|error| anyhow::anyhow!("关闭开机自启动失败：{error}"))
-    }
-}
-
-fn format_registration_failure(
-    error: anyhow::Error,
-    restore_registration: anyhow::Result<()>,
-    restore_preference: anyhow::Result<()>,
-) -> String {
-    let mut message = format!("更新开机自启动失败：{error}");
-    if let Err(restore_error) = restore_registration {
-        message.push_str(&format!("；恢复系统注册状态失败：{restore_error}"));
-    }
-    if let Err(restore_error) = restore_preference {
-        message.push_str(&format!("；恢复配置失败：{restore_error}"));
-    }
-    message
 }

@@ -5,7 +5,7 @@
   import { addPluginListener, invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, createOutgoingPaths, getOutgoingPrepare, browseManagedPath, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
+  import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, requestWithTimeout, createOutgoingPaths, getOutgoingPrepare, browseManagedPath, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { Sha256, digestFile } from './sha256';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
@@ -46,7 +46,6 @@
   let clipboardHistorySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
   let selectedClipboardHistory: ClipboardHistoryDetail | null = null;
   let clipboardHistoryBusy = false;
-  let clipboardHistorySettingsBusy = false;
   let clipboardStatus: ClipboardStatus = { session: 'unknown', available: false, retrying: true, message: '正在连接系统剪贴板…' };
   type AndroidReceiveStorage = { directory: string; public_download: boolean };
   let androidReceiveStorage: AndroidReceiveStorage | null = null;
@@ -60,7 +59,6 @@
   let mobileQr: { url: string; image: string } | null = null;
   let syncEnabled = true;
   let autostartEnabled = true;
-  let autostartBusy = false;
   let updateFrequency: UpdateFrequency = 'weekly';
   let updateStatus: UpdateStatus | null = null;
   let updateProxy = '';
@@ -68,9 +66,10 @@
   let updateProxyReset = 0;
   const UNKNOWN_MONITOR_CAPABILITIES: MonitorCapabilities = { backend: 'unknown', can_persist_position: false, can_click_through: false, can_keep_above: false };
   let monitorCapabilities: MonitorCapabilities = UNKNOWN_MONITOR_CAPABILITIES;
-  let updateBusy = false;
   let receiveSettings: ReceiveSettings = { mode: 'confirm' };
-  let receiveSettingsBusy = false;
+  let settingsReady = false;
+  let settingsRead: Promise<NodeSettings> | null = null;
+  let settingsWrites = new Set<string>();
   let remoteFileAccess = false;
   let remoteFileAccessBusy = false;
   let browseOpen = false;
@@ -175,6 +174,7 @@
   $: phoneFailures = failures;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
+  $: settingsDisabled = !settingsReady || !node || settingsWrites.has(node.node_id);
   // 远程管理页的发送由目标机器选文件，需要目标节点声明对应的管理能力。
   $: managedFilesSupported = remoteMode && !!node?.capabilities.includes(REMOTE_FILES_CAPABILITY);
   $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
@@ -401,20 +401,11 @@
         localBaseUrl = base;
         if (!activeBaseUrl) activeBaseUrl = base;
         if (isDesktopWindow) {
-          updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
-          updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
           updateProxy = (await invoke<string | null>('update_proxy').catch(() => null)) ?? '';
-          clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
-          receiveSettings = await invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings);
           remoteFileAccess = await invoke<boolean>('remote_file_access').catch(() => remoteFileAccess);
-          clipboardStatus = await invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus);
         }
         if (isAndroidApp) void refreshAndroidReceiveStorage();
         await refresh();
-        if (isDesktopWindow) {
-          syncEnabled = await invoke<boolean>('clipboard_sync_enabled').catch(() => true);
-          autostartEnabled = await invoke<boolean>('autostart_enabled').catch(() => true);
-        }
         connectWebSocket();
         timer = window.setInterval(() => {
           void refresh().catch(async (error) => {
@@ -473,30 +464,18 @@
     }
   }
 
-  async function refreshLocalMonitorState(): Promise<void> {
-    if (!isDesktopWindow || remoteMode) return;
-    const [capabilities, locked, visible] = await Promise.all([
-      invoke<MonitorCapabilities>('monitor_capabilities').catch(() => monitorCapabilities),
-      invoke<boolean>('monitor_locked').catch(() => monitorLocked),
-      invoke<boolean>('monitor_visible').catch(() => monitorVisible),
-    ]);
-    monitorCapabilities = capabilities;
-    monitorLocked = locked;
-    monitorVisible = visible;
-  }
-
   async function refresh() {
     const requestId = ++refreshRequestId;
     const generation = targetGeneration;
     const target = activeBaseUrl;
-    await refreshLocalMonitorState();
     if (isMonitor) {
-      const [nextNode, nextMetrics] = await Promise.all([getInfo(), getMetrics()]);
-      if (generation !== targetGeneration || target !== activeBaseUrl) return;
+      const [nextNode, nextMetrics] = await Promise.all([getInfo(target), getMetrics(target)]);
+      if (requestId !== refreshRequestId || generation !== targetGeneration || target !== activeBaseUrl) return;
       node = nextNode;
       metrics = nextMetrics;
       status = '节点在线';
       statusKind = 'ok';
+      await refreshSettings(generation, target);
       return;
     }
     if (isWeb && !mobileSessionId) await ensureMobileSession();
@@ -506,11 +485,7 @@
       getClipboard(),
       getMetrics(),
       getClipboardHistory(),
-      getClipboardStatus().catch(() => remoteMode
-        ? clipboardStatus
-        : isDesktopWindow
-          ? invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus)
-          : clipboardStatus),
+      getClipboardStatus().catch(() => clipboardStatus),
     ]);
     const nextTransfers = isWeb ? [] : await getTransfers();
     // 目标切换时旧请求不能把上一个节点的历史写进当前界面。
@@ -598,24 +573,66 @@
     }
     status = '节点在线';
     statusKind = 'ok';
-    if (remoteMode) await refreshRemoteSettings(generation, target);
+    if (!isWeb) await refreshSettings(generation, target);
   }
 
-  async function refreshRemoteSettings(generation = targetGeneration, target = activeBaseUrl) {
-    if (!remoteMode) return;
+  async function refreshSettings(generation = targetGeneration, target = activeBaseUrl) {
+    if (pageStopped || generation !== targetGeneration || target !== activeBaseUrl) return;
+    if (!node || settingsRead || settingsWrites.has(node.node_id)) return;
+    const read = getSettings(target);
+    settingsRead = read;
     try {
-      const settings = await getSettings();
-      if (generation !== targetGeneration || target !== activeBaseUrl) return;
-      applyRemoteSettings(settings);
+      const settings = await read;
+      if (pageStopped || settingsRead !== read) return;
+      applySettings(settings);
+      settingsReady = true;
     } catch (error) {
-      if (error instanceof Error && !error.message.includes('404')) {
-        status = error.message;
-        statusKind = 'warn';
+      if (pageStopped || settingsRead !== read) return;
+      if (error instanceof ApiError && error.status === 404) {
+        settingsReady = false;
+        status = '节点不支持设置接口，请检查节点版本';
+      } else {
+        status = error instanceof Error ? error.message : '无法读取节点设置';
       }
+      statusKind = 'warn';
+    } finally {
+      if (settingsRead === read) settingsRead = null;
     }
   }
 
-  function applyRemoteSettings(settings: NodeSettings) {
+  /** 同一节点串行写入，旧上下文的结果不更新当前界面。 */
+  async function saveSettings(
+    change: (target: string) => Promise<NodeSettings>,
+    success: string | ((settings: NodeSettings) => string),
+    failure: string,
+  ): Promise<boolean> {
+    if (pageStopped || !settingsReady || !node || settingsWrites.has(node.node_id)) return false;
+    const nodeId = node.node_id;
+    const generation = targetGeneration;
+    const target = activeBaseUrl;
+    settingsRead = null;
+    settingsWrites = new Set(settingsWrites).add(nodeId);
+    try {
+      const settings = await change(target);
+      if (pageStopped || generation !== targetGeneration) return false;
+      applySettings(settings);
+      showTransientNotice(typeof success === 'string' ? success : success(settings));
+      return true;
+    } catch (error) {
+      if (!pageStopped && generation === targetGeneration) {
+        settingsReady = false;
+        showTransientNotice(error instanceof Error ? error.message : failure, 6000);
+      }
+      return false;
+    } finally {
+      const remaining = new Set(settingsWrites);
+      remaining.delete(nodeId);
+      settingsWrites = remaining;
+      if (!settingsReady && node?.node_id === nodeId) void refreshSettings();
+    }
+  }
+
+  function applySettings(settings: NodeSettings) {
     syncEnabled = settings.clipboard_sync_enabled;
     autostartEnabled = settings.autostart_enabled;
     updateFrequency = settings.update_frequency;
@@ -626,28 +643,6 @@
     monitorLocked = settings.monitor.locked;
     monitorVisible = settings.monitor.visible;
     monitorCapabilities = settings.monitor.capabilities;
-  }
-
-  async function refreshLocalSettings() {
-    if (!isDesktopWindow || remoteMode) return;
-    const [nextFrequency, nextStatus, nextProxy, nextHistory, nextReceive, nextClipboard, nextSync, nextAutostart] = await Promise.all([
-      invoke<UpdateFrequency>('update_frequency').catch(() => updateFrequency),
-      invoke<UpdateStatus>('update_status').catch(() => updateStatus),
-      invoke<string | null>('update_proxy').catch(() => updateProxy || null),
-      invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings),
-      invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings),
-      invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus),
-      invoke<boolean>('clipboard_sync_enabled').catch(() => syncEnabled),
-      invoke<boolean>('autostart_enabled').catch(() => true),
-    ]);
-    updateFrequency = nextFrequency;
-    updateStatus = nextStatus;
-    updateProxy = nextProxy ?? '';
-    clipboardHistorySettings = nextHistory;
-    receiveSettings = nextReceive;
-    clipboardStatus = nextClipboard;
-    syncEnabled = nextSync;
-    autostartEnabled = nextAutostart;
   }
 
   async function ensureMobileSession() {
@@ -860,54 +855,28 @@
   }
 
   async function toggleSync() {
-    if (remoteMode) {
-      try {
-        const settings = await patchSettings({ clipboard_sync_enabled: !syncEnabled });
-        applyRemoteSettings(settings);
-        showTransientNotice(syncEnabled ? '目标节点的剪贴板自动同步已恢复' : '目标节点的剪贴板自动同步已暂停');
-      } catch (error) {
-        showTransientNotice(error instanceof Error ? error.message : '无法更新目标节点同步设置', 6000);
-      }
-      return;
-    }
-    syncEnabled = await invoke<boolean>('toggle_clipboard_sync').catch(() => !syncEnabled);
-    showTransientNotice(syncEnabled ? '剪贴板自动同步已恢复' : '剪贴板自动同步已暂停');
+    const scope = remoteMode ? '目标节点的' : '';
+    await saveSettings(
+      (target) => patchSettings({ clipboard_sync_enabled: !syncEnabled }, target),
+      (settings) => settings.clipboard_sync_enabled ? `${scope}剪贴板自动同步已恢复` : `${scope}剪贴板自动同步已暂停`,
+      '无法更新剪贴板同步设置',
+    );
   }
 
   async function toggleAutostart() {
-    if (autostartBusy) return;
-    const next = !autostartEnabled;
-    autostartBusy = true;
-    try {
-      if (remoteMode) {
-        const settings = await patchSettings({ autostart_enabled: next });
-        applyRemoteSettings(settings);
-      } else {
-        autostartEnabled = await invoke<boolean>('set_autostart_enabled', { enabled: next });
-      }
-      showTransientNotice(autostartEnabled ? '开机自启动已开启' : '开机自启动已关闭');
-    } catch (error) {
-      showTransientNotice(typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新开机自启动设置', 6000);
-    } finally {
-      autostartBusy = false;
-    }
+    await saveSettings(
+      (target) => patchSettings({ autostart_enabled: !autostartEnabled }, target),
+      (settings) => settings.autostart_enabled ? '开机自启动已开启' : '开机自启动已关闭',
+      '无法更新开机自启动设置',
+    );
   }
 
   async function setUpdateFrequency(next: UpdateFrequency) {
-    const previous = updateFrequency;
-    try {
-      if (remoteMode) {
-        const settings = await patchSettings({ update_frequency: next });
-        applyRemoteSettings(settings);
-      } else {
-        updateFrequency = await invoke<UpdateFrequency>('set_update_frequency', { frequency: next });
-        updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
-      }
-      showTransientNotice(next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`);
-    } catch (error) {
-      updateFrequency = previous;
-      showTransientNotice(error instanceof Error ? error.message : '无法更新自动更新设置', 6000);
-    }
+    await saveSettings(
+      (target) => patchSettings({ update_frequency: next }, target),
+      next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`,
+      '无法更新自动更新设置',
+    );
   }
 
   async function setUpdateProxy(value: string) {
@@ -926,18 +895,21 @@
   }
 
   async function setReceiveMode(mode: ReceiveMode) {
+    if (settingsDisabled) return;
     if (mode === 'auto' && !receiveSettings.default_path) {
-      await chooseReceiveDirectory();
-      if (!receiveSettings.default_path) return;
+      await chooseReceiveDirectory(mode);
+      return;
     }
     await saveReceiveSettings(mode, receiveSettings.default_path);
   }
 
-  async function chooseReceiveDirectory() {
+  async function chooseReceiveDirectory(mode?: ReceiveMode) {
+    if (settingsDisabled) return;
+    const generation = targetGeneration;
     if (remoteMode) {
       const path = window.prompt('输入目标节点上的默认接收目录', receiveSettings.default_path ?? '');
       if (path === null) return;
-      await saveReceiveSettings(receiveSettings.mode, path.trim() || null);
+      await saveReceiveSettings(mode ?? receiveSettings.mode, path.trim() || receiveSettings.default_path);
       return;
     }
     let destination: string | string[] | null = null;
@@ -947,32 +919,16 @@
       destination = null;
     }
     const path = Array.isArray(destination) ? destination[0] : destination;
-    if (!path) return;
-    await saveReceiveSettings(receiveSettings.mode, path);
+    if (!path || generation !== targetGeneration) return;
+    await saveReceiveSettings(mode ?? receiveSettings.mode, path);
   }
 
   async function saveReceiveSettings(mode: ReceiveMode, defaultPath?: string | null) {
-    if (receiveSettingsBusy) return;
-    receiveSettingsBusy = true;
-    try {
-      if (remoteMode) {
-        const settings = await patchSettings({ receive_settings: {
-          mode,
-          default_path: defaultPath ?? receiveSettings.default_path ?? null,
-        } });
-        applyRemoteSettings(settings);
-      } else {
-        receiveSettings = await invoke<ReceiveSettings>('set_receive_settings', {
-          mode,
-          defaultPath: defaultPath ?? receiveSettings.default_path ?? null,
-        });
-      }
-      showTransientNotice(mode === 'auto' ? '已启用自动接收' : '已设为每次确认');
-    } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法更新接收设置', 6000);
-    } finally {
-      receiveSettingsBusy = false;
-    }
+    await saveSettings(
+      (target) => patchSettings({ receive_settings: { mode, default_path: defaultPath ?? null } }, target),
+      mode === 'auto' ? '已启用自动接收' : '已设为每次确认',
+      '无法更新接收设置',
+    );
   }
 
   async function setClipboardHistoryMode(mode: ClipboardHistoryMode) {
@@ -989,29 +945,25 @@
   }
 
   async function saveClipboardHistorySettings(mode: ClipboardHistoryMode, value: number) {
-    if (clipboardHistorySettingsBusy) return;
-    clipboardHistorySettingsBusy = true;
-    try {
-      if (remoteMode) {
-        const settings = await patchSettings({ clipboard_history_settings: { mode, value } });
-        applyRemoteSettings(settings);
-      } else {
-        clipboardHistorySettings = await invoke<ClipboardHistorySettings>('set_clipboard_history_settings', { mode, value });
-      }
-      await refreshClipboardHistory();
-      showTransientNotice(mode === 'count'
-        ? `已保留最近 ${clipboardHistorySettings.count} 条剪贴板内容`
-        : `已保留最近 ${clipboardHistorySettings.days} 天剪贴板内容`);
-    } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法更新剪贴板历史设置', 6000);
-    } finally {
-      clipboardHistorySettingsBusy = false;
+    const generation = targetGeneration;
+    const target = activeBaseUrl;
+    const saved = await saveSettings(
+      (base) => patchSettings({ clipboard_history_settings: { mode, value } }, base),
+      ({ clipboard_history_settings: settings }) => settings.mode === 'count'
+        ? `已保留最近 ${settings.count} 条剪贴板内容`
+        : `已保留最近 ${settings.days} 天剪贴板内容`,
+      '无法更新剪贴板历史设置',
+    );
+    if (saved) {
+      await refreshClipboardHistory(generation, target).catch((error) => console.error('刷新剪贴板历史失败', error));
     }
   }
 
-  async function refreshClipboardHistory() {
-    const response = await getClipboardHistory();
-    clipboardHistorySettings = response.settings;
+  async function refreshClipboardHistory(generation = targetGeneration, target = activeBaseUrl) {
+    if (generation !== targetGeneration) return;
+    const response = await getClipboardHistory(target);
+    if (generation !== targetGeneration || pageStopped) return;
+    if (isWeb) clipboardHistorySettings = response.settings;
     clipboardHistory = response.items;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
       selectedClipboardHistory = null;
@@ -1019,21 +971,7 @@
   }
 
   async function checkForUpdates() {
-    if (updateBusy) return;
-    updateBusy = true;
-    try {
-      if (remoteMode) {
-        applyRemoteSettings(await requestUpdateCheck());
-      } else {
-        await invoke('check_for_updates');
-        updateStatus = await invoke<UpdateStatus>('update_status').catch(() => updateStatus);
-      }
-      showTransientNotice('已发起更新检查');
-    } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法检查更新', 6000);
-    } finally {
-      updateBusy = false;
-    }
+    await saveSettings(requestUpdateCheck, '已发起更新检查', '无法检查更新');
   }
 
   function selectMetricsPeer(peer: PeerInfo) {
@@ -1074,29 +1012,19 @@
   }
 
   async function toggleMonitorLock() {
-    try {
-      if (remoteMode) {
-        applyRemoteSettings(await patchSettings({ monitor: { locked: !monitorLocked } }));
-      } else {
-        monitorLocked = await invoke<boolean>('set_monitor_locked', { locked: !monitorLocked });
-      }
-      showTransientNotice(monitorLocked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动');
-    } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法更新悬浮监控条状态', 6000);
-    }
+    await saveSettings(
+      (target) => patchSettings({ monitor: { locked: !monitorLocked } }, target),
+      (settings) => settings.monitor.locked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动',
+      '无法更新悬浮监控条状态',
+    );
   }
 
   async function toggleMonitorVisibility() {
-    try {
-      if (remoteMode) {
-        applyRemoteSettings(await patchSettings({ monitor: { visible: !monitorVisible } }));
-      } else {
-        monitorVisible = await invoke<boolean>('set_monitor_visible', { visible: !monitorVisible });
-      }
-      showTransientNotice(monitorVisible ? '悬浮监控条已显示' : '悬浮监控条已隐藏');
-    } catch (error) {
-      showTransientNotice(typeof error === 'string' ? error : error instanceof Error ? error.message : '无法更新悬浮监控条可见性', 6000);
-    }
+    await saveSettings(
+      (target) => patchSettings({ monitor: { visible: !monitorVisible } }, target),
+      (settings) => settings.monitor.visible ? '悬浮监控条已显示' : '悬浮监控条已隐藏',
+      '无法更新悬浮监控条可见性',
+    );
   }
 
   async function openMonitorMenu(event: MouseEvent) {
@@ -1348,7 +1276,7 @@
     const transfer = browseTransfer;
     closeBrowse();
     if (!transfer) return;
-    const entered = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
+    const entered = window.prompt('输入目标节点上的接收目录', settingsReady ? receiveSettings.default_path ?? '' : '');
     const path = entered?.trim();
     if (!path) {
       showTransientNotice('需要输入目标节点上的接收目录', 6000);
@@ -1523,16 +1451,6 @@
     return error instanceof Error ? error.message : '文件传输失败';
   }
 
-  async function requestWithTimeout<T>(path: string, options: RequestInit, target: string, timeoutMs = 6000): Promise<T> {
-    const controller = new AbortController();
-    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      return await request<T>(path, { ...options, redirect: 'error', signal: controller.signal }, target);
-    } finally {
-      window.clearTimeout(timer);
-    }
-  }
-
   function transferCandidates(route: TransferRoute): string[] {
     const peer = peers.find((candidate) => candidate.node_id === route.nodeId) ?? route.peer;
     return [...new Set([route.target, ...(peer ? targetCandidates(peer) : [])])];
@@ -1585,6 +1503,9 @@
 
   function resetTargetUi() {
     targetGeneration += 1;
+    settingsReady = false;
+    settingsRead = null;
+    closeBrowse();
     node = null;
     peers = [];
     clipboard = null;
@@ -1643,8 +1564,6 @@
       status = error instanceof Error ? error.message : target ? '无法连接目标节点' : '无法连接本机节点';
       statusKind = 'error';
     });
-    if (context !== contextGeneration) return;
-    if (!target) await refreshLocalSettings();
     if (context !== contextGeneration) return;
     connectWebSocket();
   }
@@ -1956,11 +1875,6 @@
         total_bytes: items.reduce((sum, item) => sum + item.size, 0),
         created_at_ms: Date.now(),
       };
-      const localProgress = await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
-      if (localProgress?.status === 'failed') {
-        observeFailure({ ...localProgress, offer, direction: 'send' });
-        throw new Error(localProgress.error ?? '传输任务数量已达到上限');
-      }
       try {
         const pending: PendingUpload = { target: candidates[0], nodeId: peer.node_id, peer, files, items, offer };
         const created = await createTransferOnCandidates(offer, pending);
@@ -1973,24 +1887,17 @@
         showTransientNotice('已发送传输请求，等待接收端确认', 3600);
       } catch (error) {
         const message = describeTransferFailure(error, peer.node_name, candidates.join('、'));
-        const failedProgress: TransferProgress = {
-          ...(localProgress ?? {
-            transfer_id: offer.transfer_id,
-            status: 'waiting',
-            completed_bytes: 0,
-            total_bytes: offer.total_bytes,
-            completed_items: 0,
-            total_items: offer.items.length,
-          }),
+        observeFailure({
+          transfer_id: offer.transfer_id,
           status: 'failed',
+          completed_bytes: 0,
+          total_bytes: offer.total_bytes,
+          completed_items: 0,
+          total_items: offer.items.length,
           error: message,
           offer,
           direction: 'send',
-        };
-        observeFailure(failedProgress);
-        if (localProgress) {
-          await invoke('update_transfer_progress', { progress: failedProgress }).catch(() => undefined);
-        }
+        });
         showTransientNotice(message, 6000);
       }
     } catch (error) {
@@ -2225,7 +2132,6 @@
           watching.delete(id);
           return;
         }
-        void invoke('update_transfer_progress', { progress }).catch(() => undefined);
         const existing = transfers.find((item) => item.transfer_id === id);
         const nextProgress = existing && shouldKeepTransferProgress(existing, progress)
           ? { ...progress, ...existing, offer: progress.offer ?? existing.offer }
@@ -2548,9 +2454,11 @@
 
   async function acceptTransfer(transfer: TransferProgress) {
     if (!transfer.offer || transferActionBusy) return;
+    const generation = targetGeneration;
     if (remoteMode) {
+      const defaultPath = settingsReady ? receiveSettings.default_path ?? '' : '';
       if (!managedFilesSupported) {
-        const entered = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
+        const entered = window.prompt('输入目标节点上的接收目录', defaultPath);
         const path = entered?.trim();
         if (!path) {
           showTransientNotice('需要输入目标节点上的接收目录', 6000);
@@ -2562,7 +2470,7 @@
       browseTransfer = transfer;
       browsePeer = null;
       browseMode = 'directory';
-      browseStartPath = receiveSettings.default_path ?? '';
+      browseStartPath = defaultPath;
       browseOpen = true;
       return;
     }
@@ -2587,7 +2495,7 @@
       showTransientNotice('当前环境无法选择接收目录', 6000);
       return;
     }
-    await acceptTransferAt(transfer, path);
+    if (generation === targetGeneration) await acceptTransferAt(transfer, path);
   }
 
   /** 接收目录确定后提交接受；远程目标的目录存在性与权限由目标节点校验。 */
@@ -2595,14 +2503,10 @@
     if (transferActionBusy) return;
     transferActionBusy = transfer.transfer_id;
     try {
-      if (remoteMode) {
-        await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/accept`, {
-          method: 'POST',
-          body: JSON.stringify({ destination: path }),
-        });
-      } else {
-        await invoke<TransferProgress>('accept_transfer', { transferId: transfer.transfer_id, destination: path });
-      }
+      await request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/accept`, {
+        method: 'POST',
+        body: JSON.stringify({ destination: path }),
+      });
       showTransientNotice(
         isAndroidApp && !remoteMode
           ? '已接受，文件将保存到 MeshShare 应用目录'
@@ -2710,7 +2614,8 @@
       {statusKind}
       {syncEnabled}
       {autostartEnabled}
-      {autostartBusy}
+      {settingsReady}
+      {settingsDisabled}
       onSync={toggleSync}
       onAutostart={toggleAutostart}
       onSettings={() => (settingsOpen = true)}
@@ -2748,6 +2653,7 @@
         metrics={metrics}
         {monitorLocked}
         {monitorVisible}
+        {settingsDisabled}
         canClickThrough={monitorCapabilities.can_click_through}
         onToggleLock={toggleMonitorLock}
         onToggleVisible={toggleMonitorVisibility}
@@ -2769,22 +2675,20 @@
       {node}
       {updateFrequency}
       {updateStatus}
-      {updateBusy}
+      {settingsDisabled}
       {updateProxy}
       {updateProxyBusy}
       {updateProxyReset}
       localMode={!remoteMode}
       {receiveSettings}
-      receiveBusy={receiveSettingsBusy}
       historySettings={clipboardHistorySettings}
-      historyBusy={clipboardHistorySettingsBusy}
       {remoteFileAccess}
       {remoteFileAccessBusy}
       onFrequency={setUpdateFrequency}
       onCheckUpdates={checkForUpdates}
       onUpdateProxy={setUpdateProxy}
       onReceiveMode={setReceiveMode}
-      onChooseDirectory={chooseReceiveDirectory}
+      onChooseDirectory={() => chooseReceiveDirectory()}
       onHistoryMode={setClipboardHistoryMode}
       onHistoryValue={setClipboardHistoryValue}
       onRemoteFileAccess={setRemoteFileAccess}

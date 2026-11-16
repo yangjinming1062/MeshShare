@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferHistoryCleared, TransferHistoryEntry, TransferOffer, TransferProgress, TransferStatus } from './types';
 
 let baseUrl = '';
+const SETTINGS_WRITE_TIMEOUT_MS = 30_000;
 
 /** HTTP 状态码保留在错误上，调用方才能区分对端拒绝与网络不可达。 */
 export class ApiError extends Error {
@@ -64,6 +65,16 @@ export async function request<T>(path: string, options: RequestInit = {}, target
   return payload as T;
 }
 
+export async function requestWithTimeout<T>(path: string, options: RequestInit, target: string, timeoutMs = 6000): Promise<T> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await request<T>(path, { ...options, redirect: 'error', signal: controller.signal }, target);
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
 async function requestList<T>(path: string, target = baseUrl): Promise<T[]> {
   const payload = await request<unknown>(path, {}, target);
   if (!Array.isArray(payload)) throw new Error(`节点返回的列表格式无效 (${path})`);
@@ -75,9 +86,9 @@ export const getPeers = (target = baseUrl) => requestList<PeerInfo>('/api/v1/pee
 export const getMetrics = (target = baseUrl) => request<HardwareMetrics | null>('/api/v1/metrics', {}, target);
 export const getClipboard = (target = baseUrl) => request<ClipboardSnapshot | null>('/api/v1/clipboard', {}, target);
 export const getClipboardStatus = (target = baseUrl) => request<ClipboardStatus>('/api/v1/clipboard/status', {}, target);
-export const getSettings = (target = baseUrl) => request<NodeSettings>('/api/v1/settings', {}, target);
-export const patchSettings = (patch: NodeSettingsPatch, target = baseUrl) => request<NodeSettings>('/api/v1/settings', { method: 'PATCH', body: JSON.stringify(patch) }, target);
-export const requestUpdateCheck = (target = baseUrl) => request<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target);
+export const getSettings = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', {}, target);
+export const patchSettings = (patch: NodeSettingsPatch, target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', { method: 'PATCH', body: JSON.stringify(patch) }, target, SETTINGS_WRITE_TIMEOUT_MS);
+export const requestUpdateCheck = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target, SETTINGS_WRITE_TIMEOUT_MS);
 export const getClipboardHistory = (target = baseUrl) => request<ClipboardHistoryResponse>('/api/v1/clipboard/history', {}, target);
 export const getClipboardHistoryDetail = (eventId: string, target = baseUrl) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`, {}, target);
 export const restoreClipboardHistory = (eventId: string, target = baseUrl) => request<ClipboardSnapshot>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/restore`, { method: 'POST' }, target);

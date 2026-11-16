@@ -16,15 +16,13 @@
   export let node: NodeInfo | null = null;
   export let updateFrequency: UpdateFrequency = 'weekly';
   export let updateStatus: UpdateStatus | null = null;
-  export let updateBusy = false;
+  export let settingsDisabled = false;
   export let updateProxy = '';
   export let updateProxyBusy = false;
   export let updateProxyReset = 0;
   export let localMode = true;
   export let receiveSettings: ReceiveSettings = { mode: 'confirm' };
-  export let receiveBusy = false;
   export let historySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
-  export let historyBusy = false;
   export let remoteFileAccess = false;
   export let remoteFileAccessBusy = false;
   export let onFrequency: (value: UpdateFrequency) => void = () => {};
@@ -39,8 +37,8 @@
 
   $: historyValue = historySettings.mode === 'count' ? historySettings.count : historySettings.days;
   $: historyMax = historySettings.mode === 'count' ? 500 : 365;
-  $: updateLocked = ['downloading', 'installing'].includes(updateStatus?.state ?? '');
-  $: checkDisabled = updateBusy || ['checking', 'downloading', 'installing'].includes(updateStatus?.state ?? '');
+  $: updateLocked = settingsDisabled || ['downloading', 'installing'].includes(updateStatus?.state ?? '');
+  $: checkDisabled = settingsDisabled || ['checking', 'downloading', 'installing'].includes(updateStatus?.state ?? '');
 </script>
 
 <Dialog {open} title="设置" width={520} {onClose}>
@@ -95,10 +93,10 @@
       </div>
       <div class="setting-actions">
         <div class="segmented" role="radiogroup" aria-label="文件接收行为">
-          <label><input type="radio" name="receive-mode" value="confirm" checked={receiveSettings.mode === 'confirm'} disabled={receiveBusy} on:change={() => onReceiveMode('confirm')} />每次确认</label>
-          <label><input type="radio" name="receive-mode" value="auto" checked={receiveSettings.mode === 'auto'} disabled={receiveBusy} on:change={() => onReceiveMode('auto')} />自动接收</label>
+          <label><input type="radio" name="receive-mode" value="confirm" checked={receiveSettings.mode === 'confirm'} disabled={settingsDisabled} on:change={() => onReceiveMode('confirm')} />每次确认</label>
+          <label><input type="radio" name="receive-mode" value="auto" checked={receiveSettings.mode === 'auto'} disabled={settingsDisabled} on:change={() => onReceiveMode('auto')} />自动接收</label>
         </div>
-        <button type="button" class="btn btn-ghost btn-sm" disabled={receiveBusy} on:click={onChooseDirectory}>选择默认目录</button>
+        <button type="button" class="btn btn-ghost btn-sm" disabled={settingsDisabled} on:click={onChooseDirectory}>选择默认目录</button>
       </div>
     </div>
   </div>
@@ -131,8 +129,8 @@
       </div>
       <div class="setting-actions">
         <div class="segmented" role="radiogroup" aria-label="剪贴板历史保留模式">
-          <label><input type="radio" name="history-mode" value="count" checked={historySettings.mode === 'count'} disabled={historyBusy} on:change={() => onHistoryMode('count')} />按条数</label>
-          <label><input type="radio" name="history-mode" value="days" checked={historySettings.mode === 'days'} disabled={historyBusy} on:change={() => onHistoryMode('days')} />按天数</label>
+          <label><input type="radio" name="history-mode" value="count" checked={historySettings.mode === 'count'} disabled={settingsDisabled} on:change={() => onHistoryMode('count')} />按条数</label>
+          <label><input type="radio" name="history-mode" value="days" checked={historySettings.mode === 'days'} disabled={settingsDisabled} on:change={() => onHistoryMode('days')} />按天数</label>
         </div>
         <input
           class="field setting-number"
@@ -141,7 +139,7 @@
           max={historyMax}
           value={historyValue}
           aria-label="剪贴板历史保留数量"
-          disabled={historyBusy}
+          disabled={settingsDisabled}
           on:change={(event) => onHistoryValue(Number(event.currentTarget.value))}
         />
         <span class="muted">{historySettings.mode === 'count' ? '条' : '天'}</span>

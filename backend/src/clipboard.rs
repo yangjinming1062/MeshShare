@@ -1,4 +1,6 @@
-use crate::model::{ClipboardSession, ClipboardSnapshot};
+use crate::model::ClipboardSession;
+#[cfg(not(target_os = "android"))]
+use crate::model::ClipboardSnapshot;
 use crate::runtime::NodeRuntime;
 #[cfg(not(target_os = "android"))]
 use arboard::{Clipboard, Error as ClipboardError, ImageData};
@@ -19,7 +21,7 @@ use std::time::Duration;
 const MAX_CLIPBOARD_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_CLIPBOARD_IMAGE_ALLOCATION: u64 = 128 * 1024 * 1024;
 #[cfg(not(target_os = "android"))]
-type ClipboardPayload = (Option<String>, Option<Vec<u8>>);
+type ClipboardPayload = (Option<String>, Option<ImageData<'static>>);
 
 #[cfg(not(target_os = "android"))]
 pub fn start_monitor(runtime: Arc<NodeRuntime>) {
@@ -60,25 +62,46 @@ fn monitor_loop(runtime: Arc<NodeRuntime>) {
             if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 break 'monitor;
             }
+            let observed_event_id = runtime.clipboard_event_id();
+            if let Some(snapshot) = runtime.take_system_clipboard_write() {
+                match write_snapshot(&mut clipboard, snapshot) {
+                    Ok(hash) => {
+                        if let Some(hash) = hash {
+                            last_hash = hash;
+                        }
+                        runtime.set_clipboard_available(current_session());
+                    }
+                    Err(error) => {
+                        eprintln!("写入系统剪贴板失败：{error}");
+                        runtime.set_clipboard_unavailable(current_session(), error, true);
+                    }
+                }
+                continue;
+            }
             if !runtime
                 .sync_enabled
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
-                thread::sleep(Duration::from_millis(500));
+                runtime.wait_for_system_clipboard_write(Duration::from_millis(500));
                 continue;
             }
-            match read_payload(&mut clipboard) {
+            let payload = read_payload(&mut clipboard);
+            if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                break 'monitor;
+            }
+            match payload {
                 Ok(payload) => {
                     runtime.set_clipboard_available(current_session());
                     if let Some((text, image)) = payload {
-                        let hash = payload_hash(text.as_deref(), image.as_deref());
+                        let hash = system_payload_hash(text.as_deref(), image.as_ref());
                         if hash != last_hash {
-                            last_hash = hash.clone();
-                            if runtime.is_clipboard_suppressed(&hash) {
-                                thread::sleep(Duration::from_millis(350));
-                                continue;
-                            }
-                            if let Some(event) = runtime.create_local_clipboard(text, image) {
+                            last_hash = hash;
+                            let image = image.as_ref().and_then(encode_image);
+                            if let Some(event) = runtime.create_local_clipboard(
+                                text,
+                                image,
+                                observed_event_id.as_deref(),
+                            ) {
                                 runtime.publish_event(crate::model::WireMessage::ClipboardUpdate {
                                     event: event.clone(),
                                 });
@@ -92,10 +115,12 @@ fn monitor_loop(runtime: Arc<NodeRuntime>) {
                 }
                 Err(error) => {
                     runtime.set_clipboard_unavailable(current_session(), error, true);
+                    // 重建 Clipboard 前退避，避免读取持续失败时空转。
+                    thread::sleep(Duration::from_secs(2));
                     break;
                 }
             }
-            thread::sleep(Duration::from_millis(350));
+            runtime.wait_for_system_clipboard_write(Duration::from_millis(350));
         }
     }
 }
@@ -125,10 +150,17 @@ fn read_payload(clipboard: &mut Clipboard) -> Result<Option<ClipboardPayload>, S
         Ok(_) | Err(ClipboardError::ContentNotAvailable) => None,
         Err(error) => return Err(error.to_string()),
     };
+    // 图片读取失败在 Wayland 等环境很常见；文字可用时继续同步文字，
+    // 只有两者都取不到才算剪贴板不可用。
     let image = match clipboard.get_image() {
-        Ok(value) => encode_image(&value),
+        Ok(value) => Some(value),
         Err(ClipboardError::ContentNotAvailable) => None,
-        Err(error) => return Err(error.to_string()),
+        Err(error) => {
+            if text.is_none() {
+                return Err(error.to_string());
+            }
+            None
+        }
     };
     if text.is_none() && image.is_none() {
         Ok(None)
@@ -149,6 +181,23 @@ fn encode_image(image: &ImageData<'_>) -> Option<Vec<u8>> {
         .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
         .ok()?;
     Some(bytes)
+}
+
+/// 系统返回的是像素，PNG 的编码方式可能与写入前不同。
+#[cfg(not(target_os = "android"))]
+fn system_payload_hash(text: Option<&str>, image: Option<&ImageData<'_>>) -> String {
+    let mut hasher = Sha256::new();
+    if let Some(image) = image {
+        hasher.update(b"rgba\0");
+        hasher.update(image.width.to_le_bytes());
+        hasher.update(image.height.to_le_bytes());
+        hasher.update(&image.bytes);
+    }
+    if let Some(text) = text {
+        hasher.update(b"text\0");
+        hasher.update(text.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 pub(crate) fn decode_png(bytes: &[u8]) -> Result<DynamicImage, String> {
@@ -178,56 +227,33 @@ pub fn payload_hash(text: Option<&str>, image_png: Option<&[u8]>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-pub fn apply_snapshot(snapshot: &ClipboardSnapshot, runtime: &NodeRuntime) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    {
-        let _ = (snapshot, runtime);
-        return Err("Android App 不自动写入系统剪贴板，请通过共享剪贴板面板手动操作".to_string());
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let text = snapshot.text.clone();
-        let image = snapshot
-            .image_png
-            .as_deref()
-            .map(|value| BASE64.decode(value).map_err(|error| error.to_string()))
-            .transpose()?;
-        let hash = payload_hash(text.as_deref(), image.as_deref());
-        runtime.set_clipboard_suppression(hash);
-        let mut clipboard = match Clipboard::new() {
-            Ok(value) => {
-                runtime.set_clipboard_available(current_session());
-                value
-            }
-            Err(error) => {
-                let message = error.to_string();
-                runtime.set_clipboard_unavailable(current_session(), message.clone(), true);
-                return Err(message);
-            }
+#[cfg(not(target_os = "android"))]
+fn write_snapshot(
+    clipboard: &mut Clipboard,
+    snapshot: ClipboardSnapshot,
+) -> Result<Option<String>, String> {
+    if let Some(encoded) = snapshot.image_png {
+        let bytes = BASE64.decode(encoded).map_err(|error| error.to_string())?;
+        let decoded = decode_png(&bytes)?.to_rgba8();
+        let image = ImageData {
+            width: decoded.width() as usize,
+            height: decoded.height() as usize,
+            bytes: Cow::Owned(decoded.into_raw()),
         };
-        if let Some(image_png) = image {
-            let decoded = decode_png(&image_png)?.to_rgba8();
-            let image = ImageData {
-                width: decoded.width() as usize,
-                height: decoded.height() as usize,
-                bytes: Cow::Owned(decoded.into_raw()),
-            };
-            if let Err(error) = clipboard.set_image(image) {
-                let message = error.to_string();
-                runtime.set_clipboard_unavailable(current_session(), message.clone(), true);
-                return Err(message);
-            }
-        } else if let Some(text) = text {
-            if let Err(error) = clipboard.set_text(text) {
-                let message = error.to_string();
-                runtime.set_clipboard_unavailable(current_session(), message.clone(), true);
-                return Err(message);
-            }
-        }
-        runtime.set_clipboard_available(current_session());
-        Ok(())
+        let hash = system_payload_hash(None, Some(&image));
+        clipboard
+            .set_image(image)
+            .map_err(|error| error.to_string())?;
+        return Ok(Some(hash));
     }
+    if let Some(text) = snapshot.text {
+        let hash = system_payload_hash(Some(&text), None);
+        clipboard
+            .set_text(text)
+            .map_err(|error| error.to_string())?;
+        return Ok(Some(hash));
+    }
+    Ok(None)
 }
 
 #[cfg(test)]

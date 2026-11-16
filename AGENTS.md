@@ -10,7 +10,7 @@
 - 拓扑、同步序列和部署图：[`docs/ARCHITECTURE_MAP.md`](docs/ARCHITECTURE_MAP.md)
 - 用户可见行为、限制和验收：[`docs/DESIGN.md`](docs/DESIGN.md)
 - 节点 HTTP 接口、WebSocket 消息和传输约束见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
-- Rust/Tauri 节点与桌面入口：`backend/`
+- Rust/Tauri 节点与桌面入口：`backend/`，模块职责、并发与传输约束见 [`backend/README.md`](backend/README.md)
 - Svelte/TypeScript 桌面和移动客户端：`frontend/`
 
 实现改动前确认生产方、消费方和恢复路径；改动公开 API、持久化 schema 或文件生命周期时同步架构文档和相关验证。不要向仓库提交为临时验证创建的测试代码；正式检查放在现有测试入口。

@@ -231,16 +231,6 @@ pub enum ClipboardHistoryMode {
     Days,
 }
 
-impl ClipboardHistoryMode {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "count" => Some(Self::Count),
-            "days" => Some(Self::Days),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClipboardHistorySettings {
     pub mode: ClipboardHistoryMode,
@@ -279,16 +269,6 @@ pub enum ReceiveMode {
     #[default]
     Confirm,
     Auto,
-}
-
-impl ReceiveMode {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "confirm" => Some(Self::Confirm),
-            "auto" => Some(Self::Auto),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

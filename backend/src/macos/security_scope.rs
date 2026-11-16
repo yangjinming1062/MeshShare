@@ -1,9 +1,8 @@
-//! Persistent access to directories selected through a macOS open panel.
+//! 通过 macOS 打开面板选择目录后的持久访问。
 //!
-//! A sandboxed macOS app only receives a temporary security scope from the
-//! open panel.  Persisting the path alone makes the next automatic receive
-//! request ask for access again.  Store a security-scoped bookmark and keep
-//! the resolved URL active for the process lifetime instead.
+//! 沙盒化的 macOS 应用只能从打开面板获得临时的安全作用域；只保存路径会让下一次自动接收
+//! 再次请求授权。这里保存 security-scoped bookmark，并在进程存活期间保持解析出的 URL
+//! 处于激活状态。
 
 use anyhow::Context;
 use core_foundation::base::TCFType;
@@ -18,9 +17,8 @@ use core_foundation_sys::url::{
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-/// Create a bookmark while the URL returned by the open panel still has its
-/// security scope.  Failure is reported so callers can retain the path as a
-/// best-effort fallback on non-sandboxed builds.
+/// 在打开面板返回的 URL 仍持有安全作用域时创建 bookmark。
+/// 失败会返回错误，调用方在非沙盒构建里可以退化为只保留路径。
 pub fn create_bookmark(path: &Path) -> anyhow::Result<Vec<u8>> {
     let url = CFURL::from_path(path, true).context("无法创建接收目录 URL")?;
     let mut error = ptr::null_mut();
@@ -41,10 +39,8 @@ pub fn create_bookmark(path: &Path) -> anyhow::Result<Vec<u8>> {
     Ok(data.bytes().to_vec())
 }
 
-/// Resolve and activate a previously stored bookmark.  The resolved URL is
-/// intentionally leaked after activation: the security scope must remain
-/// active while background transfer tasks write files, and the process owns
-/// this small object until exit.
+/// 解析并激活先前保存的 bookmark。解析出的 URL 在激活后被有意泄漏：
+/// 后台传输任务写入文件期间安全作用域必须保持有效，进程退出时才释放这个对象。
 pub fn activate_bookmark(bookmark: &[u8]) -> anyhow::Result<PathBuf> {
     if bookmark.is_empty() {
         anyhow::bail!("接收目录授权为空");

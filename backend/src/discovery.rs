@@ -36,9 +36,9 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                 };
                 let mut restart = false;
                 while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                    // mdns-sd owns one socket per interface. Recreate the daemon
-                    // after a VPN/Wi-Fi change so its existing physical socket is
-                    // not left on the old process network.
+                    // mdns-sd 为每个接口持有一个 socket。
+                    // 网络变化（VPN/Wi-Fi）后重建守护进程，
+                    // 避免它原有的物理 socket 留在旧的进程网络绑定上。
                     let current_addresses = crate::runtime::bind_addresses();
                     let current_network_rebind_generation = runtime.network_rebind_generation();
                     if current_addresses != observed_addresses
@@ -51,10 +51,8 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     let current_node = runtime.node_info();
                     let current_address = service_address(&current_node);
                     if current_address != registered_address {
-                        if registered_address.is_some() {
-                            let fullname = format!("{}{}", current_node.node_id, SERVICE_TYPE);
-                            let _ = daemon.unregister(&fullname);
-                        }
+                        // 地址变化直接重新注册：mdns-sd 对同一实例名做更新，
+                        // 且 fullname 由 "<实例>.<服务类型>" 组成，手动拼接容易漏分隔点。
                         registered_address = register_service(&daemon, &current_node);
                     }
                     if let Ok(ServiceEvent::ServiceResolved(info)) = event {
@@ -71,9 +69,9 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                         if protocol != Some(PROTOCOL_VERSION) {
                             continue;
                         }
-                        // mDNS visibility can be asymmetric across Wi-Fi, VPN and guest networks.
-                        // Let either side dial; add_peer_channel rejects the duplicate session so
-                        // simultaneous discovery still settles on one stable WebSocket channel.
+                        // 在 Wi-Fi、VPN 与访客网络之间，mDNS 可见性可能是不对称的。
+                        // 因此允许任意一方发起拨号；add_peer_channel 会拒绝重复会话，
+                        // 同时发现也能收敛到一条稳定的 WebSocket 通道。
                         if node_id == node.node_id {
                             continue;
                         }
@@ -216,70 +214,39 @@ pub async fn connect_manual(
 }
 
 fn normalize_http_base_url(value: &str) -> Result<String, String> {
-    let base_url = value
+    let candidate = value
         .trim()
         .trim_end_matches('/')
-        .trim_end_matches("/mobile")
+        .trim_end_matches("/mobile");
+    let path = reqwest::Url::parse(candidate)
+        .map_err(|_| "节点地址必须使用有效的 http:// 或 https:// 地址".to_string())?
+        .path()
+        .trim_end_matches('/')
         .to_string();
-    let parsed = reqwest::Url::parse(&base_url)
-        .map_err(|_| "节点地址必须使用有效的 http:// 或 https:// 地址".to_string())?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err("节点地址必须使用 http:// 或 https://".to_string());
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("节点地址不能包含用户名或密码".to_string());
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        return Err("节点地址不能包含查询参数或片段".to_string());
-    }
-    let Some(host) = parsed.host_str() else {
-        return Err("节点地址缺少主机名".to_string());
-    };
-    if !is_allowed_manual_host(host) {
-        return Err("节点地址必须是本机、局域网、链路本地或 Tailscale 地址".to_string());
-    }
-    let path = parsed.path().trim_end_matches('/');
     if !path.is_empty() && path != "/mobile" {
         return Err("节点地址只能包含根路径或 /mobile".to_string());
     }
-    let mut normalized = parsed;
-    normalized.set_path("");
-    Ok(normalized.to_string().trim_end_matches('/').to_string())
-}
-
-fn is_allowed_manual_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
-        return true;
-    }
-    host.parse::<IpAddr>()
-        .ok()
-        .is_some_and(|address| match address {
-            IpAddr::V4(address) => is_allowed_ipv4(address),
-            IpAddr::V6(_) => false,
-        })
+    crate::runtime::normalize_peer_http_base(candidate).ok_or_else(|| {
+        "节点地址必须是不含凭据与查询参数的本机、局域网、链路本地或 Tailscale 地址".to_string()
+    })
 }
 
 fn is_allowed_ipv4(address: Ipv4Addr) -> bool {
-    address.is_loopback()
-        || address.is_private()
-        || address.is_link_local()
-        || (u32::from(address) & 0xffc0_0000) == 0x6440_0000
+    address.is_loopback() || crate::runtime::is_network_ipv4(address)
 }
 
 fn websocket_endpoint(base_url: &str) -> Result<String, String> {
-    let Some((scheme, rest)) = base_url.split_once("://") else {
-        return Err("节点地址必须使用 http:// 或 https://".to_string());
-    };
-    let websocket_scheme = match scheme.to_ascii_lowercase().as_str() {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|_| "节点地址必须使用 http:// 或 https://".to_string())?;
+    let scheme = match url.scheme() {
         "http" => "ws",
         "https" => "wss",
         _ => return Err("节点地址必须使用 http:// 或 https://".to_string()),
     };
-    if rest.is_empty() {
-        return Err("节点地址缺少主机名".to_string());
-    }
-    Ok(format!("{websocket_scheme}://{rest}/api/v1/ws"))
+    url.set_scheme(scheme)
+        .map_err(|_| "节点地址必须使用 http:// 或 https://".to_string())?;
+    url.set_path("/api/v1/ws");
+    Ok(url.to_string())
 }
 
 pub(crate) async fn connect_peer(
@@ -302,13 +269,13 @@ pub(crate) async fn connect_peer(
                     let Some(connected) =
                         run_peer_session(&runtime, &node_id, &node_name, &endpoint, socket).await
                     else {
-                        // Another socket won the race between the connection
-                        // guard and the handshake. Keep this discovery task
-                        // alive as a watcher so that it can resume dialing if
-                        // the winning channel later disappears. The winning
-                        // socket registration clears the original guard;
-                        // release any remaining marker before waiting so this
-                        // watcher can resume dialing after that socket closes.
+                        // 另一个 socket 在连接守卫与握手之间赢得了竞态。
+                        // 当前发现任务继续作为观察者存活，
+                        // 以便获胜通道之后消失时能恢复拨号。
+                        // 胜出的 socket 注册时会清掉原来的守卫；
+                        // 因此等待之前要释放所有剩余标记，
+                        // 让本观察者在该 socket 关闭后
+                        // 能够恢复拨号。
                         runtime.cancel_peer_connection(&node_id);
                         while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst)
                             && runtime.has_peer_channel(&node_id)
@@ -325,11 +292,22 @@ pub(crate) async fn connect_peer(
                     };
                     connected
                 }
-                Ok(Err(_)) | Err(_) => false,
+                Ok(Err(error)) => {
+                    if attempt < 3 {
+                        eprintln!("连接 {endpoint} 失败：{error}");
+                    }
+                    false
+                }
+                Err(_) => {
+                    if attempt < 3 {
+                        eprintln!("连接 {endpoint} 超时");
+                    }
+                    false
+                }
             };
-        // Keep the connection slot reserved until this task exits.  mDNS may
-        // resolve the same peer repeatedly while it is offline; releasing the
-        // slot before sleeping would defeat the retry backoff.
+        // 连接槽位保留到本任务退出。对端离线期间 mDNS 可能反复解析到它；
+        // 若在休眠之前释放槽位，
+        // 重试退避就会失效。
         runtime.remove_peer_for_retry(&node_id);
         if connected {
             attempt = 0;
@@ -360,9 +338,9 @@ async fn run_peer_session(
     if !runtime.add_peer_channel(node_id.to_string(), tx) {
         return None;
     }
-    // `add_peer_channel` clears the handshake guard. Reclaim it for the
-    // dialer's entire session so mDNS cannot bypass reconnect backoff after a
-    // disconnect.
+    // `add_peer_channel` 会清掉握手守卫。
+    // 为拨号方的整个会话重新占住它，
+    // 使断连后 mDNS 无法绕过重连退避。
     runtime.reserve_peer_connection(node_id);
     if !matches!(
         tokio::time::timeout(
@@ -379,21 +357,31 @@ async fn run_peer_session(
     ) {
         return Some(false);
     }
-    runtime.set_peer(PeerInfo {
-        node_id: node_id.to_string(),
-        node_name: node_name.to_string(),
-        platform: "unknown".to_string(),
-        addresses: Vec::new(),
-        mobile_addresses: Vec::new(),
-        capabilities: Vec::new(),
-        online: true,
-        last_seen_ms: crate::clock::now_millis(),
-        endpoint: Some(endpoint.to_string()),
-        source: "mdns".to_string(),
-        metrics: None,
-        metrics_received_at_ms: None,
-        metrics_stale: false,
-    });
+    // 手动连接与 mDNS 发现可能已有完整对端信息，拨号成功只更新连接状态。
+    let peer = runtime.peer(node_id).map_or_else(
+        || PeerInfo {
+            node_id: node_id.to_string(),
+            node_name: node_name.to_string(),
+            platform: "unknown".to_string(),
+            addresses: Vec::new(),
+            mobile_addresses: Vec::new(),
+            capabilities: Vec::new(),
+            online: true,
+            last_seen_ms: crate::clock::now_millis(),
+            endpoint: Some(endpoint.to_string()),
+            source: "mdns".to_string(),
+            metrics: None,
+            metrics_received_at_ms: None,
+            metrics_stale: false,
+        },
+        |peer| PeerInfo {
+            online: true,
+            last_seen_ms: crate::clock::now_millis(),
+            endpoint: Some(endpoint.to_string()),
+            ..peer
+        },
+    );
+    runtime.set_peer(peer);
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut clipboard_resync = tokio::time::interval(Duration::from_secs(1));
     let mut last_pong = tokio::time::Instant::now();
@@ -524,6 +512,17 @@ mod tests {
     }
 
     #[test]
+    fn manual_address_accepts_trailing_dot_mdns_host() {
+        let base = normalize_http_base_url("http://meshshare-device.local.:37880")
+            .expect("normalize trailing-dot mdns host");
+        assert_eq!(base, "http://meshshare-device.local.:37880");
+        assert_eq!(
+            websocket_endpoint(&base).expect("convert websocket address"),
+            "ws://meshshare-device.local.:37880/api/v1/ws"
+        );
+    }
+
+    #[test]
     fn manual_address_rejects_non_http_schemes() {
         assert!(normalize_http_base_url("ws://192.168.1.10:37880").is_err());
         assert!(websocket_endpoint("ftp://192.168.1.10:37880").is_err());
@@ -542,9 +541,9 @@ mod tests {
         std::fs::create_dir_all(&static_root).expect("create static directory");
         std::fs::write(static_root.join("index.html"), "<html></html>")
             .expect("write static index");
-        // The reconnect assertion only needs the remote snapshot store.  Use
-        // the view-only profile so this network test cannot write its fixture
-        // text into the host system clipboard through the normal peer path.
+        // 重连断言只需要远端的快照存储。使用只读配置，
+        // 该网络测试就无法通过正常对端路径
+        // 把测试文本写进宿主系统剪贴板。
         let server_runtime = NodeRuntime::new_with_profile(
             server_data.clone(),
             0,

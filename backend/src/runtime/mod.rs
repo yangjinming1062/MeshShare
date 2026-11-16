@@ -14,11 +14,13 @@ use crate::model::{
     TRANSFER_HISTORY_CAPABILITY, TRANSFER_HISTORY_LIMIT,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+#[cfg(not(target_os = "android"))]
+use parking_lot::Condvar;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -29,6 +31,21 @@ use tokio_util::io::ReaderStream;
 use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
+
+mod config;
+mod history;
+mod network;
+mod outgoing;
+
+use config::*;
+use history::*;
+use network::*;
+use outgoing::*;
+
+pub(crate) use config::file_modified_ms;
+pub use network::bind_addresses;
+pub(crate) use network::{is_network_ipv4, normalize_peer_http_base};
+pub use outgoing::validate_receive_directory;
 
 fn default_autostart_enabled() -> bool {
     true
@@ -127,8 +144,8 @@ struct PersistedConfig {
     receive_mode: ReceiveMode,
     #[serde(default)]
     receive_directory: Option<String>,
-    /// macOS security-scoped bookmark for the selected receive directory.
-    /// Other platforms leave this unset and continue using the path field.
+    /// 所选接收目录的 macOS 安全作用域书签。
+    /// 其他平台保持未设置，继续使用 path 字段。
     #[serde(default)]
     receive_directory_bookmark: Option<Vec<u8>>,
     /// 是否允许其他设备在远程管理中浏览本机目录并选择发送；默认关闭。
@@ -248,6 +265,8 @@ pub struct MobileTransferRecord {
     pub staged_items: HashSet<String>,
     pub downloaded_items: HashSet<String>,
     pub retryable_downloads: HashSet<String>,
+    /// 创建时算好的清单序列化字节数，用于全局清单内存预算。
+    pub manifest_bytes: u64,
     pub updated_at_ms: i64,
 }
 
@@ -264,11 +283,19 @@ struct MobileCa {
     fingerprint: String,
 }
 
+struct ClipboardState {
+    snapshot: Option<ClipboardSnapshot>,
+    #[cfg(not(target_os = "android"))]
+    pending_system_write: bool,
+}
+
 pub struct NodeRuntime {
     profile: NodeProfile,
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
-    pub clipboard: RwLock<Option<ClipboardSnapshot>>,
+    clipboard: Mutex<ClipboardState>,
+    #[cfg(not(target_os = "android"))]
+    system_clipboard_ready: Condvar,
     clipboard_status: RwLock<ClipboardStatus>,
     clipboard_history: Mutex<Vec<ClipboardHistoryRecord>>,
     pub peers: RwLock<HashMap<String, PeerInfo>>,
@@ -285,7 +312,6 @@ pub struct NodeRuntime {
     data_dir: PathBuf,
     clipboard_update: Mutex<()>,
     seen_events: Mutex<HashMap<String, i64>>,
-    suppression: Mutex<Option<(String, i64)>>,
     peer_channels: Mutex<HashMap<String, mpsc::Sender<WireMessage>>>,
     pending_clipboard_resync: Mutex<HashSet<String>>,
     connecting_peers: Mutex<HashSet<String>>,
@@ -380,6 +406,8 @@ const MAX_TERMINAL_TRANSFERS: usize = 256;
 const MAX_FAILED_TRANSFERS: usize = 20;
 const MAX_MOBILE_TERMINAL_TRANSFERS_PER_SESSION: usize = 128;
 const MAX_MOBILE_FAILED_TRANSFERS_PER_SESSION: usize = 20;
+/// 全部会话合计的失败记录上限，避免大量会话把失败列表撑满。
+const MAX_MOBILE_FAILED_TRANSFERS: usize = 64;
 const MAX_MOBILE_TRANSFER_RECORDS: usize = 512;
 const MAX_MOBILE_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_MOBILE_CA_BYTES: usize = 64 * 1024;
@@ -403,6 +431,18 @@ const CLIPBOARD_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_CLIPBOARD_HISTORY_BYTES: u64 = 512 * 1024 * 1024;
 const TRANSFER_HISTORY_FILE: &str = "transfer-history.json";
 const MAX_PENDING_HISTORY_DELETIONS_PER_PEER: usize = MAX_HISTORY_DELETE_BATCH;
+
+fn history_settings(config: &PersistedConfig) -> ClipboardHistorySettings {
+    ClipboardHistorySettings {
+        mode: config.clipboard_history_mode,
+        count: config
+            .clipboard_history_count
+            .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT),
+        days: config
+            .clipboard_history_days
+            .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS),
+    }
+}
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     let mut downloaded_item_ids = record.downloaded_items.iter().cloned().collect::<Vec<_>>();
@@ -453,10 +493,11 @@ fn short_node_id(node_id: &str) -> String {
     node_id.chars().take(8).collect()
 }
 
+/// 清单在全局内存预算里的占用；创建传输时算一次并记录在案。
 fn mobile_manifest_size(offer: &TransferOffer) -> u64 {
     serde_json::to_vec(offer)
         .map(|value| value.len() as u64)
-        .unwrap_or(u64::MAX)
+        .unwrap_or_default()
 }
 
 fn is_clipboard_message(message: &WireMessage) -> bool {
@@ -478,17 +519,9 @@ impl NodeRuntime {
         profile: NodeProfile,
     ) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&data_dir)?;
-        let staging_root = data_dir.join("mobile-transfers");
-        match std::fs::remove_dir_all(&staging_root) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        match std::fs::remove_dir_all(data_dir.join(OUTGOING_STAGING_DIR)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        // 启动时清空网页暂存与出站暂存：两处内容只服务于进程内任务。
+        crate::fsutil::remove_dir_if_exists(&data_dir.join("mobile-transfers"))?;
+        crate::fsutil::remove_dir_if_exists(&data_dir.join(OUTGOING_STAGING_DIR))?;
         let desktop_temp_files = load_and_cleanup_desktop_temp_files(&data_dir)?;
         cleanup_clipboard_temp_files(&data_dir)?;
         let config = load_or_create_config(&data_dir, profile)?;
@@ -496,13 +529,13 @@ impl NodeRuntime {
         let mut config = config;
         #[cfg(target_os = "macos")]
         {
-            // Configurations written before bookmark support only contain a
-            // path.  Try to migrate that path without opening a new panel;
-            // if macOS still requires a user grant, the next explicit folder
-            // selection will create the bookmark.
+            // 书签支持之前写入的配置只含路径。
+            // 尝试在不打开面板的情况下迁移该路径；
+            // 若 macOS 仍要求用户授权，
+            // 下一次显式选择文件夹时会创建书签。
             if config.receive_directory_bookmark.is_none() {
                 if let Some(path) = config.receive_directory.as_deref().map(Path::new) {
-                    if let Ok(bookmark) = crate::macos_security_scope::create_bookmark(path) {
+                    if let Ok(bookmark) = crate::macos::security_scope::create_bookmark(path) {
                         config.receive_directory_bookmark = Some(bookmark);
                         if let Err(error) = persist_config(&data_dir, &config) {
                             eprintln!("保存接收目录授权失败：{error}");
@@ -548,7 +581,13 @@ impl NodeRuntime {
             profile,
             clock,
             node: RwLock::new(node),
-            clipboard: RwLock::new(clipboard),
+            clipboard: Mutex::new(ClipboardState {
+                snapshot: clipboard,
+                #[cfg(not(target_os = "android"))]
+                pending_system_write: false,
+            }),
+            #[cfg(not(target_os = "android"))]
+            system_clipboard_ready: Condvar::new(),
             clipboard_status: RwLock::new(ClipboardStatus::default()),
             clipboard_history: Mutex::new(clipboard_history),
             transfer_history: Mutex::new(load_transfer_history(&data_dir)),
@@ -566,7 +605,6 @@ impl NodeRuntime {
             data_dir,
             clipboard_update: Mutex::new(()),
             seen_events: Mutex::new(HashMap::new()),
-            suppression: Mutex::new(None),
             peer_channels: Mutex::new(HashMap::new()),
             pending_clipboard_resync: Mutex::new(HashSet::new()),
             connecting_peers: Mutex::new(HashSet::new()),
@@ -728,11 +766,11 @@ impl NodeRuntime {
         self.data_dir.join("mobile-transfers")
     }
 
-    /// Only return directories that are direct children of the staging root.
+    /// 只返回暂存根目录的直接子目录。
     ///
-    /// The path is kept in the in-memory record, so this check is intentionally
-    /// lexical and rejects the root itself, parent components, and nested paths.
-    /// It is the final guard before a cleanup caller performs recursive removal.
+    /// 路径保存在内存记录中，因此该检查刻意只做词法判断，
+    /// 拒绝根目录本身、父级组件以及嵌套路径。
+    /// 它是清理调用方执行递归删除之前的最后一道守卫。
     fn is_mobile_staging_directory(&self, directory: &Path) -> bool {
         let Ok(relative) = directory.strip_prefix(self.mobile_staging_root()) else {
             return false;
@@ -860,11 +898,11 @@ impl NodeRuntime {
         self.pending_clipboard_resync.lock().remove(node_id);
     }
 
-    /// Remove a dialer's current channel while retaining its connection slot.
+    /// 移除拨号方当前的通道，同时保留其连接槽位。
     ///
-    /// The discovery task owns that slot across its reconnect backoff.  Keeping
-    /// it reserved prevents a burst of mDNS resolutions from starting parallel
-    /// sockets and bypassing the exponential retry delay after a disconnect.
+    /// 发现任务在重连退避期间持有该槽位。
+    /// 保持占用可防止一波 mDNS 解析同时开出多个并行 socket，
+    /// 绕过断连后的指数重试延迟。
     pub fn remove_peer_for_retry(&self, node_id: &str) {
         self.peers.write().remove(node_id);
         self.peer_channels.lock().remove(node_id);
@@ -914,21 +952,21 @@ impl NodeRuntime {
     }
 
     pub async fn send_to_peer_with_retry(&self, node_id: &str, message: WireMessage) -> bool {
-        const RETRY_DELAYS: [Duration; 4] = [
-            Duration::from_millis(50),
+        const RETRY_DELAYS: [Duration; 3] = [
             Duration::from_millis(100),
             Duration::from_millis(250),
             Duration::from_millis(500),
         ];
-        for (attempt, delay) in RETRY_DELAYS.iter().enumerate() {
-            if attempt > 0 {
-                tokio::time::sleep(*delay).await;
-            }
-            if self.send_to_peer(node_id, message.clone()) {
-                return true;
-            }
+        if self.send_to_peer(node_id, message.clone()) {
+            return true;
+        }
+        for delay in RETRY_DELAYS {
             if !self.has_peer_channel(node_id) {
                 return false;
+            }
+            tokio::time::sleep(delay).await;
+            if self.send_to_peer(node_id, message.clone()) {
+                return true;
             }
         }
         false
@@ -936,17 +974,19 @@ impl NodeRuntime {
 
     pub fn send_to_peers_except(&self, except: Option<&str>, message: WireMessage) {
         let is_clipboard = is_clipboard_message(&message);
+        // 先复制通道再判定能力：持 peer_channels 锁时不能再取 peers 锁，
+        // 否则与 remove_peer 的加锁顺序相反。
         let channels = self
             .peer_channels
             .lock()
             .iter()
-            .filter(|(node_id, _)| {
-                Some(node_id.as_str()) != except
-                    && (!is_clipboard || self.peer_supports_clipboard(node_id))
-            })
+            .filter(|(node_id, _)| Some(node_id.as_str()) != except)
             .map(|(node_id, channel)| (node_id.clone(), channel.clone()))
             .collect::<Vec<_>>();
         for (node_id, channel) in channels {
+            if is_clipboard && !self.peer_supports_clipboard(&node_id) {
+                continue;
+            }
             match channel.try_send(message.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) if is_clipboard => {
@@ -994,10 +1034,10 @@ impl NodeRuntime {
                 .metrics_received_at_ms
                 .or(previous.metrics_received_at_ms);
             peer.metrics_stale = previous.metrics_stale;
-            // A Hello refreshes advertised addresses, but must not discard
-            // the endpoint that carried the currently verified WebSocket
-            // channel. Keeping it lets HTTP management follow the interface
-            // that was actually reachable.
+            // Hello 会刷新对端通告的地址，
+            // 但不得丢弃承载当前已验证 WebSocket 通道的端点。
+            // 保留该端点，
+            // 能让 HTTP 管理跟随实际可达的接口。
             if peer.source == "websocket" && previous.endpoint.is_some() {
                 peer.endpoint = previous.endpoint.clone();
             }
@@ -1027,10 +1067,10 @@ impl NodeRuntime {
             .is_some_and(|peer| peer.capabilities.iter().any(|item| item == capability))
     }
 
-    /// Empty capability lists belong to legacy peers that predate capability
-    /// negotiation. Keep clipboard delivery compatible with those peers while
-    /// treating an explicit capability list without `clipboard.text` or
-    /// `clipboard.view` as an intentional opt-out.
+    /// 空能力列表属于能力协商之前的旧对端。
+    /// 对这些对端保持剪贴板投递兼容；
+    /// 而显式给出不含 `clipboard.text` 或 `clipboard.view` 的能力列表，
+    /// 视为主动放弃。
     pub fn peer_supports_clipboard(&self, node_id: &str) -> bool {
         self.peers.read().get(node_id).is_none_or(|peer| {
             peer.capabilities.is_empty()
@@ -1041,20 +1081,26 @@ impl NodeRuntime {
         })
     }
 
+    pub fn peer(&self, node_id: &str) -> Option<PeerInfo> {
+        self.peers.read().get(node_id).cloned()
+    }
+
+    /// 对端显示名；空名称按未知处理，由调用方决定回退文案。
     pub fn peer_name(&self, node_id: &str) -> Option<String> {
         self.peers
             .read()
             .get(node_id)
             .map(|peer| peer.node_name.clone())
+            .filter(|name| !name.trim().is_empty())
     }
 
     pub fn peer_http_base(&self, node_id: &str) -> Option<String> {
         self.peer_http_bases(node_id).into_iter().next()
     }
 
-    /// Return HTTP bases in the order in which this node has evidence that
-    /// they are usable. An endpoint is recorded when a WebSocket channel was
-    /// established, so it outranks the peer's advertised interface order.
+    /// 按本节点掌握的可用证据排序返回 HTTP 基地址。
+    /// 端点是在 WebSocket 通道建立时记录的，
+    /// 因此优先级高于对端通告的接口顺序。
     pub fn peer_http_bases(&self, node_id: &str) -> Vec<String> {
         let Some(peer) = self.peers.read().get(node_id).cloned() else {
             return Vec::new();
@@ -1111,12 +1157,24 @@ impl NodeRuntime {
         self.monitor_visible.load(Ordering::SeqCst)
     }
 
-    pub fn set_monitor_visible(&self, visible: bool) -> anyhow::Result<()> {
+    /// 配置修改统一顺序：锁内改副本，写盘成功后回写内存；写盘失败保持原值。
+    fn update_config(
+        &self,
+        change: impl FnOnce(&mut PersistedConfig) -> anyhow::Result<()>,
+    ) -> anyhow::Result<PersistedConfig> {
         let mut config = self.config.lock();
         let mut next = config.clone();
-        next.monitor_visible = visible;
+        change(&mut next)?;
         persist_config(&self.data_dir, &next)?;
-        *config = next;
+        *config = next.clone();
+        Ok(next)
+    }
+
+    pub fn set_monitor_visible(&self, visible: bool) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.monitor_visible = visible;
+            Ok(())
+        })?;
         self.monitor_visible.store(visible, Ordering::SeqCst);
         Ok(())
     }
@@ -1126,11 +1184,10 @@ impl NodeRuntime {
     }
 
     pub fn set_monitor_locked(&self, locked: bool) -> anyhow::Result<()> {
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.monitor_locked = locked;
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
+        self.update_config(|config| {
+            config.monitor_locked = locked;
+            Ok(())
+        })?;
         self.monitor_locked.store(locked, Ordering::SeqCst);
         Ok(())
     }
@@ -1140,12 +1197,19 @@ impl NodeRuntime {
     }
 
     pub fn set_monitor_position(&self, position: MonitorPosition) -> anyhow::Result<()> {
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.monitor_position = Some(position);
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
-        Ok(())
+        self.update_config(|config| {
+            config.monitor_position = Some(position);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// 切换剪贴板同步开关并返回新状态；托盘与控制面共用。
+    pub fn toggle_sync_enabled(&self) -> bool {
+        let enabled = !self.sync_enabled.load(std::sync::atomic::Ordering::SeqCst);
+        self.sync_enabled
+            .store(enabled, std::sync::atomic::Ordering::SeqCst);
+        enabled
     }
 
     pub fn autostart_enabled(&self) -> bool {
@@ -1153,12 +1217,11 @@ impl NodeRuntime {
     }
 
     pub fn set_autostart_enabled(&self, enabled: bool) -> anyhow::Result<()> {
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.autostart_enabled = enabled;
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
-        Ok(())
+        self.update_config(|config| {
+            config.autostart_enabled = enabled;
+            Ok(())
+        })
+        .map(|_| ())
     }
 
     pub fn remote_file_access(&self) -> bool {
@@ -1166,12 +1229,11 @@ impl NodeRuntime {
     }
 
     pub fn set_remote_file_access(&self, enabled: bool) -> anyhow::Result<()> {
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.remote_file_access = enabled;
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
-        Ok(())
+        self.update_config(|config| {
+            config.remote_file_access = enabled;
+            Ok(())
+        })
+        .map(|_| ())
     }
 
     pub fn receive_settings(&self) -> ReceiveSettings {
@@ -1194,27 +1256,28 @@ impl NodeRuntime {
         if mode == ReceiveMode::Auto && canonical_directory.is_none() {
             anyhow::bail!("自动接收必须设置默认目录");
         }
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.receive_mode = mode;
-        next.receive_directory = canonical_directory
-            .as_ref()
-            .map(|path| path.to_string_lossy().into_owned());
-        #[cfg(target_os = "macos")]
-        {
-            next.receive_directory_bookmark = canonical_directory
-                .as_deref()
-                .and_then(|path| crate::macos_security_scope::create_bookmark(path).ok());
-            if let Some(bookmark) = next.receive_directory_bookmark.as_deref() {
-                if let Err(error) = crate::macos_security_scope::activate_bookmark(bookmark) {
-                    eprintln!("激活接收目录授权失败：{error}");
+        let config = self.update_config(|config| {
+            config.receive_mode = mode;
+            config.receive_directory = canonical_directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            #[cfg(target_os = "macos")]
+            {
+                config.receive_directory_bookmark = canonical_directory
+                    .as_deref()
+                    .and_then(|path| crate::macos::security_scope::create_bookmark(path).ok());
+                if let Some(bookmark) = config.receive_directory_bookmark.as_deref() {
+                    if let Err(error) = crate::macos::security_scope::activate_bookmark(bookmark) {
+                        eprintln!("激活接收目录授权失败：{error}");
+                    }
                 }
             }
-        }
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
-        drop(config);
-        Ok(self.receive_settings())
+            Ok(())
+        })?;
+        Ok(ReceiveSettings {
+            mode: config.receive_mode,
+            default_path: config.receive_directory,
+        })
     }
 
     fn default_receive_directory(&self) -> Option<PathBuf> {
@@ -1236,12 +1299,11 @@ impl NodeRuntime {
     }
 
     pub fn set_update_frequency(&self, frequency: UpdateFrequency) -> anyhow::Result<()> {
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.update_frequency = frequency;
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
-        Ok(())
+        self.update_config(|config| {
+            config.update_frequency = frequency;
+            Ok(())
+        })
+        .map(|_| ())
     }
 
     pub fn set_update_check_state(
@@ -1249,13 +1311,12 @@ impl NodeRuntime {
         checked_at_ms: Option<i64>,
         pending_version: Option<String>,
     ) -> anyhow::Result<()> {
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.update_last_checked_at_ms = checked_at_ms;
-        next.pending_update_version = pending_version;
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
-        Ok(())
+        self.update_config(|config| {
+            config.update_last_checked_at_ms = checked_at_ms;
+            config.pending_update_version = pending_version;
+            Ok(())
+        })
+        .map(|_| ())
     }
 
     pub fn update_proxy(&self) -> Option<String> {
@@ -1282,25 +1343,15 @@ impl NodeRuntime {
             Some(value) => Some(parse_update_proxy(value)?.to_string()),
             None => None,
         };
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        next.update_proxy = normalized.clone();
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
+        self.update_config(|config| {
+            config.update_proxy = normalized.clone();
+            Ok(())
+        })?;
         Ok(normalized)
     }
 
     pub fn clipboard_history_settings(&self) -> ClipboardHistorySettings {
-        let config = self.config.lock();
-        ClipboardHistorySettings {
-            mode: config.clipboard_history_mode,
-            count: config
-                .clipboard_history_count
-                .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT),
-            days: config
-                .clipboard_history_days
-                .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS),
-        }
+        history_settings(&self.config.lock())
     }
 
     pub fn set_clipboard_history_settings(
@@ -1308,44 +1359,42 @@ impl NodeRuntime {
         mode: ClipboardHistoryMode,
         value: u64,
     ) -> anyhow::Result<ClipboardHistorySettings> {
-        let mut config = self.config.lock();
-        let mut next = config.clone();
-        match mode {
-            ClipboardHistoryMode::Count => {
-                let count = usize::try_from(value)
-                    .ok()
-                    .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_COUNT).contains(value))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "剪贴板历史条数必须在 1 到 {MAX_CLIPBOARD_HISTORY_COUNT} 之间"
-                        )
-                    })?;
-                next.clipboard_history_count = count;
+        let config = self.update_config(|config| {
+            match mode {
+                ClipboardHistoryMode::Count => {
+                    let count = usize::try_from(value)
+                        .ok()
+                        .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_COUNT).contains(value))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "剪贴板历史条数必须在 1 到 {MAX_CLIPBOARD_HISTORY_COUNT} 之间"
+                            )
+                        })?;
+                    config.clipboard_history_count = count;
+                }
+                ClipboardHistoryMode::Days => {
+                    let days = u32::try_from(value)
+                        .ok()
+                        .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_DAYS).contains(value))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "剪贴板历史天数必须在 1 到 {MAX_CLIPBOARD_HISTORY_DAYS} 之间"
+                            )
+                        })?;
+                    config.clipboard_history_days = days;
+                }
             }
-            ClipboardHistoryMode::Days => {
-                let days = u32::try_from(value)
-                    .ok()
-                    .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_DAYS).contains(value))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "剪贴板历史天数必须在 1 到 {MAX_CLIPBOARD_HISTORY_DAYS} 之间"
-                        )
-                    })?;
-                next.clipboard_history_days = days;
-            }
-        }
-        next.clipboard_history_count = next
-            .clipboard_history_count
-            .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
-        next.clipboard_history_days = next
-            .clipboard_history_days
-            .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
-        next.clipboard_history_mode = mode;
-        persist_config(&self.data_dir, &next)?;
-        *config = next;
-        drop(config);
+            config.clipboard_history_count = config
+                .clipboard_history_count
+                .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
+            config.clipboard_history_days = config
+                .clipboard_history_days
+                .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
+            config.clipboard_history_mode = mode;
+            Ok(())
+        })?;
         self.prune_clipboard_history();
-        Ok(self.clipboard_history_settings())
+        Ok(history_settings(&config))
     }
 
     pub fn prune_clipboard_history(&self) -> usize {
@@ -1494,23 +1543,22 @@ impl NodeRuntime {
 
     pub fn accept_clipboard(&self, event: ClipboardEvent, source_name: String) -> bool {
         let _update_guard = self.clipboard_update.lock();
+        self.accept_clipboard_locked(event, source_name, true)
+    }
+
+    fn accept_clipboard_locked(
+        &self,
+        event: ClipboardEvent,
+        source_name: String,
+        write_to_system: bool,
+    ) -> bool {
         let now = now_millis();
         let mut seen = self.seen_events.lock();
         seen.retain(|_, timestamp| now.saturating_sub(*timestamp) < 10 * 60 * 1000);
         if seen.contains_key(&event.event_id) {
             return false;
         }
-        seen.insert(event.event_id.clone(), now);
-        while seen.len() > MAX_SEEN_CLIPBOARD_EVENTS {
-            let Some(oldest) = seen
-                .iter()
-                .min_by_key(|(_, timestamp)| **timestamp)
-                .map(|(event_id, _)| event_id.clone())
-            else {
-                break;
-            };
-            seen.remove(&oldest);
-        }
+        let event_id = event.event_id.clone();
         let snapshot = ClipboardSnapshot {
             event_id: event.event_id,
             source_node_id: event.origin_node_id,
@@ -1524,19 +1572,34 @@ impl NodeRuntime {
             eprintln!("忽略无效剪贴板内容：{error}");
             return false;
         }
-        let current = self.clipboard.read().clone();
-        let replayed_current = current
-            .as_ref()
-            .is_some_and(|current| current.event_id == snapshot.event_id);
+        // 只有校验通过的负载才登记为已见，避免非法内容占用去重标识。
+        seen.insert(event_id, now);
+        while seen.len() > MAX_SEEN_CLIPBOARD_EVENTS {
+            let Some(oldest) = seen
+                .iter()
+                .min_by_key(|(_, timestamp)| **timestamp)
+                .map(|(event_id, _)| event_id.clone())
+            else {
+                break;
+            };
+            seen.remove(&oldest);
+        }
+        let (replayed_current, newer) =
+            self.clipboard
+                .lock()
+                .snapshot
+                .as_ref()
+                .map_or((false, true), |current| {
+                    (
+                        current.event_id == snapshot.event_id,
+                        snapshot.clock.compare(&current.clock).is_gt(),
+                    )
+                });
         if !replayed_current {
             if let Err(error) = self.upsert_clipboard_history_locked(&snapshot, now) {
                 eprintln!("保存剪贴板历史失败：{error}");
             }
         }
-        let newer = current
-            .as_ref()
-            .map(|current| snapshot.clock.compare(&current.clock).is_gt())
-            .unwrap_or(true);
         if !newer {
             return false;
         }
@@ -1544,7 +1607,17 @@ impl NodeRuntime {
         if let Err(error) = persist_clipboard_current(&self.data_dir, &snapshot) {
             eprintln!("保存当前剪贴板失败：{error}");
         }
-        *self.clipboard.write() = Some(snapshot);
+        let mut clipboard = self.clipboard.lock();
+        clipboard.snapshot = Some(snapshot);
+        #[cfg(not(target_os = "android"))]
+        {
+            clipboard.pending_system_write = write_to_system && !self.profile.is_android();
+            if clipboard.pending_system_write {
+                self.system_clipboard_ready.notify_one();
+            }
+        }
+        #[cfg(target_os = "android")]
+        let _ = write_to_system;
         true
     }
 
@@ -1558,9 +1631,9 @@ impl NodeRuntime {
         let duplicate_index = history.iter().position(|record| {
             record.event_id == snapshot.event_id || record.content_hash == content_hash
         });
-        // Write the replacement payload before changing the index or deleting the
-        // old record. A disk or permission failure therefore leaves the old
-        // history entry and its payload available for restore.
+        // 先写入替换用的载荷，再修改索引或删除旧记录。
+        // 这样磁盘或权限失败时，
+        // 旧历史条目及其载荷仍然可用于恢复。
         let record =
             write_clipboard_history_record(&self.data_dir, snapshot, recorded_at_ms, content_hash)?;
         let new_record = record.clone();
@@ -1572,8 +1645,8 @@ impl NodeRuntime {
         let config = self.config.lock().clone();
         prune_clipboard_history_records(&mut next, &config, recorded_at_ms);
         if let Err(error) = persist_clipboard_history(&self.data_dir, &next) {
-            // The new payload is not referenced by the previous index. Remove it
-            // after the failed index write while preserving the old entry.
+            // 旧索引不引用新载荷。
+            // 索引写入失败之后再删除它，同时保留旧条目。
             remove_clipboard_record_payloads(&self.data_dir, &new_record);
             return Err(error);
         }
@@ -1581,13 +1654,22 @@ impl NodeRuntime {
         Ok(())
     }
 
+    /// 系统读操作可能等待其他应用。若共享状态期间已更新，保留较新的事件。
+    #[cfg(not(target_os = "android"))]
     pub fn create_local_clipboard(
         &self,
         text: Option<String>,
         image_png: Option<Vec<u8>>,
+        observed_event_id: Option<&str>,
     ) -> Option<ClipboardEvent> {
         let source_name = self.node.read().node_name.clone();
-        self.create_local_clipboard_named(text, image_png, source_name)
+        let event = self.local_clipboard_event(text, image_png, &source_name)?;
+        let _update_guard = self.clipboard_update.lock();
+        if self.clipboard_event_id().as_deref() != observed_event_id {
+            return None;
+        }
+        self.accept_clipboard_locked(event.clone(), source_name, false)
+            .then_some(event)
     }
 
     pub fn create_local_clipboard_named(
@@ -1595,6 +1677,17 @@ impl NodeRuntime {
         text: Option<String>,
         image_png: Option<Vec<u8>>,
         source_name: String,
+    ) -> Option<ClipboardEvent> {
+        let event = self.local_clipboard_event(text, image_png, &source_name)?;
+        self.accept_clipboard(event.clone(), source_name)
+            .then_some(event)
+    }
+
+    fn local_clipboard_event(
+        &self,
+        text: Option<String>,
+        image_png: Option<Vec<u8>>,
+        source_name: &str,
     ) -> Option<ClipboardEvent> {
         if !self.sync_enabled.load(Ordering::SeqCst) {
             return None;
@@ -1612,17 +1705,14 @@ impl NodeRuntime {
         if text.is_none() && image_png.is_none() {
             return None;
         }
-        let clock = self.clock.tick();
-        let event = ClipboardEvent {
+        Some(ClipboardEvent {
             event_id: Uuid::new_v4().to_string(),
             origin_node_id: self.node_id(),
-            clock,
+            clock: self.clock.tick(),
             text,
             image_png,
             updated_at_ms: now_millis(),
-        };
-        self.accept_clipboard(event.clone(), source_name)
-            .then_some(event)
+        })
     }
 
     pub fn restore_clipboard_history(&self, event_id: &str) -> Option<ClipboardEvent> {
@@ -1632,31 +1722,40 @@ impl NodeRuntime {
             .image_png
             .as_deref()
             .and_then(|value| BASE64.decode(value).ok());
-        self.create_local_clipboard_named(
-            detail.snapshot.text,
-            image,
-            self.node.read().node_name.clone(),
-        )
+        let source_name = self.node.read().node_name.clone();
+        self.create_local_clipboard_named(detail.snapshot.text, image, source_name)
     }
 
     pub fn clipboard_snapshot(&self) -> Option<ClipboardSnapshot> {
-        self.clipboard.read().clone()
+        self.clipboard.lock().snapshot.clone()
     }
 
-    pub fn set_clipboard_suppression(&self, hash: String) {
-        *self.suppression.lock() = Some((hash, now_millis() + 2_000));
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn clipboard_event_id(&self) -> Option<String> {
+        self.clipboard
+            .lock()
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.event_id.clone())
     }
 
-    pub fn is_clipboard_suppressed(&self, hash: &str) -> bool {
-        let now = now_millis();
-        let mut suppression = self.suppression.lock();
-        if let Some((expected, expires_at)) = suppression.as_ref() {
-            if *expires_at >= now {
-                return expected == hash;
-            }
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn take_system_clipboard_write(&self) -> Option<ClipboardSnapshot> {
+        let mut clipboard = self.clipboard.lock();
+        if std::mem::take(&mut clipboard.pending_system_write) {
+            clipboard.snapshot.clone()
+        } else {
+            None
         }
-        *suppression = None;
-        false
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn wait_for_system_clipboard_write(&self, timeout: Duration) {
+        let mut clipboard = self.clipboard.lock();
+        if !clipboard.pending_system_write {
+            self.system_clipboard_ready
+                .wait_for(&mut clipboard, timeout);
+        }
     }
 
     pub fn add_transfer(&self, offer: TransferOffer) -> bool {
@@ -1690,16 +1789,16 @@ impl NodeRuntime {
             },
         );
         drop(transfers);
-        // Progress carries the offer as well. Publish it first so an
-        // auto-accepted transfer cannot briefly appear as a new confirmation
-        // request in a UI that receives the two events at different times.
+        // 进度事件同时携带提议。先发布进度，
+        // 使自动接受的传输不会在
+        // 分时收到两个事件的 UI 中短暂显示为新的确认请求。
         self.publish_event(WireMessage::TransferProgress { progress });
         self.publish_event(WireMessage::TransferOffer { offer });
         true
     }
 
     pub fn add_outgoing_transfer(&self, offer: TransferOffer) -> TransferProgress {
-        let peer_name = self.peer_display_name(&offer.target_node_id);
+        let peer_name = self.peer_name(&offer.target_node_id);
         let _update_gate = self.transfer_update_gate.lock();
         if self.update_installing.load(Ordering::SeqCst) {
             let mut failed = transfer_progress(&offer, "send");
@@ -2446,32 +2545,27 @@ impl NodeRuntime {
                 let was_terminal = is_terminal_transfer(&record.progress.status);
                 let mut next = progress.clone();
                 next.offer = Some(record.offer.clone());
-                next.direction = if record.progress.direction.as_deref() == Some("send") {
-                    Some("send".to_string())
-                } else {
-                    record.progress.direction.clone()
-                };
+                next.direction = record.progress.direction.clone();
                 record.progress = next;
                 record.updated_at_ms = now_millis();
                 (record.clone(), was_terminal)
             })
         };
-        if let Some((record, was_terminal)) = snapshot {
-            if is_terminal_transfer(&record.progress.status) {
-                // 对端重复发送终态进度时不重复写入历史，也不推迟结束时间。
-                if !was_terminal {
-                    self.record_terminal_transfer(&record);
-                }
-            } else {
-                // 对端把失败任务重新打开后，本机不再保留旧的失败历史。
-                self.remove_transfer_history_entry(transfer_id);
-            }
-            self.publish_event(WireMessage::TransferProgress {
-                progress: record.progress,
-            });
+        let Some((record, was_terminal)) = snapshot else {
             return;
+        };
+        if is_terminal_transfer(&record.progress.status) {
+            // 对端重复发送终态进度时不重复写入历史，也不推迟结束时间。
+            if !was_terminal {
+                self.record_terminal_transfer(&record);
+            }
+        } else {
+            // 对端把失败任务重新打开后，本机不再保留旧的失败历史。
+            self.remove_transfer_history_entry(transfer_id);
         }
-        self.publish_event(WireMessage::TransferProgress { progress });
+        self.publish_event(WireMessage::TransferProgress {
+            progress: record.progress,
+        });
     }
 
     pub fn transfer(&self, transfer_id: &str) -> Option<TransferRecord> {
@@ -2542,12 +2636,12 @@ impl NodeRuntime {
         Some(progress)
     }
 
-    /// Return the current progress when an upload item was already committed.
+    /// 上传条目已提交时返回当前进度。
     ///
-    /// A sender may lose the HTTP response after the receiver has committed a
-    /// file and then retry the same PUT. Keeping this check in the runtime
-    /// makes that retry observable without incrementing transfer progress a
-    /// second time.
+    /// 发送方可能在接收方已提交文件后丢失 HTTP 响应，然后重试同一个 PUT。
+    /// 把该检查放在运行时里，
+    /// 使重试可被观察到，
+    /// 同时不会第二次累加传输进度。
     pub fn transfer_item_already_received(
         &self,
         transfer_id: &str,
@@ -2633,22 +2727,14 @@ impl NodeRuntime {
         Ok(progress)
     }
 
-    /// Remove a failed transfer record. Non-failed records are retained and
-    /// rejected so an active task cannot be dropped without cancelling it.
+    /// 删除失败的传输记录。未失败的记录会保留并拒绝删除，
+    /// 使活动任务不会被直接丢弃而不先取消。
     pub fn remove_failed_transfer(&self, transfer_id: &str) -> Option<TransferProgress> {
         let mut transfers = self.transfers.write();
         if transfers.get(transfer_id)?.progress.status != TransferStatus::Failed {
             return None;
         }
         transfers.remove(transfer_id).map(|record| record.progress)
-    }
-
-    fn peer_display_name(&self, node_id: &str) -> Option<String> {
-        self.peers
-            .read()
-            .get(node_id)
-            .map(|peer| peer.node_name.clone())
-            .filter(|name| !name.trim().is_empty())
     }
 
     pub fn set_transfer_source_paths(&self, transfer_id: &str, paths: Vec<String>) {
@@ -3262,10 +3348,10 @@ impl NodeRuntime {
             return Err("手机传输记录资源暂时不足，请稍后重试".to_string());
         }
         let progress = transfer_progress(&offer, "receive");
-        // `transfer_id` is supplied by the peer and is also exposed in the
-        // HTTP API.  Keep it as the protocol key, but never use it as a path
-        // component: a fresh UUID gives every transfer an opaque staging
-        // directory with no traversal or root-directory collision risk.
+        // `transfer_id` 由对端提供，也会出现在 HTTP API 中。
+        // 它只作为协议键使用，绝不作为路径组件：
+        // 新生成的 UUID 给每个传输一个不透明的暂存目录，
+        // 不存在路径穿越或与根目录重名的风险。
         let staged_directory = self.mobile_staging_root().join(Uuid::new_v4().to_string());
         let record = MobileTransferRecord {
             session_id: session_id.to_string(),
@@ -3275,6 +3361,7 @@ impl NodeRuntime {
             staged_items: HashSet::new(),
             downloaded_items: HashSet::new(),
             retryable_downloads: HashSet::new(),
+            manifest_bytes,
             updated_at_ms: now_millis(),
         };
         let view = mobile_view(&record);
@@ -3435,9 +3522,7 @@ impl NodeRuntime {
             })
             .collect::<Vec<_>>();
         failed_ids.sort_by_key(|(_, updated_at, _)| *updated_at);
-        let failed_remove_count = failed_ids
-            .len()
-            .saturating_sub(MAX_MOBILE_FAILED_TRANSFERS_PER_SESSION);
+        let failed_remove_count = failed_ids.len().saturating_sub(MAX_MOBILE_FAILED_TRANSFERS);
         remove.extend(
             failed_ids
                 .into_iter()
@@ -3450,7 +3535,7 @@ impl NodeRuntime {
         for (transfer_id, _) in &remove {
             if let Some(record) = transfers.remove(transfer_id) {
                 released_manifest_bytes =
-                    released_manifest_bytes.saturating_add(mobile_manifest_size(&record.offer));
+                    released_manifest_bytes.saturating_add(record.manifest_bytes);
             }
         }
         if released_manifest_bytes > 0 {
@@ -3476,17 +3561,16 @@ impl NodeRuntime {
         self.mobile_transfers.read().get(transfer_id).cloned()
     }
 
-    /// Remove a failed mobile transfer record and release its manifest budget.
+    /// 删除失败的移动端传输记录，并释放其清单预算。
     pub fn remove_failed_mobile_transfer(&self, transfer_id: &str) -> Option<MobileTransferRecord> {
         let mut transfers = self.mobile_transfers.write();
         if transfers.get(transfer_id)?.progress.status != TransferStatus::Failed {
             return None;
         }
         let record = transfers.remove(transfer_id)?;
-        let manifest_bytes = mobile_manifest_size(&record.offer);
-        if manifest_bytes > 0 {
+        if record.manifest_bytes > 0 {
             self.mobile_manifest_bytes
-                .fetch_sub(manifest_bytes, Ordering::SeqCst);
+                .fetch_sub(record.manifest_bytes, Ordering::SeqCst);
         }
         Some(record)
     }
@@ -3713,1124 +3797,6 @@ fn evict_terminal_transfer_if_needed(transfers: &mut HashMap<String, TransferRec
     } else {
         false
     }
-}
-
-const ANDROID_DEFAULT_NODE_NAME: &str = "移动设备";
-const DESKTOP_DEFAULT_NODE_NAME: &str = "MeshShare 节点";
-/// 与对端 `validate_node_info` 的名称上限一致：超长名称会让整个握手消息被丢弃。
-const MAX_NODE_NAME_BYTES: usize = 256;
-
-fn truncate_node_name(name: &str) -> String {
-    if name.len() <= MAX_NODE_NAME_BYTES {
-        return name.to_string();
-    }
-    let mut end = MAX_NODE_NAME_BYTES;
-    while end > 0 && !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    name[..end].to_string()
-}
-
-fn system_hostname() -> Option<String> {
-    hostname::get()
-        .ok()
-        .and_then(|value| value.into_string().ok())
-}
-
-/// 主机名只是系统占位值时不能当设备名：Android 的 net.hostname 默认就是 localhost，
-/// 照抄会让每台手机都以同一个名字出现在其他节点的设备列表里。
-fn is_placeholder_node_name(name: &str) -> bool {
-    let name = name.trim().to_ascii_lowercase();
-    name.is_empty()
-        || matches!(
-            name.as_str(),
-            "localhost" | "localhost.localdomain" | "ip6-localhost" | "ip6-loopback"
-        )
-}
-
-fn default_node_name(profile: NodeProfile, hostname: Option<String>) -> String {
-    if let Some(name) = hostname.filter(|value| !is_placeholder_node_name(value)) {
-        return truncate_node_name(name.trim());
-    }
-    if profile.is_android() {
-        ANDROID_DEFAULT_NODE_NAME.to_string()
-    } else {
-        DESKTOP_DEFAULT_NODE_NAME.to_string()
-    }
-}
-
-/// 节点名称以系统设备名为权威：系统名可用时覆盖已保存名称，不可用时保留有效的旧名。
-/// 返回是否改写了名称；调用方负责把结果落盘。
-fn sync_node_name(name: &mut String, profile: NodeProfile, hostname: Option<String>) -> bool {
-    let resolved = match hostname.filter(|value| !is_placeholder_node_name(value)) {
-        Some(hostname) => truncate_node_name(hostname.trim()),
-        None if is_placeholder_node_name(name) => default_node_name(profile, None),
-        None => return false,
-    };
-    if name == &resolved {
-        return false;
-    }
-    *name = resolved;
-    true
-}
-
-fn load_or_create_config(data_dir: &Path, profile: NodeProfile) -> anyhow::Result<PersistedConfig> {
-    load_or_create_config_with_hostname(data_dir, profile, system_hostname())
-}
-
-fn load_or_create_config_with_hostname(
-    data_dir: &Path,
-    profile: NodeProfile,
-    hostname: Option<String>,
-) -> anyhow::Result<PersistedConfig> {
-    let path = data_dir.join("node.json");
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            let value: serde_json::Value = serde_json::from_str(&contents)
-                .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
-            let mut config: PersistedConfig = serde_json::from_value(value.clone())
-                .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
-            if value.get("monitor_visible").is_none() {
-                config.monitor_visible = !matches!(
-                    value.get("monitor_display").and_then(|item| item.as_str()),
-                    Some("tray" | "disabled")
-                );
-            }
-            config.clipboard_history_count = config
-                .clipboard_history_count
-                .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
-            config.clipboard_history_days = config
-                .clipboard_history_days
-                .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
-            if sync_node_name(&mut config.node_name, profile, hostname.clone()) {
-                if let Err(error) = persist_config(data_dir, &config) {
-                    eprintln!("保存节点名称失败：{error}");
-                }
-            }
-            return Ok(config);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    let config = PersistedConfig {
-        node_id: Uuid::new_v4().to_string(),
-        node_name: default_node_name(profile, hostname),
-        monitor_visible: true,
-        monitor_position: None,
-        monitor_locked: false,
-        autostart_enabled: default_autostart_enabled(),
-        update_frequency: UpdateFrequency::default(),
-        update_last_checked_at_ms: None,
-        pending_update_version: None,
-        update_proxy: None,
-        clipboard_history_mode: ClipboardHistoryMode::default(),
-        clipboard_history_count: default_clipboard_history_count(),
-        clipboard_history_days: default_clipboard_history_days(),
-        receive_mode: default_receive_mode(),
-        remote_file_access: false,
-        receive_directory: None,
-        receive_directory_bookmark: None,
-    };
-    persist_config(data_dir, &config)?;
-    Ok(config)
-}
-
-#[cfg(target_os = "macos")]
-fn activate_receive_directory_access(config: &PersistedConfig) -> Option<PathBuf> {
-    let bookmark = config.receive_directory_bookmark.as_deref()?;
-    match crate::macos_security_scope::activate_bookmark(bookmark) {
-        Ok(path) => Some(path),
-        Err(error) => {
-            eprintln!("恢复接收目录授权失败：{error}");
-            None
-        }
-    }
-}
-
-pub(crate) fn file_modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_millis() as i64)
-}
-
-fn outgoing_media_type(relative_path: &str) -> String {
-    let extension = relative_path
-        .rsplit('.')
-        .next()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    match extension.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "pdf" => "application/pdf",
-        "txt" => "text/plain",
-        "zip" => "application/zip",
-        "apk" => "application/vnd.android.package-archive",
-        _ => "application/octet-stream",
-    }
-    .to_string()
-}
-
-fn push_outgoing_source(
-    sources: &mut Vec<PreparedSource>,
-    seen: &mut HashSet<String>,
-    prefix: &str,
-    relative: &Path,
-    path: &Path,
-) -> Result<(), String> {
-    let segments = relative
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
-        return Err("文件相对路径无效".to_string());
-    }
-    let relative_path = if prefix.is_empty() {
-        segments.join("/")
-    } else {
-        format!("{prefix}/{}", segments.join("/"))
-    };
-    if relative_path.len() > OUTGOING_MAX_RELATIVE_PATH
-        || segments
-            .iter()
-            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
-    {
-        return Err(format!("文件相对路径无效：{relative_path}"));
-    }
-    if sources.len() >= OUTGOING_PREPARE_MAX_ITEMS {
-        return Err("一次发送的项目过多，请分批发送".to_string());
-    }
-    if !seen.insert(relative_path.clone()) {
-        return Err(format!("存在重名文件：{relative_path}"));
-    }
-    let metadata =
-        std::fs::metadata(path).map_err(|error| format!("无法读取 {relative_path}：{error}"))?;
-    if !metadata.is_file() {
-        return Ok(());
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .map(str::to_string)
-        .ok_or_else(|| format!("{relative_path} 的文件名无效"))?;
-    sources.push(PreparedSource {
-        file_name,
-        relative_path,
-        path: path.to_path_buf(),
-        size: metadata.len(),
-        modified_ms: file_modified_ms(&metadata),
-    });
-    Ok(())
-}
-
-fn display_absolute_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    text.strip_prefix(r"\\?\")
-        .map(str::to_string)
-        .unwrap_or_else(|| text.into_owned())
-}
-
-/// 把用户选中的文件与文件夹展开成待发送清单，文件夹按选中目录名保留层级。
-fn expand_outgoing_paths(paths: &[String]) -> Result<(Vec<PreparedSource>, Vec<String>), String> {
-    let mut sources = Vec::new();
-    let mut roots = Vec::new();
-    let mut seen = HashSet::new();
-    for raw in paths {
-        let requested = PathBuf::from(raw);
-        if !requested.is_absolute() {
-            return Err("发送路径必须是绝对路径".to_string());
-        }
-        let canonical = std::fs::canonicalize(&requested)
-            .map_err(|error| format!("无法访问 {raw}：{error}"))?;
-        let metadata =
-            std::fs::metadata(&canonical).map_err(|error| format!("无法读取 {raw}：{error}"))?;
-        if roots.len() < MAX_TRANSFER_HISTORY_PATHS {
-            let root = display_absolute_path(&canonical);
-            if root.len() <= 4_096 && !roots.contains(&root) {
-                roots.push(root);
-            }
-        }
-        if metadata.is_dir() {
-            let prefix = canonical
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(str::to_string)
-                .ok_or_else(|| format!("{raw} 的文件夹名无效"))?;
-            for entry in WalkDir::new(&canonical).follow_links(false) {
-                let entry = entry.map_err(|error| format!("遍历 {raw} 失败：{error}"))?;
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let relative = entry
-                    .path()
-                    .strip_prefix(&canonical)
-                    .map_err(|_| format!("{raw} 的相对路径无效"))?;
-                push_outgoing_source(&mut sources, &mut seen, &prefix, relative, entry.path())?;
-            }
-        } else if metadata.is_file() {
-            let name = canonical
-                .file_name()
-                .map(PathBuf::from)
-                .ok_or_else(|| format!("{raw} 的文件名无效"))?;
-            push_outgoing_source(&mut sources, &mut seen, "", &name, &canonical)?;
-        } else {
-            return Err(format!("{raw} 不是普通文件或文件夹"));
-        }
-    }
-    sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok((sources, roots))
-}
-
-pub fn validate_receive_directory(path: &Path) -> anyhow::Result<PathBuf> {
-    if !path.is_absolute() {
-        anyhow::bail!("接收目录必须是绝对路径");
-    }
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!("接收目录必须是实际目录，不能是符号链接");
-    }
-    Ok(std::fs::canonicalize(path)?)
-}
-
-fn desktop_temp_registry_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(DESKTOP_TEMP_REGISTRY_FILE)
-}
-
-fn is_desktop_temp_file_path(path: &Path) -> bool {
-    if !path.is_absolute() {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    name.contains(".meshshare-") && name.ends_with(".part")
-}
-
-fn load_and_cleanup_desktop_temp_files(data_dir: &Path) -> anyhow::Result<HashSet<PathBuf>> {
-    let registry_path = desktop_temp_registry_path(data_dir);
-    let contents = match std::fs::read(&registry_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => return Err(error.into()),
-    };
-    let registered = if contents.is_empty() {
-        Vec::new()
-    } else {
-        serde_json::from_slice::<Vec<PathBuf>>(&contents)
-            .map_err(|error| anyhow::anyhow!("桌面临时文件登记损坏：{error}"))?
-    };
-    if registered.len() > MAX_DESKTOP_TEMP_FILES {
-        return Err(anyhow::anyhow!("桌面临时文件登记超过数量上限"));
-    }
-    let mut remaining = HashSet::new();
-    for path in registered {
-        if !is_desktop_temp_file_path(&path) {
-            eprintln!("忽略无效的桌面临时文件登记：{}", path.display());
-            continue;
-        }
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                eprintln!("读取桌面临时文件失败 {}：{error}", path.display());
-                remaining.insert(path);
-                continue;
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            eprintln!("跳过非普通桌面临时文件：{}", path.display());
-            remaining.insert(path);
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(error) => {
-                eprintln!("清理桌面临时文件失败 {}：{error}", path.display());
-                remaining.insert(path);
-            }
-        }
-    }
-    persist_desktop_temp_files(data_dir, &remaining)?;
-    Ok(remaining)
-}
-
-fn persist_desktop_temp_files(data_dir: &Path, files: &HashSet<PathBuf>) -> anyhow::Result<()> {
-    let path = desktop_temp_registry_path(data_dir);
-    let temporary = data_dir.join(format!(
-        "{DESKTOP_TEMP_REGISTRY_FILE}.tmp-{}",
-        std::process::id()
-    ));
-    let mut entries = files.iter().cloned().collect::<Vec<_>>();
-    entries.sort();
-    std::fs::write(&temporary, serde_json::to_vec_pretty(&entries)?)?;
-    if let Err(error) = std::fs::rename(&temporary, &path) {
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-                std::fs::rename(&temporary, &path)?;
-            } else {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(error.into());
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            if let Err(cleanup_error) = std::fs::remove_file(&temporary) {
-                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "清理桌面临时文件登记临时文件失败 {}：{cleanup_error}",
-                        temporary.display()
-                    );
-                }
-            }
-            return Err(error.into());
-        }
-    }
-    Ok(())
-}
-
-fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyhow::Result<()> {
-    let path = data_dir.join("node.json");
-    let temporary = data_dir.join(format!("node.json.tmp-{}", std::process::id()));
-    std::fs::write(&temporary, serde_json::to_vec_pretty(config)?)?;
-    if let Err(error) = std::fs::rename(&temporary, &path) {
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-                std::fs::rename(&temporary, &path)?;
-            } else {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(error.into());
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            if let Err(cleanup_error) = std::fs::remove_file(&temporary) {
-                if cleanup_error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "清理配置临时文件失败 {}：{cleanup_error}",
-                        temporary.display()
-                    );
-                }
-            }
-            return Err(error.into());
-        }
-    }
-    Ok(())
-}
-
-fn clipboard_payload_dir(data_dir: &Path) -> PathBuf {
-    data_dir.join(CLIPBOARD_PAYLOAD_DIR)
-}
-
-fn is_clipboard_index_temp_name(name: &str, base: &str) -> bool {
-    name.strip_prefix(base)
-        .is_some_and(|suffix| suffix.starts_with(".tmp-"))
-}
-
-fn remove_clipboard_temp_file(path: &Path) {
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return;
-    };
-    if !(metadata.is_file() || metadata.file_type().is_symlink()) {
-        return;
-    }
-    if let Err(error) = std::fs::remove_file(path) {
-        eprintln!("清理剪贴板临时文件失败 {}：{error}", path.display());
-    }
-}
-
-fn cleanup_clipboard_temp_files(data_dir: &Path) -> anyhow::Result<()> {
-    for entry in std::fs::read_dir(data_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if is_clipboard_index_temp_name(name, CLIPBOARD_HISTORY_FILE)
-            || is_clipboard_index_temp_name(name, CLIPBOARD_CURRENT_FILE)
-        {
-            remove_clipboard_temp_file(&entry.path());
-        }
-    }
-    let payload_dir = clipboard_payload_dir(data_dir);
-    let entries = match std::fs::read_dir(&payload_dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_str().is_some_and(|name| name.contains(".tmp-")) {
-            remove_clipboard_temp_file(&entry.path());
-        }
-    }
-    Ok(())
-}
-
-fn safe_clipboard_payload_name(name: &str, extension: &str) -> bool {
-    let path = Path::new(name);
-    path.components().count() == 1
-        && path.file_name().and_then(|value| value.to_str()) == Some(name)
-        && path.extension().and_then(|value| value.to_str()) == Some(extension)
-        && name.len() <= 128
-}
-
-fn clipboard_history_record_valid(data_dir: &Path, record: &ClipboardHistoryRecord) -> bool {
-    if record.event_id.is_empty()
-        || record.event_id.len() > 256
-        || record.source_node_id.is_empty()
-        || record.source_node_id.len() > 256
-        || record.source_name.len() > 256
-        || record.content_hash.len() != 64
-        || (record.text_path.is_none() && record.image_path.is_none())
-    {
-        return false;
-    }
-    let payload_dir = clipboard_payload_dir(data_dir);
-    if let Some(path) = record.text_path.as_deref() {
-        let full = payload_dir.join(path);
-        if !safe_clipboard_payload_name(path, "txt")
-            || std::fs::symlink_metadata(&full)
-                .map(|metadata| {
-                    !metadata.is_file()
-                        || metadata.file_type().is_symlink()
-                        || metadata.len() as usize != record.text_len
-                })
-                .unwrap_or(true)
-            || record.text_len > CLIPBOARD_TEXT_LIMIT
-        {
-            return false;
-        }
-    }
-    if let Some(path) = record.image_path.as_deref() {
-        let full = payload_dir.join(path);
-        let valid_png = std::fs::read(&full)
-            .ok()
-            .is_some_and(|bytes| crate::clipboard::is_valid_png(&bytes));
-        if !safe_clipboard_payload_name(path, "png")
-            || std::fs::symlink_metadata(&full)
-                .map(|metadata| {
-                    !metadata.is_file()
-                        || metadata.file_type().is_symlink()
-                        || metadata.len() as usize != record.image_len
-                })
-                .unwrap_or(true)
-            || record.image_len > CLIPBOARD_IMAGE_LIMIT
-            || !valid_png
-        {
-            return false;
-        }
-    }
-    true
-}
-
-fn transfer_history_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(TRANSFER_HISTORY_FILE)
-}
-
-/// 历史损坏不能阻止节点启动，读取失败按空历史处理。
-fn load_transfer_history(data_dir: &Path) -> TransferHistoryStore {
-    let contents = match std::fs::read(transfer_history_path(data_dir)) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return TransferHistoryStore::default()
-        }
-        Err(error) => {
-            eprintln!("读取传输历史失败：{error}");
-            return TransferHistoryStore::default();
-        }
-    };
-    let mut store = match serde_json::from_slice::<TransferHistoryStore>(&contents) {
-        Ok(store) => store,
-        Err(error) => {
-            eprintln!("传输历史文件损坏，已忽略：{error}");
-            return TransferHistoryStore::default();
-        }
-    };
-    store
-        .entries
-        .retain(|entry| is_terminal_transfer(&entry.status));
-    store.entries.truncate(TRANSFER_HISTORY_LIMIT);
-    store.pending_deletions.retain(|peer_id, ids| {
-        if peer_id.is_empty() || peer_id.len() > 256 {
-            return false;
-        }
-        ids.retain(|id| !id.trim().is_empty() && id.len() <= 256);
-        ids.dedup();
-        ids.truncate(MAX_PENDING_HISTORY_DELETIONS_PER_PEER);
-        !ids.is_empty()
-    });
-    store
-}
-
-fn persist_transfer_history(data_dir: &Path, store: &TransferHistoryStore) -> anyhow::Result<()> {
-    let path = transfer_history_path(data_dir);
-    let temporary = data_dir.join(format!(
-        "{TRANSFER_HISTORY_FILE}.tmp-{}",
-        std::process::id()
-    ));
-    let contents = serde_json::to_vec_pretty(store)?;
-    if let Err(error) =
-        std::fs::write(&temporary, contents).and_then(|()| std::fs::rename(&temporary, &path))
-    {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error.into());
-    }
-    Ok(())
-}
-
-fn load_clipboard_history(data_dir: &Path) -> anyhow::Result<Vec<ClipboardHistoryRecord>> {
-    let path = data_dir.join(CLIPBOARD_HISTORY_FILE);
-    let contents = match std::fs::read(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let records = match serde_json::from_slice::<Vec<ClipboardHistoryRecord>>(&contents) {
-        Ok(records) => records,
-        Err(error) => {
-            eprintln!("剪贴板历史索引损坏，已忽略：{error}");
-            return Ok(Vec::new());
-        }
-    };
-    Ok(records
-        .into_iter()
-        .take(MAX_CLIPBOARD_HISTORY_COUNT)
-        .filter(|record| clipboard_history_record_valid(data_dir, record))
-        .collect())
-}
-
-fn persist_clipboard_history(
-    data_dir: &Path,
-    history: &[ClipboardHistoryRecord],
-) -> anyhow::Result<()> {
-    std::fs::create_dir_all(clipboard_payload_dir(data_dir))?;
-    let path = data_dir.join(CLIPBOARD_HISTORY_FILE);
-    let temporary = data_dir.join(format!(
-        "{CLIPBOARD_HISTORY_FILE}.tmp-{}",
-        std::process::id()
-    ));
-    let contents = serde_json::to_vec_pretty(history)?;
-    if let Err(error) =
-        std::fs::write(&temporary, contents).and_then(|()| std::fs::rename(&temporary, &path))
-    {
-        remove_clipboard_temp_file(&temporary);
-        return Err(error.into());
-    }
-    let referenced = history
-        .iter()
-        .flat_map(|record| [record.text_path.as_deref(), record.image_path.as_deref()])
-        .flatten()
-        .collect::<HashSet<_>>();
-    let entries = match std::fs::read_dir(clipboard_payload_dir(data_dir)) {
-        Ok(entries) => entries,
-        Err(error) => {
-            // The index has already been atomically replaced. A cleanup
-            // failure must not be reported as a failed transaction, otherwise
-            // callers could roll back memory while disk points at the new
-            // index. Stale unreferenced files are safe to retry next startup.
-            eprintln!("清理剪贴板历史 payload 失败：{error}");
-            return Ok(());
-        }
-    };
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if name.contains(".tmp-") {
-            remove_clipboard_temp_file(&entry.path());
-        } else if !referenced.contains(name) {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-    Ok(())
-}
-
-fn persist_clipboard_current(data_dir: &Path, snapshot: &ClipboardSnapshot) -> anyhow::Result<()> {
-    let path = data_dir.join(CLIPBOARD_CURRENT_FILE);
-    let temporary = data_dir.join(format!(
-        "{CLIPBOARD_CURRENT_FILE}.tmp-{}",
-        std::process::id()
-    ));
-    std::fs::write(&temporary, serde_json::to_vec(snapshot)?)?;
-    if let Err(error) = std::fs::rename(&temporary, &path) {
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-                std::fs::rename(&temporary, &path)?;
-            } else {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(error.into());
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error.into());
-        }
-    }
-    Ok(())
-}
-
-fn load_clipboard_current(data_dir: &Path) -> Option<ClipboardSnapshot> {
-    let contents = std::fs::read(data_dir.join(CLIPBOARD_CURRENT_FILE)).ok()?;
-    let snapshot = serde_json::from_slice::<ClipboardSnapshot>(&contents).ok()?;
-    clipboard_snapshot_hash(&snapshot).ok().map(|_| snapshot)
-}
-
-fn write_clipboard_payload(
-    data_dir: &Path,
-    storage_id: &str,
-    extension: &str,
-    bytes: &[u8],
-) -> anyhow::Result<String> {
-    let directory = clipboard_payload_dir(data_dir);
-    std::fs::create_dir_all(&directory)?;
-    let name = format!("{storage_id}.{extension}");
-    let path = directory.join(&name);
-    let temporary = directory.join(format!("{name}.tmp-{}", std::process::id()));
-    std::fs::write(&temporary, bytes)?;
-    match std::fs::rename(&temporary, &path) {
-        Ok(()) => {}
-        Err(error) => {
-            #[cfg(windows)]
-            {
-                if path.exists() {
-                    std::fs::remove_file(&path)?;
-                    std::fs::rename(&temporary, &path)?;
-                } else {
-                    let _ = std::fs::remove_file(&temporary);
-                    return Err(error.into());
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(error.into());
-            }
-        }
-    }
-    Ok(name)
-}
-
-fn write_clipboard_history_record(
-    data_dir: &Path,
-    snapshot: &ClipboardSnapshot,
-    recorded_at_ms: i64,
-    content_hash: String,
-) -> anyhow::Result<ClipboardHistoryRecord> {
-    let storage_id = Uuid::new_v4().to_string();
-    let text_path = match snapshot
-        .text
-        .as_ref()
-        .map(|text| write_clipboard_payload(data_dir, &storage_id, "txt", text.as_bytes()))
-        .transpose()
-    {
-        Ok(path) => path,
-        Err(error) => {
-            remove_clipboard_payload_set(data_dir, &storage_id);
-            return Err(error);
-        }
-    };
-    let image_bytes = match snapshot
-        .image_png
-        .as_deref()
-        .map(|value| BASE64.decode(value))
-        .transpose()
-    {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            remove_clipboard_payload_set(data_dir, &storage_id);
-            return Err(error.into());
-        }
-    };
-    let image_path = match image_bytes
-        .as_deref()
-        .map(|bytes| write_clipboard_payload(data_dir, &storage_id, "png", bytes))
-        .transpose()
-    {
-        Ok(path) => path,
-        Err(error) => {
-            remove_clipboard_payload_set(data_dir, &storage_id);
-            return Err(error);
-        }
-    };
-    Ok(ClipboardHistoryRecord {
-        event_id: snapshot.event_id.clone(),
-        source_node_id: snapshot.source_node_id.clone(),
-        source_name: snapshot.source_name.clone(),
-        clock: snapshot.clock.clone(),
-        updated_at_ms: snapshot.updated_at_ms,
-        recorded_at_ms,
-        content_hash,
-        text_path,
-        image_path,
-        text_len: snapshot.text.as_ref().map_or(0, String::len),
-        image_len: image_bytes.map_or(0, |bytes| bytes.len()),
-    })
-}
-
-fn remove_clipboard_payload_set(data_dir: &Path, storage_id: &str) {
-    let directory = clipboard_payload_dir(data_dir);
-    for extension in ["txt", "png"] {
-        let _ = std::fs::remove_file(directory.join(format!("{storage_id}.{extension}")));
-    }
-    for entry in [
-        directory.join(format!("{storage_id}.txt.tmp-{}", std::process::id())),
-        directory.join(format!("{storage_id}.png.tmp-{}", std::process::id())),
-    ] {
-        remove_clipboard_temp_file(&entry);
-    }
-}
-
-fn load_history_snapshot(
-    data_dir: &Path,
-    record: &ClipboardHistoryRecord,
-) -> anyhow::Result<ClipboardSnapshot> {
-    let directory = clipboard_payload_dir(data_dir);
-    let text = record
-        .text_path
-        .as_deref()
-        .map(|path| std::fs::read(directory.join(path)))
-        .transpose()?
-        .map(|bytes| String::from_utf8(bytes).map_err(anyhow::Error::from))
-        .transpose()?;
-    let image_png = record
-        .image_path
-        .as_deref()
-        .map(|path| {
-            std::fs::read(directory.join(path))
-                .map(|bytes| BASE64.encode(bytes))
-                .map_err(anyhow::Error::from)
-        })
-        .transpose()?;
-    Ok(ClipboardSnapshot {
-        event_id: record.event_id.clone(),
-        source_node_id: record.source_node_id.clone(),
-        source_name: record.source_name.clone(),
-        clock: record.clock.clone(),
-        text,
-        image_png,
-        updated_at_ms: record.updated_at_ms,
-    })
-}
-
-fn remove_clipboard_record_payloads(data_dir: &Path, record: &ClipboardHistoryRecord) {
-    let directory = clipboard_payload_dir(data_dir);
-    for path in [record.text_path.as_deref(), record.image_path.as_deref()]
-        .into_iter()
-        .flatten()
-    {
-        let _ = std::fs::remove_file(directory.join(path));
-    }
-}
-
-fn clipboard_snapshot_hash(snapshot: &ClipboardSnapshot) -> anyhow::Result<String> {
-    let image = snapshot
-        .image_png
-        .as_deref()
-        .map(|value| BASE64.decode(value))
-        .transpose()?;
-    if snapshot
-        .text
-        .as_ref()
-        .is_some_and(|value| value.len() > CLIPBOARD_TEXT_LIMIT)
-        || image
-            .as_ref()
-            .is_some_and(|value| value.len() > CLIPBOARD_IMAGE_LIMIT)
-    {
-        return Err(anyhow::anyhow!("剪贴板内容超过大小限制"));
-    }
-    if image
-        .as_deref()
-        .is_some_and(|bytes| !crate::clipboard::is_valid_png(bytes))
-    {
-        return Err(anyhow::anyhow!("剪贴板图片不是有效的 PNG"));
-    }
-    Ok(crate::clipboard::payload_hash(
-        snapshot.text.as_deref(),
-        image.as_deref(),
-    ))
-}
-
-fn prune_clipboard_history_records(
-    history: &mut Vec<ClipboardHistoryRecord>,
-    config: &PersistedConfig,
-    now: i64,
-) {
-    prune_clipboard_history_records_with_limit(history, config, now, MAX_CLIPBOARD_HISTORY_BYTES);
-}
-
-fn prune_clipboard_history_records_with_limit(
-    history: &mut Vec<ClipboardHistoryRecord>,
-    config: &PersistedConfig,
-    now: i64,
-    max_bytes: u64,
-) {
-    match config.clipboard_history_mode {
-        ClipboardHistoryMode::Count => history.truncate(
-            config
-                .clipboard_history_count
-                .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT),
-        ),
-        ClipboardHistoryMode::Days => {
-            let age = i64::from(
-                config
-                    .clipboard_history_days
-                    .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS),
-            )
-            .saturating_mul(CLIPBOARD_DAY_MS);
-            let threshold = now.saturating_sub(age);
-            history.retain(|record| record.recorded_at_ms >= threshold);
-            history.truncate(MAX_CLIPBOARD_HISTORY_COUNT);
-        }
-    }
-    let mut total_bytes = history
-        .iter()
-        .map(|record| (record.text_len as u64).saturating_add(record.image_len as u64))
-        .sum::<u64>();
-    while total_bytes > max_bytes && history.len() > 1 {
-        let Some(record) = history.pop() else { break };
-        total_bytes = total_bytes
-            .saturating_sub((record.text_len as u64).saturating_add(record.image_len as u64));
-    }
-}
-
-fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
-    (u32::from(address) & 0xffc00000) == 0x64400000
-}
-
-pub(crate) fn is_network_ipv4(address: Ipv4Addr) -> bool {
-    address.is_private() || address.is_link_local() || is_tailscale_ipv4(address)
-}
-
-fn normalize_peer_http_base(raw: &str) -> Option<String> {
-    let mut url = reqwest::Url::parse(raw).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return None;
-    }
-    let host = url.host_str()?;
-    let allowed_host = host.eq_ignore_ascii_case("localhost")
-        || host.ends_with(".local")
-        || host
-            .parse::<Ipv4Addr>()
-            .is_ok_and(|address| address.is_loopback() || is_network_ipv4(address));
-    if !allowed_host {
-        return None;
-    }
-    url.set_path("");
-    Some(url.to_string().trim_end_matches('/').to_string())
-}
-
-fn http_base_from_peer_endpoint(raw: &str) -> Option<String> {
-    let mut url = reqwest::Url::parse(raw).ok()?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        "http" | "https" => url.scheme(),
-        _ => return None,
-    }
-    .to_string();
-    url.set_scheme(&scheme).ok()?;
-    if !url.path().ends_with("/api/v1/ws") {
-        return None;
-    }
-    url.set_path("");
-    url.set_query(None);
-    url.set_fragment(None);
-    normalize_peer_http_base(url.as_str())
-}
-
-fn mobile_ca_url(raw: &str) -> Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(raw).map_err(|_| "CA 地址无效".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err("CA 地址只支持 HTTP 或 HTTPS".to_string());
-    }
-    let host = url.host_str().unwrap_or_default();
-    let Some(address) = host.parse::<Ipv4Addr>().ok() else {
-        return Err("CA 地址必须是节点的私网 IPv4 地址".to_string());
-    };
-    if !(address.is_loopback() || is_network_ipv4(address)) {
-        return Err("CA 地址必须是节点的私网 IPv4 地址".to_string());
-    }
-    Ok(url)
-}
-
-fn is_cellular_interface(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    // CLAT 把蜂窝接口包装成 v4-/v6- 前缀的同名接口，判定前先剥掉包装。
-    // 宁可放过未知的运营商网卡名，也不用白名单漏掉手机 Wi-Fi 导致节点不可达。
-    let name = name
-        .strip_prefix("v4-")
-        .or_else(|| name.strip_prefix("v6-"))
-        .unwrap_or(&name);
-    ["rmnet", "ccmni", "radio", "clat", "ppp", "pdp", "wwan"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-}
-
-fn is_android_vpn_interface(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    if name.starts_with("tailscale") {
-        return false;
-    }
-    ["tun", "tap", "utun", "wg", "wireguard", "vpn", "ipsec"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-}
-
-/// 物理以太网和无线地址更可能是对端可达的入口；虚拟网卡与蜂窝地址排在后面，
-/// 让公布顺序与手机、桌面互相直连时实际能用的地址一致。
-fn interface_rank(name: &str) -> u8 {
-    let name = name.to_ascii_lowercase();
-    if is_cellular_interface(&name) {
-        return 2;
-    }
-    if [
-        "vethernet",
-        "veth",
-        "vmnet",
-        "docker",
-        "bridge",
-        "br-",
-        "utun",
-        "tun",
-        "tap",
-        "wg",
-        "wireguard",
-        "vpn",
-        "ipsec",
-        "tailscale",
-        "zt",
-        "dummy",
-        "ifb",
-    ]
-    .iter()
-    .any(|prefix| name.starts_with(prefix))
-    {
-        return 2;
-    }
-    if ["eth", "en", "wl", "wlan", "wi-fi", "ethernet"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
-    {
-        return 0;
-    }
-    1
-}
-
-fn interface_names() -> HashMap<Ipv4Addr, String> {
-    let mut names = HashMap::new();
-    match if_addrs::get_if_addrs() {
-        Ok(interfaces) => {
-            for interface in interfaces {
-                if let IpAddr::V4(address) = interface.ip() {
-                    names.entry(address).or_insert(interface.name);
-                }
-            }
-        }
-        Err(error) => eprintln!("读取本机网卡名称失败：{error}"),
-    }
-    names
-}
-
-fn network_addresses_for_bound(port: u16, bound: &BTreeSet<Ipv4Addr>) -> Vec<AddressInfo> {
-    network_addresses(port, bound, &interface_names())
-}
-
-fn network_addresses(
-    port: u16,
-    bound: &BTreeSet<Ipv4Addr>,
-    names: &HashMap<Ipv4Addr, String>,
-) -> Vec<AddressInfo> {
-    let mut addresses = bound
-        .iter()
-        .copied()
-        .filter(|address| is_network_ipv4(*address))
-        .map(|address| {
-            let kind = if is_tailscale_ipv4(address) {
-                "tailscale"
-            } else if address.is_private() {
-                "lan"
-            } else {
-                "network"
-            };
-            AddressInfo {
-                address: address.to_string(),
-                url: format!("http://{address}:{port}"),
-                label: address.to_string(),
-                kind: kind.to_string(),
-            }
-        })
-        .collect::<Vec<_>>();
-    addresses.sort_by_key(|address| {
-        let kind_rank = match address.kind.as_str() {
-            "lan" => 0,
-            "tailscale" => 1,
-            _ => 2,
-        };
-        let parsed = address.address.parse::<Ipv4Addr>().ok();
-        let interface = parsed
-            .and_then(|ip| names.get(&ip).map(|name| interface_rank(name)))
-            .unwrap_or(1);
-        (
-            kind_rank,
-            interface,
-            parsed.map(u32::from).unwrap_or(u32::MAX),
-        )
-    });
-    addresses
-}
-
-pub fn bind_addresses() -> BTreeSet<Ipv4Addr> {
-    let mut addresses = BTreeSet::from([Ipv4Addr::LOCALHOST]);
-    match if_addrs::get_if_addrs() {
-        Ok(interfaces) => {
-            addresses.extend(bindable_addresses(
-                NodeProfile::current(),
-                interfaces.into_iter().map(|interface| {
-                    let ip = interface.ip();
-                    (interface.name, ip)
-                }),
-            ));
-        }
-        Err(error) => eprintln!("读取本机网卡失败：{error}"),
-    }
-    addresses
-}
-
-fn bindable_addresses(
-    profile: NodeProfile,
-    interfaces: impl IntoIterator<Item = (String, IpAddr)>,
-) -> BTreeSet<Ipv4Addr> {
-    interfaces
-        .into_iter()
-        // 蜂窝地址在局域网内没有可达意义，Android 上也不应让节点绑定到运营商地址。
-        .filter(|(name, _)| !(profile.is_android() && is_cellular_interface(name)))
-        // Android 原生插件会把进程 socket 固定到 Wi-Fi/以太网；VPN 地址不能在该网络上监听。
-        .filter(|(name, _)| !(profile.is_android() && is_android_vpn_interface(name)))
-        .filter_map(|(_, ip)| match ip {
-            IpAddr::V4(address) if is_network_ipv4(address) => Some(address),
-            _ => None,
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -6975,6 +5941,45 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "android"))]
+    fn system_clipboard_keeps_latest_pending_snapshot_and_discards_stale_reads() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let observed_event_id = runtime.clipboard_event_id();
+
+        // 系统线程还在读取时，节点仍能接受后续剪贴板事件。
+        runtime
+            .create_local_clipboard_named(Some("first".to_string()), None, "web".to_string())
+            .expect("accept first publication");
+        let newest = runtime
+            .create_local_clipboard_named(Some("newest".to_string()), None, "web".to_string())
+            .expect("accept latest publication");
+        assert!(runtime
+            .create_local_clipboard(
+                Some("stale read".to_string()),
+                None,
+                observed_event_id.as_deref()
+            )
+            .is_none());
+        let pending = runtime
+            .take_system_clipboard_write()
+            .expect("pending write");
+        assert_eq!(pending.event_id, newest.event_id);
+        assert!(runtime.take_system_clipboard_write().is_none());
+
+        let copied = runtime
+            .create_local_clipboard(Some("fresh copy".to_string()), None, Some(&newest.event_id))
+            .expect("publish fresh system clipboard read");
+        assert_eq!(
+            runtime.clipboard_event_id().as_deref(),
+            Some(copied.event_id.as_str())
+        );
+        assert!(runtime.take_system_clipboard_write().is_none());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
     fn local_clipboard_accepts_png_payloads() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
@@ -6984,7 +5989,7 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encode png");
         let event = runtime
-            .create_local_clipboard(None, Some(png))
+            .create_local_clipboard_named(None, Some(png), "local".to_string())
             .expect("create image clipboard event");
         assert!(event.image_png.is_some());
         assert!(runtime

@@ -85,16 +85,60 @@ fn available_disk_space(path: &Path) -> Option<u64> {
         .list()
         .iter()
         .filter_map(|disk| {
-            // `canonicalize` on Windows returns an extended-length path such as
-            // `\\?\\C:\\...`, while sysinfo reports drive-letter mount points.
-            // Canonicalize the mount point as well so the two forms can be
-            // compared component by component.
+            // `canonicalize` 在 Windows 上返回扩展长度路径，
+            // 形如 `\\?\C:\...`；而 sysinfo 报告的挂载点是盘符形式。
+            // 因此挂载点也要一并规范化，
+            // 两者才能按组件逐个比较。
             let mount_point = std::fs::canonicalize(disk.mount_point()).ok()?;
             path.starts_with(&mount_point)
                 .then_some((mount_point.components().count(), disk.available_space()))
         })
         .max_by_key(|(component_count, _)| *component_count)
         .map(|(_, available_space)| available_space)
+}
+
+/// 把请求体写入已打开的临时文件并计算 SHA-256。
+///
+/// 每块数据都受 60 秒空闲超时、清单大小上限和磁盘余量约束；调用方通过
+/// `on_chunk` 检查传输或会话是否仍然有效。
+async fn stream_body_to_file(
+    body: Body,
+    mut file: fs::File,
+    limit: u64,
+    disk_root: &Path,
+    mut on_chunk: impl FnMut() -> Result<(), ApiError>,
+) -> Result<(u64, String), ApiError> {
+    let mut stream = body.into_data_stream();
+    let mut hasher = Sha256::new();
+    let mut total = 0u64;
+    let mut disk_guard = DiskSpaceGuard::new(disk_root.to_path_buf());
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(60), stream.next())
+            .await
+            .map_err(|_| ApiError::request_timeout("上传长时间没有数据"))?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        on_chunk()?;
+        let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
+        total = total
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| ApiError::payload_too_large("传输内容大小溢出"))?;
+        if total > limit {
+            return Err(ApiError::payload_too_large("传输内容超过清单大小"));
+        }
+        if !disk_guard.has_headroom(chunk.len() as u64) {
+            return Err(ApiError::conflict("磁盘可用空间不足"));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    file.flush()
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    Ok((total, format!("{:x}", hasher.finalize())))
 }
 
 #[derive(Clone)]
@@ -711,20 +755,7 @@ async fn restore_clipboard_history(
         .runtime
         .restore_clipboard_history(&event_id)
         .ok_or_else(|| ApiError::not_found("剪贴板历史不存在或内容无效"))?;
-    let snapshot = state
-        .runtime
-        .clipboard_snapshot()
-        .ok_or_else(|| ApiError::internal("剪贴板状态不可用"))?;
-    if let Err(error) = clipboard::apply_snapshot(&snapshot, &state.runtime) {
-        eprintln!("无法写入本机剪贴板，仍继续广播恢复内容：{error}");
-    }
-    state.runtime.publish_event(WireMessage::ClipboardUpdate {
-        event: event.clone(),
-    });
-    state
-        .runtime
-        .send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
-    Ok(Json(snapshot))
+    publish_local_clipboard(&state.runtime, event).map(Json)
 }
 
 async fn clear_clipboard_history(
@@ -762,7 +793,7 @@ async fn post_clipboard(
     }
     if image_bytes
         .as_ref()
-        .is_some_and(|value| !is_valid_png(value))
+        .is_some_and(|value| !clipboard::is_valid_png(value))
     {
         return Err(ApiError::bad_request("image_png 不是有效的 PNG 图片"));
     }
@@ -790,20 +821,22 @@ async fn post_clipboard(
                 .unwrap_or_else(|| "手机浏览器".to_string()),
         )
         .ok_or_else(|| ApiError::bad_request("剪贴板内容为空或同步已暂停"))?;
-    let snapshot = state
-        .runtime
+    publish_local_clipboard(&state.runtime, event).map(Json)
+}
+
+/// 把已接受的本机剪贴板事件发给界面与其他节点。
+fn publish_local_clipboard(
+    runtime: &NodeRuntime,
+    event: ClipboardEvent,
+) -> Result<ClipboardSnapshot, ApiError> {
+    let snapshot = runtime
         .clipboard_snapshot()
         .ok_or_else(|| ApiError::internal("剪贴板状态不可用"))?;
-    if let Err(error) = clipboard::apply_snapshot(&snapshot, &state.runtime) {
-        eprintln!("无法写入本机剪贴板，仍继续广播主动同步内容：{error}");
-    }
-    state.runtime.publish_event(WireMessage::ClipboardUpdate {
+    runtime.publish_event(WireMessage::ClipboardUpdate {
         event: event.clone(),
     });
-    state
-        .runtime
-        .send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
-    Ok(Json(snapshot))
+    runtime.send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
+    Ok(snapshot)
 }
 
 async fn websocket(
@@ -845,9 +878,9 @@ async fn handle_socket(
     let mut owns_peer_channel = false;
     let mut ui_client = false;
     let mut clipboard_resync = tokio::time::interval(std::time::Duration::from_secs(1));
-    // A client must identify itself promptly.  Keeping an unauthenticated
-    // socket alive would retain the receiver task and broadcast subscription
-    // indefinitely without ever becoming a usable peer channel.
+    // 客户端必须尽快表明身份。未认证的连接一旦保留，
+    // 接收任务与广播订阅就会一直挂着，
+    // 而该连接永远不会成为可用的对端通道。
     let handshake_deadline = tokio::time::sleep(PEER_HANDSHAKE_TIMEOUT);
     tokio::pin!(handshake_deadline);
 
@@ -861,11 +894,10 @@ async fn handle_socket(
                             Ok(message) => {
                                 if let WireMessage::Ping { at_ms } = &message {
                                     if peer_id.is_none() {
-                                        // Browser clients do not identify as a
-                                        // peer node. Their application-level
-                                        // heartbeat still needs a response and
-                                        // must keep the handshake deadline from
-                                        // closing the UI channel.
+                                        // 浏览器客户端不会以对端节点身份注册。
+                                        // 它的应用层心跳仍需要应答，
+                                        // 同时必须避免握手截止时间
+                                        // 把这个 UI 通道关闭。
                                         ui_client = true;
                                         let pong = serde_json::to_string(
                                             &WireMessage::Pong { at_ms: *at_ms },
@@ -1000,6 +1032,28 @@ async fn handle_socket(
     }
 }
 
+/// 接受远端剪贴板内容。能写系统剪贴板的节点同时向其他对端转发，只读节点仅更新本地快照。
+fn accept_remote_clipboard(
+    runtime: &Arc<NodeRuntime>,
+    peer_id: &str,
+    event: ClipboardEvent,
+    source_name: String,
+) {
+    let can_write_system_clipboard = runtime.supports_capability("clipboard.text");
+    if !can_write_system_clipboard && !runtime.supports_capability(CLIPBOARD_VIEW_CAPABILITY) {
+        return;
+    }
+    if !runtime.accept_clipboard(event.clone(), source_name) {
+        return;
+    }
+    runtime.publish_event(WireMessage::ClipboardUpdate {
+        event: event.clone(),
+    });
+    if can_write_system_clipboard {
+        runtime.send_to_peers_except(Some(peer_id), WireMessage::ClipboardUpdate { event });
+    }
+}
+
 pub(crate) async fn handle_wire_message(
     message: WireMessage,
     runtime: &Arc<NodeRuntime>,
@@ -1025,8 +1079,8 @@ async fn handle_wire_message_with_endpoint(
             if node.protocol_version != crate::model::PROTOCOL_VERSION {
                 return None;
             }
-            // Reject a duplicate incoming socket before updating peer metadata;
-            // the existing channel remains the single source of truth.
+            // 先拒绝重复的入站连接，再更新对端元数据；
+            // 已有通道仍是唯一权威来源。
             if current_peer.is_none() && runtime.has_peer_channel(&node.node_id) {
                 return None;
             }
@@ -1090,48 +1144,16 @@ async fn handle_wire_message_with_endpoint(
         }
         WireMessage::ClipboardUpdate { event } => {
             let peer_id = current_peer?;
-            let can_write_system_clipboard = runtime.supports_capability("clipboard.text");
-            let can_receive_clipboard = can_write_system_clipboard
-                || runtime.supports_capability(CLIPBOARD_VIEW_CAPABILITY);
-            if !can_receive_clipboard {
-                return Some(peer_id.to_string());
-            }
-            if !validate_clipboard_event(&event) {
-                return Some(peer_id.to_string());
-            }
-            let source_name = runtime
-                .peer_name(peer_id)
-                .unwrap_or_else(|| "远端设备".to_string());
-            if runtime.accept_clipboard(event.clone(), source_name) {
-                if can_write_system_clipboard {
-                    if let Some(snapshot) = runtime.clipboard_snapshot() {
-                        if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
-                            eprintln!("无法写入远端剪贴板：{error}");
-                        }
-                    }
-                }
-                if can_write_system_clipboard {
-                    runtime.publish_event(WireMessage::ClipboardUpdate {
-                        event: event.clone(),
-                    });
-                    runtime.send_to_peers_except(
-                        Some(peer_id),
-                        WireMessage::ClipboardUpdate { event },
-                    );
-                } else {
-                    runtime.publish_event(WireMessage::ClipboardUpdate { event });
-                }
+            if validate_clipboard_event(&event) {
+                let source_name = runtime
+                    .peer_name(peer_id)
+                    .unwrap_or_else(|| "远端设备".to_string());
+                accept_remote_clipboard(runtime, peer_id, event, source_name);
             }
             Some(peer_id.to_string())
         }
         WireMessage::ClipboardSnapshot { snapshot } => {
             let peer_id = current_peer?;
-            let can_write_system_clipboard = runtime.supports_capability("clipboard.text");
-            let can_receive_clipboard = can_write_system_clipboard
-                || runtime.supports_capability(CLIPBOARD_VIEW_CAPABILITY);
-            if !can_receive_clipboard {
-                return Some(peer_id.to_string());
-            }
             if snapshot.source_name.len() > 256 {
                 return Some(peer_id.to_string());
             }
@@ -1150,28 +1172,8 @@ async fn handle_wire_message_with_endpoint(
                 image_png: snapshot.image_png,
                 updated_at_ms: snapshot.updated_at_ms,
             };
-            if !validate_clipboard_event(&event) {
-                return Some(peer_id.to_string());
-            }
-            if runtime.accept_clipboard(event.clone(), source_name) {
-                if can_write_system_clipboard {
-                    if let Some(snapshot) = runtime.clipboard_snapshot() {
-                        if let Err(error) = clipboard::apply_snapshot(&snapshot, runtime) {
-                            eprintln!("无法写入远端剪贴板：{error}");
-                        }
-                    }
-                }
-                if can_write_system_clipboard {
-                    runtime.publish_event(WireMessage::ClipboardUpdate {
-                        event: event.clone(),
-                    });
-                    runtime.send_to_peers_except(
-                        Some(peer_id),
-                        WireMessage::ClipboardUpdate { event },
-                    );
-                } else {
-                    runtime.publish_event(WireMessage::ClipboardUpdate { event });
-                }
+            if validate_clipboard_event(&event) {
+                accept_remote_clipboard(runtime, peer_id, event, source_name);
             }
             Some(peer_id.to_string())
         }
@@ -1435,7 +1437,7 @@ fn validate_clipboard_event(event: &ClipboardEvent) -> bool {
     let Ok(bytes) = BASE64.decode(image_png) else {
         return false;
     };
-    bytes.len() <= CLIPBOARD_IMAGE_LIMIT && is_valid_png(&bytes)
+    bytes.len() <= CLIPBOARD_IMAGE_LIMIT && clipboard::is_valid_png(&bytes)
 }
 
 fn validate_transfer_progress_payload(progress: &TransferProgress) -> bool {
@@ -1532,10 +1534,6 @@ fn validate_node_info(node: &NodeInfo) -> bool {
             .capabilities
             .iter()
             .all(|capability| !capability.is_empty() && capability.len() <= 128)
-}
-
-fn is_valid_png(bytes: &[u8]) -> bool {
-    clipboard::is_valid_png(bytes)
 }
 
 fn is_allowed_advertised_address(address: &AddressInfo) -> bool {
@@ -1733,9 +1731,9 @@ async fn remove_file_with_diagnostics(path: &Path) -> bool {
     }
 }
 
-/// Owns a registered desktop upload temporary file until it is committed or
-/// explicitly cleaned up. The synchronous drop path covers a request future
-/// that is cancelled while the body is still being streamed.
+/// 持有一个已登记的桌面端上传临时文件，直到提交或被显式清理。
+/// 同步的 drop 路径覆盖请求 future
+/// 在请求体仍在流式传输时被取消的情况。
 struct DesktopTempFileGuard {
     runtime: Arc<NodeRuntime>,
     path: PathBuf,
@@ -1988,7 +1986,7 @@ async fn upload_mobile_item(
         .begin_mobile_upload(&transfer_id)
         .ok_or_else(|| ApiError::conflict("手机传输已结束"))?;
     let temp = target.with_extension(format!("meshshare-{}.part", uuid::Uuid::new_v4()));
-    let mut file = match fs::OpenOptions::new()
+    let file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)
@@ -2004,15 +2002,8 @@ async fn upload_mobile_item(
             return Err(ApiError::internal(message));
         }
     };
-    let mut stream = body.into_data_stream();
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut disk_guard = DiskSpaceGuard::new(record.staged_directory.clone());
-    let stream_result: Result<(u64, String), ApiError> = async {
-        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next())
-            .await
-            .map_err(|_| ApiError::request_timeout("上传长时间没有数据"))?
-        {
+    let stream_result =
+        stream_body_to_file(body, file, item.size, &record.staged_directory, || {
             if state
                 .runtime
                 .touch_mobile_session(&record.session_id)
@@ -2021,28 +2012,9 @@ async fn upload_mobile_item(
                 return Err(ApiError::not_found("手机会话已过期"));
             }
             state.runtime.touch_mobile_transfer_activity(&transfer_id);
-            let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
-            total = total
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| ApiError::payload_too_large("传输内容大小溢出"))?;
-            if total > item.size {
-                return Err(ApiError::payload_too_large("传输内容超过清单大小"));
-            }
-            if !disk_guard.has_headroom(chunk.len() as u64) {
-                return Err(ApiError::conflict("接收磁盘可用空间不足"));
-            }
-            hasher.update(&chunk);
-            file.write_all(&chunk)
-                .await
-                .map_err(|error| ApiError::internal(error.to_string()))?;
-        }
-        file.flush()
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        Ok((total, format!("{:x}", hasher.finalize())))
-    }
-    .await;
-    drop(file);
+            Ok(())
+        })
+        .await;
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
@@ -2201,8 +2173,8 @@ async fn download_mobile_item(
     .map_err(|error| ApiError::internal(error.to_string()))?;
     let runtime = state.runtime;
     let auto_complete = query.auto_complete && method == Method::GET;
-    // Hyper may skip polling an empty body, or stop at Content-Length.
-    // The HTTP download has no browser acknowledgement, so keep the staged data for retry.
+    // Hyper 可能不去轮询空请求体，或在 Content-Length 处停止。
+    // HTTP 下载没有浏览器侧确认，因此暂存数据要保留以便重试。
     if auto_complete && size == 0 {
         runtime.mark_mobile_item_downloaded(&transfer_id, &item_id, true);
     }
@@ -2264,38 +2236,14 @@ async fn reject_transfer(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    let progress = state
-        .runtime
-        .fail_transfer(
-            &id,
-            "接收端拒绝了传输".to_string(),
-            TransferStatus::Rejected,
-        )
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
-        let _ = state
-            .runtime
-            .send_to_peer_with_retry(
-                &source_node_id,
-                WireMessage::TransferAction {
-                    transfer_id: id.clone(),
-                    action: "reject".to_string(),
-                    reason: progress.error.clone(),
-                    retry_count: None,
-                },
-            )
-            .await;
-    }
-    state.runtime.publish_event(WireMessage::TransferAction {
-        transfer_id: id,
-        action: "reject".to_string(),
-        reason: progress.error.clone(),
-        retry_count: None,
-    });
-    state.runtime.publish_event(WireMessage::TransferProgress {
-        progress: progress.clone(),
-    });
-    Ok(Json(progress))
+    finish_transfer(
+        &state,
+        id,
+        TransferStatus::Rejected,
+        "reject",
+        "接收端拒绝了传输",
+    )
+    .await
 }
 
 async fn accept_transfer(
@@ -2315,34 +2263,14 @@ async fn cancel_transfer(
     AxumPath(id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    let progress = state
-        .runtime
-        .fail_transfer(&id, "传输已取消".to_string(), TransferStatus::Cancelled)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
-        let _ = state
-            .runtime
-            .send_to_peer_with_retry(
-                &source_node_id,
-                WireMessage::TransferAction {
-                    transfer_id: id.clone(),
-                    action: "cancel".to_string(),
-                    reason: progress.error.clone(),
-                    retry_count: None,
-                },
-            )
-            .await;
-    }
-    state.runtime.publish_event(WireMessage::TransferAction {
-        transfer_id: id,
-        action: "cancel".to_string(),
-        reason: progress.error.clone(),
-        retry_count: None,
-    });
-    state.runtime.publish_event(WireMessage::TransferProgress {
-        progress: progress.clone(),
-    });
-    Ok(Json(progress))
+    finish_transfer(
+        &state,
+        id,
+        TransferStatus::Cancelled,
+        "cancel",
+        "传输已取消",
+    )
+    .await
 }
 
 async fn fail_transfer(
@@ -2357,18 +2285,29 @@ async fn fail_transfer(
     if message.len() > MAX_WIRE_ERROR_LENGTH {
         return Err(ApiError::bad_request("失败原因过长"));
     }
+    finish_transfer(&state, id, TransferStatus::Failed, "fail", &message).await
+}
+
+/// 结束本机发起的传输并把结果通知对端；拒绝、取消与上传失败共用同一收尾路径。
+async fn finish_transfer(
+    state: &AppState,
+    transfer_id: String,
+    status: TransferStatus,
+    action: &str,
+    reason: &str,
+) -> Result<Json<TransferProgress>, ApiError> {
     let progress = state
         .runtime
-        .fail_transfer(&id, message, TransferStatus::Failed)
+        .fail_transfer(&transfer_id, reason.to_string(), status)
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if let Some(source_node_id) = state.runtime.transfer_source_id(&id) {
+    if let Some(source_node_id) = state.runtime.transfer_source_id(&transfer_id) {
         let _ = state
             .runtime
             .send_to_peer_with_retry(
                 &source_node_id,
                 WireMessage::TransferAction {
-                    transfer_id: id.clone(),
-                    action: "fail".to_string(),
+                    transfer_id,
+                    action: action.to_string(),
                     reason: progress.error.clone(),
                     retry_count: Some(progress.retry_count),
                 },
@@ -2486,6 +2425,14 @@ async fn create_outgoing_paths(
     if !is_loopback_request(connect_info.as_ref()) {
         return Err(ApiError::forbidden("暂存接口只允许本机调用"));
     }
+    start_outgoing_paths(&state, payload)
+}
+
+/// 持有源文件的节点按本机绝对路径建立发送任务；本机直传与远程管理共用。
+fn start_outgoing_paths(
+    state: &AppState,
+    payload: OutgoingPathRequest,
+) -> Result<Json<OutgoingPrepareView>, ApiError> {
     if payload.target_node_id == state.runtime.node_id()
         || state
             .runtime
@@ -2494,11 +2441,11 @@ async fn create_outgoing_paths(
     {
         return Err(ApiError::not_found("目标设备当前不可用"));
     }
-    let view = state
+    state
         .runtime
         .begin_outgoing_paths(payload.target_node_id, payload.paths)
-        .map_err(ApiError::bad_request)?;
-    Ok(Json(view))
+        .map(Json)
+        .map_err(ApiError::bad_request)
 }
 
 /// 远程管理页的文件浏览与路径发送只在本机开启「远程文件访问」后可用。
@@ -2561,19 +2508,7 @@ async fn create_managed_outgoing_paths(
     Json(payload): Json<OutgoingPathRequest>,
 ) -> Result<Json<OutgoingPrepareView>, ApiError> {
     ensure_remote_file_access(&state)?;
-    if payload.target_node_id == state.runtime.node_id()
-        || state
-            .runtime
-            .peer_http_base(&payload.target_node_id)
-            .is_none()
-    {
-        return Err(ApiError::not_found("目标设备当前不可用"));
-    }
-    let view = state
-        .runtime
-        .begin_outgoing_paths(payload.target_node_id, payload.paths)
-        .map_err(ApiError::bad_request)?;
-    Ok(Json(view))
+    start_outgoing_paths(&state, payload)
 }
 
 async fn managed_outgoing_prepare(
@@ -2581,11 +2516,7 @@ async fn managed_outgoing_prepare(
     State(state): State<AppState>,
 ) -> Result<Json<OutgoingPrepareView>, ApiError> {
     ensure_remote_file_access(&state)?;
-    state
-        .runtime
-        .outgoing_prepare_view(&transfer_id)
-        .map(Json)
-        .ok_or_else(|| ApiError::not_found("准备任务已结束"))
+    prepare_view(&state, &transfer_id)
 }
 
 async fn cancel_managed_outgoing_prepare(
@@ -2593,8 +2524,7 @@ async fn cancel_managed_outgoing_prepare(
     State(state): State<AppState>,
 ) -> Result<Json<OutgoingStagingCancelled>, ApiError> {
     ensure_remote_file_access(&state)?;
-    state.runtime.cancel_outgoing_prepare(&transfer_id);
-    Ok(Json(OutgoingStagingCancelled { transfer_id }))
+    Ok(cancel_prepare(&state, transfer_id))
 }
 
 async fn outgoing_prepare_status(
@@ -2605,11 +2535,23 @@ async fn outgoing_prepare_status(
     if !is_loopback_request(connect_info.as_ref()) {
         return Err(ApiError::forbidden("暂存接口只允许本机调用"));
     }
+    prepare_view(&state, &transfer_id)
+}
+
+fn prepare_view(
+    state: &AppState,
+    transfer_id: &str,
+) -> Result<Json<OutgoingPrepareView>, ApiError> {
     state
         .runtime
-        .outgoing_prepare_view(&transfer_id)
+        .outgoing_prepare_view(transfer_id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("准备任务已结束"))
+}
+
+fn cancel_prepare(state: &AppState, transfer_id: String) -> Json<OutgoingStagingCancelled> {
+    state.runtime.cancel_outgoing_prepare(&transfer_id);
+    Json(OutgoingStagingCancelled { transfer_id })
 }
 
 /// 原生界面把待发送文件交给本机节点，此后的上传不再依赖页面状态。
@@ -2670,49 +2612,26 @@ async fn upload_outgoing_item(
             .map(Path::to_path_buf)
             .ok_or_else(|| ApiError::internal("暂存路径无效"))?;
         let temp = target.with_extension("part");
-        let mut disk_guard = DiskSpaceGuard::new(directory);
-        let mut file = fs::OpenOptions::new()
+        let file = match fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .open(&temp)
             .await
-            .map_err(|error| ApiError::internal(format!("无法创建暂存文件：{error}")))?;
-        let mut stream = body.into_data_stream();
-        let mut hasher = Sha256::new();
-        let mut total = 0u64;
-        let stream_result: Result<(), ApiError> = async {
-            while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next())
-                .await
-                .map_err(|_| ApiError::request_timeout("暂存写入长时间没有数据"))?
-            {
-                let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
-                total = total
-                    .checked_add(chunk.len() as u64)
-                    .ok_or_else(|| ApiError::payload_too_large("源文件大小溢出"))?;
-                if total > item.size {
-                    return Err(ApiError::payload_too_large("源文件超过清单大小"));
-                }
-                if !disk_guard.has_headroom(chunk.len() as u64) {
-                    return Err(ApiError::conflict("暂存磁盘可用空间不足"));
-                }
-                hasher.update(&chunk);
-                file.write_all(&chunk)
-                    .await
-                    .map_err(|error| ApiError::internal(format!("写入暂存文件失败：{error}")))?;
+        {
+            Ok(file) => file,
+            Err(error) => {
+                return Err(ApiError::internal(format!("无法创建暂存文件：{error}")));
             }
-            file.flush()
-                .await
-                .map_err(|error| ApiError::internal(format!("写入暂存文件失败：{error}")))?;
-            Ok(())
-        }
-        .await;
-        drop(file);
-        if let Err(error) = stream_result {
-            let _ = fs::remove_file(&temp).await;
-            return Err(error);
-        }
-        let digest = format!("{:x}", hasher.finalize());
+        };
+        let streamed = stream_body_to_file(body, file, item.size, &directory, || Ok(())).await;
+        let (total, digest) = match streamed {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_file(&temp).await;
+                return Err(error);
+            }
+        };
         if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
             let _ = fs::remove_file(&temp).await;
             return Err(ApiError::bad_request("源文件校验失败"));
@@ -2785,9 +2704,8 @@ async fn cancel_outgoing_staging(
     if !is_loopback_request(connect_info.as_ref()) {
         return Err(ApiError::forbidden("暂存接口只允许本机调用"));
     }
-    state.runtime.cancel_outgoing_prepare(&transfer_id);
     state.runtime.remove_outgoing_staging(&transfer_id);
-    Ok(Json(OutgoingStagingCancelled { transfer_id }))
+    Ok(cancel_prepare(&state, transfer_id))
 }
 
 async fn upload_item(
@@ -2822,9 +2740,9 @@ async fn upload_item(
         return Err(ApiError::conflict("传输尚未被接收端接受"));
     }
     let _item_lock = TransferItemLock::new(&state.runtime, &transfer_id, &item_id)?;
-    // The receiver may have committed the file while the sender was losing
-    // the HTTP response. Treat a repeated PUT as an idempotent acknowledgement
-    // when the committed item and its final file are still present.
+    // 接收方可能已在发送方丢失 HTTP 响应时提交了文件。
+    // 当已提交条目及其最终文件仍然存在时，
+    // 重复的 PUT 视为幂等确认。
     if let Some(progress) = state
         .runtime
         .transfer_item_already_received(&transfer_id, &item_id)
@@ -2858,7 +2776,7 @@ async fn upload_item(
         return Err(ApiError::internal(message));
     }
     let mut temp_guard = DesktopTempFileGuard::new(state.runtime.clone(), temp.clone());
-    let mut file = match fs::OpenOptions::new()
+    let file = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)
@@ -2879,41 +2797,14 @@ async fn upload_item(
             return Err(ApiError::internal(message));
         }
     };
-    let mut stream = body.into_data_stream();
-    let mut hasher = Sha256::new();
-    let mut total = 0u64;
-    let mut disk_guard = DiskSpaceGuard::new(destination.clone());
-    let stream_result: Result<(u64, String), ApiError> = async {
-        while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next())
-            .await
-            .map_err(|_| ApiError::request_timeout("上传长时间没有数据"))?
-        {
-            if !state.runtime.transfer_upload_active(&transfer_id) {
-                return Err(ApiError::conflict("传输已取消"));
-            }
-            let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
-            total = total
-                .checked_add(chunk.len() as u64)
-                .ok_or_else(|| ApiError::payload_too_large("传输内容大小溢出"))?;
-            if total > item.size {
-                return Err(ApiError::payload_too_large("传输内容超过清单大小"));
-            }
-            if !disk_guard.has_headroom(chunk.len() as u64) {
-                return Err(ApiError::conflict("接收磁盘可用空间不足"));
-            }
-            hasher.update(&chunk);
-            state.runtime.touch_transfer_activity(&transfer_id);
-            file.write_all(&chunk)
-                .await
-                .map_err(|error| ApiError::internal(error.to_string()))?;
+    let stream_result = stream_body_to_file(body, file, item.size, &destination, || {
+        if !state.runtime.transfer_upload_active(&transfer_id) {
+            return Err(ApiError::conflict("传输已取消"));
         }
-        file.flush()
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        Ok((total, format!("{:x}", hasher.finalize())))
-    }
+        state.runtime.touch_transfer_activity(&transfer_id);
+        Ok(())
+    })
     .await;
-    drop(file);
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
@@ -2944,9 +2835,9 @@ async fn upload_item(
         temp_guard.cleanup().await;
         return Err(ApiError::conflict("传输已取消"));
     }
-    // Mark the guard's target immediately after the commit. If the request is
-    // cancelled before the transfer is marked complete, it removes the
-    // incomplete final file as well as any remaining temporary file.
+    // 提交后立即记录守卫的目标。
+    // 若请求在传输标记完成之前被取消，
+    // 守卫会删掉不完整的最终文件以及残留的临时文件。
     if let Err(error) = commit_desktop_temp_file(&temp, &target).await {
         temp_guard.cleanup().await;
         if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -3002,9 +2893,9 @@ struct TransferItemLock {
 impl TransferItemLock {
     fn new(runtime: &Arc<NodeRuntime>, transfer_id: &str, item_id: &str) -> Result<Self, ApiError> {
         if !runtime.try_lock_transfer_item(transfer_id, item_id) {
-            // A duplicate request can race with the original upload after a
-            // transient disconnect. Tell senders that retrying is safe once
-            // the in-flight request releases the item lock.
+            // 瞬时断连后，重复请求可能与原始上传并发。
+            // 因此在在途请求释放条目锁之后，
+            // 才告知发送方重试是安全的。
             return Err(ApiError::too_early("文件项目正在上传"));
         }
         Ok(Self {
@@ -3040,14 +2931,14 @@ async fn prepare_target(destination: &Path, relative_path: &str) -> Result<PathB
     Ok(target)
 }
 
-/// Commit a verified upload without replacing an existing file.
+/// 提交一份校验通过的上传，且不覆盖已存在的文件。
 ///
-/// The desktop implementation uses a hard link so the final name appears
-/// atomically and the temporary file guard can remove an incomplete commit.
-/// Android's app-specific Download storage is commonly backed by emulated/FUSE
-/// storage, where hard links are rejected even though ordinary file writes
-/// succeed. Android therefore falls back to a no-replace rename primitive (or
-/// a serialized check-and-rename fallback on older filesystems).
+/// 桌面端实现用硬链接，使最终文件名原子出现，
+/// 临时文件守卫也能清掉未完成的提交。
+/// Android 的应用专属 Download 存储通常由模拟/FUSE 存储支撑，
+/// 这类存储会拒绝硬链接，尽管普通文件写入可以成功。
+/// 因此 Android 退化为不覆盖的 rename 原语
+/// （在较旧文件系统上是串行化的检查后 rename 回退）。
 async fn commit_desktop_temp_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
     match fs::hard_link(temp, target).await {
         Ok(()) => Ok(()),
@@ -3066,11 +2957,11 @@ async fn commit_desktop_temp_file(temp: &Path, target: &Path) -> Result<(), std:
     }
 }
 
-/// Android's app-specific Download storage may reject hard links. Keep the
-/// fallback commit serialized so two transfers cannot both observe an absent
-/// target and then race a replacing `rename`. On kernels/filesystems that
-/// provide `renameat2(RENAME_NOREPLACE)`, use that primitive to preserve the
-/// no-overwrite guarantee even when another process touches the destination.
+/// Android 的应用专属 Download 存储可能拒绝硬链接。
+/// 回退提交保持串行化，避免两个传输都看到目标不存在、
+/// 随后并发执行覆盖式 `rename`。
+/// 对提供 `renameat2(RENAME_NOREPLACE)` 的内核/文件系统，
+/// 改用该原语，即使其他进程触碰目标也能维持不覆盖保证。
 static ANDROID_COMMIT_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
 async fn commit_android_temp_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
@@ -3093,9 +2984,9 @@ async fn commit_android_temp_file(temp: &Path, target: &Path) -> Result<(), std:
         }
     }
 
-    // Older Android kernels and some emulated/FUSE filesystems do not expose
-    // renameat2. The process-wide lock still closes the race between the
-    // existence check and rename for all MeshShare transfers in this node.
+    // 较旧的 Android 内核与部分模拟/FUSE 文件系统没有 renameat2。
+    // 进程级锁仍能为本节点所有 MeshShare 传输闭合
+    // 存在性检查与 rename 之间的竞态。
     match fs::symlink_metadata(target).await {
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
@@ -3273,8 +3164,8 @@ async fn apply_transfer_action(
     }
     match action {
         "accept" => {
-            // The destination is selected locally on the receiving node and is
-            // never accepted from a peer message.
+            // 目标目录由接收节点本地选择，
+            // 绝不从对端消息中接受。
             if current_peer == Some(target_node_id.as_str()) {
                 if let Some(progress) = runtime.mark_transfer_accepted(transfer_id) {
                     runtime.publish_event(WireMessage::TransferProgress { progress });
@@ -5025,8 +4916,8 @@ mod tests {
                 .expect("upload item");
             assert!(response.status().is_success());
             if item_id == "first" {
-                // A lost response must be safe to retry after the receiver
-                // has already committed the item.
+                // 接收方已提交条目后，
+                // 丢失的响应必须可以安全重试。
                 let duplicate = runtime
                     .http
                     .put(format!(
@@ -5138,9 +5029,9 @@ mod tests {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-forward-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("create test directory");
-        // This test exercises wire handling only; a view-only profile keeps
-        // its clipboard snapshot without writing the fixture into the host
-        // system clipboard.
+        // 该测试只验证线上协议处理；使用只读配置可以让
+        // 剪贴板快照留在本地，
+        // 而不把测试数据写进宿主系统剪贴板。
         let runtime = NodeRuntime::new_with_profile(
             data_dir.clone(),
             0,
@@ -5222,8 +5113,8 @@ mod tests {
         std::fs::create_dir_all(&static_root).expect("create static directory");
         std::fs::write(static_root.join("index.html"), "<html></html>")
             .expect("write static index");
-        // Clipboard messages are part of the connection smoke test, but the
-        // test must not change the host system clipboard.
+        // 剪贴板消息是连接冒烟测试的一部分，
+        // 但测试不得改动宿主系统剪贴板。
         let runtime = NodeRuntime::new_with_profile(
             data_dir.clone(),
             0,

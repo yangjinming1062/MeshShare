@@ -77,7 +77,7 @@ sequenceDiagram
   actor U as 接收方用户
   S->>R: POST transfer offer(manifest)
   R-->>U: 提示接收请求
-  U->>R: 本机 Tauri 命令确认并选择保存目录
+  U->>R: 确认并选择保存目录（本机对话框或目标节点路径）
   S->>R: 查询任务状态
   R-->>S: 已接受
   S->>R: PUT transfer item(stream)

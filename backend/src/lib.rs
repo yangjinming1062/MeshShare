@@ -1,37 +1,32 @@
-#[cfg(target_os = "android")]
-mod android_network;
-#[cfg(target_os = "android")]
-mod android_storage;
 #[cfg(any(target_os = "android", test))]
-mod android_update;
+mod android;
 mod autostart;
 mod browse;
 mod clipboard;
 mod clock;
 mod control;
 mod discovery;
-mod linux_update;
+mod fsutil;
+mod linux;
 mod listeners;
 #[cfg(target_os = "macos")]
-mod macos_security_scope;
+mod macos;
 mod metrics;
 mod mobile_tls;
 mod model;
 mod runtime;
 mod server;
 mod updater;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(not(target_os = "android"))]
 use anyhow::Context;
 #[cfg(not(target_os = "android"))]
 use model::MonitorPosition;
-use model::{
-    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, ReceiveMode, ReceiveSettings,
-    TransferProgress,
-};
 #[cfg(target_os = "linux")]
 use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-use runtime::{NodeRuntime, UpdateFrequency};
+use runtime::NodeRuntime;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,7 +44,6 @@ use tauri::{LogicalSize, PhysicalPosition, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 #[cfg(not(target_os = "android"))]
 use updater::UpdateCoordinator;
-use updater::UpdateStatus;
 
 #[derive(Clone)]
 struct ManagedNode {
@@ -102,6 +96,18 @@ pub(crate) struct MonitorCapabilities {
     pub(crate) can_keep_above: bool,
 }
 
+impl MonitorCapabilities {
+    /// 无法判定桌面后端时按“不支持全局控制”处理。
+    pub(crate) const fn unknown() -> Self {
+        Self {
+            backend: MonitorBackend::Unknown,
+            can_persist_position: false,
+            can_click_through: false,
+            can_keep_above: false,
+        }
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilities {
     match backend {
@@ -117,12 +123,7 @@ fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilit
             can_click_through: true,
             can_keep_above: true,
         },
-        MonitorBackend::Unknown => MonitorCapabilities {
-            backend,
-            can_persist_position: false,
-            can_click_through: false,
-            can_keep_above: false,
-        },
+        MonitorBackend::Unknown => MonitorCapabilities::unknown(),
     }
 }
 
@@ -150,7 +151,7 @@ pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabiliti
     {
         app.get_webview_window("monitor")
             .map(|window| monitor_capabilities_for_backend(monitor_backend(&window)))
-            .unwrap_or_else(|| monitor_capabilities_for_backend(MonitorBackend::Unknown))
+            .unwrap_or_else(MonitorCapabilities::unknown)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -166,12 +167,7 @@ pub(crate) fn effective_monitor_locked(app: &AppHandle, runtime: &NodeRuntime) -
 
 #[cfg(target_os = "android")]
 pub(crate) fn current_monitor_capabilities(_app: &AppHandle) -> MonitorCapabilities {
-    MonitorCapabilities {
-        backend: MonitorBackend::Unknown,
-        can_persist_position: false,
-        can_click_through: false,
-        can_keep_above: false,
-    }
+    MonitorCapabilities::unknown()
 }
 
 #[cfg(target_os = "android")]
@@ -240,65 +236,6 @@ async fn save_ca_certificate(
 }
 
 #[tauri::command]
-fn toggle_clipboard_sync(state: State<'_, ManagedNode>) -> bool {
-    state.control.toggle_clipboard_sync()
-}
-
-#[tauri::command]
-fn clipboard_sync_enabled(state: State<'_, ManagedNode>) -> bool {
-    state
-        .runtime
-        .sync_enabled
-        .load(std::sync::atomic::Ordering::SeqCst)
-}
-
-#[tauri::command]
-fn clipboard_status(state: State<'_, ManagedNode>) -> ClipboardStatus {
-    state.runtime.clipboard_status()
-}
-
-#[tauri::command]
-fn clipboard_history_settings(state: State<'_, ManagedNode>) -> ClipboardHistorySettings {
-    state.runtime.clipboard_history_settings()
-}
-
-#[tauri::command]
-fn set_clipboard_history_settings(
-    state: State<'_, ManagedNode>,
-    mode: String,
-    value: u64,
-) -> Result<ClipboardHistorySettings, String> {
-    let mode =
-        ClipboardHistoryMode::parse(&mode).ok_or_else(|| "剪贴板历史模式无效".to_string())?;
-    state.control.set_clipboard_history_settings(mode, value)
-}
-
-#[tauri::command]
-fn update_frequency(state: State<'_, ManagedNode>) -> String {
-    state.control.update_frequency()
-}
-
-#[tauri::command]
-fn set_update_frequency(
-    state: State<'_, ManagedNode>,
-    frequency: String,
-) -> Result<String, String> {
-    let frequency =
-        UpdateFrequency::parse(&frequency).ok_or_else(|| "自动更新频率无效".to_string())?;
-    state.control.set_update_frequency(frequency)
-}
-
-#[tauri::command]
-fn check_for_updates(state: State<'_, ManagedNode>) -> Result<(), String> {
-    state.control.request_update_check().map(|_| ())
-}
-
-#[tauri::command]
-fn update_status(state: State<'_, ManagedNode>) -> Result<UpdateStatus, String> {
-    state.control.update_status()
-}
-
-#[tauri::command]
 fn update_proxy(state: State<'_, ManagedNode>) -> Option<String> {
     state.control.update_proxy()
 }
@@ -309,147 +246,6 @@ fn set_update_proxy(
     proxy: Option<String>,
 ) -> Result<Option<String>, String> {
     state.control.set_update_proxy(proxy)
-}
-
-#[tauri::command]
-fn autostart_enabled(state: State<'_, ManagedNode>) -> Result<bool, String> {
-    if cfg!(debug_assertions) {
-        return Err("开发构建不注册开机自启动".to_string());
-    }
-    let enabled = autostart::Registration::current()
-        .and_then(|registration| registration.is_enabled())
-        .map_err(|error| format!("无法读取开机自启动状态：{error}"))?;
-    if state.runtime.autostart_enabled() && !enabled {
-        return Err("开机自启动尚未注册，请检查系统权限或重新安装正式版本".to_string());
-    }
-    Ok(enabled)
-}
-
-#[tauri::command]
-fn set_autostart_enabled(state: State<'_, ManagedNode>, enabled: bool) -> Result<bool, String> {
-    state.control.set_autostart_enabled(enabled)
-}
-
-#[tauri::command]
-fn receive_settings(state: State<'_, ManagedNode>) -> ReceiveSettings {
-    state.runtime.receive_settings()
-}
-
-#[tauri::command]
-fn set_receive_settings(
-    state: State<'_, ManagedNode>,
-    mode: String,
-    default_path: Option<String>,
-) -> Result<ReceiveSettings, String> {
-    let mode = ReceiveMode::parse(&mode).ok_or_else(|| "接收模式无效".to_string())?;
-    let directory = default_path.map(PathBuf::from);
-    state.control.set_receive_settings(mode, directory)
-}
-
-#[tauri::command]
-fn accept_transfer(
-    state: State<'_, ManagedNode>,
-    transfer_id: String,
-    destination: String,
-) -> Result<TransferProgress, String> {
-    control::accept_transfer_at(&state.runtime, transfer_id, PathBuf::from(destination))
-}
-
-#[cfg(target_os = "android")]
-const ANDROID_PUBLIC_DOWNLOAD_DIR: &str = "/storage/emulated/0/Download";
-
-/// 公共下载目录只有在授予「所有文件访问权限」后才可写，用一次真实写入判断。
-#[cfg(target_os = "android")]
-fn android_public_download_directory() -> Option<PathBuf> {
-    let directory = PathBuf::from(ANDROID_PUBLIC_DOWNLOAD_DIR).join("MeshShare");
-    std::fs::create_dir_all(&directory).ok()?;
-    let probe = directory.join(".meshshare-write-probe");
-    match std::fs::write(&probe, []) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            Some(directory)
-        }
-        Err(_) => None,
-    }
-}
-
-#[cfg(target_os = "android")]
-fn android_private_download_directory(app: &AppHandle) -> Result<PathBuf, String> {
-    let directory = app
-        .path()
-        .download_dir()
-        .map_err(|error| format!("无法取得 Android 应用存储目录：{error}"))?
-        .join("MeshShare");
-    std::fs::create_dir_all(&directory)
-        .map_err(|error| format!("无法创建 Android 接收目录：{error}"))?;
-    Ok(directory)
-}
-
-#[cfg(target_os = "android")]
-fn android_receive_target(app: &AppHandle) -> Result<(PathBuf, bool), String> {
-    if let Some(directory) = android_public_download_directory() {
-        return Ok((directory, true));
-    }
-    Ok((android_private_download_directory(app)?, false))
-}
-
-#[cfg(target_os = "android")]
-#[derive(Serialize)]
-struct AndroidReceiveStorage {
-    directory: String,
-    public_download: bool,
-}
-
-#[cfg(target_os = "android")]
-#[tauri::command]
-fn android_receive_storage(app: AppHandle) -> Result<AndroidReceiveStorage, String> {
-    let (directory, public_download) = android_receive_target(&app)?;
-    Ok(AndroidReceiveStorage {
-        directory: directory.to_string_lossy().into_owned(),
-        public_download,
-    })
-}
-
-#[cfg(target_os = "android")]
-#[tauri::command]
-fn android_request_receive_storage(app: AppHandle) -> Result<(), String> {
-    app.state::<android_storage::AndroidStoragePluginHandle>()
-        .0
-        .run_mobile_plugin::<()>("requestAllFilesAccess", ())
-        .map_err(|error| format!("无法打开存储授权页面：{error}"))
-}
-
-#[cfg(target_os = "android")]
-#[tauri::command]
-fn android_receive_directory(app: AppHandle) -> Result<String, String> {
-    let (directory, _) = android_receive_target(&app)?;
-    Ok(directory.to_string_lossy().into_owned())
-}
-
-#[tauri::command]
-fn register_outgoing_transfer(
-    state: State<'_, ManagedNode>,
-    offer: model::TransferOffer,
-) -> TransferProgress {
-    state.runtime.add_outgoing_transfer(offer)
-}
-
-#[tauri::command]
-fn update_transfer_progress(state: State<'_, ManagedNode>, progress: TransferProgress) {
-    let transfer_id = progress.transfer_id.clone();
-    state.runtime.update_transfer(&transfer_id, progress);
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-fn monitor_capabilities(app: AppHandle) -> MonitorCapabilities {
-    current_monitor_capabilities(&app)
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-fn monitor_locked(app: AppHandle, state: State<'_, ManagedNode>) -> bool {
-    effective_monitor_locked(&app, state.runtime.as_ref())
 }
 
 #[cfg(not(target_os = "android"))]
@@ -476,33 +272,6 @@ pub(crate) fn apply_monitor_locked(
     }
     sync_tray_labels(app);
     Ok(locked)
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-fn set_monitor_locked(
-    app: AppHandle,
-    state: State<'_, ManagedNode>,
-    locked: bool,
-) -> Result<bool, String> {
-    apply_monitor_locked(&app, state.runtime.as_ref(), locked)
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-fn monitor_visible(state: State<'_, ManagedNode>) -> bool {
-    state.runtime.monitor_visible()
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-fn set_monitor_visible(
-    app: AppHandle,
-    state: State<'_, ManagedNode>,
-    visible: bool,
-) -> Result<bool, String> {
-    apply_monitor_visible(&app, state.runtime.as_ref(), visible)?;
-    Ok(state.runtime.monitor_visible())
 }
 
 #[cfg(not(target_os = "android"))]
@@ -728,22 +497,6 @@ pub(crate) fn apply_monitor_locked(
 }
 
 #[cfg(not(target_os = "android"))]
-fn apply_autostart_registration(
-    registration: &autostart::Registration,
-    enabled: bool,
-) -> anyhow::Result<()> {
-    if enabled {
-        registration
-            .enable()
-            .map_err(|error| anyhow::anyhow!("启用开机自启动失败：{error}"))
-    } else {
-        registration
-            .disable()
-            .map_err(|error| anyhow::anyhow!("关闭开机自启动失败：{error}"))
-    }
-}
-
-#[cfg(not(target_os = "android"))]
 fn sync_autostart_registration(runtime: &NodeRuntime) {
     if cfg!(debug_assertions) {
         return;
@@ -755,8 +508,8 @@ fn sync_autostart_registration(runtime: &NodeRuntime) {
             return;
         }
     };
-    if let Err(error) = apply_autostart_registration(&registration, runtime.autostart_enabled()) {
-        eprintln!("{error}");
+    if let Err(error) = registration.set_enabled(runtime.autostart_enabled()) {
+        eprintln!("同步开机自启动失败：{error}");
     }
 }
 
@@ -860,27 +613,17 @@ fn position_monitor_window<R: tauri::Runtime>(
     if monitors.is_empty() {
         return;
     }
-    let saved = runtime.monitor_position();
-    let monitor = saved
-        .filter(|position| {
-            monitors
-                .iter()
-                .any(|item| point_is_in_work_area(position, item))
-        })
-        .and_then(|position| {
-            monitors
-                .iter()
-                .find(|item| point_is_in_work_area(&position, item))
-                .map(|item| (position, item.clone()))
-        });
-    let (position, monitor) = if let Some((position, monitor)) = monitor {
-        (position, monitor)
-    } else {
+    let saved = runtime.monitor_position().and_then(|position| {
+        monitors
+            .iter()
+            .find(|item| point_is_in_work_area(&position, item))
+            .map(|item| (position, item.clone()))
+    });
+    let (position, monitor) = saved.unwrap_or_else(|| {
         let monitor = window
             .primary_monitor()
             .ok()
             .flatten()
-            .or_else(|| monitors.first().cloned())
             .unwrap_or_else(|| monitors[0].clone());
         let area = monitor.work_area();
         let position = MonitorPosition {
@@ -892,7 +635,7 @@ fn position_monitor_window<R: tauri::Runtime>(
                 - i64::from(MONITOR_MARGIN_PX)) as i32,
         };
         (position, monitor)
-    };
+    });
     let position = clamp_monitor_position(position, &monitor, window_width, window_height);
     if window
         .set_position(PhysicalPosition::new(position.x, position.y))
@@ -1039,14 +782,7 @@ fn setup_tray_menu(app: &AppHandle) -> anyhow::Result<()> {
         }
         "toggle-sync" => {
             if let Some(state) = app.try_state::<ManagedNode>() {
-                let enabled = !state
-                    .runtime
-                    .sync_enabled
-                    .load(std::sync::atomic::Ordering::SeqCst);
-                state
-                    .runtime
-                    .sync_enabled
-                    .store(enabled, std::sync::atomic::Ordering::SeqCst);
+                state.runtime.toggle_sync_enabled();
             }
             sync_tray_labels(app);
         }
@@ -1149,31 +885,10 @@ fn run_desktop() {
         .invoke_handler(tauri::generate_handler![
             node_base_url,
             save_ca_certificate,
-            toggle_clipboard_sync,
-            clipboard_sync_enabled,
-            clipboard_status,
-            clipboard_history_settings,
-            set_clipboard_history_settings,
-            update_frequency,
-            set_update_frequency,
-            check_for_updates,
-            update_status,
             update_proxy,
             set_update_proxy,
-            autostart_enabled,
-            set_autostart_enabled,
-            receive_settings,
-            set_receive_settings,
             remote_file_access,
             set_remote_file_access,
-            accept_transfer,
-            register_outgoing_transfer,
-            update_transfer_progress,
-            monitor_capabilities,
-            monitor_locked,
-            set_monitor_locked,
-            monitor_visible,
-            set_monitor_visible,
             popup_monitor_menu,
             set_monitor_position
         ])
@@ -1198,10 +913,10 @@ pub fn run() {
 #[tauri::mobile_entry_point]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(android_network::plugin())
-        .plugin(android_storage::plugin())
+        .plugin(android::network::plugin())
+        .plugin(android::storage::plugin())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(android_update::app::plugin())
+        .plugin(android::update::app::plugin())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -1213,7 +928,8 @@ pub fn run() {
                 app.package_info().version.to_string(),
                 app.handle().clone(),
             ))?;
-            if let Err(error) = android_update::app::start(app.handle(), runtime.clone(), &data_dir)
+            if let Err(error) =
+                android::update::app::start(app.handle(), runtime.clone(), &data_dir)
             {
                 eprintln!("启动 Android 更新服务失败：{error:#}");
             }
@@ -1223,23 +939,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             node_base_url,
             android_network_changed,
-            clipboard_status,
-            clipboard_history_settings,
-            set_clipboard_history_settings,
-            receive_settings,
-            set_receive_settings,
             remote_file_access,
             set_remote_file_access,
-            accept_transfer,
-            android_receive_directory,
-            android_receive_storage,
-            android_request_receive_storage,
-            register_outgoing_transfer,
-            update_transfer_progress,
-            android_update::app::android_update_status,
-            android_update::app::android_set_update_frequency,
-            android_update::app::android_check_for_updates,
-            android_update::app::android_continue_update
+            android::commands::android_receive_directory,
+            android::commands::android_receive_storage,
+            android::commands::android_request_receive_storage,
+            android::update::app::android_update_status,
+            android::update::app::android_set_update_frequency,
+            android::update::app::android_check_for_updates,
+            android::update::app::android_continue_update
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")

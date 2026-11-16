@@ -610,9 +610,8 @@ fn read_linux_gpu_name(slot: &str, memory_total_bytes: Option<u64>) -> Option<St
 
 #[cfg(any(target_os = "linux", test))]
 fn refine_linux_gpu_name(name: &str, memory_total_bytes: Option<u64>) -> String {
-    // pci.ids groups the consumer Navi 31 cards under one device ID. Their
-    // dedicated VRAM capacities distinguish the common 20 GiB XT and 24 GiB
-    // XTX variants without depending on an optional vendor utility.
+    // pci.ids 把消费级 Navi 31 显卡归在同一个设备 ID 下，用独立显存容量区分
+    // 常见的 20 GiB XT 与 24 GiB XTX 版本，无需依赖可选的厂商工具。
     if name.contains("Navi 31") {
         if let Some(memory_total_bytes) = memory_total_bytes {
             let memory_gib =

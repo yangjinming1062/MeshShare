@@ -17,19 +17,20 @@ MeshShare 由多个平等的桌面节点和按需打开的 Android 节点组成�
 
 ```text
 Tauri/Svelte UI (`frontend/`, `backend/src/lib.rs`)
-        │ HTTP / WebSocket / Tauri commands
+        │ HTTP / WebSocket（本机界面、浏览器页面与远程管理共用）
+        │ Tauri commands（仅原生能力：窗口、托盘、对话框、平台插件）
         ▼
-节点运行时 (`backend/src/runtime.rs`)
+节点运行时 (`backend/src/runtime/`)
         ├── 剪贴板适配 (`clipboard.rs`)
         ├── 节点发现与连接 (`discovery.rs`)
         ├── 硬件指标采集 (`metrics.rs`)
-        ├── 桌面更新服务 (`updater.rs`)
-        ├── Android 更新服务 (`android_update/`，安装器适配在 `backend/android/`)
+        ├── 桌面更新服务 (`updater.rs`，Linux 系统包在 `linux/update.rs`)
+        ├── Android 平台代码 (`android/`：网络、存储、更新；安装器适配在 `backend/android/`)
         ├── HTTP/WebSocket API (`server.rs`)
         └── 传输清单与状态 (`model.rs`)
 ```
 
-桌面窗口和 Android 窗口都保留本机节点作为根上下文，也可以通过在线节点地址建立目标上下文。目标上下文只有一层，切换直接替换，目标列表中的本机节点按返回本机处理，不建立递归管理链。远程请求绑定目标地址，目标节点运行时是剪贴板、历史、设置、监控和传输状态的唯一权威；Android 只对局域网节点使用 HTTP/WebSocket。Tauri 命令只在本机上下文执行。
+桌面窗口和 Android 窗口都保留本机节点作为根上下文，也可以通过在线节点地址建立目标上下文。目标上下文只有一层，切换直接替换，目标列表中的本机节点按返回本机处理，不建立递归管理链。远程请求绑定目标地址，目标节点运行时是剪贴板、历史、设置、监控和传输状态的唯一权威；Android 只对局域网节点使用 HTTP/WebSocket。本机界面与远程管理使用同一套 HTTP 设置接口，Tauri 命令只承担需要原生能力的动作，因此同一状态不存在两条修改通道。
 
 剪贴板、历史和传输任务以节点运行时为准，节点之间只交换最新快照，不同步历史索引或批量内容。原生态发送由发送端节点上传：桌面按原路径读取对话框选中的文件，节点只记录清单、摘要和修改时间；拖放与 Android 先复制到本机暂存。接收端确认后节点流式上传并负责重试，页面只选择文件、展示进度和取消。浏览器页面没有可交给节点的本地文件，仍由页面直接上传。远程管理页面的发送由目标节点读取自己的文件，管理端只提交路径。
 
@@ -54,6 +55,6 @@ Android 更新通过本机 Tauri 命令操作，Rust 从同一清单读取 `andr
 
 ## 平台支持
 
-- **Windows / macOS / Linux。** `arboard` 轮询系统剪贴板；Linux Wayland 优先 `wayland-data-control`，不可用时回退 X11/XWayland，两者都不可用时持续重试并报告原因。共享快照、历史和节点间广播不依赖本机剪贴板，写入失败不会停止网络或文件传输。Wayland 不保证全局坐标、置顶和点击穿透。
+- **Windows / macOS / Linux。** `arboard` 在独立线程读写系统剪贴板。Linux Wayland 优先 `wayland-data-control`，不可用时回退 X11/XWayland，两者都不可用时持续重试并报告原因。系统剪贴板读写阻塞或失败时，共享快照、历史、节点间广播及文件传输仍可继续。Wayland 不保证全局坐标、置顶和点击穿透。
 - **Android。** 不启动 `arboard`，只在 App 内手动读写剪贴板。发送使用系统文件选择器并把源文件交给节点暂存；接收默认写入应用专属目录，授予「所有文件访问权限」后改为公共 `Download/MeshShare`，未授权时回退私有目录并在界面标明。关闭 App 不保持传输连接。
 - **硬件采集。** CPU、内存、交换分区、磁盘和网络采样在三桌面平台共用，系统信息来自 `sysinfo`；GPU 与显存来自平台计数器、驱动接口或 sysfs，只统计独立显存，共享与统一内存不折算，读不到的指标标记不可用。
