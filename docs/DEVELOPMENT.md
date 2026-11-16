@@ -117,6 +117,7 @@ Rust 格式和 lint 检查需要 `rustfmt` 和 `clippy` 组件，可通过 `rust
 ```bash
 npm --prefix frontend run check
 npm --prefix frontend run build
+npm --prefix frontend test
 cargo fmt --manifest-path backend/Cargo.toml --all -- --check
 cargo clippy --manifest-path backend/Cargo.toml --all-targets --all-features --locked -- -D warnings
 cargo test --manifest-path backend/Cargo.toml --locked

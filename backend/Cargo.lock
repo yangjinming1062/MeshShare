@@ -2561,6 +2561,7 @@ dependencies = [
  "http-body-util",
  "if-addrs",
  "image",
+ "libc",
  "mdns-sd",
  "parking_lot",
  "pem 3.0.6",

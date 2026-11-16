@@ -11,8 +11,12 @@ use crate::runtime::{
     validate_receive_directory, NodeRuntime, TransferRetryError, UPDATE_INSTALLING_MESSAGE,
 };
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State, WebSocketUpgrade,
+};
 use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::middleware::{from_fn, Next};
+use axum::response::Response as AxumResponse;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -21,14 +25,17 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::io::ReaderStream;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -304,8 +311,63 @@ pub fn router_with_control(
         )
         .fallback_service(ServeDir::new(state.static_root.clone()).fallback(ServeFile::new(index)))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-        .layer(CorsLayer::permissive())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    is_allowed_origin(origin)
+                }))
+                .allow_methods(AllowMethods::any())
+                .allow_headers(AllowHeaders::any()),
+        )
+        .layer(from_fn(origin_guard))
         .with_state(state)
+}
+
+async fn origin_guard(request: axum::http::Request<Body>, next: Next) -> AxumResponse {
+    let is_mutation = !matches!(
+        request.method(),
+        &Method::GET | &Method::HEAD | &Method::OPTIONS
+    );
+    let is_websocket_upgrade = request.uri().path() == "/api/v1/ws"
+        && request
+            .headers()
+            .get(header::UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+    let is_api = request.uri().path().starts_with("/api/");
+    let allowed = request
+        .headers()
+        .get(header::ORIGIN)
+        .is_none_or(is_allowed_origin);
+    if is_api && (is_mutation || is_websocket_upgrade) && !allowed {
+        return (StatusCode::FORBIDDEN, "跨来源管理请求被拒绝").into_response();
+    }
+    next.run(request).await
+}
+
+fn is_allowed_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https" | "tauri") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if matches!(host, "localhost" | "tauri.localhost") {
+        return true;
+    }
+    let Ok(address) = host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    address.is_loopback()
+        || address.is_private()
+        || address.is_link_local()
+        || (u32::from(address) & 0xffc00000) == 0x64400000
 }
 
 async fn info(State(state): State<AppState>) -> Json<NodeInfo> {
@@ -697,13 +759,23 @@ async fn post_clipboard(
     Ok(Json(snapshot))
 }
 
-async fn websocket(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+async fn websocket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+) -> impl IntoResponse {
     ws.max_message_size(32 * 1024 * 1024)
         .max_frame_size(32 * 1024 * 1024)
-        .on_upgrade(move |socket| handle_socket(socket, state.runtime))
+        .on_upgrade(move |socket| {
+            handle_socket(socket, state.runtime, connect_info.map(|info| info.0))
+        })
 }
 
-async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRuntime>) {
+async fn handle_socket(
+    socket: axum::extract::ws::WebSocket,
+    runtime: Arc<NodeRuntime>,
+    remote_address: Option<SocketAddr>,
+) {
     let (mut sender, mut receiver) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<WireMessage>(64);
     let mut events = runtime.subscribe();
@@ -776,7 +848,13 @@ async fn handle_socket(socket: axum::extract::ws::WebSocket, runtime: Arc<NodeRu
                                     }
                                 }
                                 let is_hello = matches!(&message, WireMessage::Hello { .. });
-                                let identified = handle_wire_message(message, &runtime, peer_id.as_deref()).await;
+                                let identified = handle_wire_message_with_endpoint(
+                                    message,
+                                    &runtime,
+                                    peer_id.as_deref(),
+                                    remote_address,
+                                )
+                                .await;
                                 if is_hello && identified.is_none() {
                                     break;
                                 }
@@ -878,6 +956,15 @@ pub(crate) async fn handle_wire_message(
     runtime: &Arc<NodeRuntime>,
     current_peer: Option<&str>,
 ) -> Option<String> {
+    handle_wire_message_with_endpoint(message, runtime, current_peer, None).await
+}
+
+async fn handle_wire_message_with_endpoint(
+    message: WireMessage,
+    runtime: &Arc<NodeRuntime>,
+    current_peer: Option<&str>,
+    remote_address: Option<SocketAddr>,
+) -> Option<String> {
     if let Some(peer_id) = current_peer {
         runtime.touch_peer(peer_id);
     }
@@ -914,9 +1001,14 @@ pub(crate) async fn handle_wire_message(
                     })
                 })
                 .collect::<Vec<_>>();
-            let endpoint = addresses
-                .first()
-                .map(|address| format!("{}/api/v1/ws", address.url));
+            let endpoint = remote_address
+                .filter(|address| is_allowed_peer_address(address.ip()))
+                .map(|address| format!("http://{}:{}/api/v1/ws", address.ip(), node.port))
+                .or_else(|| {
+                    addresses
+                        .first()
+                        .map(|address| format!("{}/api/v1/ws", address.url))
+                });
             runtime.set_peer(PeerInfo {
                 node_id: node.node_id.clone(),
                 node_name: node.node_name,
@@ -1612,6 +1704,13 @@ fn is_allowed_advertised_address(address: &AddressInfo) -> bool {
     }
 }
 
+fn is_allowed_peer_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_loopback() || crate::runtime::is_network_ipv4(address),
+        IpAddr::V6(_) => false,
+    }
+}
+
 fn normalize_relative_path(value: &str) -> String {
     Path::new(value)
         .components()
@@ -2243,26 +2342,12 @@ async fn download_mobile_item(
     if size != item.size {
         return Err(ApiError::conflict("暂存文件大小不匹配"));
     }
-    let filename = item
-        .name
-        .chars()
-        .map(|value| {
-            if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_' | ' ') {
-                value
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
+    let (fallback_filename, encoded_filename) = content_disposition_filename(&item.name);
     let content_type = HeaderValue::from_str(&item.media_type)
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
     let content_disposition = HeaderValue::from_str(&format!(
-        "attachment; filename=\"{}\"",
-        if filename.is_empty() {
-            "download"
-        } else {
-            &filename
-        }
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        fallback_filename, encoded_filename
     ))
     .map_err(|error| ApiError::internal(error.to_string()))?;
     let runtime = state.runtime;
@@ -2789,9 +2874,8 @@ async fn prepare_target(destination: &Path, relative_path: &str) -> Result<PathB
 /// atomically and the temporary file guard can remove an incomplete commit.
 /// Android's app-specific Download storage is commonly backed by emulated/FUSE
 /// storage, where hard links are rejected even though ordinary file writes
-/// succeed. Android therefore falls back to an atomic rename after rechecking
-/// that the target is still absent; the per-item transfer lock prevents a
-/// concurrent MeshShare upload from racing this check.
+/// succeed. Android therefore falls back to a no-replace rename primitive (or
+/// a serialized check-and-rename fallback on older filesystems).
 async fn commit_desktop_temp_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
     match fs::hard_link(temp, target).await {
         Ok(()) => Ok(()),
@@ -2804,18 +2888,79 @@ async fn commit_desktop_temp_file(temp: &Path, target: &Path) -> Result<(), std:
                         | std::io::ErrorKind::CrossesDevices
                 ) =>
         {
-            match fs::symlink_metadata(target).await {
-                Ok(_) => Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "目标文件已存在",
-                )),
-                Err(check) if check.kind() == std::io::ErrorKind::NotFound => {
-                    fs::rename(temp, target).await
-                }
-                Err(check) => Err(check),
-            }
+            commit_android_temp_file(temp, target).await
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Android's app-specific Download storage may reject hard links. Keep the
+/// fallback commit serialized so two transfers cannot both observe an absent
+/// target and then race a replacing `rename`. On kernels/filesystems that
+/// provide `renameat2(RENAME_NOREPLACE)`, use that primitive to preserve the
+/// no-overwrite guarantee even when another process touches the destination.
+static ANDROID_COMMIT_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
+async fn commit_android_temp_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
+    let _guard = ANDROID_COMMIT_LOCK
+        .get_or_init(|| AsyncMutex::new(()))
+        .lock()
+        .await;
+
+    #[cfg(target_os = "android")]
+    {
+        match rename_noreplace(temp, target) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Err(error),
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    // Older Android kernels and some emulated/FUSE filesystems do not expose
+    // renameat2. The process-wide lock still closes the race between the
+    // existence check and rename for all MeshShare transfers in this node.
+    match fs::symlink_metadata(target).await {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "目标文件已存在",
+        )),
+        Err(check) if check.kind() == std::io::ErrorKind::NotFound => {
+            fs::rename(temp, target).await
+        }
+        Err(check) => Err(check),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn rename_noreplace(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = CString::new(temp.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "临时路径包含 NUL 字节")
+    })?;
+    let target = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标路径包含 NUL 字节")
+    })?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            temp.as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 
@@ -3023,10 +3168,69 @@ fn has_parent_component(value: &str) -> bool {
         })
 }
 
+fn content_disposition_filename(raw: &str) -> (String, String) {
+    let sanitized = raw
+        .chars()
+        .map(|value| {
+            if value.is_control() || matches!(value, '/' | '\\') {
+                '_'
+            } else {
+                value
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim();
+    let unicode_name = if sanitized.is_empty() || matches!(sanitized, "." | "..") {
+        "download"
+    } else {
+        sanitized
+    };
+    let fallback = unicode_name
+        .chars()
+        .map(|value| {
+            if value.is_ascii_alphanumeric() || matches!(value, '.' | '-' | '_' | ' ') {
+                value
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let fallback = if fallback.is_empty() {
+        "download".to_string()
+    } else {
+        fallback
+    };
+    let mut encoded = String::with_capacity(unicode_name.len());
+    for byte in unicode_name.as_bytes() {
+        let allowed = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+        if allowed {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(
+                char::from_digit(u32::from(byte >> 4), 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            encoded.push(
+                char::from_digit(u32::from(byte & 0x0f), 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    (fallback, encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_path_segment, handle_wire_message, has_parent_component, validate_offer,
+        content_disposition_filename, encode_path_segment, handle_wire_message,
+        handle_wire_message_with_endpoint, has_parent_component, is_allowed_origin, validate_offer,
         MobileSessionRequest, PEER_HANDSHAKE_TIMEOUT,
     };
     use crate::model::{
@@ -3035,6 +3239,7 @@ mod tests {
         METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
     };
     use crate::runtime::{NodeProfile, NodeRuntime};
+    use axum::http::{HeaderValue, Request};
     use futures_util::{SinkExt, StreamExt};
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
@@ -3042,6 +3247,28 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_tungstenite::connect_async;
     use uuid::Uuid;
+
+    #[test]
+    fn content_disposition_preserves_unicode_filename_with_ascii_fallback() {
+        let (fallback, encoded) = content_disposition_filename("报告 2026\".txt");
+        assert_eq!(fallback, "__ 2026_.txt");
+        assert!(encoded.starts_with("%E6%8A%A5%E5%91%8A%202026%22.txt"));
+        assert!(!encoded.contains('/'));
+    }
+
+    #[test]
+    fn origin_policy_allows_lan_and_tauri_but_rejects_public_websites() {
+        assert!(is_allowed_origin(&HeaderValue::from_static(
+            "http://192.168.1.20:37880"
+        )));
+        assert!(is_allowed_origin(&HeaderValue::from_static(
+            "tauri://localhost"
+        )));
+        assert!(!is_allowed_origin(&HeaderValue::from_static(
+            "https://evil.example"
+        )));
+        assert!(!is_allowed_origin(&HeaderValue::from_static("null")));
+    }
 
     #[tokio::test]
     async fn settings_and_remote_accept_endpoints_update_runtime_state() {
@@ -3088,6 +3315,26 @@ mod tests {
         assert_eq!(settings["clipboard_sync_enabled"], true);
         assert_eq!(settings["update_frequency"], "weekly");
         assert_eq!(settings["monitor"]["capabilities"]["backend"], "unknown");
+
+        let denied = runtime
+            .http
+            .patch(format!("http://{address}/api/v1/settings"))
+            .header("Origin", "https://evil.example")
+            .json(&serde_json::json!({ "clipboard_sync_enabled": false }))
+            .send()
+            .await
+            .expect("send denied origin request");
+        assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let allowed = runtime
+            .http
+            .patch(format!("http://{address}/api/v1/settings"))
+            .header("Origin", "http://192.168.1.10:37880")
+            .json(&serde_json::json!({ "clipboard_sync_enabled": true }))
+            .send()
+            .await
+            .expect("send allowed origin request");
+        assert!(allowed.status().is_success());
 
         let patched = runtime
             .http
@@ -3189,6 +3436,37 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         server_task.abort();
         let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn incoming_websocket_uses_the_verified_remote_address_for_http_peer_endpoint() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "meshshare-incoming-peer-endpoint-{}",
+            Uuid::new_v4()
+        ));
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut node = runtime.node_info();
+        node.node_id = "incoming-peer".to_string();
+        node.port = 37880;
+        node.addresses.reverse();
+        let identified = handle_wire_message_with_endpoint(
+            WireMessage::Hello { node },
+            &runtime,
+            None,
+            Some("100.64.0.8:43122".parse().expect("remote socket address")),
+        )
+        .await;
+        assert_eq!(identified.as_deref(), Some("incoming-peer"));
+        assert_eq!(
+            runtime
+                .peers_snapshot()
+                .into_iter()
+                .find(|peer| peer.node_id == "incoming-peer")
+                .and_then(|peer| peer.endpoint),
+            Some("http://100.64.0.8:37880/api/v1/ws".to_string())
+        );
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
@@ -3906,7 +4184,7 @@ mod tests {
                 .headers()
                 .get("content-disposition")
                 .and_then(|value| value.to_str().ok()),
-            Some("attachment; filename=\"hello.txt\"")
+            Some("attachment; filename=\"hello.txt\"; filename*=UTF-8''hello.txt")
         );
         let expected_content_length = bytes.len().to_string();
         assert_eq!(
@@ -4247,6 +4525,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_android_style_commits_never_replace_target() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-android-commit-race-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create data directory");
+        let target = data_dir.join("same-name.bin");
+        let first_temp = data_dir.join("first.part");
+        let second_temp = data_dir.join("second.part");
+        std::fs::write(&first_temp, b"first payload").expect("write first temporary file");
+        std::fs::write(&second_temp, b"second payload").expect("write second temporary file");
+
+        let first_target = target.clone();
+        let first_temp_for_task = first_temp.clone();
+        let first = tokio::spawn(async move {
+            super::commit_android_temp_file(&first_temp_for_task, &first_target).await
+        });
+        let second_target = target.clone();
+        let second_temp_for_task = second_temp.clone();
+        let second = tokio::spawn(async move {
+            super::commit_android_temp_file(&second_temp_for_task, &second_target).await
+        });
+        let (first_result, second_result) = tokio::join!(first, second);
+        let first_result = first_result.expect("first commit task");
+        let second_result = second_result.expect("second commit task");
+        let successes = [first_result.is_ok(), second_result.is_ok()]
+            .into_iter()
+            .filter(|success| *success)
+            .count();
+        assert_eq!(successes, 1, "at most one transfer may claim a target");
+        assert!(first_result.is_ok() ^ second_result.is_ok());
+        let content = std::fs::read(&target).expect("read committed target");
+        assert!(content == b"first payload" || content == b"second payload");
+        assert!(target.exists());
+        assert!(!target.is_symlink());
+
+        std::fs::write(&target, b"existing payload").expect("replace test target");
+        let third_temp = data_dir.join("third.part");
+        std::fs::write(&third_temp, b"must not replace").expect("write third temporary file");
+        let result = super::commit_android_temp_file(&third_temp, &target).await;
+        assert_eq!(
+            result
+                .expect_err("existing destination must reject commit")
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            std::fs::read(&target).expect("read existing target"),
+            b"existing payload"
+        );
+
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn multi_file_upload_preserves_relative_paths_and_completes_once() {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-multi-upload-{}", Uuid::new_v4()));
@@ -4531,6 +4862,12 @@ mod tests {
         let server_task = tokio::spawn(async move {
             axum::serve(listener, app).await.expect("serve test router");
         });
+        let denied_request = Request::builder()
+            .uri(format!("ws://{address}/api/v1/ws"))
+            .header("Origin", "https://evil.example")
+            .body(())
+            .expect("build denied websocket request");
+        assert!(connect_async(denied_request).await.is_err());
         let (mut socket, _) = connect_async(format!("ws://{address}/api/v1/ws"))
             .await
             .expect("connect websocket");

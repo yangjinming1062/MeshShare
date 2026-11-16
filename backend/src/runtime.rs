@@ -277,6 +277,7 @@ const CLIPBOARD_CURRENT_FILE: &str = "clipboard-current.json";
 const CLIPBOARD_PAYLOAD_DIR: &str = "clipboard-history-payloads";
 const CLIPBOARD_HISTORY_PREVIEW_BYTES: usize = 256;
 const CLIPBOARD_DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const MAX_CLIPBOARD_HISTORY_BYTES: u64 = 512 * 1024 * 1024;
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     let mut downloaded_item_ids = record.downloaded_items.iter().cloned().collect::<Vec<_>>();
@@ -812,6 +813,13 @@ impl NodeRuntime {
                 .metrics_received_at_ms
                 .or(previous.metrics_received_at_ms);
             peer.metrics_stale = previous.metrics_stale;
+            // A Hello refreshes advertised addresses, but must not discard
+            // the endpoint that carried the currently verified WebSocket
+            // channel. Keeping it lets HTTP management follow the interface
+            // that was actually reachable.
+            if peer.source == "websocket" && previous.endpoint.is_some() {
+                peer.endpoint = previous.endpoint.clone();
+            }
         }
         peers.insert(peer.node_id.clone(), peer);
         let _ = self.events.send(WireMessage::Hello {
@@ -860,13 +868,32 @@ impl NodeRuntime {
     }
 
     pub fn peer_http_base(&self, node_id: &str) -> Option<String> {
-        self.peers.read().get(node_id).and_then(|peer| {
-            peer.addresses
-                .iter()
-                .find(|address| address.kind == "lan")
-                .or_else(|| peer.addresses.first())
-                .map(|address| address.url.trim_end_matches('/').to_string())
-        })
+        self.peer_http_bases(node_id).into_iter().next()
+    }
+
+    /// Return HTTP bases in the order in which this node has evidence that
+    /// they are usable. An endpoint is recorded when a WebSocket channel was
+    /// established, so it outranks the peer's advertised interface order.
+    pub fn peer_http_bases(&self, node_id: &str) -> Vec<String> {
+        let Some(peer) = self.peers.read().get(node_id).cloned() else {
+            return Vec::new();
+        };
+        let mut bases = Vec::new();
+        if let Some(endpoint) = peer
+            .endpoint
+            .as_deref()
+            .and_then(http_base_from_peer_endpoint)
+        {
+            bases.push(endpoint);
+        }
+        for address in peer.addresses {
+            if let Some(base) = normalize_peer_http_base(&address.url) {
+                if !bases.iter().any(|candidate| candidate == &base) {
+                    bases.push(base);
+                }
+            }
+        }
+        bases
     }
 
     pub fn update_peer_metrics(&self, node_id: &str, metrics: HardwareMetrics) -> bool {
@@ -1302,18 +1329,29 @@ impl NodeRuntime {
     ) -> anyhow::Result<()> {
         let content_hash = clipboard_snapshot_hash(snapshot)?;
         let mut history = self.clipboard_history.lock();
-        if let Some(index) = history.iter().position(|record| {
+        let duplicate_index = history.iter().position(|record| {
             record.event_id == snapshot.event_id || record.content_hash == content_hash
-        }) {
-            let old = history.remove(index);
-            remove_clipboard_record_payloads(&self.data_dir, &old);
-        }
+        });
+        // Write the replacement payload before changing the index or deleting the
+        // old record. A disk or permission failure therefore leaves the old
+        // history entry and its payload available for restore.
         let record =
             write_clipboard_history_record(&self.data_dir, snapshot, recorded_at_ms, content_hash)?;
-        history.insert(0, record);
+        let new_record = record.clone();
+        let mut next = history.clone();
+        if let Some(index) = duplicate_index {
+            next.remove(index);
+        }
+        next.insert(0, record);
         let config = self.config.lock().clone();
-        prune_clipboard_history_records(&mut history, &config, recorded_at_ms);
-        persist_clipboard_history(&self.data_dir, &history)?;
+        prune_clipboard_history_records(&mut next, &config, recorded_at_ms);
+        if let Err(error) = persist_clipboard_history(&self.data_dir, &next) {
+            // The new payload is not referenced by the previous index. Remove it
+            // after the failed index write while preserving the old entry.
+            remove_clipboard_record_payloads(&self.data_dir, &new_record);
+            return Err(error);
+        }
+        *history = next;
         Ok(())
     }
 
@@ -2722,8 +2760,25 @@ fn persist_clipboard_history(
         #[cfg(windows)]
         {
             if path.exists() {
-                std::fs::remove_file(&path)?;
-                std::fs::rename(&temporary, &path)?;
+                let backup = data_dir.join(format!(
+                    "{CLIPBOARD_HISTORY_FILE}.backup-{}",
+                    std::process::id()
+                ));
+                let _ = std::fs::remove_file(&backup);
+                if let Err(error) = std::fs::rename(&path, &backup) {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(error.into());
+                }
+                match std::fs::rename(&temporary, &path) {
+                    Ok(()) => {
+                        let _ = std::fs::remove_file(&backup);
+                    }
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&temporary);
+                        let _ = std::fs::rename(&backup, &path);
+                        return Err(error.into());
+                    }
+                }
             } else {
                 let _ = std::fs::remove_file(&temporary);
                 return Err(error.into());
@@ -2740,8 +2795,19 @@ fn persist_clipboard_history(
         .flat_map(|record| [record.text_path.as_deref(), record.image_path.as_deref()])
         .flatten()
         .collect::<HashSet<_>>();
-    for entry in std::fs::read_dir(clipboard_payload_dir(data_dir))? {
-        let entry = entry?;
+    let entries = match std::fs::read_dir(clipboard_payload_dir(data_dir)) {
+        Ok(entries) => entries,
+        Err(error) => {
+            // The index has already been atomically replaced. A cleanup
+            // failure must not be reported as a failed transaction, otherwise
+            // callers could roll back memory while disk points at the new
+            // index. Stale unreferenced files are safe to retry next startup.
+            eprintln!("清理剪贴板历史 payload 失败：{error}");
+            return Ok(());
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if name.contains(".tmp-") {
@@ -2828,20 +2894,41 @@ fn write_clipboard_history_record(
     content_hash: String,
 ) -> anyhow::Result<ClipboardHistoryRecord> {
     let storage_id = Uuid::new_v4().to_string();
-    let text_path = snapshot
+    let text_path = match snapshot
         .text
         .as_ref()
         .map(|text| write_clipboard_payload(data_dir, &storage_id, "txt", text.as_bytes()))
-        .transpose()?;
-    let image_bytes = snapshot
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => {
+            remove_clipboard_payload_set(data_dir, &storage_id);
+            return Err(error);
+        }
+    };
+    let image_bytes = match snapshot
         .image_png
         .as_deref()
         .map(|value| BASE64.decode(value))
-        .transpose()?;
-    let image_path = image_bytes
+        .transpose()
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            remove_clipboard_payload_set(data_dir, &storage_id);
+            return Err(error.into());
+        }
+    };
+    let image_path = match image_bytes
         .as_deref()
         .map(|bytes| write_clipboard_payload(data_dir, &storage_id, "png", bytes))
-        .transpose()?;
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => {
+            remove_clipboard_payload_set(data_dir, &storage_id);
+            return Err(error);
+        }
+    };
     Ok(ClipboardHistoryRecord {
         event_id: snapshot.event_id.clone(),
         source_node_id: snapshot.source_node_id.clone(),
@@ -2855,6 +2942,19 @@ fn write_clipboard_history_record(
         text_len: snapshot.text.as_ref().map_or(0, String::len),
         image_len: image_bytes.map_or(0, |bytes| bytes.len()),
     })
+}
+
+fn remove_clipboard_payload_set(data_dir: &Path, storage_id: &str) {
+    let directory = clipboard_payload_dir(data_dir);
+    for extension in ["txt", "png"] {
+        let _ = std::fs::remove_file(directory.join(format!("{storage_id}.{extension}")));
+    }
+    for entry in [
+        directory.join(format!("{storage_id}.txt.tmp-{}", std::process::id())),
+        directory.join(format!("{storage_id}.png.tmp-{}", std::process::id())),
+    ] {
+        remove_clipboard_temp_file(&entry);
+    }
 }
 
 fn load_history_snapshot(
@@ -2932,6 +3032,15 @@ fn prune_clipboard_history_records(
     config: &PersistedConfig,
     now: i64,
 ) {
+    prune_clipboard_history_records_with_limit(history, config, now, MAX_CLIPBOARD_HISTORY_BYTES);
+}
+
+fn prune_clipboard_history_records_with_limit(
+    history: &mut Vec<ClipboardHistoryRecord>,
+    config: &PersistedConfig,
+    now: i64,
+    max_bytes: u64,
+) {
     match config.clipboard_history_mode {
         ClipboardHistoryMode::Count => history.truncate(
             config
@@ -2950,6 +3059,15 @@ fn prune_clipboard_history_records(
             history.truncate(MAX_CLIPBOARD_HISTORY_COUNT);
         }
     }
+    let mut total_bytes = history
+        .iter()
+        .map(|record| (record.text_len as u64).saturating_add(record.image_len as u64))
+        .sum::<u64>();
+    while total_bytes > max_bytes && history.len() > 1 {
+        let Some(record) = history.pop() else { break };
+        total_bytes = total_bytes
+            .saturating_sub((record.text_len as u64).saturating_add(record.image_len as u64));
+    }
 }
 
 fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
@@ -2958,6 +3076,48 @@ fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
 
 pub(crate) fn is_network_ipv4(address: Ipv4Addr) -> bool {
     address.is_private() || address.is_link_local() || is_tailscale_ipv4(address)
+}
+
+fn normalize_peer_http_base(raw: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(raw).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    let allowed_host = host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".local")
+        || host
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|address| address.is_loopback() || is_network_ipv4(address));
+    if !allowed_host {
+        return None;
+    }
+    url.set_path("");
+    Some(url.to_string().trim_end_matches('/').to_string())
+}
+
+fn http_base_from_peer_endpoint(raw: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(raw).ok()?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        "http" | "https" => url.scheme(),
+        _ => return None,
+    }
+    .to_string();
+    url.set_scheme(&scheme).ok()?;
+    if !url.path().ends_with("/api/v1/ws") {
+        return None;
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    normalize_peer_http_base(url.as_str())
 }
 
 fn mobile_ca_url(raw: &str) -> Result<reqwest::Url, String> {
@@ -3125,14 +3285,15 @@ mod tests {
     use super::{
         bind_addresses, bindable_addresses, default_node_name, interface_rank,
         is_cellular_interface, is_placeholder_node_name, load_or_create_config, mobile_ca_url,
-        network_addresses, network_addresses_for_bound, normalize_node_name, NodeProfile,
-        NodeRuntime, UpdateFrequency, DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS,
+        network_addresses, network_addresses_for_bound, normalize_node_name,
+        prune_clipboard_history_records_with_limit, NodeProfile, NodeRuntime, UpdateFrequency,
+        CLIPBOARD_HISTORY_FILE, DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS,
         TRANSFER_ACTIVITY_TIMEOUT_MS,
     };
     use crate::model::{
-        ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc,
-        PeerInfo, ReceiveMode, TransferItem, TransferOffer, TransferStatus, WireMessage,
-        CLIPBOARD_VIEW_CAPABILITY, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
+        AddressInfo, ClipboardEvent, ClipboardHistoryMode, GpuMemoryKind, GpuMetrics,
+        HardwareMetrics, Hlc, PeerInfo, ReceiveMode, TransferItem, TransferOffer, TransferStatus,
+        WireMessage, CLIPBOARD_VIEW_CAPABILITY, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
         METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
         METRICS_SYSTEM_VIEW_CAPABILITY,
     };
@@ -3164,6 +3325,61 @@ mod tests {
         let path = std::env::temp_dir().join(format!("meshshare-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&path).expect("create test directory");
         path
+    }
+
+    #[test]
+    fn peer_http_base_prefers_verified_websocket_endpoint() {
+        let data_dir = temp_data_dir();
+        let runtime = NodeRuntime::new_with_profile(
+            data_dir.clone(),
+            37880,
+            "test".to_string(),
+            NodeProfile::Desktop,
+        )
+        .expect("create runtime");
+        let mut peer = test_peer("peer", Vec::new());
+        peer.endpoint = Some("ws://100.64.0.2:37880/api/v1/ws".to_string());
+        peer.addresses = vec![
+            AddressInfo {
+                address: "192.168.1.20".to_string(),
+                url: "http://192.168.1.20:37880".to_string(),
+                label: "Wi-Fi".to_string(),
+                kind: "lan".to_string(),
+            },
+            AddressInfo {
+                address: "100.64.0.2".to_string(),
+                url: "http://100.64.0.2:37880".to_string(),
+                label: "Tailscale".to_string(),
+                kind: "tailscale".to_string(),
+            },
+        ];
+        runtime.set_peer(peer);
+        assert_eq!(
+            runtime.peer_http_base("peer").as_deref(),
+            Some("http://100.64.0.2:37880")
+        );
+        assert_eq!(
+            runtime.peer_http_bases("peer"),
+            vec![
+                "http://100.64.0.2:37880".to_string(),
+                "http://192.168.1.20:37880".to_string(),
+            ]
+        );
+        let mut hello = test_peer("peer", Vec::new());
+        hello.source = "websocket".to_string();
+        hello.endpoint = Some("http://192.168.1.20:37880/api/v1/ws".to_string());
+        hello.addresses = runtime
+            .peers_snapshot()
+            .into_iter()
+            .next()
+            .expect("peer metadata")
+            .addresses;
+        runtime.set_peer(hello);
+        assert_eq!(
+            runtime.peer_http_base("peer").as_deref(),
+            Some("http://100.64.0.2:37880")
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
     }
 
     #[test]
@@ -4805,6 +5021,65 @@ mod tests {
         let history = runtime.clipboard_history_list();
         assert_eq!(history.items.len(), 1);
         assert_eq!(history.items[0].text_preview.as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_history_write_failure_keeps_previous_record_and_payload() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .create_local_clipboard_named(Some("old".to_string()), None, "local".to_string())
+            .expect("create old clipboard event");
+        let old = runtime.clipboard_history.lock()[0].clone();
+        let history_path = path.join(CLIPBOARD_HISTORY_FILE);
+        std::fs::remove_file(&history_path).expect("remove history index");
+        std::fs::create_dir(&history_path).expect("block history index");
+
+        let result = runtime.create_local_clipboard_named(
+            Some("new".to_string()),
+            None,
+            "local".to_string(),
+        );
+        assert!(
+            result.is_some(),
+            "failed history write must not block publication"
+        );
+        let history = runtime.clipboard_history.lock();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].event_id, old.event_id);
+        assert_eq!(history[0].text_path, old.text_path);
+        drop(history);
+        std::fs::remove_dir(&history_path).expect("remove blocking directory");
+        let detail = runtime
+            .clipboard_history_detail(&old.event_id)
+            .expect("old history detail");
+        assert_eq!(detail.snapshot.text.as_deref(), Some("old"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_history_prunes_oldest_records_at_byte_limit() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        for value in ["one", "two", "three"] {
+            runtime
+                .create_local_clipboard_named(Some(value.to_string()), None, "local".to_string())
+                .expect("create clipboard event");
+        }
+        let config = runtime.config.lock().clone();
+        let mut history = runtime.clipboard_history.lock().clone();
+        prune_clipboard_history_records_with_limit(
+            &mut history,
+            &config,
+            crate::clock::now_millis(),
+            8,
+        );
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].text_len, 5);
+        assert_eq!(history[1].text_len, 3);
         let _ = std::fs::remove_dir_all(path);
     }
 

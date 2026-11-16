@@ -6,6 +6,7 @@
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { ApiError, apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
+  import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { Sha256, digestFile } from './sha256';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
@@ -105,6 +106,8 @@
   const uploadStopped = new Set<string>();
   const prepareControllers = new Map<string, AbortController>();
   const mobileDownloading = new Set<string>();
+  type PendingMobileCompletion = { directory: MobileDirectoryHandle; fileName: string };
+  const pendingMobileCompletions = new Map<string, PendingMobileCompletion>();
   let mobileBrowserDownloadStarted = new Set<string>();
   const MOBILE_UPLOAD_MAX_ATTEMPTS = 6;
   const DESKTOP_UPLOAD_MAX_ATTEMPTS = 6;
@@ -113,6 +116,7 @@
   const TRANSFER_RELAY_CAPABILITY = 'transfer.relay.v1';
   const WS_RECONNECT_BASE_MS = 1500;
   const WS_RECONNECT_MAX_MS = 30000;
+  const CANDIDATE_PROBE_BUDGET_MS = 12000;
   let mobileReceiveDirectory: MobileDirectoryHandle | null = null;
   let mobileReceiveDirectoryName = '';
   let pageStopped = false;
@@ -348,8 +352,9 @@
         }
         connectWebSocket();
         timer = window.setInterval(() => {
-          void refresh().catch((error) => {
+          void refresh().catch(async (error) => {
             if (pageStopped) return;
+            if (await switchRemoteTargetCandidate()) return;
             status = error instanceof Error ? error.message : '无法刷新节点状态';
             statusKind = 'error';
           });
@@ -451,6 +456,9 @@
     node = nextNode;
     if (!remoteMode) localNodeId = nextNode.node_id;
     peers = nextPeers.filter((peer) => peer.online);
+    if (remoteMode && remoteTarget) {
+      remoteTarget = nextPeers.find((peer) => peer.node_id === remoteTarget?.node_id) ?? remoteTarget;
+    }
     clipboard = nextClipboard;
     clipboardStatus = nextClipboardStatus;
     clipboardHistory = nextHistory.items;
@@ -1131,27 +1139,61 @@
     for (const child of entries) await readDropEntry(child, `${prefix}${entry.name}/`, files);
   }
 
+  function normalizePeerEndpoint(endpoint: string | null | undefined): string | null {
+    if (!endpoint) return null;
+    try {
+      const parsed = new URL(endpoint);
+      if (!['http:', 'https:', 'ws:', 'wss:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+      if (!parsed.pathname.endsWith('/api/v1/ws')) return null;
+      parsed.protocol = parsed.protocol === 'ws:' ? 'http:' : parsed.protocol === 'wss:' ? 'https:' : parsed.protocol;
+      parsed.pathname = '';
+      const base = parsed.toString().replace(/\/$/, '');
+      return isAllowedPeerBase(base) ? base : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function isAllowedPeerBase(raw: string): boolean {
+    try {
+      const parsed = new URL(raw);
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) return false;
+      const host = parsed.hostname.toLowerCase();
+      if (host === 'localhost' || host.endsWith('.local')) return true;
+      const octets = host.split('.').map((value) => Number(value));
+      if (octets.length !== 4 || octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return false;
+      const [a, b] = octets;
+      return a === 127 || a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)
+        || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127);
+    } catch {
+      return false;
+    }
+  }
+
   function targetBase(peer: PeerInfo): string | null {
     if (isWeb) {
       if (peer.node_id === node?.node_id) return window.location.origin;
       if (window.location.protocol === 'https:') return `${window.location.origin}/api/v1/mobile/peers/${encodeURIComponent(peer.node_id)}`;
     }
-    const url = peer.addresses.find((address) => address.kind === 'lan')?.url ?? peer.addresses[0]?.url;
-    return url ?? (peer.endpoint ? peer.endpoint.replace(/\/api\/v1\/ws$/, '') : null);
+    return normalizePeerEndpoint(peer.endpoint)
+      ?? peer.addresses.find((address) => isAllowedPeerBase(address.url) && address.kind === 'lan')?.url
+      ?? peer.addresses.find((address) => isAllowedPeerBase(address.url))?.url
+      ?? null;
   }
 
   /**
    * 对端可能同时公布多个地址（WiFi、Tailscale、虚拟网卡），其中只有一部分能被本机访问。
-   * 发送时按公布顺序逐个尝试，全部失败才判定为不可达。
+   * 发送时按公布顺序逐个尝试，并受总探测预算限制，避免不可达地址拖住界面。
    */
   function targetCandidates(peer: PeerInfo): string[] {
     if (isWeb) {
       const base = targetBase(peer);
       return base ? [base] : [];
     }
-    const bases = peer.addresses.map((address) => address.url).filter((url): url is string => !!url);
-    const endpointBase = peer.endpoint?.replace(/\/api\/v1\/ws$/, '');
+    const bases: string[] = [];
+    const endpointBase = normalizePeerEndpoint(peer.endpoint);
     if (endpointBase) bases.push(endpointBase);
+    bases.push(...peer.addresses.map((address) => address.url).filter((url): url is string => !!url && isAllowedPeerBase(url)));
     const unique = new Set<string>();
     for (const base of bases) {
       const normalized = base.replace(/\/$/, '');
@@ -1160,7 +1202,7 @@
     const candidates = [...unique];
     // 链路本地地址只有在没有其他入口时才值得尝试，否则先试常规地址。
     const routable = candidates.filter((base) => !base.includes('//169.254.'));
-    return (routable.length ? routable : candidates).slice(0, 4);
+    return routable.length ? routable : candidates;
   }
 
   function isRetryableHttpStatus(status: number): boolean {
@@ -1199,9 +1241,17 @@
 
   async function onTransferRoute<T>(route: TransferRoute, perform: (base: string) => Promise<T>): Promise<T> {
     let lastError: unknown;
+    const deadline = Date.now() + CANDIDATE_PROBE_BUDGET_MS;
     for (const base of transferCandidates(route)) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
       try {
-        const info = await requestWithTimeout<NodeInfo>('/api/v1/info', {}, base);
+        const info = await requestWithTimeout<NodeInfo>(
+          '/api/v1/info',
+          {},
+          base,
+          Math.min(6000, remaining),
+        );
         if (info?.node_id !== route.nodeId) throw new ApiError('地址上的设备与传输目标不匹配', 421);
       } catch (error) {
         lastError = error;
@@ -1311,13 +1361,61 @@
       showTransientNotice('目标节点不支持远程管理，请先升级目标节点', 6000);
       return;
     }
-    const target = targetBase(peer);
+    const candidates = targetCandidates(peer);
+    let target: string | null = null;
+    const deadline = Date.now() + CANDIDATE_PROBE_BUDGET_MS;
+    for (const candidate of candidates) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      try {
+        const info = await requestWithTimeout<NodeInfo>(
+          '/api/v1/info',
+          {},
+          candidate,
+          Math.min(6000, remaining),
+        );
+        if (info.node_id === peer.node_id) {
+          target = candidate;
+          break;
+        }
+      } catch {
+        // A peer can advertise interfaces that are not reachable from this
+        // network. Continue with the next private/Tailscale candidate.
+      }
+    }
     if (!target) {
       showTransientNotice('目标设备没有可访问地址', 6000);
       return;
     }
     localBaseUrl ||= activeBaseUrl;
     await applyTargetContext(target, peer);
+  }
+
+  async function switchRemoteTargetCandidate(): Promise<boolean> {
+    if (!remoteMode || !remoteTarget) return false;
+    const deadline = Date.now() + CANDIDATE_PROBE_BUDGET_MS;
+    for (const candidate of targetCandidates(remoteTarget)) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      if (candidate === activeBaseUrl) continue;
+      try {
+        const info = await requestWithTimeout<NodeInfo>(
+          '/api/v1/info',
+          {},
+          candidate,
+          Math.min(6000, remaining),
+        );
+        if (info.node_id !== remoteTarget.node_id) continue;
+        for (const pending of pendingUploads.values()) {
+          if (pending.relay && pending.nodeId === remoteTarget.node_id) pending.target = candidate;
+        }
+        await applyTargetContext(candidate, remoteTarget);
+        return true;
+      } catch {
+        // Keep probing the remaining private/Tailscale interfaces.
+      }
+    }
+    return false;
   }
 
   async function returnToLocal() {
@@ -1840,21 +1938,12 @@
     }
   }
 
-  type MobileWritable = {
-    write: (data: Uint8Array) => Promise<void>;
-    close: () => Promise<void>;
-    abort?: () => Promise<void>;
-  };
-  type MobileFileHandle = {
-    getFile: () => Promise<File>;
-    createWritable: () => Promise<MobileWritable>;
-  };
-  type MobileDirectoryHandle = {
-    name: string;
-    getDirectoryHandle: (name: string, options?: { create?: boolean }) => Promise<MobileDirectoryHandle>;
-    getFileHandle: (name: string, options?: { create?: boolean }) => Promise<MobileFileHandle>;
-    removeEntry: (name: string, options?: { recursive?: boolean }) => Promise<void>;
-  };
+  class MobileCompletionError extends Error {
+    constructor(message: string) {
+      super(message);
+      this.name = 'MobileCompletionError';
+    }
+  }
   type MobilePickerWindow = Window & {
     showDirectoryPicker?: (options?: { mode?: 'readwrite' }) => Promise<MobileDirectoryHandle>;
   };
@@ -1909,37 +1998,35 @@
 
   async function downloadMobileItem(view: MobileTransferView, item: TransferItem) {
     if (!mobileSessionId) throw new Error('网页会话已过期');
-    const { directory, fileName } = await mobileTargetHandle(item.relative_path);
-    const response = await fetch(mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId));
-    if (!response.ok) {
-      const payload = await response.json().catch(() => ({}));
-      throw new Error(payload.error ?? `下载失败 (${response.status})`);
+    const completionKey = mobileBrowserDownloadKey(view, item);
+    let saved = pendingMobileCompletions.get(completionKey);
+    if (!saved) {
+      const target = await mobileTargetHandle(item.relative_path);
+      const response = await fetch(mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId));
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
+        throw new Error(payload.error ?? `下载失败 (${response.status})`);
+      }
+      await saveMobileResponse(target.directory, target.fileName, response, item.size, item.sha256);
+      saved = target;
+    } else {
+      // The previous completion request may have failed after the file was
+      // closed. Keep that file and retry only the state notification.
+      try {
+        await saved.directory.getFileHandle(saved.fileName);
+      } catch {
+        pendingMobileCompletions.delete(completionKey);
+        return downloadMobileItem(view, item);
+      }
     }
-    if (!response.body) throw new Error('浏览器不支持流式下载');
-    const fileHandle = await directory.getFileHandle(fileName, { create: true });
-    const writable = await fileHandle.createWritable();
-    const reader = response.body.getReader();
-    const hasher = new Sha256();
-    let total = 0;
+
     try {
-      while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        const bytes = chunk.value;
-        total += bytes.byteLength;
-        hasher.update(bytes);
-        await writable.write(bytes);
-      }
-      if (total !== item.size || hasher.digestHex().toLowerCase() !== item.sha256.toLowerCase()) {
-        throw new Error(`文件校验失败：${item.name}`);
-      }
-      await writable.close();
       await completeMobileItem(view.progress.transfer_id, item.item_id, mobileSessionId);
+      pendingMobileCompletions.delete(completionKey);
     } catch (error) {
-      await reader.cancel().catch(() => undefined);
-      await writable.abort?.().catch(() => undefined);
-      await directory.removeEntry(fileName).catch(() => undefined);
-      throw error;
+      pendingMobileCompletions.set(completionKey, saved);
+      const message = error instanceof Error ? error.message : '文件完成通知失败';
+      throw new MobileCompletionError(`${message}，文件已保存，可稍后重试完成通知`);
     }
   }
 
@@ -1958,6 +2045,10 @@
     } catch (error) {
       const message = error instanceof Error ? error.message : '网页端文件保存失败';
       showTransientNotice(message, 6000);
+      if (error instanceof MobileCompletionError) {
+        await refresh();
+        return;
+      }
       await request(`/api/v1/mobile/transfers/${encodeURIComponent(view.progress.transfer_id)}/fail`, {
         method: 'POST',
         body: JSON.stringify({ error: message }),
@@ -2061,7 +2152,14 @@
       } else {
         await invoke<TransferProgress>('accept_transfer', { transferId: transfer.transfer_id, destination: path });
       }
-      showTransientNotice(isAndroidApp && !remoteMode ? '已接受，文件将保存到 MeshShare 应用目录' : '已接受，等待文件直传', 3600);
+      showTransientNotice(
+        isAndroidApp && !remoteMode
+          ? '已接受，文件将保存到 MeshShare 应用目录'
+          : remoteMode
+            ? '已接受，等待接入节点流式转发'
+            : '已接受，等待文件直传',
+        3600,
+      );
     } catch (error) {
       showTransientNotice(error instanceof Error ? error.message : '无法接受传输', 6000);
     } finally {
@@ -2194,7 +2292,7 @@
         onOpenHistory={openClipboardHistory}
         onClearHistory={requestClearHistory}
       />
-      <TransferPanel {transfers} {prepares} {failures} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} />
+      <TransferPanel {transfers} {prepares} {failures} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} />
     </main>
     <SettingsDialog
       open={settingsOpen}

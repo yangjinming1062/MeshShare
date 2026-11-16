@@ -11,6 +11,7 @@
   export let onRetry: (failure: TransferFailure) => void = () => {};
   export let onDismissFailure: (failure: TransferFailure) => void = () => {};
   export let onCancelPrepare: (prepareId: string) => void = () => {};
+  export let remoteMode = false;
 
   $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status));
   $: waiting = activeTransfers.some((transfer) => transfer.direction === 'receive' && transfer.status === 'waiting');
@@ -32,7 +33,7 @@
       {/if}
     </div>
     <div class="surface-actions">
-      <span class="hint">文件只在两台设备之间直传</span>
+      <span class="hint">{remoteMode ? '文件经当前接入节点流式转发' : '文件只在两台设备之间直传'}</span>
     </div>
   </div>
   <div class="surface-body">

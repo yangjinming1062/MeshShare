@@ -196,7 +196,9 @@ fn serve_http(listener: TcpListener, app: Router) -> io::Result<Listener> {
     let address = listener.local_addr()?;
     let server = axum_server::from_tcp(listener.into_std()?)?;
     let handle = axum_server::Handle::new();
-    let future = server.handle(handle.clone()).serve(app.into_make_service());
+    let future = server
+        .handle(handle.clone())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
     Ok(serve(address, handle, future))
 }
 
@@ -204,7 +206,9 @@ fn serve_https(listener: TcpListener, app: Router, config: RustlsConfig) -> io::
     let address = listener.local_addr()?;
     let server = axum_server::from_tcp_rustls(listener.into_std()?, config)?;
     let handle = axum_server::Handle::new();
-    let future = server.handle(handle.clone()).serve(app.into_make_service());
+    let future = server
+        .handle(handle.clone())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>());
     Ok(serve(address, handle, future))
 }
 
