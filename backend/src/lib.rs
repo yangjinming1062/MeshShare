@@ -281,6 +281,19 @@ fn update_status(state: State<'_, ManagedNode>) -> Result<UpdateStatus, String> 
 }
 
 #[tauri::command]
+fn update_proxy(state: State<'_, ManagedNode>) -> Option<String> {
+    state.control.update_proxy()
+}
+
+#[tauri::command]
+fn set_update_proxy(
+    state: State<'_, ManagedNode>,
+    proxy: Option<String>,
+) -> Result<Option<String>, String> {
+    state.control.set_update_proxy(proxy)
+}
+
+#[tauri::command]
 fn autostart_enabled(state: State<'_, ManagedNode>) -> Result<bool, String> {
     if cfg!(debug_assertions) {
         return Err("开发构建不注册开机自启动".to_string());
@@ -1069,6 +1082,8 @@ fn run_desktop() {
             set_update_frequency,
             check_for_updates,
             update_status,
+            update_proxy,
+            set_update_proxy,
             autostart_enabled,
             set_autostart_enabled,
             receive_settings,

@@ -124,3 +124,5 @@ cargo fmt --manifest-path backend/Cargo.toml --all -- --check
 cargo clippy --manifest-path backend/Cargo.toml --all-targets --all-features --locked -- -D warnings
 cargo test --manifest-path backend/Cargo.toml --locked
 ```
+
+更新代理和错误提示的验证：把「更新代理」设为 `http://127.0.0.1:9` 后点「立即检查」，应显示连接失败原因和处置提示；改成可用代理后应检查成功，代理端能看到清单和安装包请求。

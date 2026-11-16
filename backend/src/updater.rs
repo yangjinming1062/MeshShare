@@ -111,6 +111,7 @@ impl UpdateCoordinator {
             return Err("更新检查正在进行中".to_string());
         }
         self.manual_requested.store(true, Ordering::SeqCst);
+        self.set_status(UpdateState::Checking, None, 0, None, None);
         self.notify.notify_one();
         Ok(())
     }
@@ -156,11 +157,8 @@ impl UpdateCoordinator {
                 continue;
             }
 
-            let keep_status = matches!(
-                self.status.lock().state,
-                UpdateState::Error | UpdateState::NeedsAuthorization
-            );
-            if frequency == UpdateFrequency::Disabled && !keep_status {
+            let state = self.status.lock().state.clone();
+            if frequency == UpdateFrequency::Disabled && should_apply_disabled_placeholder(&state) {
                 self.set_status(UpdateState::Disabled, None, 0, None, None);
             }
             self.wait_until_next_check(frequency, last_checked_at_ms, pending, retry_at_ms)
@@ -213,7 +211,12 @@ impl UpdateCoordinator {
         }
 
         self.set_status(UpdateState::Checking, None, 0, None, None);
-        let updater = match self.app.updater_builder().timeout(CHECK_TIMEOUT).build() {
+        let proxy = self.runtime.update_proxy_url();
+        let mut builder = self.app.updater_builder().timeout(CHECK_TIMEOUT);
+        if let Some(proxy) = proxy.clone() {
+            builder = builder.proxy(proxy);
+        }
+        let updater = match builder.build() {
             Ok(updater) => updater,
             Err(error) => {
                 return self.check_error_result(error);
@@ -242,9 +245,11 @@ impl UpdateCoordinator {
         // Keep the short timeout for the manifest request, but let the package
         // download use the updater's normal streaming request without that
         // timeout. Large installers may legitimately take longer to download.
-        let update = match self
-            .app
-            .updater_builder()
+        let mut builder = self.app.updater_builder();
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(proxy);
+        }
+        let update = match builder
             .build()
             .and_then(|updater| updater.restore_update(checked_update.raw_json.clone()))
         {
@@ -428,7 +433,7 @@ impl UpdateCoordinator {
 
     fn check_error_result(&self, error: tauri_plugin_updater::Error) -> CheckResult {
         let retry = should_retry_check_error(&error);
-        let error_message = error.to_string();
+        let error_message = describe_update_error(&error);
         if !retry {
             if let Err(state_error) = self
                 .runtime
@@ -455,7 +460,7 @@ impl UpdateCoordinator {
         version: &str,
     ) -> CheckResult {
         let retry = should_retry_install_error(&error);
-        let error_message = error.to_string();
+        let error_message = describe_update_error(&error);
         if let Err(state_error) = self
             .runtime
             .set_update_check_state(Some(checked_at_ms), retry.then(|| version.to_string()))
@@ -523,6 +528,47 @@ fn should_retry_check_error(error: &tauri_plugin_updater::Error) -> bool {
     )
 }
 
+fn describe_update_error(error: &tauri_plugin_updater::Error) -> String {
+    let mut message = error.to_string();
+    if let Some(cause) = deepest_source(error) {
+        if !cause.is_empty() && !message.contains(&cause) {
+            message.push('：');
+            message.push_str(&cause);
+        }
+    }
+    if let Some(hint) = update_error_hint(error) {
+        message.push('（');
+        message.push_str(hint);
+        message.push('）');
+    }
+    message
+}
+
+fn deepest_source(mut error: &(dyn std::error::Error + 'static)) -> Option<String> {
+    let mut deepest = None;
+    while let Some(cause) = error.source() {
+        deepest = Some(cause.to_string());
+        error = cause;
+    }
+    deepest
+}
+
+fn update_error_hint(error: &tauri_plugin_updater::Error) -> Option<&'static str> {
+    match error {
+        tauri_plugin_updater::Error::Reqwest(inner) if inner.is_timeout() => {
+            Some("连接 GitHub 超时，请检查网络或代理设置")
+        }
+        tauri_plugin_updater::Error::Reqwest(_) => {
+            Some("无法访问 GitHub，请检查网络、DNS 或代理设置")
+        }
+        tauri_plugin_updater::Error::ReleaseNotFound => {
+            Some("未获取到稳定版更新清单，请确认能访问 GitHub 后重试")
+        }
+        tauri_plugin_updater::Error::Network(_) => Some("更新包下载失败，请检查网络或稍后重试"),
+        _ => None,
+    }
+}
+
 enum CheckResult {
     Completed,
     RetryLater,
@@ -553,6 +599,12 @@ impl Drop for UpdateInstallGuard<'_> {
     }
 }
 
+// 关闭自动更新时只替换尚未检查过的占位状态，
+// 保留手动检查得到的已是最新、待授权和失败结果。
+fn should_apply_disabled_placeholder(state: &UpdateState) -> bool {
+    matches!(state, UpdateState::Idle)
+}
+
 fn is_due(
     frequency: UpdateFrequency,
     last_checked_at_ms: Option<i64>,
@@ -578,7 +630,9 @@ fn is_due(
 #[cfg(test)]
 mod tests {
     use super::{
-        is_due, should_retry_check_error, should_retry_install_error, AUTHORIZATION_RETRY_MS,
+        deepest_source, describe_update_error, is_due, should_apply_disabled_placeholder,
+        should_retry_check_error, should_retry_install_error, update_error_hint, UpdateState,
+        AUTHORIZATION_RETRY_MS,
     };
     use crate::runtime::UpdateFrequency;
 
@@ -700,5 +754,84 @@ mod tests {
         assert!(!should_retry_check_error(
             &tauri_plugin_updater::Error::ReleaseNotFound
         ));
+    }
+
+    #[derive(Debug)]
+    struct TestCause(&'static str);
+
+    impl std::fmt::Display for TestCause {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for TestCause {}
+
+    #[derive(Debug)]
+    struct TestError {
+        message: &'static str,
+        cause: Option<TestCause>,
+    }
+
+    impl std::fmt::Display for TestError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for TestError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause
+                .as_ref()
+                .map(|cause| cause as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn disabled_frequency_only_replaces_the_idle_placeholder() {
+        assert!(should_apply_disabled_placeholder(&UpdateState::Idle));
+        for state in [
+            UpdateState::Unavailable,
+            UpdateState::Disabled,
+            UpdateState::Checking,
+            UpdateState::Available,
+            UpdateState::Deferred,
+            UpdateState::Downloading,
+            UpdateState::Installing,
+            UpdateState::UpToDate,
+            UpdateState::NeedsAuthorization,
+            UpdateState::Error,
+        ] {
+            assert!(!should_apply_disabled_placeholder(&state), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn deepest_source_returns_the_innermost_cause() {
+        let chained = TestError {
+            message: "top",
+            cause: Some(TestCause("root cause")),
+        };
+        assert_eq!(deepest_source(&chained), Some("root cause".to_string()));
+        let plain = TestError {
+            message: "top",
+            cause: None,
+        };
+        assert_eq!(deepest_source(&plain), None);
+    }
+
+    #[test]
+    fn update_errors_keep_the_actionable_hint() {
+        let message = describe_update_error(&tauri_plugin_updater::Error::Network(
+            "Download request failed with status: 404".to_string(),
+        ));
+        assert!(message.contains("Download request failed with status: 404"));
+        assert!(message.ends_with("（更新包下载失败，请检查网络或稍后重试）"));
+        let message = describe_update_error(&tauri_plugin_updater::Error::ReleaseNotFound);
+        assert!(message.ends_with("（未获取到稳定版更新清单，请确认能访问 GitHub 后重试）"));
+        assert_eq!(
+            update_error_hint(&tauri_plugin_updater::Error::UnsupportedOs),
+            None
+        );
     }
 }

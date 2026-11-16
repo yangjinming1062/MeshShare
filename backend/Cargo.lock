@@ -2582,6 +2582,7 @@ dependencies = [
  "tokio-tungstenite",
  "tokio-util",
  "tower-http 0.5.2",
+ "url",
  "uuid",
  "walkdir",
  "windows-registry",

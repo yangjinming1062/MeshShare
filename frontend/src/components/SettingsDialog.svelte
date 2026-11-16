@@ -16,12 +16,17 @@
   export let updateFrequency: UpdateFrequency = 'weekly';
   export let updateStatus: UpdateStatus | null = null;
   export let updateBusy = false;
+  export let updateProxy = '';
+  export let updateProxyBusy = false;
+  export let updateProxyReset = 0;
+  export let localMode = true;
   export let receiveSettings: ReceiveSettings = { mode: 'confirm' };
   export let receiveBusy = false;
   export let historySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
   export let historyBusy = false;
   export let onFrequency: (value: UpdateFrequency) => void = () => {};
   export let onCheckUpdates: () => void = () => {};
+  export let onUpdateProxy: (value: string) => void = () => {};
   export let onReceiveMode: (value: ReceiveMode) => void = () => {};
   export let onChooseDirectory: () => void = () => {};
   export let onHistoryMode: (value: ClipboardHistoryMode) => void = () => {};
@@ -49,6 +54,27 @@
         </div>
       </div>
     </div>
+    {#if localMode}
+      <div class="setting">
+        <div class="setting-copy">
+          <strong>更新代理</strong>
+          <span>留空时跟随系统或环境代理；只用于检查更新和下载安装包。</span>
+        </div>
+        <div class="setting-actions">
+          {#key updateProxyReset + ':' + updateProxy}
+            <input
+              class="field setting-proxy"
+              type="url"
+              placeholder="http://127.0.0.1:7890"
+              value={updateProxy}
+              aria-label="更新代理地址"
+              disabled={updateProxyBusy}
+              on:change={(event) => onUpdateProxy(event.currentTarget.value)}
+            />
+          {/key}
+        </div>
+      </div>
+    {/if}
     <div class="setting-foot">
       <span class="update-status" data-state={updateStatus?.state ?? 'idle'}>{updateStatusLabel(updateStatus)}</span>
       <button type="button" class="btn btn-sm" disabled={checkDisabled} on:click={onCheckUpdates}>立即检查</button>

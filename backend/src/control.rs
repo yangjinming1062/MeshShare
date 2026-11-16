@@ -154,6 +154,16 @@ impl ControlPlane {
             .ok_or_else(|| "更新服务尚未初始化".to_string())
     }
 
+    pub fn update_proxy(&self) -> Option<String> {
+        self.runtime.update_proxy()
+    }
+
+    pub fn set_update_proxy(&self, proxy: Option<String>) -> Result<Option<String>, String> {
+        self.runtime
+            .set_update_proxy(proxy)
+            .map_err(|error| error.to_string())
+    }
+
     fn monitor_capabilities(&self) -> MonitorCapabilitiesSnapshot {
         let Some(app) = self.app.as_ref() else {
             return MonitorCapabilitiesSnapshot {

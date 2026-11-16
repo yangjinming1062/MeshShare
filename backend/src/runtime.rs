@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
+use url::Url;
 use uuid::Uuid;
 
 fn default_autostart_enabled() -> bool {
@@ -79,6 +80,17 @@ impl UpdateFrequency {
     }
 }
 
+fn parse_update_proxy(value: &str) -> anyhow::Result<Url> {
+    let url = Url::parse(value).map_err(|error| anyhow::anyhow!("更新代理地址无效：{error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(anyhow::anyhow!("更新代理只支持 http 或 https 地址"));
+    }
+    if url.host_str().is_none_or(|host| host.is_empty()) {
+        return Err(anyhow::anyhow!("更新代理地址缺少主机名"));
+    }
+    Ok(url)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedConfig {
     node_id: String,
@@ -97,6 +109,8 @@ struct PersistedConfig {
     update_last_checked_at_ms: Option<i64>,
     #[serde(default)]
     pending_update_version: Option<String>,
+    #[serde(default)]
+    update_proxy: Option<String>,
     #[serde(default)]
     clipboard_history_mode: ClipboardHistoryMode,
     #[serde(default = "default_clipboard_history_count")]
@@ -1084,6 +1098,38 @@ impl NodeRuntime {
         persist_config(&self.data_dir, &next)?;
         *config = next;
         Ok(())
+    }
+
+    pub fn update_proxy(&self) -> Option<String> {
+        self.config.lock().update_proxy.clone()
+    }
+
+    pub fn update_proxy_url(&self) -> Option<Url> {
+        let value = self.update_proxy()?;
+        match parse_update_proxy(&value) {
+            Ok(url) => Some(url),
+            Err(error) => {
+                eprintln!("读取更新代理失败：{error}");
+                None
+            }
+        }
+    }
+
+    pub fn set_update_proxy(&self, proxy: Option<String>) -> anyhow::Result<Option<String>> {
+        let normalized = match proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => Some(parse_update_proxy(value)?.to_string()),
+            None => None,
+        };
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.update_proxy = normalized.clone();
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        Ok(normalized)
     }
 
     pub fn clipboard_history_settings(&self) -> ClipboardHistorySettings {
@@ -2476,6 +2522,7 @@ fn load_or_create_config(data_dir: &Path, profile: NodeProfile) -> anyhow::Resul
         update_frequency: UpdateFrequency::default(),
         update_last_checked_at_ms: None,
         pending_update_version: None,
+        update_proxy: None,
         clipboard_history_mode: ClipboardHistoryMode::default(),
         clipboard_history_count: default_clipboard_history_count(),
         clipboard_history_days: default_clipboard_history_days(),
@@ -3294,7 +3341,7 @@ mod tests {
     use super::{
         bind_addresses, bindable_addresses, default_node_name, interface_rank,
         is_cellular_interface, is_placeholder_node_name, load_or_create_config, mobile_ca_url,
-        network_addresses, network_addresses_for_bound, normalize_node_name,
+        network_addresses, network_addresses_for_bound, normalize_node_name, parse_update_proxy,
         prune_clipboard_history_records_with_limit, NodeProfile, NodeRuntime, UpdateFrequency,
         CLIPBOARD_HISTORY_FILE, DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS,
         TRANSFER_ACTIVITY_TIMEOUT_MS,
@@ -3880,6 +3927,51 @@ mod tests {
             Some(UpdateFrequency::Disabled)
         );
         assert_eq!(UpdateFrequency::parse("monthly"), None);
+    }
+
+    #[test]
+    fn update_proxy_is_validated_and_persisted() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        assert_eq!(runtime.update_proxy(), None);
+        let saved = runtime
+            .set_update_proxy(Some("  http://127.0.0.1:7890  ".to_string()))
+            .expect("save update proxy");
+        assert_eq!(saved.as_deref(), Some("http://127.0.0.1:7890/"));
+        let url = runtime.update_proxy_url().expect("parse update proxy");
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.port(), Some(7890));
+
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert_eq!(
+            restored.update_proxy().as_deref(),
+            Some("http://127.0.0.1:7890/")
+        );
+        assert_eq!(
+            restored
+                .set_update_proxy(Some("   ".to_string()))
+                .expect("clear update proxy"),
+            None
+        );
+        assert!(restored.update_proxy_url().is_none());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn update_proxy_rejects_unsupported_addresses() {
+        for value in [
+            "socks5://127.0.0.1:1080",
+            "ftp://127.0.0.1:21",
+            "127.0.0.1:7890",
+            "http://",
+        ] {
+            assert!(parse_update_proxy(value).is_err(), "{value}");
+        }
+        let proxy = parse_update_proxy("https://proxy.example.com:8443").expect("https proxy");
+        assert_eq!(proxy.host_str(), Some("proxy.example.com"));
+        assert_eq!(proxy.port(), Some(8443));
     }
 
     #[test]

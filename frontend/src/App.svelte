@@ -58,6 +58,9 @@
   let autostartBusy = false;
   let updateFrequency: UpdateFrequency = 'weekly';
   let updateStatus: UpdateStatus | null = null;
+  let updateProxy = '';
+  let updateProxyBusy = false;
+  let updateProxyReset = 0;
   const UNKNOWN_MONITOR_CAPABILITIES: MonitorCapabilities = { backend: 'unknown', can_persist_position: false, can_click_through: false, can_keep_above: false };
   let monitorCapabilities: MonitorCapabilities = UNKNOWN_MONITOR_CAPABILITIES;
   let updateBusy = false;
@@ -352,6 +355,7 @@
         if (isDesktopWindow) {
           updateFrequency = await invoke<UpdateFrequency>('update_frequency').catch(() => 'weekly');
           updateStatus = await invoke<UpdateStatus>('update_status').catch(() => null);
+          updateProxy = (await invoke<string | null>('update_proxy').catch(() => null)) ?? '';
           clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
           receiveSettings = await invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings);
           clipboardStatus = await invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus);
@@ -550,9 +554,10 @@
 
   async function refreshLocalSettings() {
     if (!isDesktopWindow || remoteMode) return;
-    const [nextFrequency, nextStatus, nextHistory, nextReceive, nextClipboard, nextSync, nextAutostart] = await Promise.all([
+    const [nextFrequency, nextStatus, nextProxy, nextHistory, nextReceive, nextClipboard, nextSync, nextAutostart] = await Promise.all([
       invoke<UpdateFrequency>('update_frequency').catch(() => updateFrequency),
       invoke<UpdateStatus>('update_status').catch(() => updateStatus),
+      invoke<string | null>('update_proxy').catch(() => updateProxy || null),
       invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings),
       invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings),
       invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus),
@@ -561,6 +566,7 @@
     ]);
     updateFrequency = nextFrequency;
     updateStatus = nextStatus;
+    updateProxy = nextProxy ?? '';
     clipboardHistorySettings = nextHistory;
     receiveSettings = nextReceive;
     clipboardStatus = nextClipboard;
@@ -814,6 +820,21 @@
     } catch (error) {
       updateFrequency = previous;
       showTransientNotice(error instanceof Error ? error.message : '无法更新自动更新设置', 6000);
+    }
+  }
+
+  async function setUpdateProxy(value: string) {
+    const next = value.trim();
+    updateProxyBusy = true;
+    try {
+      updateProxy = (await invoke<string | null>('set_update_proxy', { proxy: next ? next : null })) ?? '';
+      showTransientNotice(updateProxy ? '更新代理已保存，下次检查生效' : '已改为跟随系统代理');
+    } catch (error) {
+      showTransientNotice(typeof error === 'string' ? error : error instanceof Error ? error.message : '无法保存更新代理', 6000);
+      updateProxy = (await invoke<string | null>('update_proxy').catch(() => updateProxy || null)) ?? '';
+      updateProxyReset += 1;
+    } finally {
+      updateProxyBusy = false;
     }
   }
 
@@ -2312,12 +2333,17 @@
       {updateFrequency}
       {updateStatus}
       {updateBusy}
+      {updateProxy}
+      {updateProxyBusy}
+      {updateProxyReset}
+      localMode={!remoteMode}
       {receiveSettings}
       receiveBusy={receiveSettingsBusy}
       historySettings={clipboardHistorySettings}
       historyBusy={clipboardHistorySettingsBusy}
       onFrequency={setUpdateFrequency}
       onCheckUpdates={checkForUpdates}
+      onUpdateProxy={setUpdateProxy}
       onReceiveMode={setReceiveMode}
       onChooseDirectory={chooseReceiveDirectory}
       onHistoryMode={setClipboardHistoryMode}
