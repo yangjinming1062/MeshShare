@@ -2755,40 +2755,12 @@ fn persist_clipboard_history(
         "{CLIPBOARD_HISTORY_FILE}.tmp-{}",
         std::process::id()
     ));
-    std::fs::write(&temporary, serde_json::to_vec_pretty(history)?)?;
-    if let Err(error) = std::fs::rename(&temporary, &path) {
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                let backup = data_dir.join(format!(
-                    "{CLIPBOARD_HISTORY_FILE}.backup-{}",
-                    std::process::id()
-                ));
-                let _ = std::fs::remove_file(&backup);
-                if let Err(error) = std::fs::rename(&path, &backup) {
-                    let _ = std::fs::remove_file(&temporary);
-                    return Err(error.into());
-                }
-                match std::fs::rename(&temporary, &path) {
-                    Ok(()) => {
-                        let _ = std::fs::remove_file(&backup);
-                    }
-                    Err(error) => {
-                        let _ = std::fs::remove_file(&temporary);
-                        let _ = std::fs::rename(&backup, &path);
-                        return Err(error.into());
-                    }
-                }
-            } else {
-                let _ = std::fs::remove_file(&temporary);
-                return Err(error.into());
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error.into());
-        }
+    let contents = serde_json::to_vec_pretty(history)?;
+    if let Err(error) =
+        std::fs::write(&temporary, contents).and_then(|()| std::fs::rename(&temporary, &path))
+    {
+        remove_clipboard_temp_file(&temporary);
+        return Err(error.into());
     }
     let referenced = history
         .iter()
@@ -5046,11 +5018,25 @@ mod tests {
             result.is_some(),
             "failed history write must not block publication"
         );
+        assert_eq!(
+            super::load_clipboard_current(&path)
+                .expect("load current snapshot")
+                .text
+                .as_deref(),
+            Some("new")
+        );
         let history = runtime.clipboard_history.lock();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].event_id, old.event_id);
         assert_eq!(history[0].text_path, old.text_path);
         drop(history);
+        assert_eq!(
+            std::fs::read_dir(super::clipboard_payload_dir(&path))
+                .expect("list history payloads")
+                .count(),
+            1,
+            "failed history write must discard the new payload"
+        );
         std::fs::remove_dir(&history_path).expect("remove blocking directory");
         let detail = runtime
             .clipboard_history_detail(&old.event_id)
