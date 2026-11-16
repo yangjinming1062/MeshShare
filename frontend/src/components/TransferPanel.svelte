@@ -33,7 +33,7 @@
       {/if}
     </div>
     <div class="surface-actions">
-      <span class="hint">{remoteMode ? '文件经当前接入节点流式转发' : '文件只在两台设备之间直传'}</span>
+      <span class="hint">{remoteMode ? '发送由目标机器读取文件后直传' : '文件只在两台设备之间直传'}</span>
     </div>
   </div>
   <div class="surface-body">

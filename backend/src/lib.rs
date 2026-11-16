@@ -5,6 +5,7 @@ mod android_storage;
 #[cfg(any(target_os = "android", test))]
 mod android_update;
 mod autostart;
+mod browse;
 mod clipboard;
 mod clock;
 mod control;
@@ -181,6 +182,21 @@ pub(crate) fn effective_monitor_locked(_app: &AppHandle, runtime: &NodeRuntime) 
 #[tauri::command]
 fn node_base_url(state: State<'_, ManagedNode>) -> String {
     format!("http://127.0.0.1:{}", state.runtime.node_info().port)
+}
+
+/// 远程管理页只能在本机界面开关这项能力；远程设置接口不暴露它。
+#[tauri::command]
+fn remote_file_access(state: State<'_, ManagedNode>) -> bool {
+    state.runtime.remote_file_access()
+}
+
+#[tauri::command]
+fn set_remote_file_access(state: State<'_, ManagedNode>, enabled: bool) -> Result<bool, String> {
+    state
+        .runtime
+        .set_remote_file_access(enabled)
+        .map(|_| enabled)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "android")]
@@ -1148,6 +1164,8 @@ fn run_desktop() {
             set_autostart_enabled,
             receive_settings,
             set_receive_settings,
+            remote_file_access,
+            set_remote_file_access,
             accept_transfer,
             register_outgoing_transfer,
             update_transfer_progress,
@@ -1210,6 +1228,8 @@ pub fn run() {
             set_clipboard_history_settings,
             receive_settings,
             set_receive_settings,
+            remote_file_access,
+            set_remote_file_access,
             accept_transfer,
             android_receive_directory,
             android_receive_storage,

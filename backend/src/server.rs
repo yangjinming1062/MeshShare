@@ -171,6 +171,13 @@ pub struct OutgoingPathRequest {
     pub paths: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BrowseQuery {
+    pub path: Option<String>,
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
+}
+
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: String,
@@ -301,23 +308,6 @@ pub fn router_with_control(
             "/api/v1/transfers",
             get(list_transfers).post(create_transfer),
         )
-        .route("/api/v1/relay/transfers", post(create_relay_transfer))
-        .route(
-            "/api/v1/relay/transfers/:id/items/:item_id",
-            put(upload_relay_item),
-        )
-        .route(
-            "/api/v1/relay/transfers/:id/cancel",
-            post(cancel_relay_transfer),
-        )
-        .route(
-            "/api/v1/relay/transfers/:id/fail",
-            post(fail_relay_transfer),
-        )
-        .route(
-            "/api/v1/relay/transfers/:id/retry",
-            post(retry_relay_transfer),
-        )
         .route("/api/v1/transfers/:id", delete(dismiss_transfer))
         .route("/api/v1/transfers/:id/reject", post(reject_transfer))
         .route("/api/v1/transfers/:id/cancel", post(cancel_transfer))
@@ -335,6 +325,20 @@ pub fn router_with_control(
         .route("/api/v1/outgoing/:id/start", post(start_outgoing_staging))
         .route("/api/v1/outgoing/:id/cancel", post(cancel_outgoing_staging))
         .route("/api/v1/outgoing/:id", get(outgoing_prepare_status))
+        .route("/api/v1/management/files/roots", get(management_file_roots))
+        .route("/api/v1/management/files", get(management_files))
+        .route(
+            "/api/v1/management/outgoing/paths",
+            post(create_managed_outgoing_paths),
+        )
+        .route(
+            "/api/v1/management/outgoing/:id",
+            get(managed_outgoing_prepare),
+        )
+        .route(
+            "/api/v1/management/outgoing/:id/cancel",
+            post(cancel_managed_outgoing_prepare),
+        )
         .route(
             "/api/*path",
             get(api_not_found)
@@ -1297,287 +1301,6 @@ async fn create_transfer(
         .transfer(&offer.transfer_id)
         .map(|record| record.progress)
         .ok_or_else(|| ApiError::internal("无法创建传输"))?;
-    Ok(Json(progress))
-}
-
-/// Create a transfer owned by this node while the control UI supplies the
-/// file bytes. The node remains the source of truth and sends the offer over
-/// its existing peer channel, so the remote UI can manage the same lifecycle
-/// as a local desktop window.
-async fn create_relay_transfer(
-    State(state): State<AppState>,
-    Json(mut offer): Json<TransferOffer>,
-) -> Result<Json<TransferProgress>, ApiError> {
-    validate_offer(&offer)?;
-    if offer.source_node_id != state.runtime.node_id() {
-        return Err(ApiError::bad_request("中继传输来源必须是目标节点"));
-    }
-    if offer.target_node_id == state.runtime.node_id()
-        || state
-            .runtime
-            .peer_http_base(&offer.target_node_id)
-            .is_none()
-    {
-        return Err(ApiError::not_found("目标设备当前不可用"));
-    }
-    offer.created_at_ms = crate::clock::now_millis();
-    let transfer_id = offer.transfer_id.clone();
-    let target_node_id = offer.target_node_id.clone();
-    let progress = state.runtime.add_outgoing_transfer(offer.clone());
-    if progress.status == TransferStatus::Failed {
-        return Err(ApiError::conflict(
-            progress
-                .error
-                .unwrap_or_else(|| "无法创建中继传输".to_string()),
-        ));
-    }
-    if !state.runtime.has_peer_channel(&target_node_id) {
-        if let Some(failed) = state.runtime.fail_transfer(
-            &transfer_id,
-            "无法连接目标设备".to_string(),
-            TransferStatus::Failed,
-        ) {
-            state
-                .runtime
-                .publish_event(WireMessage::TransferProgress { progress: failed });
-        }
-        return Err(ApiError::conflict("无法连接目标设备"));
-    }
-    if !state
-        .runtime
-        .send_to_peer_with_retry(&target_node_id, WireMessage::TransferOffer { offer })
-        .await
-    {
-        if let Some(failed) = state.runtime.fail_transfer(
-            &transfer_id,
-            "目标设备暂时无法接收传输请求".to_string(),
-            TransferStatus::Failed,
-        ) {
-            state
-                .runtime
-                .publish_event(WireMessage::TransferProgress { progress: failed });
-        }
-        return Err(ApiError::conflict("目标设备暂时无法接收传输请求"));
-    }
-    Ok(Json(progress))
-}
-
-async fn upload_relay_item(
-    AxumPath((transfer_id, item_id)): AxumPath<(String, String)>,
-    State(state): State<AppState>,
-    body: Body,
-) -> Result<Json<TransferProgress>, ApiError> {
-    let record = state
-        .runtime
-        .transfer(&transfer_id)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if record.offer.source_node_id != state.runtime.node_id()
-        || !matches!(
-            record.progress.status,
-            TransferStatus::Accepted | TransferStatus::Uploading
-        )
-    {
-        return Err(ApiError::conflict("传输尚未被目标设备接受"));
-    }
-    let item = record
-        .offer
-        .items
-        .iter()
-        .find(|item| item.item_id == item_id)
-        .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
-    if item.directory || has_parent_component(&item.relative_path) || item.relative_path.is_empty()
-    {
-        return Err(ApiError::bad_request("传输路径无效"));
-    }
-    let target = state
-        .runtime
-        .peer_http_base(&record.offer.target_node_id)
-        .ok_or_else(|| ApiError::not_found("目标设备当前不可用"))?;
-    let progress = state
-        .runtime
-        .begin_transfer_upload(&transfer_id)
-        .ok_or_else(|| ApiError::conflict("传输已结束"))?;
-    state
-        .runtime
-        .publish_event(WireMessage::TransferProgress { progress });
-    let relay_runtime = state.runtime.clone();
-    let relay_transfer_id = transfer_id.clone();
-    let stream = body.into_data_stream().map(move |chunk| {
-        relay_runtime.touch_transfer_activity(&relay_transfer_id);
-        chunk.map_err(|error| std::io::Error::other(error.to_string()))
-    });
-    let response = state
-        .runtime
-        .proxy_http
-        .put(format!(
-            "{target}/api/v1/transfers/{}/items/{}",
-            encode_path_segment(&transfer_id),
-            encode_path_segment(&item_id),
-        ))
-        .header("content-type", item.media_type.clone())
-        .body(reqwest::Body::wrap_stream(stream))
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
-    let result = proxy_json::<TransferProgress>(response).await?;
-    state
-        .runtime
-        .update_transfer(&transfer_id, result.0.clone());
-    Ok(result)
-}
-
-async fn cancel_relay_transfer(
-    AxumPath(id): AxumPath<String>,
-    State(state): State<AppState>,
-) -> Result<Json<TransferProgress>, ApiError> {
-    let (source_node_id, target_node_id) = state
-        .runtime
-        .transfer_peer_ids(&id)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if source_node_id != state.runtime.node_id() {
-        return Err(ApiError::bad_request("目标传输不是本节点的中继任务"));
-    }
-    let progress = state
-        .runtime
-        .fail_transfer(&id, "传输已取消".to_string(), TransferStatus::Cancelled)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    let _ = state
-        .runtime
-        .send_to_peer_with_retry(
-            &target_node_id,
-            WireMessage::TransferAction {
-                transfer_id: id.clone(),
-                action: "cancel".to_string(),
-                reason: progress.error.clone(),
-                retry_count: None,
-            },
-        )
-        .await;
-    state.runtime.publish_event(WireMessage::TransferAction {
-        transfer_id: id,
-        action: "cancel".to_string(),
-        reason: progress.error.clone(),
-        retry_count: None,
-    });
-    state.runtime.publish_event(WireMessage::TransferProgress {
-        progress: progress.clone(),
-    });
-    Ok(Json(progress))
-}
-
-async fn fail_relay_transfer(
-    AxumPath(id): AxumPath<String>,
-    State(state): State<AppState>,
-    Json(payload): Json<MobileTransferFailureRequest>,
-) -> Result<Json<TransferProgress>, ApiError> {
-    let (source_node_id, target_node_id) = state
-        .runtime
-        .transfer_peer_ids(&id)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if source_node_id != state.runtime.node_id() {
-        return Err(ApiError::bad_request("目标传输不是本节点的中继任务"));
-    }
-    let message = payload
-        .error
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "文件上传失败，已停止重试".to_string());
-    if message.len() > MAX_WIRE_ERROR_LENGTH {
-        return Err(ApiError::bad_request("失败原因过长"));
-    }
-    let progress = state
-        .runtime
-        .fail_transfer(&id, message, TransferStatus::Failed)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    let delivered = state
-        .runtime
-        .send_to_peer_with_retry(
-            &target_node_id,
-            WireMessage::TransferAction {
-                transfer_id: id.clone(),
-                action: "fail".to_string(),
-                reason: progress.error.clone(),
-                retry_count: Some(progress.retry_count),
-            },
-        )
-        .await;
-    if !delivered {
-        state.runtime.publish_event(WireMessage::TransferProgress {
-            progress: progress.clone(),
-        });
-        return Err(ApiError::conflict("无法同步目标设备的失败状态"));
-    }
-    state.runtime.publish_event(WireMessage::TransferProgress {
-        progress: progress.clone(),
-    });
-    Ok(Json(progress))
-}
-
-async fn retry_relay_transfer(
-    AxumPath(id): AxumPath<String>,
-    State(state): State<AppState>,
-) -> Result<Json<TransferProgress>, ApiError> {
-    let (source_node_id, target_node_id) = state
-        .runtime
-        .transfer_peer_ids(&id)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if source_node_id != state.runtime.node_id() {
-        return Err(ApiError::bad_request("目标传输不是本节点的中继任务"));
-    }
-    let record = state
-        .runtime
-        .transfer(&id)
-        .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    let progress = state
-        .runtime
-        .retry_transfer(&id, TransferStatus::Waiting, None)?;
-    let offer = record.offer;
-    let sent_offer = state
-        .runtime
-        .send_to_peer_with_retry(&target_node_id, WireMessage::TransferOffer { offer })
-        .await;
-    if !sent_offer {
-        let failed = state
-            .runtime
-            .fail_transfer(
-                &id,
-                "无法同步目标设备的重试请求".to_string(),
-                TransferStatus::Failed,
-            )
-            .unwrap_or(progress.clone());
-        state
-            .runtime
-            .publish_event(WireMessage::TransferProgress { progress: failed });
-        return Err(ApiError::conflict("无法同步目标设备的重试请求"));
-    }
-    let sent_retry = state
-        .runtime
-        .send_to_peer_with_retry(
-            &target_node_id,
-            WireMessage::TransferAction {
-                transfer_id: id.clone(),
-                action: "retry".to_string(),
-                reason: None,
-                retry_count: Some(progress.retry_count),
-            },
-        )
-        .await;
-    if !sent_retry {
-        let failed = state
-            .runtime
-            .fail_transfer(
-                &id,
-                "无法同步目标设备的重试请求".to_string(),
-                TransferStatus::Failed,
-            )
-            .unwrap_or(progress.clone());
-        state
-            .runtime
-            .publish_event(WireMessage::TransferProgress { progress: failed });
-        return Err(ApiError::conflict("无法同步目标设备的重试请求"));
-    }
-    state.runtime.publish_event(WireMessage::TransferProgress {
-        progress: progress.clone(),
-    });
     Ok(Json(progress))
 }
 
@@ -2718,6 +2441,102 @@ async fn create_outgoing_paths(
     Ok(Json(view))
 }
 
+/// 远程管理页的文件浏览与路径发送只在本机开启「远程文件访问」后可用。
+fn ensure_remote_file_access(state: &AppState) -> Result<(), ApiError> {
+    if state.runtime.remote_file_access() {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "远程文件访问未启用，请在目标机器的设置中开启",
+        ))
+    }
+}
+
+fn browse_api_error(error: crate::browse::BrowseError) -> ApiError {
+    match error {
+        crate::browse::BrowseError::NotFound => ApiError::not_found("目录不存在"),
+        crate::browse::BrowseError::NotDirectory => {
+            ApiError::bad_request("需要目标机器上的绝对目录路径")
+        }
+        crate::browse::BrowseError::Denied(message) => {
+            ApiError::forbidden(format!("无法读取该目录：{message}"))
+        }
+        crate::browse::BrowseError::Io(message) => {
+            ApiError::internal(format!("无法读取该目录：{message}"))
+        }
+    }
+}
+
+async fn management_file_roots(
+    State(state): State<AppState>,
+) -> Result<Json<crate::browse::BrowseRoots>, ApiError> {
+    ensure_remote_file_access(&state)?;
+    Ok(Json(crate::browse::roots()))
+}
+
+async fn management_files(
+    State(state): State<AppState>,
+    Query(query): Query<BrowseQuery>,
+) -> Result<Json<crate::browse::BrowseListing>, ApiError> {
+    ensure_remote_file_access(&state)?;
+    let path = query
+        .path
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("需要目标机器上的绝对目录路径"))?;
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(crate::browse::DEFAULT_BROWSE_ENTRIES);
+    // 目录可能很大，读元数据放到阻塞线程，避免拖住 HTTP 运行时。
+    let requested = PathBuf::from(path);
+    let listing =
+        tokio::task::spawn_blocking(move || crate::browse::list(&requested, offset, limit))
+            .await
+            .map_err(|error| ApiError::internal(format!("无法读取该目录：{error}")))?
+            .map_err(browse_api_error)?;
+    Ok(Json(listing))
+}
+
+/// 远程管理页在目标机器上按路径建立发送任务，文件由目标机器自己读取与上传。
+async fn create_managed_outgoing_paths(
+    State(state): State<AppState>,
+    Json(payload): Json<OutgoingPathRequest>,
+) -> Result<Json<OutgoingPrepareView>, ApiError> {
+    ensure_remote_file_access(&state)?;
+    if payload.target_node_id == state.runtime.node_id()
+        || state
+            .runtime
+            .peer_http_base(&payload.target_node_id)
+            .is_none()
+    {
+        return Err(ApiError::not_found("目标设备当前不可用"));
+    }
+    let view = state
+        .runtime
+        .begin_outgoing_paths(payload.target_node_id, payload.paths)
+        .map_err(ApiError::bad_request)?;
+    Ok(Json(view))
+}
+
+async fn managed_outgoing_prepare(
+    AxumPath(transfer_id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<OutgoingPrepareView>, ApiError> {
+    ensure_remote_file_access(&state)?;
+    state
+        .runtime
+        .outgoing_prepare_view(&transfer_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("准备任务已结束"))
+}
+
+async fn cancel_managed_outgoing_prepare(
+    AxumPath(transfer_id): AxumPath<String>,
+    State(state): State<AppState>,
+) -> Result<Json<OutgoingStagingCancelled>, ApiError> {
+    ensure_remote_file_access(&state)?;
+    state.runtime.cancel_outgoing_prepare(&transfer_id);
+    Ok(Json(OutgoingStagingCancelled { transfer_id }))
+}
+
 async fn outgoing_prepare_status(
     AxumPath(transfer_id): AxumPath<String>,
     State(state): State<AppState>,
@@ -3564,6 +3383,178 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn management_file_endpoints_require_the_local_switch() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-browse-switch-{}", Uuid::new_v4()));
+        let root = data_dir.join("root");
+        std::fs::create_dir_all(&root).expect("create root");
+        std::fs::write(root.join("note.txt"), b"data").expect("write file");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let state = super::AppState {
+            runtime: runtime.clone(),
+            control: super::ControlPlane::runtime_only(runtime.clone()),
+            static_root: data_dir.clone(),
+        };
+        let path = root.to_string_lossy().into_owned();
+        let query = || super::BrowseQuery {
+            path: Some(path.clone()),
+            offset: None,
+            limit: None,
+        };
+        let prepare = || super::OutgoingPathRequest {
+            target_node_id: runtime.node_id(),
+            paths: vec![path.clone()],
+        };
+        for status in [
+            super::management_file_roots(super::State(state.clone()))
+                .await
+                .expect_err("roots require the switch")
+                .status,
+            super::management_files(super::State(state.clone()), super::Query(query()))
+                .await
+                .expect_err("listing requires the switch")
+                .status,
+            super::create_managed_outgoing_paths(
+                super::State(state.clone()),
+                super::Json(prepare()),
+            )
+            .await
+            .expect_err("path sends require the switch")
+            .status,
+            super::managed_outgoing_prepare(
+                super::AxumPath("missing".to_string()),
+                super::State(state.clone()),
+            )
+            .await
+            .expect_err("prepare status requires the switch")
+            .status,
+            super::cancel_managed_outgoing_prepare(
+                super::AxumPath("missing".to_string()),
+                super::State(state.clone()),
+            )
+            .await
+            .expect_err("prepare cancel requires the switch")
+            .status,
+        ] {
+            assert_eq!(status, super::StatusCode::FORBIDDEN);
+        }
+        assert!(!runtime.remote_file_access());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn management_file_endpoints_read_directories_and_reject_bad_targets() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-browse-list-{}", Uuid::new_v4()));
+        let root = data_dir.join("root");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).expect("create directories");
+        let file = root.join("note.txt");
+        std::fs::write(&file, b"data").expect("write file");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime
+            .set_remote_file_access(true)
+            .expect("enable remote file access");
+        let state = super::AppState {
+            runtime: runtime.clone(),
+            control: super::ControlPlane::runtime_only(runtime.clone()),
+            static_root: data_dir.clone(),
+        };
+        let query = |value: PathBuf| super::BrowseQuery {
+            path: Some(value.to_string_lossy().into_owned()),
+            offset: None,
+            limit: None,
+        };
+
+        let listing = super::management_files(
+            super::State(state.clone()),
+            super::Query(query(root.clone())),
+        )
+        .await
+        .expect("list directory")
+        .0;
+        assert_eq!(
+            listing.path,
+            std::fs::canonicalize(&root)
+                .expect("canonical root")
+                .to_string_lossy()
+        );
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.name == "child" && entry.directory));
+        assert!(listing
+            .entries
+            .iter()
+            .any(|entry| entry.name == "note.txt" && !entry.directory));
+
+        let roots = super::management_file_roots(super::State(state.clone()))
+            .await
+            .expect("list roots")
+            .0;
+        assert!(!roots.roots.is_empty());
+
+        assert_eq!(
+            super::management_files(
+                super::State(state.clone()),
+                super::Query(query(file.clone())),
+            )
+            .await
+            .expect_err("files are not directories")
+            .status,
+            super::StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            super::management_files(
+                super::State(state.clone()),
+                super::Query(query(root.join("missing"))),
+            )
+            .await
+            .expect_err("missing directories are not listed")
+            .status,
+            super::StatusCode::NOT_FOUND
+        );
+
+        let prepare = |target: String| super::OutgoingPathRequest {
+            target_node_id: target,
+            paths: vec![file.to_string_lossy().into_owned()],
+        };
+        assert_eq!(
+            super::create_managed_outgoing_paths(
+                super::State(state.clone()),
+                super::Json(prepare("unknown-peer".to_string())),
+            )
+            .await
+            .expect_err("unknown peers cannot be targets")
+            .status,
+            super::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            super::create_managed_outgoing_paths(
+                super::State(state.clone()),
+                super::Json(prepare(runtime.node_id())),
+            )
+            .await
+            .expect_err("the local node cannot be a target")
+            .status,
+            super::StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            super::managed_outgoing_prepare(
+                super::AxumPath("missing".to_string()),
+                super::State(state.clone()),
+            )
+            .await
+            .expect_err("finished prepares are gone")
+            .status,
+            super::StatusCode::NOT_FOUND
+        );
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
     async fn settings_and_remote_accept_endpoints_update_runtime_state() {
         let data_dir =
             std::env::temp_dir().join(format!("meshshare-settings-api-{}", Uuid::new_v4()));
@@ -3584,7 +3575,7 @@ mod tests {
             .node_info()
             .capabilities
             .iter()
-            .any(|value| value == "transfer.relay.v1"));
+            .any(|value| value == "management.files.v1"));
         let app = super::router(runtime.clone(), static_root);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3838,7 +3829,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_path_segments_are_percent_encoded() {
+    fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path_segment("a/b?c"), "a%2Fb%3Fc");
         assert_eq!(encode_path_segment("uuid-like_1"), "uuid-like_1");
     }

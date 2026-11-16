@@ -5,10 +5,10 @@
   import { addPluginListener, invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, createOutgoingPaths, getOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
+  import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, createOutgoingPaths, getOutgoingPrepare, browseManagedPath, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { Sha256, digestFile } from './sha256';
-  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
@@ -17,6 +17,7 @@
   import TransferPanel from './components/TransferPanel.svelte';
   import MobileApp from './components/MobileApp.svelte';
   import SettingsDialog from './components/SettingsDialog.svelte';
+  import RemoteFileBrowser from './components/RemoteFileBrowser.svelte';
   import MobileAccessDialog from './components/MobileAccessDialog.svelte';
   import HistoryDetailDialog from './components/HistoryDetailDialog.svelte';
   import MetricsDetailDialog from './components/MetricsDetailDialog.svelte';
@@ -70,6 +71,13 @@
   let updateBusy = false;
   let receiveSettings: ReceiveSettings = { mode: 'confirm' };
   let receiveSettingsBusy = false;
+  let remoteFileAccess = false;
+  let remoteFileAccessBusy = false;
+  let browseOpen = false;
+  let browseMode: 'send' | 'directory' = 'send';
+  let browseStartPath = '';
+  let browsePeer: PeerInfo | null = null;
+  let browseTransfer: TransferProgress | null = null;
   let ws: WebSocket | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
@@ -98,7 +106,7 @@
   let historyDetailOpen = false;
   let metricsPeerOpen = false;
   let clearHistoryOpen = false;
-  type TransferRoute = { target: string; nodeId: string; relay: boolean; peer?: PeerInfo };
+  type TransferRoute = { target: string; nodeId: string; peer?: PeerInfo };
   type PendingUpload = TransferRoute & { peer: PeerInfo; files: File[]; items: TransferItem[]; offer: TransferOffer };
   const pendingUploads = new Map<string, PendingUpload>();
   let remoteMode = false;
@@ -112,6 +120,8 @@
   const uploadAttempts = new Map<string, number>();
   const uploadStopped = new Set<string>();
   const prepareControllers = new Map<string, AbortController>();
+  // 准备任务可能由本机节点或远程目标节点持有，取消要回到创建它的那台节点。
+  const prepareCancels = new Map<string, (transferId: string) => Promise<unknown>>();
   const mobileDownloading = new Set<string>();
   type PendingMobileCompletion = { directory: MobileDirectoryHandle; fileName: string };
   const pendingMobileCompletions = new Map<string, PendingMobileCompletion>();
@@ -120,7 +130,7 @@
   const DESKTOP_UPLOAD_MAX_ATTEMPTS = 6;
   const FILE_UPLOAD_ATTEMPTS = 4;
   const REMOTE_MANAGEMENT_CAPABILITY = 'management.remote.v1';
-  const TRANSFER_RELAY_CAPABILITY = 'transfer.relay.v1';
+  const REMOTE_FILES_CAPABILITY = 'management.files.v1';
   const WS_RECONNECT_BASE_MS = 1500;
   const WS_RECONNECT_MAX_MS = 30000;
   const CANDIDATE_PROBE_BUDGET_MS = 12000;
@@ -156,6 +166,8 @@
   $: phoneFailures = failures;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
+  // 远程管理页的发送由目标机器选文件，需要目标节点声明对应的管理能力。
+  $: managedFilesSupported = remoteMode && !!node?.capabilities.includes(REMOTE_FILES_CAPABILITY);
   $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
   $: mobileTargets = node ? [{
     node_id: node.node_id,
@@ -174,12 +186,13 @@
   } satisfies PeerInfo, ...peers] : peers;
 
   function failureRetryable(progress: TransferProgress): boolean {
-    if (progress.direction !== 'send') return false;
+    // 服务端刷新回来的进度可能没有方向，按 offer 的来源节点判断归属即可。
+    if (progress.direction === 'receive') return false;
     if (pendingUploads.has(progress.transfer_id) || pendingMobileUploads.has(progress.transfer_id)) return true;
-    // 原生发送的源文件由本机节点持有，可以按接收端的重试语义续传；
-    // 本地建单失败（节点上没有记录）时不给无效的重试入口。
+    // 节点驱动的发送由源文件所在节点持有任务，可以按接收端的重试语义续传；
+    // 建单失败（节点上没有记录）时不给无效的重试入口。
     return !isWeb
-      && progress.offer?.source_node_id === localNodeId
+      && progress.offer?.source_node_id === node?.node_id
       && transfers.some((item) => item.transfer_id === progress.transfer_id);
   }
 
@@ -369,6 +382,7 @@
           updateProxy = (await invoke<string | null>('update_proxy').catch(() => null)) ?? '';
           clipboardHistorySettings = await invoke<ClipboardHistorySettings>('clipboard_history_settings').catch(() => clipboardHistorySettings);
           receiveSettings = await invoke<ReceiveSettings>('receive_settings').catch(() => receiveSettings);
+          remoteFileAccess = await invoke<boolean>('remote_file_access').catch(() => remoteFileAccess);
           clipboardStatus = await invoke<ClipboardStatus>('clipboard_status').catch(() => clipboardStatus);
         }
         if (isAndroidApp) void refreshAndroidReceiveStorage();
@@ -1134,11 +1148,23 @@
   }
 
   function startChoose(peer: PeerInfo, folder = false) {
+    // 远程管理页的发送由目标机器选文件；本机发送仍由系统对话框给出绝对路径。
+    if (remoteMode) {
+      if (!managedFilesSupported) {
+        showTransientNotice('目标节点不支持远程文件选择，请先升级目标节点', 6000);
+        return;
+      }
+      browsePeer = peer;
+      browseTransfer = null;
+      browseMode = 'send';
+      browseStartPath = '';
+      browseOpen = true;
+      return;
+    }
     selectedPeer = peer;
     selectedMobileSession = null;
     // 桌面端由系统对话框给出绝对路径，节点直接读原文件，不再复制一份。
-    // 远程管理页面发送仍走中继，由目标节点接收页面传入的文件流。
-    if (isDesktopWindow && !remoteMode) void pickAndSendPaths(peer, folder);
+    if (isDesktopWindow) void pickAndSendPaths(peer, folder);
     else if (folder) folderInput?.click();
     else fileInput?.click();
   }
@@ -1159,20 +1185,29 @@
   }
 
   /**
-   * 桌面端发送主路径：节点按原路径读取、计算摘要并上传，页面只轮询准备进度。
-   * 拖放仍走暂存复制（浏览器只提供 File 对象，拿不到绝对路径）。
+   * 节点侧按路径准备并发送：本机节点与远程管理目标共用准备行、轮询、取消和失败语义。
+   * 状态权威留在持有源文件的那台节点上，页面只展示。
    */
-  async function sendPathsThroughNode(peer: PeerInfo, paths: string[]) {
+  async function runPathsPrepare(
+    targetName: string,
+    api: {
+      create: () => Promise<OutgoingPrepareView>;
+      status: (transferId: string) => Promise<OutgoingPrepareView>;
+      cancel: (transferId: string) => Promise<unknown>;
+    },
+    doneNotice: string,
+  ) {
     let prepareId = '';
     const controller = new AbortController();
     try {
-      const view = await createOutgoingPaths(peer.node_id, paths);
+      const view = await api.create();
       prepareId = view.transfer_id;
       prepareControllers.set(prepareId, controller);
+      prepareCancels.set(prepareId, api.cancel);
       prepares = [
         {
           prepare_id: prepareId,
-          target_name: peer.node_name,
+          target_name: targetName,
           item_count: view.total_items,
           total_bytes: view.total_bytes,
           hashed_bytes: 0,
@@ -1182,22 +1217,95 @@
       ];
       while (!controller.signal.aborted) {
         await new Promise((resolve) => window.setTimeout(resolve, 600));
-        const status = await getOutgoingPrepare(prepareId).catch(() => null);
+        const status = await api.status(prepareId).catch(() => null);
         // 准备条目消失表示清单已发给接收端（或任务被取消）。
         if (!status) break;
         if (status.state === 'failed') throw new Error(status.error || '准备发送失败');
         updatePrepare(prepareId, status.hashed_bytes);
       }
       if (controller.signal.aborted) return;
-      showTransientNotice('已交给本机节点，等待接收端确认', 3600);
+      showTransientNotice(doneNotice, 3600);
       await refresh();
     } catch (error) {
-      if (prepareId) await cancelOutgoingStaging(prepareId).catch(() => undefined);
+      if (prepareId) await api.cancel(prepareId).catch(() => undefined);
       if (!isPrepareCancelled(error)) {
         showTransientNotice(error instanceof Error ? error.message : '无法发送文件', 6000);
       }
     } finally {
       if (prepareId) finishPrepare(prepareId);
+    }
+  }
+
+  /** 桌面端发送主路径：本机节点按原路径读取、计算摘要并上传。 */
+  async function sendPathsThroughNode(peer: PeerInfo, paths: string[]) {
+    await runPathsPrepare(
+      peer.node_name,
+      {
+        create: () => createOutgoingPaths(peer.node_id, paths),
+        status: (transferId) => getOutgoingPrepare(transferId),
+        cancel: (transferId) => cancelOutgoingStaging(transferId),
+      },
+      '已交给本机节点，等待接收端确认',
+    );
+  }
+
+  /** 远程管理页发送：目标机器读取自己磁盘上的文件并直接发给对端。 */
+  async function sendPathsThroughTarget(peer: PeerInfo, paths: string[]) {
+    await runPathsPrepare(
+      peer.node_name,
+      {
+        create: () => createManagedOutgoingPaths(peer.node_id, paths),
+        status: (transferId) => getManagedOutgoingPrepare(transferId),
+        cancel: (transferId) => cancelManagedOutgoingPrepare(transferId),
+      },
+      '已交给目标机器，等待接收端确认',
+    );
+  }
+
+  async function confirmBrowse(paths: string[]) {
+    const peer = browsePeer;
+    const transfer = browseTransfer;
+    const directory = browseMode === 'directory';
+    closeBrowse();
+    if (!paths.length) return;
+    if (directory) {
+      if (transfer) await acceptTransferAt(transfer, paths[0]);
+      return;
+    }
+    if (peer) await sendPathsThroughTarget(peer, paths);
+  }
+
+  function closeBrowse() {
+    browseOpen = false;
+    browseStartPath = '';
+    browsePeer = null;
+    browseTransfer = null;
+  }
+
+  /** 目标机器未开启远程文件访问时，接收目录仍可手输。 */
+  function requestManualAcceptPath() {
+    const transfer = browseTransfer;
+    closeBrowse();
+    if (!transfer) return;
+    const entered = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
+    const path = entered?.trim();
+    if (!path) {
+      showTransientNotice('需要输入目标节点上的接收目录', 6000);
+      return;
+    }
+    void acceptTransferAt(transfer, path);
+  }
+
+  async function setRemoteFileAccess(enabled: boolean) {
+    if (remoteFileAccessBusy) return;
+    remoteFileAccessBusy = true;
+    try {
+      remoteFileAccess = await invoke<boolean>('set_remote_file_access', { enabled });
+      showTransientNotice(enabled ? '已允许远程浏览本机文件，其他设备可从本机选择发送' : '已关闭远程文件访问');
+    } catch (error) {
+      showTransientNotice(error instanceof Error ? error.message : '无法更新远程文件访问', 6000);
+    } finally {
+      remoteFileAccessBusy = false;
     }
   }
 
@@ -1218,6 +1326,11 @@
   async function onDrop(peer: PeerInfo, event: DragEvent) {
     event.preventDefault();
     dragPeer = '';
+    // 远程管理页面的文件只存在于目标机器上，本机拖放会被静默当作另一条来源。
+    if (remoteMode) {
+      showTransientNotice('远程管理页面的发送从目标机器选择文件', 6000);
+      return;
+    }
     const files = event.dataTransfer ? await filesFromDataTransfer(event.dataTransfer) : [];
     if (files.length) await sendFiles(peer, files);
   }
@@ -1225,6 +1338,10 @@
   async function onDropMobile(session: MobileSession, event: DragEvent) {
     event.preventDefault();
     dragPeer = '';
+    if (remoteMode) {
+      showTransientNotice('远程管理页面的发送从目标机器选择文件', 6000);
+      return;
+    }
     const files = event.dataTransfer ? await filesFromDataTransfer(event.dataTransfer) : [];
     if (files.length) await sendFilesToMobile(session, files);
   }
@@ -1357,7 +1474,7 @@
 
   function transferCandidates(route: TransferRoute): string[] {
     const peer = peers.find((candidate) => candidate.node_id === route.nodeId) ?? route.peer;
-    return [...new Set([route.target, ...(!route.relay && peer ? targetCandidates(peer) : [])])];
+    return [...new Set([route.target, ...(peer ? targetCandidates(peer) : [])])];
   }
 
   async function onTransferRoute<T>(route: TransferRoute, perform: (base: string) => Promise<T>): Promise<T> {
@@ -1392,7 +1509,7 @@
 
   async function createTransferOnCandidates(offer: TransferOffer, route: TransferRoute): Promise<TransferProgress> {
     const post = (base: string) => requestWithTimeout<TransferProgress>(
-      route.relay ? '/api/v1/relay/transfers' : '/api/v1/transfers',
+      '/api/v1/transfers',
       { method: 'POST', body: JSON.stringify(offer) },
       base,
     );
@@ -1528,7 +1645,7 @@
         );
         if (info.node_id !== remoteTarget.node_id) continue;
         for (const pending of pendingUploads.values()) {
-          if (pending.relay && pending.nodeId === remoteTarget.node_id) pending.target = candidate;
+          if (pending.nodeId === remoteTarget.node_id) pending.target = candidate;
         }
         await applyTargetContext(candidate, remoteTarget);
         return true;
@@ -1550,13 +1667,15 @@
 
   function finishPrepare(prepareId: string) {
     prepareControllers.delete(prepareId);
+    prepareCancels.delete(prepareId);
     prepares = prepares.filter((item) => item.prepare_id !== prepareId);
   }
 
   function cancelPrepare(prepareId: string) {
     prepareControllers.get(prepareId)?.abort();
-    // 取消同时通知节点：准备中的路径任务或已写入的暂存都要清理。
-    void cancelOutgoingStaging(prepareId).catch(() => undefined);
+    // 取消同时通知创建者：准备中的路径任务或已写入的暂存都要清理。
+    const cancel = prepareCancels.get(prepareId) ?? cancelOutgoingStaging;
+    void cancel(prepareId).catch(() => undefined);
     finishPrepare(prepareId);
   }
 
@@ -1643,7 +1762,12 @@
   }
 
   async function sendFiles(peer: PeerInfo, files: File[]) {
-    if (isNativeSender && !remoteMode) await sendFilesThroughNode(peer, files);
+    // 远程管理页面的发送由目标机器读取文件，本机不再提供文件来源。
+    if (remoteMode) {
+      showTransientNotice('远程管理页面的发送从目标机器选择文件', 6000);
+      return;
+    }
+    if (isNativeSender) await sendFilesThroughNode(peer, files);
     else await sendFilesFromPage(peer, files);
   }
 
@@ -1751,14 +1875,9 @@
   }
 
   async function sendFilesFromPage(peer: PeerInfo, files: File[]) {
-    const relay = remoteMode;
     const source = node;
     const generation = targetGeneration;
-    if (relay && !peer.capabilities.includes(TRANSFER_RELAY_CAPABILITY)) {
-      showTransientNotice('目标节点不支持远程文件中继，请先升级目标节点', 6000);
-      return;
-    }
-    const candidates = relay ? [activeBaseUrl] : targetCandidates(peer);
+    const candidates = targetCandidates(peer);
     if (!candidates[0] || !source) {
       showTransientNotice('目标设备没有可访问地址', 6000);
       return;
@@ -1776,15 +1895,13 @@
         total_bytes: items.reduce((sum, item) => sum + item.size, 0),
         created_at_ms: Date.now(),
       };
-      const localProgress = relay
-        ? undefined
-        : await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
+      const localProgress = await invoke<TransferProgress>('register_outgoing_transfer', { offer }).catch(() => undefined);
       if (localProgress?.status === 'failed') {
         observeFailure({ ...localProgress, offer, direction: 'send' });
         throw new Error(localProgress.error ?? '传输任务数量已达到上限');
       }
       try {
-        const pending: PendingUpload = { target: candidates[0], nodeId: relay ? source.node_id : peer.node_id, peer, files, items, offer, relay };
+        const pending: PendingUpload = { target: candidates[0], nodeId: peer.node_id, peer, files, items, offer };
         const created = await createTransferOnCandidates(offer, pending);
         if (created.status === 'failed') {
           throw new Error(created.error ?? '无法创建传输');
@@ -2047,7 +2164,7 @@
           watching.delete(id);
           return;
         }
-        if (!route.relay) void invoke('update_transfer_progress', { progress }).catch(() => undefined);
+        void invoke('update_transfer_progress', { progress }).catch(() => undefined);
         const existing = transfers.find((item) => item.transfer_id === id);
         const nextProgress = existing && shouldKeepTransferProgress(existing, progress)
           ? { ...progress, ...existing, offer: progress.offer ?? existing.offer }
@@ -2078,7 +2195,7 @@
         const file = pending.files.find((candidate) => ((candidate as File & { webkitRelativePath?: string }).webkitRelativePath || candidate.name) === item.relative_path) ?? pending.files[pending.items.indexOf(item)];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
         await onTransferRoute(pending, (base) => uploadFileWithRetry(
-          `${base}${pending.relay ? '/api/v1/relay/transfers' : '/api/v1/transfers'}/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
+          `${base}/api/v1/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
           file,
           item.media_type,
         ));
@@ -2092,9 +2209,7 @@
       if (attempts >= DESKTOP_UPLOAD_MAX_ATTEMPTS) {
         uploadStopped.add(id);
         const failed = `${message}，已停止重试`;
-        const failPath = pending.relay
-          ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/fail`
-          : `/api/v1/transfers/${encodeURIComponent(id)}/fail`;
+        const failPath = `/api/v1/transfers/${encodeURIComponent(id)}/fail`;
         await onTransferRoute(pending, (base) => requestWithTimeout(
           failPath, { method: 'POST', body: JSON.stringify({ error: failed }) }, base,
         )).catch(() => undefined);
@@ -2118,9 +2233,7 @@
     if (pending) {
       transferActionBusy = id;
       try {
-        const path = pending.relay
-          ? `/api/v1/relay/transfers/${encodeURIComponent(id)}/retry`
-          : `/api/v1/transfers/${encodeURIComponent(id)}/retry`;
+        const path = `/api/v1/transfers/${encodeURIComponent(id)}/retry`;
         const retried = await onTransferRoute(pending, (base) => requestWithTimeout<TransferProgress>(path, { method: 'POST' }, base));
         uploadAttempts.delete(id);
         uploadStopped.delete(id);
@@ -2134,8 +2247,9 @@
       }
       return;
     }
-    if (!isWeb && failure.progress.offer?.source_node_id === localNodeId) {
-      const offer = failure.progress.offer;
+    const failureOffer = failure.progress.offer;
+    if (!isWeb && failureOffer && failureOffer.source_node_id === node?.node_id) {
+      const offer = failureOffer;
       const peer = peers.find((item) => item.node_id === offer.target_node_id);
       const target = peer ? targetBase(peer) : null;
       if (!peer || !target) {
@@ -2144,8 +2258,8 @@
       }
       transferActionBusy = id;
       try {
-        // 源文件暂存在本机节点上，按接收端的重试语义重新打开任务后由节点续传。
-        await onTransferRoute({ target, nodeId: peer.node_id, relay: false, peer }, (base) =>
+        // 源文件仍由持有任务的节点保留，按接收端的重试语义重新打开任务后由该节点续传。
+        await onTransferRoute({ target, nodeId: peer.node_id, peer }, (base) =>
           requestWithTimeout<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/retry`, { method: 'POST' }, base),
         );
         failures = failures.filter((item) => item.progress.transfer_id !== id);
@@ -2373,12 +2487,27 @@
 
   async function acceptTransfer(transfer: TransferProgress) {
     if (!transfer.offer || transferActionBusy) return;
+    if (remoteMode) {
+      if (!managedFilesSupported) {
+        const entered = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
+        const path = entered?.trim();
+        if (!path) {
+          showTransientNotice('需要输入目标节点上的接收目录', 6000);
+          return;
+        }
+        await acceptTransferAt(transfer, path);
+        return;
+      }
+      browseTransfer = transfer;
+      browsePeer = null;
+      browseMode = 'directory';
+      browseStartPath = receiveSettings.default_path ?? '';
+      browseOpen = true;
+      return;
+    }
     let destination: string | string[] | null = null;
     let path: string | undefined;
-    if (remoteMode) {
-      const remoteDirectory = window.prompt('输入目标节点上的接收目录', receiveSettings.default_path ?? '');
-      path = remoteDirectory?.trim() || undefined;
-    } else if (isAndroidApp) {
+    if (isAndroidApp) {
       try {
         path = await invoke<string>('android_receive_directory');
       } catch (error) {
@@ -2394,9 +2523,15 @@
       path = Array.isArray(destination) ? destination[0] : destination ?? undefined;
     }
     if (!path) {
-      showTransientNotice(remoteMode ? '需要输入目标节点上的接收目录' : '当前环境无法选择接收目录', 6000);
+      showTransientNotice('当前环境无法选择接收目录', 6000);
       return;
     }
+    await acceptTransferAt(transfer, path);
+  }
+
+  /** 接收目录确定后提交接受；远程目标的目录存在性与权限由目标节点校验。 */
+  async function acceptTransferAt(transfer: TransferProgress, path: string) {
+    if (transferActionBusy) return;
     transferActionBusy = transfer.transfer_id;
     try {
       if (remoteMode) {
@@ -2411,7 +2546,7 @@
         isAndroidApp && !remoteMode
           ? '已接受，文件将保存到 MeshShare 应用目录'
           : remoteMode
-            ? '已接受，等待接入节点流式转发'
+            ? '已接受，等待目标机器发送文件'
             : '已接受，等待文件直传',
         3600,
       );
@@ -2543,6 +2678,7 @@
         onDragLeave={(key) => { if (dragPeer === key) dragPeer = ''; }}
         onDropPeer={onDrop}
         onDropMobile={onDropMobile}
+        allowFolderSend={!remoteMode}
       />
       <HardwarePanel
         metrics={metrics}
@@ -2578,6 +2714,8 @@
       receiveBusy={receiveSettingsBusy}
       historySettings={clipboardHistorySettings}
       historyBusy={clipboardHistorySettingsBusy}
+      {remoteFileAccess}
+      {remoteFileAccessBusy}
       onFrequency={setUpdateFrequency}
       onCheckUpdates={checkForUpdates}
       onUpdateProxy={setUpdateProxy}
@@ -2585,6 +2723,7 @@
       onChooseDirectory={chooseReceiveDirectory}
       onHistoryMode={setClipboardHistoryMode}
       onHistoryValue={setClipboardHistoryValue}
+      onRemoteFileAccess={setRemoteFileAccess}
       onClose={() => (settingsOpen = false)}
     />
 
@@ -2611,6 +2750,15 @@
       open={metricsPeerOpen && !!selectedMetricsPeer}
       peer={selectedMetricsPeer}
       onClose={() => (metricsPeerOpen = false)}
+    />
+    <RemoteFileBrowser
+      open={browseOpen}
+      mode={browseMode}
+      targetLabel={remoteTarget?.node_name ?? ''}
+      startPath={browseStartPath}
+      onConfirm={confirmBrowse}
+      onFallback={browseMode === 'directory' ? requestManualAcceptPath : null}
+      onClose={closeBrowse}
     />
     <ConfirmDialog
       open={clearHistoryOpen}

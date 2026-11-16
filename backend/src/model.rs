@@ -16,7 +16,7 @@ pub const METRICS_NETWORK_CAPABILITY: &str = "metrics.network";
 pub const METRICS_SYSTEM_VIEW_CAPABILITY: &str = "metrics.view.system";
 pub const METRICS_GPU_VIEW_CAPABILITY: &str = "metrics.view.gpu";
 pub const REMOTE_MANAGEMENT_CAPABILITY: &str = "management.remote.v1";
-pub const TRANSFER_RELAY_CAPABILITY: &str = "transfer.relay.v1";
+pub const REMOTE_FILES_CAPABILITY: &str = "management.files.v1";
 pub const METRICS_STALE_AFTER_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

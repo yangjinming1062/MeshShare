@@ -36,11 +36,11 @@
 | `POST` | `/api/v1/outgoing/{id}/cancel` | 取消暂存并清理暂存目录（仅本机回环） |
 | `POST` | `/api/v1/outgoing/paths` | 桌面端把选中的文件与文件夹路径交给本机节点，节点按原路径读取并计算摘要（仅本机回环） |
 | `GET` | `/api/v1/outgoing/{id}` | 查询原路径发送的准备进度；准备结束或被取消后返回 404（仅本机回环） |
-| `POST` | `/api/v1/relay/transfers` | 远程管理界面在目标节点创建由目标节点拥有的发送任务 |
-| `PUT` | `/api/v1/relay/transfers/{id}/items/{item_id}` | 远程管理界面把文件流交给目标节点，再由目标节点转发给其 peer |
-| `POST` | `/api/v1/relay/transfers/{id}/cancel` | 取消目标节点拥有的中继发送任务并通知目标 peer |
-| `POST` | `/api/v1/relay/transfers/{id}/fail` | 中继发送端重试耗尽后标记失败并通知目标 peer |
-| `POST` | `/api/v1/relay/transfers/{id}/retry` | 重新打开中继失败任务并通知目标 peer |
+| `GET` | `/api/v1/management/files/roots` | 远程管理页读取目标机器可浏览的起始位置（需目标机器开启远程文件访问） |
+| `GET` | `/api/v1/management/files?path=...` | 列出目标机器目录的一层内容，只返回名称、类型、大小和时间（需目标机器开启远程文件访问） |
+| `POST` | `/api/v1/management/outgoing/paths` | 用目标机器上的绝对路径建立发送任务，文件由目标节点读取并直传（需目标机器开启远程文件访问） |
+| `GET` | `/api/v1/management/outgoing/{id}` | 查询远程触发的准备进度；结束或取消后返回 404（需目标机器开启远程文件访问） |
+| `POST` | `/api/v1/management/outgoing/{id}/cancel` | 取消远程触发的准备任务（需目标机器开启远程文件访问） |
 | `POST` | `/api/v1/mobile/sessions` | 创建网页接收会话 |
 | `GET` | `/api/v1/mobile/sessions` | 查询本机活跃网页会话 |
 | `POST` | `/api/v1/mobile/transfers` | 为网页会话创建待下载清单 |
@@ -62,7 +62,7 @@
 
 桌面主窗口可以直接连接在线节点的 HTTP 和 WebSocket 地址，在同一窗口切换管理目标。目标节点通过 `NodeInfo.capabilities` 声明远程管理能力；缺少能力标记或返回接口不存在时，界面保留本机上下文并提示目标节点需要升级。远程管理继续沿用受信任私网和 Tailscale 网络的无账号模型，不应通过端口转发暴露到互联网。
 
-远程管理目标应声明 `management.remote.v1`；目标节点的远程文件中继还需声明 `transfer.relay.v1`。中继创建请求中的 `source_node_id` 必须是目标节点自身，`target_node_id` 必须是目标节点已连接的 peer；目标节点先通过现有 WebSocket 发送清单，目标设备接受后才转发文件流，并沿用普通传输的路径、哈希、状态和取消校验。
+远程管理目标应声明 `management.remote.v1`；远程文件选择还需声明 `management.files.v1`。管理接口只返回目标机器上的目录元数据，路径发送请求里的 `target_node_id` 必须是目标节点已连接的 peer，发送源固定为目标节点自身；目标节点按原路径枚举、计算摘要后通过现有 WebSocket 发送清单，并沿用普通传输的路径、哈希、状态和取消校验，管理端不接触文件内容。这组接口只在目标机器本机设置 `remote_file_access` 开启时可用，关闭时统一返回 403；该设置不出现在 `GET/PATCH /api/v1/settings` 中，只能经目标机器本机界面修改。路径由目标节点规范化与校验，相对路径和不可访问路径分别返回 400 与 404。
 
 ## WebSocket 消息
 

@@ -1,5 +1,6 @@
 <script lang="ts">
   import Dialog from './Dialog.svelte';
+  import TogglePill from './TogglePill.svelte';
   import { clipboardHistoryRetentionLabel, updateStatusLabel } from '../format';
   import type {
     ClipboardHistoryMode,
@@ -24,6 +25,8 @@
   export let receiveBusy = false;
   export let historySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
   export let historyBusy = false;
+  export let remoteFileAccess = false;
+  export let remoteFileAccessBusy = false;
   export let onFrequency: (value: UpdateFrequency) => void = () => {};
   export let onCheckUpdates: () => void = () => {};
   export let onUpdateProxy: (value: string) => void = () => {};
@@ -31,6 +34,7 @@
   export let onChooseDirectory: () => void = () => {};
   export let onHistoryMode: (value: ClipboardHistoryMode) => void = () => {};
   export let onHistoryValue: (value: number) => void = () => {};
+  export let onRemoteFileAccess: (value: boolean) => void = () => {};
   export let onClose: () => void = () => {};
 
   $: historyValue = historySettings.mode === 'count' ? historySettings.count : historySettings.days;
@@ -98,6 +102,26 @@
       </div>
     </div>
   </div>
+
+  {#if localMode}
+    <div class="setting-block">
+      <div class="setting">
+        <div class="setting-copy">
+          <strong>远程文件访问</strong>
+          <span>开启后，同一局域网或 Tailscale 网络中的其他设备可以在远程管理里浏览本机目录，并选择本机文件发给它们的目标；默认关闭。</span>
+        </div>
+        <div class="setting-actions">
+          <TogglePill
+            active={remoteFileAccess}
+            label="已允许"
+            pressedLabel="已关闭"
+            disabled={remoteFileAccessBusy}
+            onToggle={() => onRemoteFileAccess(!remoteFileAccess)}
+          />
+        </div>
+      </div>
+    </div>
+  {/if}
 
   <div class="setting-block">
     <div class="setting">

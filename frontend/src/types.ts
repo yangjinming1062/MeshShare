@@ -275,6 +275,33 @@ export type PhoneTransfer = TransferProgress & {
   retryableDownloadItemIds?: string[];
 };
 
+/** 远程管理页在目标机器上的目录浏览结果；路径都由目标节点规范化返回。 */
+export type BrowseRoot = {
+  label: string;
+  path: string;
+};
+
+export type BrowseRoots = {
+  home: string | null;
+  roots: BrowseRoot[];
+};
+
+export type BrowseEntry = {
+  name: string;
+  path: string;
+  directory: boolean;
+  symlink: boolean;
+  size: number;
+  modified_ms: number | null;
+};
+
+export type BrowseListing = {
+  path: string;
+  parent: string | null;
+  entries: BrowseEntry[];
+  truncated: boolean;
+};
+
 export type WireMessage =
   | { type: 'Hello'; payload: { node: NodeInfo } }
   | { type: 'Ping'; payload: { at_ms: number } }

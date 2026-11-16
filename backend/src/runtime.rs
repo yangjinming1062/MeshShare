@@ -9,7 +9,7 @@ use crate::model::{
     DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT,
     MAX_CLIPBOARD_HISTORY_DAYS, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
     METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
-    METRICS_SYSTEM_VIEW_CAPABILITY, REMOTE_MANAGEMENT_CAPABILITY, TRANSFER_RELAY_CAPABILITY,
+    METRICS_SYSTEM_VIEW_CAPABILITY, REMOTE_FILES_CAPABILITY, REMOTE_MANAGEMENT_CAPABILITY,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -129,6 +129,9 @@ struct PersistedConfig {
     /// Other platforms leave this unset and continue using the path field.
     #[serde(default)]
     receive_directory_bookmark: Option<Vec<u8>>,
+    /// 是否允许其他设备在远程管理中浏览本机目录并选择发送；默认关闭。
+    #[serde(default)]
+    remote_file_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,7 +313,7 @@ impl NodeProfile {
                 METRICS_GPU_CAPABILITY.to_string(),
                 METRICS_NETWORK_CAPABILITY.to_string(),
                 REMOTE_MANAGEMENT_CAPABILITY.to_string(),
-                TRANSFER_RELAY_CAPABILITY.to_string(),
+                REMOTE_FILES_CAPABILITY.to_string(),
             ],
             Self::Android => vec![
                 "transfer.file".to_string(),
@@ -1101,6 +1104,19 @@ impl NodeRuntime {
         let mut config = self.config.lock();
         let mut next = config.clone();
         next.autostart_enabled = enabled;
+        persist_config(&self.data_dir, &next)?;
+        *config = next;
+        Ok(())
+    }
+
+    pub fn remote_file_access(&self) -> bool {
+        self.config.lock().remote_file_access
+    }
+
+    pub fn set_remote_file_access(&self, enabled: bool) -> anyhow::Result<()> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        next.remote_file_access = enabled;
         persist_config(&self.data_dir, &next)?;
         *config = next;
         Ok(())
@@ -3357,6 +3373,7 @@ fn load_or_create_config_with_hostname(
         clipboard_history_count: default_clipboard_history_count(),
         clipboard_history_days: default_clipboard_history_days(),
         receive_mode: default_receive_mode(),
+        remote_file_access: false,
         receive_directory: None,
         receive_directory_bookmark: None,
     };
@@ -3376,7 +3393,7 @@ fn activate_receive_directory_access(config: &PersistedConfig) -> Option<PathBuf
     }
 }
 
-fn file_modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
+pub(crate) fn file_modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
     metadata
         .modified()
         .ok()

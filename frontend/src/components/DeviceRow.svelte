@@ -15,6 +15,7 @@
   export let onDetails: () => void = () => {};
   export let onOpen: () => void = () => {};
   export let allowOpen = false;
+  export let allowFolderSend = true;
   export let onDragOver: () => void = () => {};
   export let onDragLeave: () => void = () => {};
   export let onDropFile: (event: DragEvent) => void = () => {};
@@ -105,9 +106,11 @@
       <Icon name="send" size={13} />
       发送
     </button>
-    <button type="button" class="btn-icon" aria-label={'向 ' + name + ' 发送文件夹'} title="发送文件夹" on:click={onSendFolder}>
-      <Icon name="folder" size={16} />
-    </button>
+    {#if allowFolderSend}
+      <button type="button" class="btn-icon" aria-label={'向 ' + name + ' 发送文件夹'} title="发送文件夹" on:click={onSendFolder}>
+        <Icon name="folder" size={16} />
+      </button>
+    {/if}
   </div>
   {#if dragging}
     <div class="drop-hint" aria-hidden="true">松开即可发送</div>

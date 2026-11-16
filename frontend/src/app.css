@@ -231,6 +231,20 @@ button.device-metrics:hover { background: var(--surface-2); }
 .sheet-head h2 { margin-right: auto; font-size: 15px; font-weight: 650; }
 .sheet-body { max-height: min(62vh, 520px); display: grid; gap: 14px; padding: 14px; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 .sheet-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); }
+.browse { display: grid; gap: 10px; min-height: 0; }
+.browse-bar { display: flex; align-items: center; gap: 8px; }
+.browse-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); font-size: 11px; }
+.browse-roots { display: flex; flex-wrap: wrap; gap: 6px; }
+.browse-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; max-height: min(44vh, 380px); overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.browse-row { display: flex; align-items: center; gap: 6px; border: 1px solid transparent; border-radius: var(--r-sm); }
+.browse-row:hover { border-color: var(--line); background: var(--surface-2); }
+.browse-row.selected { border-color: var(--primary); background: var(--primary-soft); }
+.browse-pick { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--r-sm); color: var(--ink-2); font-size: 12px; text-align: left; }
+.browse-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browse-check { display: inline-grid; place-items: center; width: 15px; height: 15px; border: 1px solid var(--line-strong); border-radius: 4px; color: var(--primary); font-size: 10px; font-weight: 700; }
+.browse-row.selected .browse-check { border-color: var(--primary); background: var(--primary); color: #fff; }
+.browse-empty { padding: 18px 12px; color: var(--muted); font-size: 12px; text-align: center; }
+.browse-error { color: var(--danger); font-size: 12px; overflow-wrap: anywhere; }
 
 .qr-wrap { display: grid; place-items: center; }
 .qr { width: 180px; height: 180px; padding: 8px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }

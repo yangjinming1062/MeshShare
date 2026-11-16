@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferOffer, TransferProgress, TransferStatus } from './types';
+import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferOffer, TransferProgress, TransferStatus } from './types';
 
 let baseUrl = '';
 
@@ -94,6 +94,13 @@ export const createOutgoingStaging = (offer: TransferOffer, target = baseUrl) =>
 /** 桌面端按原路径直传：节点枚举、计算摘要后自己发送清单。 */
 export const createOutgoingPaths = (targetNodeId: string, paths: string[], target = baseUrl) => request<OutgoingPrepareView>('/api/v1/outgoing/paths', { method: 'POST', body: JSON.stringify({ target_node_id: targetNodeId, paths }) }, target);
 export const getOutgoingPrepare = (transferId: string, target = baseUrl) => request<OutgoingPrepareView>(`/api/v1/outgoing/${encodeURIComponent(transferId)}`, {}, target);
+/** 远程管理页浏览目标机器目录：只读元数据，需要目标机器开启远程文件访问。 */
+export const getManagedRoots = (target = baseUrl) => request<BrowseRoots>('/api/v1/management/files/roots', {}, target);
+export const browseManagedPath = (path: string, target = baseUrl) => request<BrowseListing>(`/api/v1/management/files?path=${encodeURIComponent(path)}`, {}, target);
+/** 远程管理页按目标机器上的路径建立发送任务，文件由目标机器读取并直传。 */
+export const createManagedOutgoingPaths = (targetNodeId: string, paths: string[], target = baseUrl) => request<OutgoingPrepareView>('/api/v1/management/outgoing/paths', { method: 'POST', body: JSON.stringify({ target_node_id: targetNodeId, paths }) }, target);
+export const getManagedOutgoingPrepare = (transferId: string, target = baseUrl) => request<OutgoingPrepareView>(`/api/v1/management/outgoing/${encodeURIComponent(transferId)}`, {}, target);
+export const cancelManagedOutgoingPrepare = (transferId: string, target = baseUrl) => request<unknown>(`/api/v1/management/outgoing/${encodeURIComponent(transferId)}/cancel`, { method: 'POST' }, target);
 export const startOutgoingStaging = (transferId: string, target = baseUrl) => request<TransferProgress>(`/api/v1/outgoing/${encodeURIComponent(transferId)}/start`, { method: 'POST' }, target);
 export const cancelOutgoingStaging = (transferId: string, target = baseUrl) => request<unknown>(`/api/v1/outgoing/${encodeURIComponent(transferId)}/cancel`, { method: 'POST' }, target);
 export const completeMobileItem = (transferId: string, itemId: string, sessionId: string, target = baseUrl) => request<MobileTransferView>(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/complete`, { method: 'POST', body: JSON.stringify({ session_id: sessionId }) }, target);

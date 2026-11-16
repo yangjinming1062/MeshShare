@@ -21,6 +21,7 @@
   export let onDetails: (peer: PeerInfo) => void = () => {};
   export let onOpenPeer: (peer: PeerInfo) => void = () => {};
   export let allowOpen = true;
+  export let allowFolderSend = true;
   export let onSendMobile: (session: MobileSession) => void = () => {};
   export let onSendMobileFolder: (session: MobileSession) => void = () => {};
   export let onDragEnter: (key: string) => void = () => {};
@@ -83,6 +84,7 @@
           onDetails={() => onDetails(peer)}
           onOpen={() => onOpenPeer(peer)}
           {allowOpen}
+          {allowFolderSend}
           onDragOver={() => onDragEnter('peer:' + peer.node_id)}
           onDragLeave={() => onDragLeave('peer:' + peer.node_id)}
           onDropFile={(event) => onDropPeer(peer, event)}

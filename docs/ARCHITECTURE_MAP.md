@@ -22,6 +22,8 @@ sequenceDiagram
   participant B as 目标节点 B
   U->>A: 点击设备图标/名称
   U->>B: GET /api/v1/info、/settings、/peers、/metrics
+  U->>B: GET /api/v1/management/files 浏览目标目录
+  U->>B: POST /api/v1/management/outgoing/paths 按目标路径发送
   U->>B: 连接 /api/v1/ws
   B-->>U: 目标节点状态和事件
   U->>B: PATCH /api/v1/settings 或执行目标传输操作
@@ -31,7 +33,7 @@ sequenceDiagram
 
 远程窗口切换只改变 UI 的目标上下文，不转移状态权威，也不累计层级：切换目标直接替换，返回按钮或目标设备列表中的本机节点都回到 A。返回本机时重新使用 A 的本地 API 和 Tauri 命令。目标节点更新或重启后，窗口保留目标标识并恢复轮询和 WebSocket。
 
-远程发送文件时，管理端把清单和文件流提交给 B 的中继接口；B 以自身身份向选定 peer 发送清单，接受后把流转发到 peer，并由 B 保留传输状态。
+远程发送文件时，管理端先通过 B 的目录接口浏览并选择 B 上的文件；B 按路径读取原文件、计算摘要，以自身身份向选定 peer 发送清单并在接受后上传，管理端只轮询准备和传输状态。浏览与路径发送要求 B 本机开启远程文件访问，开关只在本机界面修改。
 
 ## 硬件指标同步
 
