@@ -235,6 +235,29 @@ export type TransferFailure = {
   retryable: boolean;
 };
 
+/** 已结束传输的摘要记录，由节点持久化保存。 */
+export type TransferHistoryEntry = {
+  transfer_id: string;
+  direction: 'send' | 'receive';
+  peer_node_id: string;
+  peer_name: string;
+  status: TransferStatus;
+  completed_bytes: number;
+  total_bytes: number;
+  completed_items: number;
+  total_items: number;
+  source_paths?: string[];
+  destination?: string;
+  error?: string;
+  retry_count?: number;
+  session_id?: string;
+  finished_at_ms: number;
+};
+
+export type TransferHistoryCleared = {
+  cleared: number;
+};
+
 /** 发送前的本地准备态：先算摘要，再把源文件交给本机节点暂存。 */
 export type TransferPrepare = {
   prepare_id: string;
@@ -311,4 +334,5 @@ export type WireMessage =
   | { type: 'TransferOffer'; payload: { offer: TransferOffer } }
   | { type: 'TransferAction'; payload: { transfer_id: string; action: string; reason?: string; retry_count?: number } }
   | { type: 'TransferProgress'; payload: { progress: TransferProgress } }
-  | { type: 'MetricsUpdate'; payload: { metrics: HardwareMetrics } };
+  | { type: 'MetricsUpdate'; payload: { metrics: HardwareMetrics } }
+  | { type: 'TransferHistoryDeleted'; payload: { transfer_ids: string[] } };

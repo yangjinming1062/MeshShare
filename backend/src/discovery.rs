@@ -424,6 +424,9 @@ async fn run_peer_session(
             }
             _ = clipboard_resync.tick() => {
                 let _ = runtime.flush_clipboard_resync(node_id);
+                if received_hello {
+                    let _ = runtime.flush_history_deletions(node_id);
+                }
             }
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break };
@@ -466,6 +469,8 @@ async fn run_peer_session(
                                     }
                                 }
                                 server::replay_active_offers(runtime, node_id).await;
+                                // 对端离线期间排队的传输历史删除，在 Hello 之后补发。
+                                let _ = runtime.flush_history_deletions(node_id);
                             }
                         }
                     }

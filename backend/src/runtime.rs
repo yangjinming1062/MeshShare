@@ -4,12 +4,14 @@ use crate::model::{
     ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSession,
     ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession,
     MobileTransferView, MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings,
-    TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
-    CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY,
+    TransferHistoryEntry, TransferItem, TransferOffer, TransferProgress, TransferStatus,
+    WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY,
     DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT,
-    MAX_CLIPBOARD_HISTORY_DAYS, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
+    MAX_CLIPBOARD_HISTORY_DAYS, MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS,
+    MAX_TRANSFER_HISTORY_PATHS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
     METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
     METRICS_SYSTEM_VIEW_CAPABILITY, REMOTE_FILES_CAPABILITY, REMOTE_MANAGEMENT_CAPABILITY,
+    TRANSFER_HISTORY_CAPABILITY, TRANSFER_HISTORY_LIMIT,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use parking_lot::{Mutex, RwLock};
@@ -188,6 +190,7 @@ enum OutgoingPrepareState {
 struct OutgoingPrepare {
     target_node_id: String,
     sources: Vec<PreparedSource>,
+    source_roots: Vec<String>,
     total_bytes: u64,
     hashed_bytes: u64,
     items_ready: usize,
@@ -213,7 +216,27 @@ pub struct TransferRecord {
     pub progress: TransferProgress,
     pub accepted_destination: Option<PathBuf>,
     pub received_items: HashSet<String>,
+    /// 创建时快照的对端显示名。对端随后离线时历史仍能显示设备名。
+    pub peer_name: Option<String>,
+    /// 发送方向用户选择的根路径；接收与暂存发送为空。
+    pub source_paths: Vec<String>,
     pub updated_at_ms: i64,
+}
+
+/// 传输历史与尚未送达对端的同步删除。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TransferHistoryStore {
+    #[serde(default)]
+    entries: Vec<TransferHistoryEntry>,
+    #[serde(default)]
+    pending_deletions: HashMap<String, Vec<String>>,
+}
+
+/// 清空历史的返回值：本地删除条数，以及需要同步给对端的 id 分组。
+#[derive(Debug, Clone)]
+pub struct TransferHistoryCleared {
+    pub cleared: usize,
+    pub peer_batches: Vec<(String, Vec<String>)>,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +303,8 @@ pub struct NodeRuntime {
     /// 上传用客户端不设整体超时：单个大文件允许长时间传输。
     upload_http: reqwest::Client,
     transfer_update_gate: Mutex<()>,
+    /// 最近 10 条终态传输的摘要，以及等待对端重连后补发的删除。
+    transfer_history: Mutex<TransferHistoryStore>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +339,7 @@ impl NodeProfile {
                 METRICS_NETWORK_CAPABILITY.to_string(),
                 REMOTE_MANAGEMENT_CAPABILITY.to_string(),
                 REMOTE_FILES_CAPABILITY.to_string(),
+                TRANSFER_HISTORY_CAPABILITY.to_string(),
             ],
             Self::Android => vec![
                 "transfer.file".to_string(),
@@ -322,6 +348,7 @@ impl NodeProfile {
                 METRICS_NETWORK_CAPABILITY.to_string(),
                 METRICS_SYSTEM_VIEW_CAPABILITY.to_string(),
                 METRICS_GPU_VIEW_CAPABILITY.to_string(),
+                TRANSFER_HISTORY_CAPABILITY.to_string(),
             ],
         }
     }
@@ -374,6 +401,8 @@ const CLIPBOARD_PAYLOAD_DIR: &str = "clipboard-history-payloads";
 const CLIPBOARD_HISTORY_PREVIEW_BYTES: usize = 256;
 const CLIPBOARD_DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_CLIPBOARD_HISTORY_BYTES: u64 = 512 * 1024 * 1024;
+const TRANSFER_HISTORY_FILE: &str = "transfer-history.json";
+const MAX_PENDING_HISTORY_DELETIONS_PER_PEER: usize = MAX_HISTORY_DELETE_BATCH;
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
     let mut downloaded_item_ids = record.downloaded_items.iter().cloned().collect::<Vec<_>>();
@@ -400,6 +429,28 @@ fn is_active_transfer(status: &TransferStatus) -> bool {
             | TransferStatus::Uploading
             | TransferStatus::Ready
     )
+}
+
+fn is_terminal_transfer(status: &TransferStatus) -> bool {
+    matches!(
+        status,
+        TransferStatus::Completed
+            | TransferStatus::Rejected
+            | TransferStatus::Failed
+            | TransferStatus::Cancelled
+    )
+}
+
+pub(crate) fn valid_history_delete_ids(ids: &[String]) -> bool {
+    !ids.is_empty()
+        && ids.len() <= MAX_HISTORY_DELETE_BATCH
+        && ids
+            .iter()
+            .all(|id| !id.trim().is_empty() && id.len() <= 256)
+}
+
+fn short_node_id(node_id: &str) -> String {
+    node_id.chars().take(8).collect()
 }
 
 fn mobile_manifest_size(offer: &TransferOffer) -> u64 {
@@ -500,6 +551,7 @@ impl NodeRuntime {
             clipboard: RwLock::new(clipboard),
             clipboard_status: RwLock::new(ClipboardStatus::default()),
             clipboard_history: Mutex::new(clipboard_history),
+            transfer_history: Mutex::new(load_transfer_history(&data_dir)),
             peers: RwLock::new(HashMap::new()),
             transfers: RwLock::new(HashMap::new()),
             mobile_sessions: RwLock::new(HashMap::new()),
@@ -1632,6 +1684,8 @@ impl NodeRuntime {
                 progress: progress.clone(),
                 accepted_destination,
                 received_items: HashSet::new(),
+                peer_name: Some(offer.source_name.clone()),
+                source_paths: Vec::new(),
                 updated_at_ms: now_millis(),
             },
         );
@@ -1645,6 +1699,7 @@ impl NodeRuntime {
     }
 
     pub fn add_outgoing_transfer(&self, offer: TransferOffer) -> TransferProgress {
+        let peer_name = self.peer_display_name(&offer.target_node_id);
         let _update_gate = self.transfer_update_gate.lock();
         if self.update_installing.load(Ordering::SeqCst) {
             let mut failed = transfer_progress(&offer, "send");
@@ -1670,6 +1725,8 @@ impl NodeRuntime {
                 progress: progress.clone(),
                 accepted_destination: None,
                 received_items: HashSet::new(),
+                peer_name,
+                source_paths: Vec::new(),
                 updated_at_ms: now_millis(),
             },
         );
@@ -1737,7 +1794,7 @@ impl NodeRuntime {
         if paths.is_empty() || paths.len() > OUTGOING_PREPARE_MAX_SELECTION {
             return Err("需要选择 1 到 512 个文件或文件夹".to_string());
         }
-        let sources = expand_outgoing_paths(&paths)?;
+        let (sources, source_roots) = expand_outgoing_paths(&paths)?;
         if sources.is_empty() {
             return Err("选择的内容里没有可发送的文件".to_string());
         }
@@ -1754,6 +1811,7 @@ impl NodeRuntime {
                 OutgoingPrepare {
                     target_node_id,
                     sources,
+                    source_roots,
                     total_bytes,
                     hashed_bytes: 0,
                     items_ready: 0,
@@ -1776,6 +1834,14 @@ impl NodeRuntime {
             items_ready: 0,
             total_items,
         })
+    }
+
+    fn outgoing_prepare_source_roots(&self, transfer_id: &str) -> Vec<String> {
+        self.outgoing_prepares
+            .lock()
+            .get(transfer_id)
+            .map(|prepare| prepare.source_roots.clone())
+            .unwrap_or_default()
     }
 
     pub fn outgoing_prepare_view(&self, transfer_id: &str) -> Option<OutgoingPrepareView> {
@@ -1902,6 +1968,8 @@ impl NodeRuntime {
             return;
         }
         let progress = self.add_outgoing_transfer(offer.clone());
+        let source_roots = self.outgoing_prepare_source_roots(transfer_id);
+        self.set_transfer_source_paths(transfer_id, source_roots);
         if progress.status == TransferStatus::Failed {
             let message = progress
                 .error
@@ -2358,7 +2426,13 @@ impl NodeRuntime {
         } else {
             TransferStatus::Uploading
         };
-        Some(record.progress.clone())
+        let progress = record.progress.clone();
+        let snapshot = record.clone();
+        drop(transfers);
+        if progress.status == TransferStatus::Completed {
+            self.record_terminal_transfer(&snapshot);
+        }
+        Some(progress)
     }
 
     pub fn update_transfer(&self, transfer_id: &str, progress: TransferProgress) {
@@ -2366,17 +2440,35 @@ impl NodeRuntime {
         if is_active_transfer(&progress.status) && self.update_installing.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(record) = self.transfers.write().get_mut(transfer_id) {
-            let mut progress = progress;
-            progress.offer = Some(record.offer.clone());
-            progress.direction = if record.progress.direction.as_deref() == Some("send") {
-                Some("send".to_string())
+        let snapshot = {
+            let mut transfers = self.transfers.write();
+            transfers.get_mut(transfer_id).map(|record| {
+                let was_terminal = is_terminal_transfer(&record.progress.status);
+                let mut next = progress.clone();
+                next.offer = Some(record.offer.clone());
+                next.direction = if record.progress.direction.as_deref() == Some("send") {
+                    Some("send".to_string())
+                } else {
+                    record.progress.direction.clone()
+                };
+                record.progress = next;
+                record.updated_at_ms = now_millis();
+                (record.clone(), was_terminal)
+            })
+        };
+        if let Some((record, was_terminal)) = snapshot {
+            if is_terminal_transfer(&record.progress.status) {
+                // 对端重复发送终态进度时不重复写入历史，也不推迟结束时间。
+                if !was_terminal {
+                    self.record_terminal_transfer(&record);
+                }
             } else {
-                record.progress.direction.clone()
-            };
-            record.progress = progress.clone();
-            record.updated_at_ms = now_millis();
-            self.publish_event(WireMessage::TransferProgress { progress });
+                // 对端把失败任务重新打开后，本机不再保留旧的失败历史。
+                self.remove_transfer_history_entry(transfer_id);
+            }
+            self.publish_event(WireMessage::TransferProgress {
+                progress: record.progress,
+            });
             return;
         }
         self.publish_event(WireMessage::TransferProgress { progress });
@@ -2441,7 +2533,13 @@ impl NodeRuntime {
             record.progress.status = TransferStatus::Uploading;
         }
         record.progress.offer = Some(record.offer.clone());
-        Some(record.progress.clone())
+        let progress = record.progress.clone();
+        let snapshot = record.clone();
+        drop(transfers);
+        if progress.status == TransferStatus::Completed {
+            self.record_terminal_transfer(&snapshot);
+        }
+        Some(progress)
     }
 
     /// Return the current progress when an upload item was already committed.
@@ -2484,7 +2582,11 @@ impl NodeRuntime {
         record.progress.error = Some(message);
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
-        Some(record.progress.clone())
+        let progress = record.progress.clone();
+        let snapshot = record.clone();
+        drop(transfers);
+        self.record_terminal_transfer(&snapshot);
+        Some(progress)
     }
 
     pub fn retry_transfer(
@@ -2524,7 +2626,11 @@ impl NodeRuntime {
         record.progress.error = None;
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
-        Ok(record.progress.clone())
+        let progress = record.progress.clone();
+        drop(transfers);
+        // 任务被重新打开后不应继续以「已结束」出现在历史里。
+        self.remove_transfer_history_entry(transfer_id);
+        Ok(progress)
     }
 
     /// Remove a failed transfer record. Non-failed records are retained and
@@ -2535,6 +2641,319 @@ impl NodeRuntime {
             return None;
         }
         transfers.remove(transfer_id).map(|record| record.progress)
+    }
+
+    fn peer_display_name(&self, node_id: &str) -> Option<String> {
+        self.peers
+            .read()
+            .get(node_id)
+            .map(|peer| peer.node_name.clone())
+            .filter(|name| !name.trim().is_empty())
+    }
+
+    pub fn set_transfer_source_paths(&self, transfer_id: &str, paths: Vec<String>) {
+        if let Some(record) = self.transfers.write().get_mut(transfer_id) {
+            record.source_paths = paths;
+        }
+    }
+
+    fn history_entry(&self, record: &TransferRecord) -> TransferHistoryEntry {
+        let receive = match record.progress.direction.as_deref() {
+            Some("receive") => true,
+            Some(_) => false,
+            None => record.offer.target_node_id == self.node_id(),
+        };
+        let (direction, peer_node_id, peer_name) = if receive {
+            (
+                "receive".to_string(),
+                record.offer.source_node_id.clone(),
+                record
+                    .peer_name
+                    .clone()
+                    .unwrap_or_else(|| record.offer.source_name.clone()),
+            )
+        } else {
+            (
+                "send".to_string(),
+                record.offer.target_node_id.clone(),
+                record
+                    .peer_name
+                    .clone()
+                    .unwrap_or_else(|| short_node_id(&record.offer.target_node_id)),
+            )
+        };
+        TransferHistoryEntry {
+            transfer_id: record.progress.transfer_id.clone(),
+            direction,
+            peer_node_id,
+            peer_name,
+            status: record.progress.status.clone(),
+            completed_bytes: record.progress.completed_bytes,
+            total_bytes: record.progress.total_bytes,
+            completed_items: record.progress.completed_items,
+            total_items: record.progress.total_items,
+            source_paths: record.source_paths.clone(),
+            destination: record.progress.destination.clone(),
+            error: record.progress.error.clone(),
+            retry_count: record.progress.retry_count,
+            session_id: None,
+            finished_at_ms: now_millis(),
+        }
+    }
+
+    fn mobile_history_entry(&self, record: &MobileTransferRecord) -> TransferHistoryEntry {
+        let peer_name = self
+            .mobile_sessions
+            .read()
+            .get(&record.session_id)
+            .map(|session| session.label.clone())
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| "网页会话".to_string());
+        TransferHistoryEntry {
+            transfer_id: record.progress.transfer_id.clone(),
+            direction: "send".to_string(),
+            peer_node_id: record.session_id.clone(),
+            peer_name,
+            status: record.progress.status.clone(),
+            completed_bytes: record.progress.completed_bytes,
+            total_bytes: record.progress.total_bytes,
+            completed_items: record.progress.completed_items,
+            total_items: record.progress.total_items,
+            source_paths: Vec::new(),
+            destination: None,
+            error: record.progress.error.clone(),
+            retry_count: record.progress.retry_count,
+            session_id: Some(record.session_id.clone()),
+            finished_at_ms: now_millis(),
+        }
+    }
+
+    fn push_transfer_history(&self, entries: Vec<TransferHistoryEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut store = self.transfer_history.lock();
+        for entry in entries {
+            store
+                .entries
+                .retain(|item| item.transfer_id != entry.transfer_id);
+            store.entries.insert(0, entry);
+        }
+        store.entries.truncate(TRANSFER_HISTORY_LIMIT);
+        if let Err(error) = persist_transfer_history(&self.data_dir, &store) {
+            eprintln!("保存传输历史失败：{error}");
+        }
+    }
+
+    fn record_terminal_transfer(&self, record: &TransferRecord) {
+        if is_terminal_transfer(&record.progress.status) {
+            self.push_transfer_history(vec![self.history_entry(record)]);
+        }
+    }
+
+    fn record_terminal_mobile_transfer(&self, record: &MobileTransferRecord) {
+        if is_terminal_transfer(&record.progress.status) {
+            self.push_transfer_history(vec![self.mobile_history_entry(record)]);
+        }
+    }
+
+    fn remove_transfer_history_entry(&self, transfer_id: &str) {
+        let mut store = self.transfer_history.lock();
+        let before = store.entries.len();
+        store
+            .entries
+            .retain(|entry| entry.transfer_id != transfer_id);
+        if store.entries.len() == before {
+            return;
+        }
+        if let Err(error) = persist_transfer_history(&self.data_dir, &store) {
+            eprintln!("保存传输历史失败：{error}");
+        }
+    }
+
+    pub fn transfer_history_snapshot(&self, session_id: Option<&str>) -> Vec<TransferHistoryEntry> {
+        self.transfer_history
+            .lock()
+            .entries
+            .iter()
+            .filter(|entry| {
+                session_id.is_none_or(|value| entry.session_id.as_deref() == Some(value))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// 清空历史并返回需要通知对端的删除分组。持久化失败时恢复原记录。
+    pub fn clear_transfer_history(
+        &self,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<TransferHistoryCleared> {
+        let self_id = self.node_id();
+        let mut store = self.transfer_history.lock();
+        let previous = store.clone();
+        let mut batches = HashMap::<String, Vec<String>>::new();
+        let mut cleared = 0usize;
+        store.entries.retain(|entry| {
+            let matched = session_id.is_none_or(|value| entry.session_id.as_deref() == Some(value));
+            if !matched {
+                return true;
+            }
+            cleared += 1;
+            if entry.session_id.is_none() && entry.peer_node_id != self_id {
+                batches
+                    .entry(entry.peer_node_id.clone())
+                    .or_default()
+                    .push(entry.transfer_id.clone());
+            }
+            false
+        });
+        if cleared == 0 {
+            return Ok(TransferHistoryCleared {
+                cleared,
+                peer_batches: Vec::new(),
+            });
+        }
+        if let Err(error) = persist_transfer_history(&self.data_dir, &store) {
+            *store = previous;
+            return Err(error);
+        }
+        Ok(TransferHistoryCleared {
+            cleared,
+            peer_batches: batches.into_iter().collect(),
+        })
+    }
+
+    /// 只删除与发送方配对的记录，网页会话记录不参与同步删除。
+    pub fn forget_transfer_history_from_peer(
+        &self,
+        peer_id: &str,
+        transfer_ids: &[String],
+    ) -> usize {
+        if transfer_ids.is_empty() {
+            return 0;
+        }
+        let mut store = self.transfer_history.lock();
+        let previous = store.clone();
+        let before = store.entries.len();
+        store.entries.retain(|entry| {
+            !(entry.session_id.is_none()
+                && entry.peer_node_id == peer_id
+                && transfer_ids.contains(&entry.transfer_id))
+        });
+        let removed = before.saturating_sub(store.entries.len());
+        if removed == 0 {
+            return 0;
+        }
+        if let Err(error) = persist_transfer_history(&self.data_dir, &store) {
+            *store = previous;
+            eprintln!("保存传输历史同步删除失败：{error}");
+            return 0;
+        }
+        removed
+    }
+
+    /// 返回 Some(true) 表示对端支持，Some(false) 表示已知不支持，None 表示不在线或尚未完成握手。
+    fn history_delete_support(&self, peer_id: &str) -> Option<bool> {
+        self.peers.read().get(peer_id).and_then(|peer| {
+            if peer.capabilities.is_empty() {
+                // 刚建立连接、还没收到 Hello，或旧到没有能力列表：不能当成已知不支持。
+                return None;
+            }
+            Some(
+                peer.capabilities
+                    .iter()
+                    .any(|item| item == TRANSFER_HISTORY_CAPABILITY),
+            )
+        })
+    }
+
+    pub fn queue_history_deletions(&self, peer_id: &str, ids: Vec<String>) {
+        if ids.is_empty() || peer_id.is_empty() || peer_id.len() > 256 || peer_id == self.node_id()
+        {
+            return;
+        }
+        let support = self.history_delete_support(peer_id);
+        // 旧节点无法反序列化新消息，能力缺失时既不发送也不排队。
+        if support == Some(false) {
+            return;
+        }
+        // 离线或还没收到 Hello 时只排队，避免把新消息发给尚未确认能力的旧节点。
+        if support == Some(true)
+            && self.send_to_peer(
+                peer_id,
+                WireMessage::TransferHistoryDeleted {
+                    transfer_ids: ids.clone(),
+                },
+            )
+        {
+            return;
+        }
+        let mut store = self.transfer_history.lock();
+        let queue = store
+            .pending_deletions
+            .entry(peer_id.to_string())
+            .or_default();
+        for id in ids {
+            if !queue.contains(&id) {
+                queue.push(id);
+            }
+        }
+        if queue.len() > MAX_PENDING_HISTORY_DELETIONS_PER_PEER {
+            let dropped = queue.len() - MAX_PENDING_HISTORY_DELETIONS_PER_PEER;
+            queue.drain(0..dropped);
+            eprintln!("传输历史待补发删除超过上限，已丢弃 {dropped} 条");
+        }
+        if let Err(error) = persist_transfer_history(&self.data_dir, &store) {
+            eprintln!("保存待补发传输历史删除失败：{error}");
+        }
+    }
+
+    pub fn flush_history_deletions(&self, peer_id: &str) -> bool {
+        let ids = match self.transfer_history.lock().pending_deletions.get(peer_id) {
+            Some(ids) if !ids.is_empty() => ids.clone(),
+            _ => return false,
+        };
+        match self.history_delete_support(peer_id) {
+            Some(true) => {}
+            Some(false) => {
+                let mut store = self.transfer_history.lock();
+                if store.pending_deletions.remove(peer_id).is_some() {
+                    if let Err(error) = persist_transfer_history(&self.data_dir, &store) {
+                        eprintln!("保存传输历史失败：{error}");
+                    }
+                }
+                return false;
+            }
+            None => return false,
+        }
+        let batch = ids
+            .iter()
+            .take(MAX_HISTORY_DELETE_BATCH)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !self.send_to_peer(
+            peer_id,
+            WireMessage::TransferHistoryDeleted {
+                transfer_ids: batch.clone(),
+            },
+        ) {
+            return false;
+        }
+        let mut store = self.transfer_history.lock();
+        if let Some(queue) = store.pending_deletions.get_mut(peer_id) {
+            queue.retain(|id| !batch.contains(id));
+        }
+        if store
+            .pending_deletions
+            .get(peer_id)
+            .is_some_and(|queue| queue.is_empty())
+        {
+            store.pending_deletions.remove(peer_id);
+        }
+        if let Err(error) = persist_transfer_history(&self.data_dir, &store) {
+            eprintln!("保存传输历史失败：{error}");
+        }
+        true
     }
 
     pub fn transfers_snapshot(&self, status: Option<TransferStatus>) -> Vec<TransferProgress> {
@@ -2590,7 +3009,11 @@ impl NodeRuntime {
                 );
                 record.progress.offer = Some(record.offer.clone());
                 record.updated_at_ms = now;
-                stale.push((record.progress.clone(), record.offer.clone()));
+                stale.push((
+                    record.progress.clone(),
+                    record.offer.clone(),
+                    record.clone(),
+                ));
             }
         }
         transfers.retain(|_, record| {
@@ -2628,7 +3051,8 @@ impl NodeRuntime {
             }
         }
         drop(transfers);
-        for (progress, offer) in stale {
+        for (progress, offer, snapshot) in stale {
+            self.record_terminal_transfer(&snapshot);
             // 自动失败要让对端也离开活动状态，否则另一端只能等自己的同一套超时。
             let peer = if offer.target_node_id == self.node_id() {
                 offer.source_node_id.clone()
@@ -2924,7 +3348,7 @@ impl NodeRuntime {
                     | TransferStatus::Cancelled
             )
         };
-        let mut cleanup = transfers
+        let mut failed_snapshots = transfers
             .values_mut()
             .filter(|record| {
                 sessions.contains_key(&record.session_id)
@@ -2935,8 +3359,12 @@ impl NodeRuntime {
                 record.progress.status = TransferStatus::Failed;
                 record.progress.error = Some("手机传输长时间没有进展，已自动失败".to_string());
                 record.updated_at_ms = now;
-                record.staged_directory.clone()
+                record.clone()
             })
+            .collect::<Vec<_>>();
+        let mut cleanup = failed_snapshots
+            .iter()
+            .map(|record| record.staged_directory.clone())
             .collect::<Vec<_>>();
         let mut remove = transfers
             .iter()
@@ -3030,6 +3458,11 @@ impl NodeRuntime {
                 .fetch_sub(released_manifest_bytes, Ordering::SeqCst);
         }
         cleanup.extend(remove.into_iter().map(|(_, directory)| directory));
+        drop(transfers);
+        drop(sessions);
+        for record in failed_snapshots.drain(..) {
+            self.record_terminal_mobile_transfer(&record);
+        }
         cleanup
             .into_iter()
             .filter_map(|directory| {
@@ -3080,7 +3513,13 @@ impl NodeRuntime {
         if status == TransferStatus::Rejected {
             record.progress.error = Some("手机端拒绝了传输".to_string());
         }
-        Some(mobile_view(record))
+        let view = mobile_view(record);
+        let snapshot = record.clone();
+        drop(transfers);
+        if status == TransferStatus::Rejected {
+            self.record_terminal_mobile_transfer(&snapshot);
+        }
+        Some(view)
     }
 
     pub fn cancel_mobile_transfer(
@@ -3105,7 +3544,11 @@ impl NodeRuntime {
         record.progress.status = TransferStatus::Cancelled;
         record.progress.error = Some("手机传输已取消".to_string());
         record.updated_at_ms = now_millis();
-        Some(mobile_view(record))
+        let view = mobile_view(record);
+        let snapshot = record.clone();
+        drop(transfers);
+        self.record_terminal_mobile_transfer(&snapshot);
+        Some(view)
     }
 
     pub fn stage_mobile_item(
@@ -3181,10 +3624,17 @@ impl NodeRuntime {
             record.retryable_downloads.remove(item_id);
         }
         record.updated_at_ms = now_millis();
+        let was_completed = record.progress.status == TransferStatus::Completed;
         if record.downloaded_items.len() >= record.progress.total_items {
             record.progress.status = TransferStatus::Completed;
         }
-        Some(mobile_view(record))
+        let view = mobile_view(record);
+        let snapshot = record.clone();
+        drop(transfers);
+        if view.progress.status == TransferStatus::Completed && !was_completed {
+            self.record_terminal_mobile_transfer(&snapshot);
+        }
+        Some(view)
     }
 
     pub fn fail_mobile_transfer(
@@ -3207,7 +3657,11 @@ impl NodeRuntime {
         record.progress.status = TransferStatus::Failed;
         record.progress.error = Some(message);
         record.updated_at_ms = now_millis();
-        Some(mobile_view(record))
+        let view = mobile_view(record);
+        let snapshot = record.clone();
+        drop(transfers);
+        self.record_terminal_mobile_transfer(&snapshot);
+        Some(view)
     }
 
     pub fn mobile_item_path(&self, transfer_id: &str, item_id: &str) -> Option<PathBuf> {
@@ -3473,9 +3927,20 @@ fn push_outgoing_source(
     Ok(())
 }
 
+fn display_absolute_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or_else(|| text.into_owned())
+}
+
 /// 把用户选中的文件与文件夹展开成待发送清单，文件夹按选中目录名保留层级。
-fn expand_outgoing_paths(paths: &[String]) -> Result<Vec<PreparedSource>, String> {
+fn expand_outgoing_paths(paths: &[String]) -> Result<(Vec<PreparedSource>, Vec<String>), String> {
     let mut sources = Vec::new();
+    let mut roots = Vec::new();
     let mut seen = HashSet::new();
     for raw in paths {
         let requested = PathBuf::from(raw);
@@ -3486,6 +3951,12 @@ fn expand_outgoing_paths(paths: &[String]) -> Result<Vec<PreparedSource>, String
             .map_err(|error| format!("无法访问 {raw}：{error}"))?;
         let metadata =
             std::fs::metadata(&canonical).map_err(|error| format!("无法读取 {raw}：{error}"))?;
+        if roots.len() < MAX_TRANSFER_HISTORY_PATHS {
+            let root = display_absolute_path(&canonical);
+            if root.len() <= 4_096 && !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
         if metadata.is_dir() {
             let prefix = canonical
                 .file_name()
@@ -3514,7 +3985,7 @@ fn expand_outgoing_paths(paths: &[String]) -> Result<Vec<PreparedSource>, String
         }
     }
     sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(sources)
+    Ok((sources, roots))
 }
 
 pub fn validate_receive_directory(path: &Path) -> anyhow::Result<PathBuf> {
@@ -3762,6 +4233,61 @@ fn clipboard_history_record_valid(data_dir: &Path, record: &ClipboardHistoryReco
         }
     }
     true
+}
+
+fn transfer_history_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(TRANSFER_HISTORY_FILE)
+}
+
+/// 历史损坏不能阻止节点启动，读取失败按空历史处理。
+fn load_transfer_history(data_dir: &Path) -> TransferHistoryStore {
+    let contents = match std::fs::read(transfer_history_path(data_dir)) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return TransferHistoryStore::default()
+        }
+        Err(error) => {
+            eprintln!("读取传输历史失败：{error}");
+            return TransferHistoryStore::default();
+        }
+    };
+    let mut store = match serde_json::from_slice::<TransferHistoryStore>(&contents) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("传输历史文件损坏，已忽略：{error}");
+            return TransferHistoryStore::default();
+        }
+    };
+    store
+        .entries
+        .retain(|entry| is_terminal_transfer(&entry.status));
+    store.entries.truncate(TRANSFER_HISTORY_LIMIT);
+    store.pending_deletions.retain(|peer_id, ids| {
+        if peer_id.is_empty() || peer_id.len() > 256 {
+            return false;
+        }
+        ids.retain(|id| !id.trim().is_empty() && id.len() <= 256);
+        ids.dedup();
+        ids.truncate(MAX_PENDING_HISTORY_DELETIONS_PER_PEER);
+        !ids.is_empty()
+    });
+    store
+}
+
+fn persist_transfer_history(data_dir: &Path, store: &TransferHistoryStore) -> anyhow::Result<()> {
+    let path = transfer_history_path(data_dir);
+    let temporary = data_dir.join(format!(
+        "{TRANSFER_HISTORY_FILE}.tmp-{}",
+        std::process::id()
+    ));
+    let contents = serde_json::to_vec_pretty(store)?;
+    if let Err(error) =
+        std::fs::write(&temporary, contents).and_then(|()| std::fs::rename(&temporary, &path))
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn load_clipboard_history(data_dir: &Path) -> anyhow::Result<Vec<ClipboardHistoryRecord>> {
@@ -4314,17 +4840,18 @@ mod tests {
         is_cellular_interface, is_placeholder_node_name, load_or_create_config,
         load_or_create_config_with_hostname, mobile_ca_url, network_addresses,
         network_addresses_for_bound, parse_update_proxy,
-        prune_clipboard_history_records_with_limit, sync_node_name, NodeProfile, NodeRuntime,
-        UpdateFrequency, CLIPBOARD_HISTORY_FILE, DESKTOP_TEMP_REGISTRY_FILE,
-        MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACCEPTED_IDLE_TIMEOUT_MS,
-        TRANSFER_ACTIVITY_TIMEOUT_MS,
+        prune_clipboard_history_records_with_limit, sync_node_name, valid_history_delete_ids,
+        NodeProfile, NodeRuntime, UpdateFrequency, CLIPBOARD_HISTORY_FILE,
+        DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACCEPTED_IDLE_TIMEOUT_MS,
+        TRANSFER_ACTIVITY_TIMEOUT_MS, TRANSFER_HISTORY_FILE, TRANSFER_HISTORY_LIMIT,
     };
     use crate::model::{
         AddressInfo, ClipboardEvent, ClipboardHistoryMode, DiskMetrics, GpuMemoryKind, GpuMetrics,
         HardwareMetrics, Hlc, LoadAverage, NodeInfo, PeerInfo, ReceiveMode, TransferItem,
         TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_VIEW_CAPABILITY,
-        MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS, METRICS_GPU_VIEW_CAPABILITY,
-        METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY, METRICS_SYSTEM_VIEW_CAPABILITY,
+        MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
+        METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+        METRICS_SYSTEM_VIEW_CAPABILITY, TRANSFER_HISTORY_CAPABILITY,
     };
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -5385,6 +5912,418 @@ mod tests {
         let _ = std::fs::remove_dir_all(path);
     }
 
+    fn named_peer(node_id: &str, node_name: &str, capabilities: Vec<String>) -> PeerInfo {
+        let mut peer = test_peer(node_id, capabilities);
+        peer.node_name = node_name.to_string();
+        peer
+    }
+
+    fn incoming_history_offer(
+        runtime: &NodeRuntime,
+        transfer_id: &str,
+        source_node_id: &str,
+    ) -> TransferOffer {
+        TransferOffer {
+            transfer_id: transfer_id.to_string(),
+            source_node_id: source_node_id.to_string(),
+            source_name: format!("{source_node_id}-name"),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: format!("{transfer_id}-item"),
+                name: "file.bin".to_string(),
+                relative_path: "file.bin".to_string(),
+                size: 4,
+                sha256: "0".repeat(64),
+                media_type: "application/octet-stream".to_string(),
+                directory: false,
+            }],
+            total_bytes: 4,
+            created_at_ms: crate::clock::now_millis(),
+        }
+    }
+
+    fn outgoing_history_offer(
+        runtime: &NodeRuntime,
+        transfer_id: &str,
+        target_node_id: &str,
+    ) -> TransferOffer {
+        TransferOffer {
+            transfer_id: transfer_id.to_string(),
+            source_node_id: runtime.node_id(),
+            source_name: "本机".to_string(),
+            target_node_id: target_node_id.to_string(),
+            items: vec![TransferItem {
+                item_id: format!("{transfer_id}-item"),
+                name: "file.bin".to_string(),
+                relative_path: "file.bin".to_string(),
+                size: 4,
+                sha256: "0".repeat(64),
+                media_type: "application/octet-stream".to_string(),
+                directory: false,
+            }],
+            total_bytes: 4,
+            created_at_ms: crate::clock::now_millis(),
+        }
+    }
+
+    fn complete_incoming(runtime: &NodeRuntime, transfer_id: &str, source_node_id: &str) {
+        runtime.add_transfer(incoming_history_offer(runtime, transfer_id, source_node_id));
+        runtime
+            .mark_item_received(transfer_id, &format!("{transfer_id}-item"), 4)
+            .expect("complete incoming transfer");
+    }
+
+    #[test]
+    fn transfer_history_keeps_latest_ten_terminal_records() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        for index in 0..12 {
+            complete_incoming(&runtime, &format!("history-{index}"), "peer-a");
+        }
+        let history = runtime.transfer_history_snapshot(None);
+        assert_eq!(history.len(), TRANSFER_HISTORY_LIMIT);
+        assert_eq!(history[0].transfer_id, "history-11");
+        assert_eq!(history[9].transfer_id, "history-2");
+        assert!(history
+            .iter()
+            .all(|entry| entry.status == TransferStatus::Completed));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn transfer_history_survives_restart_and_ignores_corruption() {
+        let path = temp_data_dir();
+        {
+            let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+                .expect("create runtime");
+            complete_incoming(&runtime, "persisted", "peer-a");
+        }
+        {
+            let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+                .expect("restore runtime");
+            let history = restored.transfer_history_snapshot(None);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].transfer_id, "persisted");
+        }
+        std::fs::write(path.join(TRANSFER_HISTORY_FILE), b"{broken")
+            .expect("write corrupt history");
+        let recovered = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("start with corrupt history");
+        assert!(recovered.transfer_history_snapshot(None).is_empty());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn transfer_history_captures_direction_peer_and_paths() {
+        let path = temp_data_dir();
+        let destination = path.join("received");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.set_peer(named_peer(
+            "peer-target",
+            "目标电脑",
+            vec![TRANSFER_HISTORY_CAPABILITY.to_string()],
+        ));
+        runtime.add_transfer(incoming_history_offer(
+            &runtime,
+            "receive-one",
+            "peer-sender",
+        ));
+        runtime
+            .set_transfer_acceptance("receive-one", destination.clone())
+            .expect("accept receive");
+        runtime
+            .mark_item_received("receive-one", "receive-one-item", 4)
+            .expect("complete receive");
+        runtime.add_outgoing_transfer(outgoing_history_offer(&runtime, "send-one", "peer-target"));
+        runtime.set_transfer_source_paths(
+            "send-one",
+            vec!["C:/资料".to_string(), "D:/照片".to_string()],
+        );
+        runtime
+            .fail_transfer("send-one", "网络中断".to_string(), TransferStatus::Failed)
+            .expect("fail send");
+        let history = runtime.transfer_history_snapshot(None);
+        let receive = history
+            .iter()
+            .find(|entry| entry.transfer_id == "receive-one")
+            .expect("receive history");
+        assert_eq!(receive.direction, "receive");
+        assert_eq!(receive.peer_node_id, "peer-sender");
+        assert_eq!(receive.peer_name, "peer-sender-name");
+        assert_eq!(
+            receive.destination,
+            Some(destination.to_string_lossy().into_owned())
+        );
+        let send = history
+            .iter()
+            .find(|entry| entry.transfer_id == "send-one")
+            .expect("send history");
+        assert_eq!(send.direction, "send");
+        assert_eq!(send.peer_node_id, "peer-target");
+        assert_eq!(send.peer_name, "目标电脑");
+        assert_eq!(
+            send.source_paths,
+            vec!["C:/资料".to_string(), "D:/照片".to_string()]
+        );
+        assert_eq!(send.error.as_deref(), Some("网络中断"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn retry_removes_failed_history_and_dismiss_keeps_it() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_transfer(incoming_history_offer(&runtime, "retry-one", "peer-a"));
+        runtime
+            .fail_transfer("retry-one", "失败".to_string(), TransferStatus::Failed)
+            .expect("fail transfer");
+        assert_eq!(runtime.transfer_history_snapshot(None).len(), 1);
+        runtime
+            .retry_transfer("retry-one", TransferStatus::Waiting, None)
+            .expect("retry transfer");
+        assert!(runtime.transfer_history_snapshot(None).is_empty());
+        runtime
+            .fail_transfer("retry-one", "再次失败".to_string(), TransferStatus::Failed)
+            .expect("fail transfer again");
+        let history = runtime.transfer_history_snapshot(None);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].retry_count, 1);
+        runtime
+            .remove_failed_transfer("retry-one")
+            .expect("remove failed transfer");
+        assert_eq!(runtime.transfer_history_snapshot(None).len(), 1);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn peer_reopened_transfer_clears_local_failure_history() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_outgoing_transfer(outgoing_history_offer(&runtime, "peer-retry", "peer-b"));
+        runtime
+            .fail_transfer("peer-retry", "失败".to_string(), TransferStatus::Failed)
+            .expect("fail transfer");
+        assert_eq!(runtime.transfer_history_snapshot(None).len(), 1);
+        let mut progress = runtime
+            .transfer("peer-retry")
+            .expect("transfer record")
+            .progress;
+        progress.status = TransferStatus::Waiting;
+        progress.error = None;
+        progress.retry_count = 1;
+        runtime.update_transfer("peer-retry", progress);
+        assert!(runtime.transfer_history_snapshot(None).is_empty());
+        let _ = std::fs::remove_dir_all(path);
+    }
+    #[test]
+    fn clear_transfer_history_is_persisted_and_reports_peer_batches() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        complete_incoming(&runtime, "from-a", "peer-a");
+        complete_incoming(&runtime, "from-b", "peer-b");
+        let cleared = runtime.clear_transfer_history(None).expect("clear history");
+        assert_eq!(cleared.cleared, 2);
+        assert!(runtime.transfer_history_snapshot(None).is_empty());
+        let mut batches = cleared.peer_batches;
+        batches.sort();
+        assert_eq!(batches.len(), 2);
+        assert!(batches
+            .iter()
+            .any(|(peer, ids)| peer == "peer-a" && ids == &vec!["from-a".to_string()]));
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert!(restored.transfer_history_snapshot(None).is_empty());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn mobile_transfer_history_is_scoped_to_session() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let first = runtime
+            .create_mobile_session("手机 A".to_string())
+            .expect("create first session");
+        let second = runtime
+            .create_mobile_session("手机 B".to_string())
+            .expect("create second session");
+        for (session_id, transfer_id) in [
+            (&first.session_id, "mobile-a"),
+            (&second.session_id, "mobile-b"),
+        ] {
+            let offer = mobile_offer(&runtime, transfer_id, 4);
+            runtime
+                .create_mobile_transfer(session_id, offer)
+                .expect("create mobile transfer");
+            runtime
+                .set_mobile_transfer_status(transfer_id, session_id, TransferStatus::Accepted)
+                .expect("accept mobile transfer");
+            runtime
+                .stage_mobile_item(transfer_id, &format!("{transfer_id}-item"), 4)
+                .expect("stage mobile item");
+            runtime
+                .mark_mobile_item_downloaded(transfer_id, &format!("{transfer_id}-item"), false)
+                .expect("complete mobile download");
+        }
+        let all = runtime.transfer_history_snapshot(None);
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|entry| entry.session_id.is_some()));
+        let scoped = runtime.transfer_history_snapshot(Some(&first.session_id));
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].peer_name, "手机 A");
+        let cleared = runtime
+            .clear_transfer_history(Some(&first.session_id))
+            .expect("clear session history");
+        assert_eq!(cleared.cleared, 1);
+        assert!(cleared.peer_batches.is_empty());
+        assert_eq!(runtime.transfer_history_snapshot(None).len(), 1);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn history_deletions_queue_for_offline_peer_and_flush_on_reconnect() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        complete_incoming(&runtime, "offline-one", "peer-offline");
+        let cleared = runtime.clear_transfer_history(None).expect("clear history");
+        for (peer_id, ids) in cleared.peer_batches {
+            runtime.queue_history_deletions(&peer_id, ids);
+        }
+        assert_eq!(
+            runtime
+                .transfer_history
+                .lock()
+                .pending_deletions
+                .get("peer-offline")
+                .cloned(),
+            Some(vec!["offline-one".to_string()])
+        );
+        let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("restore runtime");
+        assert_eq!(
+            restored
+                .transfer_history
+                .lock()
+                .pending_deletions
+                .get("peer-offline")
+                .cloned(),
+            Some(vec!["offline-one".to_string()])
+        );
+        let (tx, mut rx) = mpsc::channel(8);
+        restored.set_peer(named_peer(
+            "peer-offline",
+            "离线电脑",
+            vec![TRANSFER_HISTORY_CAPABILITY.to_string()],
+        ));
+        restored.add_peer_channel("peer-offline".to_string(), tx);
+        assert!(restored.flush_history_deletions("peer-offline"));
+        match rx.try_recv().expect("peer receives history deletion") {
+            WireMessage::TransferHistoryDeleted { transfer_ids } => {
+                assert_eq!(transfer_ids, vec!["offline-one".to_string()]);
+            }
+            _ => panic!("unexpected message"),
+        }
+        assert!(restored
+            .transfer_history
+            .lock()
+            .pending_deletions
+            .is_empty());
+        // 旧节点声明了其他能力但没有 transfer.history.v1：既不能收新消息，也不应留下队列。
+        restored.set_peer(named_peer(
+            "peer-legacy",
+            "旧电脑",
+            vec!["transfer.file".to_string()],
+        ));
+        restored.queue_history_deletions("peer-legacy", vec!["legacy-one".to_string()]);
+        assert!(!restored
+            .transfer_history
+            .lock()
+            .pending_deletions
+            .contains_key("peer-legacy"));
+        // 能力尚未确认的对端只排队，不把新消息直接发给可能是旧版本的连接。
+        let (tx, mut rx) = mpsc::channel(8);
+        restored.set_peer(named_peer("peer-handshake", "握手中的电脑", Vec::new()));
+        restored.add_peer_channel("peer-handshake".to_string(), tx);
+        restored.queue_history_deletions("peer-handshake", vec!["handshake-one".to_string()]);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            restored
+                .transfer_history
+                .lock()
+                .pending_deletions
+                .get("peer-handshake")
+                .cloned(),
+            Some(vec!["handshake-one".to_string()])
+        );
+        // 尚未收到 Hello 的对端不能按旧节点丢弃待删除记录。
+        restored.set_peer(named_peer("peer-pending", "握手中的电脑", Vec::new()));
+        restored.queue_history_deletions("peer-pending", vec!["pending-one".to_string()]);
+        assert_eq!(
+            restored
+                .transfer_history
+                .lock()
+                .pending_deletions
+                .get("peer-pending")
+                .cloned(),
+            Some(vec!["pending-one".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn history_deletion_from_peer_only_removes_paired_entries() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        complete_incoming(&runtime, "from-a", "peer-a");
+        complete_incoming(&runtime, "from-b", "peer-b");
+        let session = runtime
+            .create_mobile_session("网页".to_string())
+            .expect("create session");
+        let offer = mobile_offer(&runtime, "mobile-one", 4);
+        runtime
+            .create_mobile_transfer(&session.session_id, offer)
+            .expect("create mobile transfer");
+        runtime
+            .set_mobile_transfer_status("mobile-one", &session.session_id, TransferStatus::Accepted)
+            .expect("accept mobile transfer");
+        runtime
+            .stage_mobile_item("mobile-one", "mobile-one-item", 4)
+            .expect("stage mobile item");
+        runtime
+            .mark_mobile_item_downloaded("mobile-one", "mobile-one-item", false)
+            .expect("complete mobile download");
+        assert_eq!(
+            runtime.forget_transfer_history_from_peer("peer-a", &["from-a".to_string()]),
+            1
+        );
+        let remaining = runtime.transfer_history_snapshot(None);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|entry| entry.transfer_id == "from-b"));
+        assert!(remaining
+            .iter()
+            .any(|entry| entry.transfer_id == "mobile-one"));
+        assert_eq!(
+            runtime.forget_transfer_history_from_peer(
+                &session.session_id,
+                &["mobile-one".to_string()]
+            ),
+            0
+        );
+        assert!(!valid_history_delete_ids(&[]));
+        assert!(!valid_history_delete_ids(&[" ".to_string()]));
+        assert!(valid_history_delete_ids(&["ok".to_string()]));
+        let too_many = vec!["x".to_string(); MAX_HISTORY_DELETE_BATCH + 1];
+        assert!(!valid_history_delete_ids(&too_many));
+        let _ = std::fs::remove_dir_all(path);
+    }
     #[test]
     fn duplicate_transfer_offer_does_not_reset_progress() {
         let path = temp_data_dir();

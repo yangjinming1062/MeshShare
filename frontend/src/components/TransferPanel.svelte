@@ -1,11 +1,14 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import { formatTime, isActiveTransferStatus, prepareProgressRatio, prepareStatusText, transferItemsLabel, transferStatusText } from '../format';
-  import type { TransferFailure, TransferPrepare, TransferProgress } from '../types';
+  import { formatTime, isActiveTransferStatus, prepareProgressRatio, prepareStatusText, transferHistoryPathText, transferHistoryPeerText, transferHistoryStatusText, transferItemsLabel, transferStatusText } from '../format';
+  import type { TransferFailure, TransferHistoryEntry, TransferPrepare, TransferProgress } from '../types';
 
   export let transfers: TransferProgress[] = [];
   export let prepares: TransferPrepare[] = [];
   export let failures: TransferFailure[] = [];
+  export let transferHistory: TransferHistoryEntry[] = [];
+  export let transferHistoryBusy = false;
+  export let onClearTransferHistory: () => void = () => {};
   export let onAccept: (transfer: TransferProgress) => void = () => {};
   export let onReject: (transfer: TransferProgress) => void = () => {};
   export let onRetry: (failure: TransferFailure) => void = () => {};
@@ -14,6 +17,7 @@
   export let remoteMode = false;
 
   $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status));
+  $: historyEntries = transferHistory.filter((entry) => !failures.some((failure) => failure.progress.transfer_id === entry.transfer_id));
   $: waiting = activeTransfers.some((transfer) => transfer.direction === 'receive' && transfer.status === 'waiting');
 
   function ratio(transfer: TransferProgress): number {
@@ -122,5 +126,33 @@
         </div>
       </div>
     {/if}
+    <div class="transfer-history">
+      <div class="transfer-subhead">
+        <strong>传输历史</strong>
+        <span class="chip">{historyEntries.length}</span>
+        <button type="button" class="btn btn-ghost btn-sm" disabled={transferHistoryBusy || !historyEntries.length} on:click={onClearTransferHistory}>清空</button>
+      </div>
+      {#if historyEntries.length}
+        <div class="transfer-list transfer-list--history">
+          {#each historyEntries as entry (entry.transfer_id)}
+            <article class="transfer-row transfer-row--history">
+              <span class="transfer-icon" aria-hidden="true">
+                <Icon name={entry.direction === 'receive' ? 'arrow-down' : 'arrow-up'} size={14} />
+              </span>
+              <div class="transfer-copy">
+                <strong title={entry.peer_node_id}>{transferHistoryPeerText(entry)}</strong>
+                <span title={transferHistoryPathText(entry)}>{transferHistoryPathText(entry)}</span>
+              </div>
+              <div class="transfer-progress">
+                <span>{transferHistoryStatusText(entry)}</span>
+                <span class="transfer-history-meta">{entry.completed_items}/{entry.total_items} 个项目 · {formatTime(entry.finished_at_ms)}</span>
+              </div>
+            </article>
+          {/each}
+        </div>
+      {:else}
+        <div class="empty">还没有传输历史。</div>
+      {/if}
+    </div>
   </div>
 </section>

@@ -3,13 +3,14 @@ use crate::control::{accept_transfer_at, ControlPlane, SettingsPatch, SettingsSn
 use crate::discovery;
 use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot,
-    HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferOffer,
-    TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT,
-    CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
+    HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferHistoryEntry,
+    TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_IMAGE_LIMIT,
+    CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY,
+    METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::{
-    validate_receive_directory, NodeRuntime, OutgoingPrepareView, TransferRetryError,
-    UPDATE_INSTALLING_MESSAGE,
+    valid_history_delete_ids, validate_receive_directory, NodeRuntime, OutgoingPrepareView,
+    TransferRetryError, UPDATE_INSTALLING_MESSAGE,
 };
 use axum::body::Body;
 use axum::extract::{
@@ -118,6 +119,11 @@ pub struct PeerConnectionRequest {
 #[derive(Debug, Deserialize)]
 pub struct TransferListQuery {
     pub status: Option<TransferStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TransferHistoryQuery {
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +313,10 @@ pub fn router_with_control(
         .route(
             "/api/v1/transfers",
             get(list_transfers).post(create_transfer),
+        )
+        .route(
+            "/api/v1/transfers/history",
+            get(list_transfer_history).delete(clear_transfer_history),
         )
         .route("/api/v1/transfers/:id", delete(dismiss_transfer))
         .route("/api/v1/transfers/:id/reject", post(reject_transfer))
@@ -912,6 +922,7 @@ async fn handle_socket(
                                                     .await;
                                             }
                                             replay_active_offers(&runtime, &identified).await;
+                                            let _ = runtime.flush_history_deletions(&identified);
                                         }
                                         Some(current) if current == identified => {}
                                         Some(_) => break,
@@ -956,6 +967,7 @@ async fn handle_socket(
                         break;
                     }
                     let _ = runtime.flush_clipboard_resync(peer_id);
+                    let _ = runtime.flush_history_deletions(peer_id);
                 }
             }
             event = events.recv() => {
@@ -1252,6 +1264,22 @@ async fn handle_wire_message_with_endpoint(
             }
             current_peer.map(str::to_string)
         }
+        WireMessage::TransferHistoryDeleted { transfer_ids } => {
+            let peer_id = current_peer?;
+            if valid_history_delete_ids(&transfer_ids) {
+                let mut seen = HashSet::new();
+                let ids = transfer_ids
+                    .into_iter()
+                    .filter(|id| seen.insert(id.clone()))
+                    .collect::<Vec<_>>();
+                if runtime.forget_transfer_history_from_peer(peer_id, &ids) > 0 {
+                    // 界面连接会收到这条事件并立即重新读取历史。
+                    runtime
+                        .publish_event(WireMessage::TransferHistoryDeleted { transfer_ids: ids });
+                }
+            }
+            Some(peer_id.to_string())
+        }
         WireMessage::MetricsUpdate { metrics } => {
             let peer_id = current_peer?;
             if validate_metrics(&metrics)
@@ -1309,6 +1337,38 @@ async fn list_transfers(
     State(state): State<AppState>,
 ) -> Json<Vec<TransferProgress>> {
     Json(state.runtime.transfers_snapshot(query.status))
+}
+
+async fn list_transfer_history(
+    Query(query): Query<TransferHistoryQuery>,
+    State(state): State<AppState>,
+) -> Json<Vec<TransferHistoryEntry>> {
+    Json(
+        state
+            .runtime
+            .transfer_history_snapshot(query.session_id.as_deref()),
+    )
+}
+
+#[derive(Debug, Serialize)]
+struct TransferHistoryClearedBody {
+    cleared: usize,
+}
+
+async fn clear_transfer_history(
+    Query(query): Query<TransferHistoryQuery>,
+    State(state): State<AppState>,
+) -> Result<Json<TransferHistoryClearedBody>, ApiError> {
+    let cleared = state
+        .runtime
+        .clear_transfer_history(query.session_id.as_deref())
+        .map_err(|error| ApiError::internal(format!("清空传输历史失败：{error}")))?;
+    for (peer_id, ids) in cleared.peer_batches {
+        state.runtime.queue_history_deletions(&peer_id, ids);
+    }
+    Ok(Json(TransferHistoryClearedBody {
+        cleared: cleared.cleared,
+    }))
 }
 
 fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
@@ -3347,8 +3407,8 @@ mod tests {
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, DiskMetrics, HardwareMetrics, Hlc, NodeInfo, PeerInfo,
-        TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
-        CLIPBOARD_TEXT_LIMIT, METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
+        TransferHistoryEntry, TransferItem, TransferOffer, TransferProgress, TransferStatus,
+        WireMessage, CLIPBOARD_TEXT_LIMIT, METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
     };
     use crate::runtime::{NodeProfile, NodeRuntime};
     use axum::http::{HeaderValue, Request};
@@ -5450,6 +5510,132 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         server_task.abort();
         let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn transfer_history_routes_list_and_clear_without_touching_active() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-transfer-history-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        runtime.add_transfer(test_offer(&runtime, "history-done"));
+        runtime
+            .mark_item_received("history-done", "history-done-item", 0)
+            .expect("complete transfer");
+        runtime.add_outgoing_transfer(test_offer(&runtime, "active-one"));
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let history = runtime
+            .http
+            .get(format!("http://{address}/api/v1/transfers/history"))
+            .send()
+            .await
+            .expect("list history")
+            .error_for_status()
+            .expect("history response")
+            .json::<Vec<TransferHistoryEntry>>()
+            .await
+            .expect("decode history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].transfer_id, "history-done");
+
+        let cleared = runtime
+            .http
+            .delete(format!("http://{address}/api/v1/transfers/history"))
+            .send()
+            .await
+            .expect("clear history");
+        assert!(cleared.status().is_success());
+        let body = cleared
+            .json::<serde_json::Value>()
+            .await
+            .expect("decode cleared");
+        assert_eq!(body["cleared"], 1);
+
+        let after = runtime
+            .http
+            .get(format!("http://{address}/api/v1/transfers/history"))
+            .send()
+            .await
+            .expect("list history after clear")
+            .error_for_status()
+            .expect("history response")
+            .json::<Vec<TransferHistoryEntry>>()
+            .await
+            .expect("decode history");
+        assert!(after.is_empty());
+        let transfers = runtime
+            .http
+            .get(format!("http://{address}/api/v1/transfers"))
+            .send()
+            .await
+            .expect("list transfers")
+            .error_for_status()
+            .expect("transfers response")
+            .json::<Vec<TransferProgress>>()
+            .await
+            .expect("decode transfers");
+        assert!(transfers
+            .iter()
+            .any(|item| item.transfer_id == "active-one"));
+
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        server_task.abort();
+        let _ = server_task.await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn transfer_history_deleted_message_requires_identified_peer() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-history-message-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create data directory");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut offer = test_offer(&runtime, "peer-history");
+        offer.source_node_id = "peer-a".to_string();
+        offer.source_name = "A".to_string();
+        runtime.add_transfer(offer);
+        runtime
+            .mark_item_received("peer-history", "peer-history-item", 0)
+            .expect("complete transfer");
+        assert_eq!(runtime.transfer_history_snapshot(None).len(), 1);
+
+        assert!(handle_wire_message(
+            WireMessage::TransferHistoryDeleted {
+                transfer_ids: vec!["peer-history".to_string()],
+            },
+            &runtime,
+            None,
+        )
+        .await
+        .is_none());
+        assert_eq!(runtime.transfer_history_snapshot(None).len(), 1);
+
+        assert!(handle_wire_message(
+            WireMessage::TransferHistoryDeleted {
+                transfer_ids: vec!["peer-history".to_string()],
+            },
+            &runtime,
+            Some("peer-a"),
+        )
+        .await
+        .is_some());
+        assert!(runtime.transfer_history_snapshot(None).is_empty());
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

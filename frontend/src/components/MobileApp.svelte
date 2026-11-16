@@ -16,12 +16,15 @@
     platformLabel,
     prepareProgressRatio,
     prepareStatusText,
+    transferHistoryPathText,
+    transferHistoryPeerText,
+    transferHistoryStatusText,
     transferItemKey,
     transferItemsLabel,
     transferStatusText,
     isActiveTransferStatus,
   } from '../format';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferItem, TransferPrepare } from '../types';
+  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferHistoryEntry, TransferItem, TransferPrepare } from '../types';
 
   export let mode: 'web' | 'android' = 'web';
   export let node: NodeInfo | null = null;
@@ -31,6 +34,9 @@
   export let transfers: PhoneTransfer[] = [];
   export let prepares: TransferPrepare[] = [];
   export let failures: TransferFailure[] = [];
+  export let transferHistory: TransferHistoryEntry[] = [];
+  export let transferHistoryBusy = false;
+  export let onClearTransferHistory: () => void = () => {};
   export let clipboard: ClipboardSnapshot | null = null;
   export let draft = '';
   export let history: ClipboardHistoryItem[] = [];
@@ -76,6 +82,7 @@
   $: pendingBytes = pending.reduce((sum, transfer) => sum + (transfer.offer?.total_bytes ?? transfer.total_bytes), 0);
   $: pendingItems = pending.reduce((sum, transfer) => sum + (transfer.offer?.items.length ?? transfer.total_items), 0);
   $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status) && !pending.some((item) => item.transfer_id === transfer.transfer_id));
+  $: historyEntries = transferHistory.filter((entry) => !failures.some((failure) => failure.progress.transfer_id === entry.transfer_id));
   $: activeIncoming = transfers
     .filter((transfer) => transfer.direction !== 'send' && (transfer.status === 'accepted' || transfer.status === 'uploading' || transfer.status === 'ready'))
     .sort((left, right) => (right.offer?.created_at_ms ?? 0) - (left.offer?.created_at_ms ?? 0));
@@ -447,6 +454,32 @@
           {/each}
         </div>
       </div>
+    {/if}
+    <div class="phone-card-head phone-subhead phone-history-head">
+      <h3>传输历史</h3>
+      <span class="chip">{historyEntries.length}</span>
+      <button type="button" class="btn btn-ghost btn-sm" disabled={transferHistoryBusy || !historyEntries.length} on:click={onClearTransferHistory}>清空</button>
+    </div>
+    {#if historyEntries.length}
+      <div class="phone-list">
+        {#each historyEntries as entry (entry.transfer_id)}
+          <article class="transfer-card">
+            <span class="transfer-icon" aria-hidden="true">
+              <Icon name={entry.direction === 'receive' ? 'arrow-down' : 'arrow-up'} size={14} />
+            </span>
+            <div class="transfer-copy">
+              <strong title={entry.peer_node_id}>{transferHistoryPeerText(entry)}</strong>
+              <span title={transferHistoryPathText(entry)}>{transferHistoryPathText(entry)}</span>
+            </div>
+            <div class="transfer-progress">
+              <span>{transferHistoryStatusText(entry)}</span>
+              <span class="muted">{entry.completed_items}/{entry.total_items} 个项目 · {formatTime(entry.finished_at_ms)}</span>
+            </div>
+          </article>
+        {/each}
+      </div>
+    {:else}
+      <div class="empty">还没有传输历史。</div>
     {/if}
   </section>
 

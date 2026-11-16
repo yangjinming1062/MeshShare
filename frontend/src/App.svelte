@@ -5,11 +5,11 @@
   import { addPluginListener, invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, createOutgoingPaths, getOutgoingPrepare, browseManagedPath, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
+  import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, createOutgoingPaths, getOutgoingPrepare, browseManagedPath, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { Sha256, digestFile } from './sha256';
-  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, updateFrequencyLabel, webSessionLabel } from './format';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
   import HardwarePanel from './components/HardwarePanel.svelte';
@@ -90,6 +90,9 @@
   let transfers: TransferProgress[] = [];
   let prepares: TransferPrepare[] = [];
   let failures: TransferFailure[] = [];
+  let transferHistory: TransferHistoryEntry[] = [];
+  let transferHistoryBusy = false;
+  let clearTransferHistoryOpen = false;
   let mobileSessions: MobileSession[] = [];
   let mobileTransfers: MobileTransferView[] = [];
   let phoneFailures: TransferFailure[] = [];
@@ -163,6 +166,10 @@
           ? peers.find((peer) => peer.node_id === transfer.offer?.target_node_id)?.node_name
           : undefined,
       }));
+  // 网页/手机页面是接收方：节点记录里的「发送到本会话」要按本会话视角显示。
+  $: phoneTransferHistory = isWeb
+    ? transferHistory.map((entry) => transferHistoryForSessionView(entry, node?.node_id ?? entry.peer_node_id, node?.node_name ?? '接入节点'))
+    : transferHistory;
   $: phoneFailures = failures;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
@@ -234,6 +241,21 @@
       ...failures.filter((failure) => failure.progress.transfer_id !== progress.transfer_id),
     ];
     pruneFailures();
+  }
+
+  /** 传输历史由节点保存；旧节点的 404 视为没有历史而不是错误。 */
+  async function loadTransferHistory(): Promise<void> {
+    try {
+      transferHistory = await getTransferHistory(isWeb ? mobileSessionId : undefined);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 404)) throw error;
+      transferHistory = [];
+    }
+  }
+
+  function requestClearTransferHistory() {
+    if (!transferHistory.length) return;
+    clearTransferHistoryOpen = true;
   }
 
   async function dismissFailure(failure: TransferFailure) {
@@ -489,6 +511,13 @@
           : clipboardStatus),
     ]);
     const nextTransfers = isWeb ? [] : await getTransfers();
+    // 目标切换时旧请求不能把上一个节点的历史写进当前界面。
+    let nextTransferHistory: TransferHistoryEntry[] = [];
+    try {
+      nextTransferHistory = await getTransferHistory(isWeb ? mobileSessionId : undefined);
+    } catch (error) {
+      if (!(error instanceof ApiError && error.status === 404)) throw error;
+    }
     if (isWeb) {
       mobileTransfers = await getMobileTransfersWithRecovery();
       for (const view of mobileTransfers) {
@@ -513,6 +542,7 @@
     }
     if (requestId !== refreshRequestId || generation !== targetGeneration || target !== activeBaseUrl) return;
     pruneFailures();
+    transferHistory = nextTransferHistory;
     node = nextNode;
     if (!remoteMode) localNodeId = nextNode.node_id;
     peers = nextPeers.filter((peer) => peer.online);
@@ -759,6 +789,10 @@
       }, ...transfers.filter((item) => item.transfer_id !== offer.transfer_id)];
       return;
     }
+    if (type === 'TransferHistoryDeleted') {
+      void loadTransferHistory();
+      return;
+    }
     if (type === 'TransferProgress') {
       const progress = payload.progress;
       const existing = transfers.find((item) => item.transfer_id === progress.transfer_id);
@@ -768,6 +802,7 @@
       // 先把记录放进列表，失败行才能在计算可重试性时看到节点上的记录。
       transfers = [next, ...transfers.filter((item) => item.transfer_id !== progress.transfer_id)];
       observeFailure(next);
+      if (!isActiveTransferStatus(next.status)) void loadTransferHistory();
     }
   }
 
@@ -1010,6 +1045,21 @@
 
   function confirmClearHistory() {
     void clearClipboardHistoryItems();
+  }
+
+  async function confirmClearTransferHistory() {
+    if (transferHistoryBusy) return;
+    transferHistoryBusy = true;
+    try {
+      await clearTransferHistory(isWeb ? mobileSessionId : undefined);
+      transferHistory = [];
+      clearTransferHistoryOpen = false;
+      showTransientNotice(isWeb ? '已清空本会话的传输历史' : '已清空传输历史，对端记录会同步删除');
+    } catch (error) {
+      showTransientNotice(error instanceof Error ? error.message : '无法清空传输历史', 6000);
+    } finally {
+      transferHistoryBusy = false;
+    }
   }
 
   async function toggleMonitorLock() {
@@ -2606,6 +2656,9 @@
       transfers={phoneTransfers}
       prepares={prepares}
       failures={phoneFailures}
+      transferHistory={phoneTransferHistory}
+      {transferHistoryBusy}
+      onClearTransferHistory={requestClearTransferHistory}
       {clipboard}
       bind:draft={clipboardDraft}
       history={clipboardHistory}
@@ -2698,7 +2751,7 @@
         onOpenHistory={openClipboardHistory}
         onClearHistory={requestClearHistory}
       />
-      <TransferPanel {transfers} {prepares} {failures} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} />
+      <TransferPanel {transfers} {prepares} {failures} {transferHistory} {transferHistoryBusy} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} onClearTransferHistory={requestClearTransferHistory} />
     </main>
     <SettingsDialog
       open={settingsOpen}
@@ -2769,6 +2822,16 @@
       onCancel={cancelClearHistory}
     />
   {/if}
+  <ConfirmDialog
+    open={clearTransferHistoryOpen}
+    title="清空传输历史"
+    message={isWeb
+      ? '本机会话的传输历史会被删除，浏览器已下载的文件不受影响。'
+      : '本机保存的最近传输记录会被删除；桌面传输会同步删除对端节点上同一任务的记录。进行中的任务和失败任务不受影响。'}
+    confirmLabel="清空"
+    onConfirm={confirmClearTransferHistory}
+    onCancel={() => (clearTransferHistoryOpen = false)}
+  />
   {#if notice}
     <div class="notice" role="status">
       <span>{notice}</span>

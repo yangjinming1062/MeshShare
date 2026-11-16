@@ -194,6 +194,12 @@ button.device-metrics:hover { background: var(--surface-2); }
 .transfer-list--failures { max-height: 180px; }
 .transfer-row--failure { background: #fff7f7; }
 .transfer-icon--failure { color: var(--danger); }
+.transfer-history .transfer-subhead { color: var(--ink); }
+.transfer-history .transfer-subhead .btn { margin-left: auto; }
+.transfer-list--history { max-height: 168px; }
+.transfer-history-meta { color: var(--muted); }
+.phone-history-head h3 { color: var(--ink); }
+.phone-subhead .btn { margin-left: auto; }
 .chip--danger { color: var(--danger); background: #fee2e2; }
 .phone-failures { margin-top: 12px; }
 .phone-subhead { margin-bottom: 6px; }

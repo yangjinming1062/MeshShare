@@ -1,4 +1,4 @@
-import type { ClipboardHistoryItem, ClipboardHistorySettings, DiskMetrics, HardwareMetrics, LoadAverage, PeerInfo, TransferPrepare, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
+import type { ClipboardHistoryItem, ClipboardHistorySettings, DiskMetrics, HardwareMetrics, LoadAverage, PeerInfo, TransferHistoryEntry, TransferPrepare, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
 
 export const METRICS_STALE_AFTER_MS = 5_000;
 
@@ -156,6 +156,32 @@ export function transferStatusText(transfer: TransferProgress, surface: 'desktop
   if (transfer.status === 'failed') return transfer.error ?? '失败';
   return formatSize(transfer.completed_bytes) + ' / ' + formatSize(transfer.total_bytes)
     + ' · ' + Math.round(ratio * 100) + '%';
+}
+
+export function transferHistoryPeerText(entry: TransferHistoryEntry): string {
+  return entry.direction === 'receive' ? '来自 ' + entry.peer_name : '发送到 ' + entry.peer_name;
+}
+
+export function transferHistoryPathText(entry: TransferHistoryEntry): string {
+  if (entry.direction === 'receive') {
+    return entry.destination ? '保存到 ' + entry.destination : '保存位置未记录';
+  }
+  const roots = entry.source_paths ?? [];
+  if (!roots.length) return '来源未知';
+  return '来源 ' + roots[0] + (roots.length > 1 ? ' 等 ' + roots.length + ' 处' : '');
+}
+
+/** 网页会话记录由节点以「发送到本会话」写入；会话页面需要按接收方视角展示。 */
+export function transferHistoryForSessionView(entry: TransferHistoryEntry, nodeId: string, nodeName: string): TransferHistoryEntry {
+  if (!entry.session_id) return entry;
+  return { ...entry, direction: 'receive', peer_node_id: nodeId, peer_name: nodeName };
+}
+
+export function transferHistoryStatusText(entry: TransferHistoryEntry): string {
+  if (entry.status === 'completed') return '已完成 · ' + formatSize(entry.total_bytes);
+  if (entry.status === 'rejected') return '已拒绝';
+  if (entry.status === 'cancelled') return '已取消';
+  return entry.error ?? '失败';
 }
 
 export function clipboardHistoryPreview(item: ClipboardHistoryItem): string {

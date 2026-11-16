@@ -9,6 +9,10 @@ pub const DEFAULT_CLIPBOARD_HISTORY_DAYS: u32 = 30;
 pub const MAX_CLIPBOARD_HISTORY_COUNT: usize = 500;
 pub const MAX_CLIPBOARD_HISTORY_DAYS: u32 = 365;
 pub const MAX_TRANSFER_RECORDS: usize = 512;
+pub const TRANSFER_HISTORY_LIMIT: usize = 10;
+pub const MAX_TRANSFER_HISTORY_PATHS: usize = 8;
+pub const MAX_HISTORY_DELETE_BATCH: usize = 128;
+pub const TRANSFER_HISTORY_CAPABILITY: &str = "transfer.history.v1";
 pub const MAX_MOBILE_SESSIONS: usize = 256;
 pub const METRICS_SYSTEM_CAPABILITY: &str = "metrics.system";
 pub const METRICS_GPU_CAPABILITY: &str = "metrics.gpu";
@@ -360,6 +364,31 @@ pub struct MobileTransferView {
     pub retryable_download_item_ids: Vec<String>,
 }
 
+/// 已结束传输的摘要记录。不保存项目清单，只保留确认历史所需的归属、路径与结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferHistoryEntry {
+    pub transfer_id: String,
+    pub direction: String,
+    pub peer_node_id: String,
+    pub peer_name: String,
+    pub status: TransferStatus,
+    pub completed_bytes: u64,
+    pub total_bytes: u64,
+    pub completed_items: usize,
+    pub total_items: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub retry_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub finished_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum WireMessage {
@@ -393,6 +422,10 @@ pub enum WireMessage {
     },
     MetricsUpdate {
         metrics: HardwareMetrics,
+    },
+    /// 对端清空传输历史时同步删除本机上与它配对的记录。
+    TransferHistoryDeleted {
+        transfer_ids: Vec<String>,
     },
 }
 

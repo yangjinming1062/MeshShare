@@ -22,6 +22,8 @@
 | `DELETE` | `/api/v1/clipboard/history` | 清空本机历史，保留当前共享快照 |
 | `POST` | `/api/v1/transfers` | 创建文件清单和接收确认任务 |
 | `GET` | `/api/v1/transfers` | 查询本节点的传输任务，可用 `status=waiting` 过滤 |
+| `GET` | `/api/v1/transfers/history` | 查询最近 10 条终态传输历史，可用 `session_id` 只看网页会话 |
+| `DELETE` | `/api/v1/transfers/history` | 清空传输历史（可带 `session_id`），并同步删除对端配对记录 |
 | `POST` | `/api/v1/transfers/{id}/accept` | 用目标节点上的绝对路径接受任务 |
 | `POST` | `/api/v1/transfers/{id}/reject` | 拒绝任务 |
 | `POST` | `/api/v1/transfers/{id}/cancel` | 取消任务 |
@@ -56,7 +58,7 @@
 | `GET` | `/api/v1/mobile/peers/{peer_id}/api/v1/info` | HTTPS 网页通过接入节点核对目标设备标识 |
 | `POST/GET/PUT` | `/api/v1/mobile/peers/{peer_id}/api/v1/transfers/...` | HTTPS 网页通过接入节点代理访问其他桌面节点的传输接口，避免浏览器混合内容和跨节点证书问题 |
 
-接口业务错误使用 `{ "error": "..." }`。`GET /api/v1/clipboard` 查询返回最新快照；历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容，避免一次加载全部历史图片或大文本。历史接口只访问目标节点本机保存的记录，不修改节点间 WebSocket 的最新快照交换。`GET/PATCH /api/v1/settings` 供桌面管理界面读取和修改目标节点设置；自动更新、开机自启和监控操作在目标节点本机执行。`POST /api/v1/transfers/{id}/accept` 的 `destination` 必须是目标节点上已存在且通过目录校验的路径，管理端不会把本机文件选择器的路径当作远程路径。文件接口按传输任务查询状态。只有 `failed` 记录可以被删除：删除后该任务立即从节点状态移除，后续 `GET` 列表不再返回；记录不存在时返回 404，任务不处于失败状态时返回 409。网页端选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径。
+接口业务错误使用 `{ "error": "..." }`。`GET /api/v1/clipboard` 查询返回最新快照；历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容，避免一次加载全部历史图片或大文本。历史接口只访问目标节点本机保存的记录，不修改节点间 WebSocket 的最新快照交换。`GET/PATCH /api/v1/settings` 供桌面管理界面读取和修改目标节点设置；自动更新、开机自启和监控操作在目标节点本机执行。`POST /api/v1/transfers/{id}/accept` 的 `destination` 必须是目标节点上已存在且通过目录校验的路径，管理端不会把本机文件选择器的路径当作远程路径。文件接口按传输任务查询状态。只有 `failed` 记录可以被删除：删除后该任务立即从节点状态移除，后续 `GET` 列表不再返回；记录不存在时返回 404，任务不处于失败状态时返回 409。网页端选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径。传输历史按结束时间倒序返回；`session_id` 只匹配网页会话记录，清空只删除历史，不影响活动任务与失败任务。
 
 普通直传清单中的 `target_node_id` 必须等于接收节点的标识，地址指向其他节点时返回 421。地址回退通过 `GET /api/v1/info` 核对端点身份，后续状态查询、上传和重试共用已验证的地址；已验证的 WebSocket 端点优先，其他受限私网候选地址在有限探测预算内按顺序尝试。节点正在安装更新时，失败任务的重试返回 425。
 
@@ -77,8 +79,11 @@
 - `TransferAction` 表示接受、拒绝、取消、失败或重试，可携带失败原因和重试代次；接收目录只由接收节点本地选择，不通过节点消息传输。节点把长时间没有进展的活动传输自动判为失败时，也会向对端发送 `fail`。
 - `TransferProgress` 的 `payload.progress` 包含传输状态、已完成字节、错误和可选的 `retry_count`。重试代次递增后才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。
 - `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
+- `TransferHistoryDeleted` 的 `payload.transfer_ids` 请求对端删除与发送方配对的历史记录。接收端最多接受 `MAX_HISTORY_DELETE_BATCH` 个标识，只删除当前 Peer 自己的记录，不反向转发。
 
 节点在 `Hello` 的 `capabilities` 中声明 `clipboard.text` 时接收剪贴板事件并允许写入本机系统剪贴板；声明 `clipboard.view` 时只接收并展示最新快照，不写入系统剪贴板。发送端会跳过明确未声明这两项能力的对端。Android 声明 `clipboard.view`，所以可以在共享剪贴板面板查看桌面内容，但不会自动回写系统剪贴板；Android 通过本地 HTTP 接口主动发布的文字仍会发送给声明 `clipboard.text` 的桌面节点。
+
+声明 `transfer.history.v1` 的节点可以处理 `TransferHistoryDeleted`。旧节点反序列化未知消息会关闭连接，因此只有对端明确声明该能力时才发送；对端离线时待删除标识写入节点数据目录，重连后补发，对端已知不支持该能力时丢弃队列。
 
 桌面和浏览器界面也使用该 WebSocket 接收本节点事件，但不作为节点 Peer 发送 `Hello`。界面连接建立后立即发送 `Ping`，之后每 15 秒发送一次；节点直接返回 `Pong` 并保持界面流，不会把界面注册为对端设备。没有发送界面心跳且未完成节点握手的普通连接仍会在握手超时后关闭。
 

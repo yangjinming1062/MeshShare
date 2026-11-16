@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferOffer, TransferProgress, TransferStatus } from './types';
+import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferHistoryCleared, TransferHistoryEntry, TransferOffer, TransferProgress, TransferStatus } from './types';
 
 let baseUrl = '';
 
@@ -84,6 +84,8 @@ export const restoreClipboardHistory = (eventId: string, target = baseUrl) => re
 export const clearClipboardHistory = (target = baseUrl) => request<{ cleared: number }>('/api/v1/clipboard/history', { method: 'DELETE' }, target);
 export const getTransfers = (status?: TransferStatus, target = baseUrl) => requestList<TransferProgress>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`, target);
 export const dismissTransfer = (transferId: string, target = baseUrl) => request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(transferId)}`, { method: 'DELETE' }, target);
+export const getTransferHistory = (sessionId?: string, target = baseUrl) => requestList<TransferHistoryEntry>(`/api/v1/transfers/history${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, target);
+export const clearTransferHistory = (sessionId?: string, target = baseUrl) => request<TransferHistoryCleared>(`/api/v1/transfers/history${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { method: 'DELETE' }, target);
 export const dismissMobileTransfer = (transferId: string, target = baseUrl) => request<TransferProgress>(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}`, { method: 'DELETE' }, target);
 export const createMobileSession = (label?: string, target = baseUrl) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) }, target);
 export const getMobileSessions = (target = baseUrl) => requestList<MobileSession>('/api/v1/mobile/sessions', target);
