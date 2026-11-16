@@ -2,40 +2,36 @@
 
 ## 环境准备
 
-安装 Git、Rust stable（当前 Tauri 2 依赖链和 single-instance 插件要求 Rust 1.90 或更高）和 Node.js 22，准备对应系统的构建依赖。Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1、Wayland 开发库和 Ayatana AppIndicator 等开发包。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
+安装 Git、Rust stable（1.90 或更高）和 Node.js 22，并准备对应系统的构建依赖：Windows 需要 MSVC 和 WebView2，macOS 需要 Xcode 命令行工具，Ubuntu 24.04 需要 WebKitGTK 4.1、Wayland 开发库和 Ayatana AppIndicator。[Tauri 2 系统依赖](https://v2.tauri.app/start/prerequisites/#system-dependencies)
 
-Android 开发还需要 Android Studio 或 Android command-line tools、JDK、Android SDK Platform、Build Tools、NDK 和四个 Rust Android targets。CI Android 构建固定使用 NDK 27.2.12479018，本地构建也应显式设置 `NDK_HOME`，避免多个 NDK 版本被自动选错。当前 App 使用局域网明文 HTTP/WebSocket，因此 Android 发行构建必须保留 `usesCleartextTraffic`；该设置只适用于受信任局域网，不表示公网安全。
+Android 开发还需要 Android Studio 或 command-line tools、JDK、SDK Platform、Build Tools、NDK 和四个 Rust Android targets。CI 固定使用 NDK 27.2.12479018，本地也应显式设置 `NDK_HOME`。发行构建必须保留 `usesCleartextTraffic`，因为 App 使用局域网明文 HTTP/WebSocket；该设置只适用于受信任局域网。
 
-以下命令从仓库根目录执行。Tauri CLI 由 `npx` 按需运行。
+以下命令从仓库根目录执行，Tauri CLI 由 `npx` 按需运行。
 
 ```bash
 npm --prefix frontend ci
 npm --prefix frontend run build
 ```
 
-浏览器临时加入的网页由桌面节点从 `frontend/dist` 构建产物提供。改动网页端后，重新构建前端并重启桌面程序，再刷新浏览器页面。
+网页端由桌面节点从 `frontend/dist` 提供；改动后重新构建并重启桌面程序，再刷新浏览器。
 
-## 更新项目图标
+## 图标
 
-项目标志和网页共用 `frontend/public/meshshare.svg`。修改源图后，从仓库根目录运行 Tauri CLI 生成各平台图标。
+标志源图是 `frontend/public/meshshare.svg`。修改后生成各平台图标：
 
 ```bash
 npx --yes @tauri-apps/cli@2 icon frontend/public/meshshare.svg --output backend/target/meshshare-icon-generation
 ```
 
-将生成的 ICO、ICNS 和 `backend/tauri.conf.json` 列出的 PNG 更新到 `backend/icons/`。这些文件随仓库维护，日常构建直接使用。
-
-同一命令还会产出移动端图标，按平台放在 `backend/icons/mobile/<platform>/` 下，避免和桌面图标混在一个目录。当前 Android 使用 `backend/icons/mobile/android/`：把产物中的 `android/` 目录整份更新到这里，由 `.github/scripts/prepare_android_project.py` 在 `tauri android init` 之后写入 `gen/android/app/src/main/res`。因此 `backend/gen` 可再生，不要手工修改生成工程里的图标。自适应图标由 `mipmap-anydpi-v26/ic_launcher.xml`、`values/ic_launcher_background.xml` 与各密度 `ic_launcher_foreground.png` 组成，minSdk 29 起始终生效。
+把 ICO、ICNS 和 `backend/tauri.conf.json` 列出的 PNG 更新到 `backend/icons/`；移动端图标放到 `backend/icons/mobile/<platform>/`，由 `.github/scripts/prepare_android_project.py` 写入生成的 Android 工程。`backend/gen` 可再生，不要手工修改其中的图标。自适应图标由 `mipmap-anydpi-v26/ic_launcher.xml`、`values/ic_launcher_background.xml` 和各密度前景图组成，minSdk 29 起生效。
 
 ## 启动与构建
-
-启动桌面开发窗口。Tauri 会自动启动 Vite。
 
 ```bash
 npx --yes @tauri-apps/cli@2 dev -- --locked
 ```
 
-初始化 Android 工程并运行：
+初始化并运行 Android 工程：
 
 ```bash
 export JAVA_HOME="/path/to/jdk"
@@ -54,67 +50,21 @@ npx --yes @tauri-apps/cli@2 android build --apk --target aarch64
 npx --yes @tauri-apps/cli@2 android build --aab --target aarch64
 ```
 
-Android App 的本机节点提供文件传输和网络指标。`prepare_android_project.py` 将 Android 网络适配器、存储插件、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源文件在 `backend/android/`。APK 的前端构建以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐 Svelte 渲染所用的 `String.replaceAll`。发送文件使用系统文件选择器，接收文件默认写入应用私有目录，授予「所有文件访问权限」后写入公共的 `Download/MeshShare`。Android 节点验证包括启动和关闭、局域网 HTTP/WS 连接、双向文件校验、手动剪贴板操作、Wi-Fi 切换、普通全隧道 VPN（含用 `0.0.0.0/1` 与 `128.0.0.0/1` 取代默认路由的代理类 VPN）在「先开 VPN 再开 App」和「运行中开关 VPN」两种顺序下的双向 mDNS/HTTP/WS 发现、Tailscale 组网连接、VPN 切换期间的 listener 重建和进程退出后的状态清理。VPN 的 lockdown 或没有 Wi‑Fi/以太网时记录系统拒绝局域网绑定的降级结果。
+`prepare_android_project.py` 把网络适配器、存储插件、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源码在 `backend/android/`。APK 前端以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐了 Svelte 所需的 `String.replaceAll`。发送使用系统文件选择器，接收默认写入应用私有目录，授予「所有文件访问权限」后写入公共 `Download/MeshShare`。
 
-构建本地调试程序，产物位于 `backend/target/debug/`。
+Android 验收覆盖启动与关闭、局域网 HTTP/WS 双向传输与校验、手动剪贴板操作、Wi‑Fi 切换、普通全隧道 VPN（含用 `0.0.0.0/1` 与 `128.0.0.0/1` 代替默认路由的代理类 VPN）在「先开 VPN 再开 App」和「运行中开关」两种顺序下的 mDNS/HTTP/WS 发现、Tailscale 连接、监听器重建和退出清理。VPN lockdown 或无物理网络时记录系统拒绝绑定的降级结果。
+
+调试构建产物位于 `backend/target/debug/`：
 
 ```bash
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 ```
 
-开发模式和调试构建不会自动写入系统登录启动项，避免把调试可执行文件注册为正式启动入口；调试界面仍显示自启动开关，切换时会提示开发构建不写入登录启动项。开机自启动需要在正式桌面安装包中验证：首次启动应默认注册，登录后主窗口保持隐藏并可从托盘打开，重复打开应用只激活已有窗口。Windows 桌面还应验证左键双击系统托盘图标可以在显示和隐藏主窗口之间切换，单击不切换且右键菜单仍可用。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
-
-推送到 `main` 时，[GitHub Actions 检查工作流](../.github/workflows/ci.yml) 会运行前端检查、构建、Rust 格式与 lint，并在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行 Rust 回归测试。Pull Request 不触发该工作流，仍可按本页检查命令本地验证。
-
-Windows MSVC 的 Rust 测试宿主会链接 Tauri 使用的原生对话框 API。`backend/build.rs` 会把 Common Controls v6 manifest 嵌入 Windows/MSVC 的所有可链接目标，并关闭 `tauri-build` 的默认应用 manifest 资源，避免测试宿主因加载旧版 `comctl32` 在启动前以 `STATUS_ENTRYPOINT_NOT_FOUND` 退出。
-
-推送 `vMAJOR.MINOR.PATCH` tag 时，[GitHub Actions 发布工作流](../.github/workflows/release.yml) 将 tag 版本注入 Tauri 构建，用于安装包元数据和节点报告的版本。Release 工作流不重复运行代码检查，只执行签名校验、前端构建、安装包生成和发布所需的校验。工作流逐个上传 Windows x64、macOS Intel 和 Apple Silicon、Linux x64 的七个桌面安装包，以及一个签名的 Android arm64 APK、两个 macOS updater archive 和 `latest.json`，不上传独立的 `.sig` 文件；发布说明会在 LLM 内容后附加按平台生成的下载指导，核对 GitHub Release 的附件完整后发布为 prerelease。Tauri CLI 按运行器系统、架构和版本缓存，缓存未命中时从 Cargo 安装固定版本。
-
-Android Release 构建使用 GitHub Actions Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS` 和 `ANDROID_KEY_PASSWORD`。`ANDROID_KEYSTORE_BASE64` 是 Android 发布 keystore 的 base64 内容，不能把 keystore 或密码提交到仓库；缺少任一 Secret 时，Android 发布 job 会失败并阻止 Release 发布。普通用户下载 `MeshShare_<版本>_android_arm64.apk` 直接安装；AAB 仍通过本地 Android 构建命令生成，用于应用商店或 `bundletool`，不上传到普通下载指引。
-
-### 自动更新发布
-
-桌面更新包由 Tauri updater 签名。首次配置时，在仓库外生成一组 updater 密钥，并将公钥内容写入 `backend/tauri.conf.json`；私钥和密码只保存到 GitHub Actions Secrets `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`，不能提交到仓库。
-
-```bash
-npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-updater.key
-```
-
-将私钥文件中的完整单行 base64 值原样保存到 `TAURI_SIGNING_PRIVATE_KEY`，不要填写文件路径、密码、URL 编码值（例如 `%2B` 或 `%0A`）、引号或命令输出；密码单独保存到 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`。工作流会在跨平台构建前检查该值的 base64 和 Tauri/minisign 私钥格式。若私钥丢失，必须重新生成密钥并同步更新 `backend/tauri.conf.json` 中的公钥，已发布版本不会接受新公钥。
-
-Release 工作流会为 Windows NSIS/MSI、macOS `.app.tar.gz`、Linux AppImage/deb/rpm 生成 `.sig` 文件，并由 `.github/scripts/generate_updater_manifest.py` 将签名内容合并进 `latest.json`；签名文件只在 Actions 构建产物中使用，不作为公开 Release Asset。清单同时包含 `windows-x86_64-nsis`、`windows-x86_64-msi`、`darwin-*-app` 和 `linux-x86_64-{appimage,deb,rpm}` 条目，使 updater 能匹配当前安装介质。发布任务在签名校验完成、清单生成且所有安装包上传后才解除 Release 草稿状态，并保持 prerelease 标记；人工验证安装包后，在 GitHub Release 页面取消 prerelease 标记，版本才会进入 `releases/latest` 并允许客户端自动更新。已人工晋级为稳定版的 Release 不会被工作流重跑覆盖。
-
-Android 构建先用 `apksigner` 校验，再用 `aapt2 dump badging` 读取 APK 的包名、ABI、`versionName` 和 `versionCode`。清单生成时核对 `com.meshshare.android`、arm64 和 tag 版本，并在 `latest.json` 的 `android` 字段记录 APK 字节数 `size`、`sha256` 和 `version_code`。`versionCode` 沿用 Tauri 的 `major * 1000000 + minor * 1000 + patch`，同一更新链应使用同一 Android 发布证书。
-
-晋级稳定版前，用同一测试密钥签名的两个递增版本验证 Android 覆盖安装。在 Android 10/11 验证系统确认，在 Android 12 及以上验证免确认及系统要求确认时的回退。复查应用数据保留、活跃传输延后、取消和拒绝授权后恢复、计费网络、断网重试，以及错误签名或版本被拒绝。更新源可在隔离的测试构建中指向受控清单和 APK，正式发布构建使用项目 GitHub 稳定版。
-
-当前 macOS 发布使用 ad-hoc 签名，不需要 Apple Developer 账号。工作流通过 `APPLE_SIGNING_IDENTITY=-` 生成可在 Apple Silicon 上运行的包，并在上传前验证 `.app` 的 ad-hoc 签名和 DMG 校验；由于没有 Apple 公证，首次从浏览器下载后需要用户在「系统设置 → 隐私与安全性」中选择「仍要打开」，或手动移除下载隔离标记。以后如果启用 Developer ID，需要把工作流的 `MACOS_SIGNING_MODE` 扩展为证书签名、公证和 stapling，并补充 Apple 凭据，不能把 ad-hoc 包描述为已公证。
-
-开发构建不会执行 GitHub 更新检查。
-
-Linux 系统包更新的安装动作由 `pkexec` 调用 `dpkg -i` 或 `rpm -U`，授权对话框由 polkit 在当前桌面会话弹出。在 Ubuntu 上验收时确认：授权通过后完成安装并重启到新版本；取消授权或没有可用授权代理时显示「待安装」而不是更新失败，24 小时内不重复请求，点「立即检查」可以立即重试；有活动传输时仍然先等传输完成，安装窗口内新的传输请求提示稍后重试。AppImage 首次运行前需要 `chmod +x`，如果系统包版本正在运行要先从托盘退出，否则只会激活已有窗口。端到端授权更新要求已安装的版本包含该实现，因此需要两个连续的签名版本，不能在本机用未签名测试包替代。
-
-### Wayland 运行验收
-
-在 Ubuntu GNOME Wayland 会话中，确认 `loginctl show-session <id> -p Type` 返回 `Type=wayland`，并记录是否存在 `WAYLAND_DISPLAY`、`DISPLAY` 和 `Xwayland` 进程。重点验证文字和 PNG 剪贴板的自动读取、远端写入、历史恢复、手动同步以及悬浮监控条的拖动、隐藏和托盘恢复。
-
-MeshShare 不强制把整个桌面壳切换到 X11。剪贴板会优先使用 Wayland data-control，没有该协议时尝试 XWayland；两者都不可用时，界面应报告原因，设备间共享、历史和文件传输仍应可用。Wayland 不提供全局窗口坐标、强制置顶或点击穿透保证，因此这些行为只能在 X11 会话中作为强保证验收。
-
-发布说明由 OpenAI 兼容接口根据上一版本到当前 tag 的提交记录生成，随后追加 `.github/release-download-guide.md` 模板；模板中的桌面与 Android APK 链接由 `.github/scripts/append_release_download_guide.py` 根据当前 tag 和仓库名生成。`LLM_API_KEY` 取自 Actions Secrets，`LLM_BASE_URL` 和 `LLM_MODEL_NAME` 可配置为 Actions Secrets 或 Variables。生成失败时发布任务等待重跑。
-
-重跑失败任务会沿用原提交和已构建的安装包。修复涉及发布工作流或脚本时，需推送指向修复提交的版本 tag 来触发新的运行。如果发布任务报告有额外附件，先到对应 Release 核对并清理旧附件，再重跑发布任务。
-
-## README 截图
-
-根 README 的界面图存放在 `.github/assets/screenshots/`。桌面图对应 1180×780 逻辑像素的 Tauri 窗口，手机图对应 390×844 逻辑像素的浏览器窄视口；两者都按 2 倍像素采集并保存为 WebP，单张不超过 300 KB。
-
-用隔离的演示环境加载实际前端。桌面图使用 Tauri 布局，手机图使用浏览器窄视口，网页端与 Android App 共用这套移动版式。
-
-演示环境使用虚构设备名、示例网段、模拟的硬件指标和演示剪贴板内容。截图前检查前景、弹窗背景和每条设备记录都来自演示环境。README 按固定宽度引用这些图片，更新时保持文件名、裁切范围与图注一致。
+开发模式和调试构建不会写入系统登录启动项；调试界面仍显示开关，切换时提示该行为不生效。开机自启需在正式安装包中验证：首次启动默认注册，登录后主窗口隐藏且可从托盘打开，重复启动只激活已有窗口；Windows 还应确认左键双击托盘切换显隐、单击不切换、右键菜单可用。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
 
 ## 检查
 
-Rust 格式和 lint 检查需要 `rustfmt` 和 `clippy` 组件，可通过 `rustup component add rustfmt clippy` 安装。
+需要 `rustfmt` 和 `clippy`，可通过 `rustup component add rustfmt clippy` 安装。
 
 ```bash
 npm --prefix frontend run check
@@ -125,4 +75,46 @@ cargo clippy --manifest-path backend/Cargo.toml --all-targets --all-features --l
 cargo test --manifest-path backend/Cargo.toml --locked
 ```
 
-更新代理和错误提示的验证：把「更新代理」设为 `http://127.0.0.1:9` 后点「立即检查」，应显示连接失败原因和处置提示；改成可用代理后应检查成功，代理端能看到清单和安装包请求。
+推送到 `main` 时，[CI 工作流](../.github/workflows/ci.yml) 运行前端检查、构建、Rust 格式与 lint，并在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行回归测试；Pull Request 不触发，需要本地按上述命令验证。Windows MSVC 的测试宿主会链接 Tauri 的原生对话框 API，因此 `backend/build.rs` 把 Common Controls v6 manifest 嵌入所有可链接目标，并关闭 `tauri-build` 的默认应用 manifest，避免测试宿主在启动前以 `STATUS_ENTRYPOINT_NOT_FOUND` 退出。
+
+## 发布
+
+推送 `vMAJOR.MINOR.PATCH` tag 触发 [发布工作流](../.github/workflows/release.yml)。工作流把 tag 版本注入安装包元数据和节点版本，不重复代码检查，只做签名校验、前端构建、安装包生成和发布校验。
+
+| 产物 | 说明 |
+| --- | --- |
+| 桌面安装包 | Windows x64、macOS Intel/Apple Silicon、Linux x64，共七个 |
+| Android | 签名的 arm64 APK；AAB 由本地构建，用于商店或 `bundletool` |
+| 更新清单 | `latest.json`，含桌面平台条目和 `android` 字段；不单独上传 `.sig` |
+
+发布说明由 OpenAI 兼容接口根据上一版本到当前 tag 的提交生成，再追加 `.github/release-download-guide.md` 模板；模板中的下载链接由 `.github/scripts/append_release_download_guide.py` 生成。`LLM_API_KEY` 来自 Actions Secrets，`LLM_BASE_URL` 和 `LLM_MODEL_NAME` 可配置为 Secrets 或 Variables；生成失败时发布任务等待重跑。
+
+桌面更新包由 Tauri updater 签名。首次配置时在仓库外生成密钥，把公钥写入 `backend/tauri.conf.json`，私钥和密码只保存到 Secrets `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`：
+
+```bash
+npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-updater.key
+```
+
+私钥 Secret 只填文件里的单行 base64 值，不要填路径、密码、URL 编码、引号或命令输出。工作流在构建前校验格式；私钥丢失只能重新生成并同步公钥，已发布版本不会接受新公钥。签名文件只用于构建产物，不进入公开 Release。清单覆盖 NSIS、MSI、macOS `.app` 和 Linux AppImage/deb/rpm，使 updater 能匹配当前安装介质。发布任务在所有安装包上传后解除草稿并保持 prerelease；人工验证后取消 prerelease 才会进入 `releases/latest` 并允许客户端自动更新，已晋级的稳定版不会被重跑覆盖。
+
+macOS 当前使用 ad-hoc 签名，不需要 Apple Developer 账号；工作流以上传前验证 `.app` 签名和 DMG 校验。由于没有公证，首次从浏览器下载后需要用户在「隐私与安全性」中选择「仍要打开」。以后启用 Developer ID 时，需要扩展 `MACOS_SIGNING_MODE` 为证书签名、公证和 stapling，不能把 ad-hoc 包描述为已公证。
+
+Linux 系统包由 `pkexec` 调用 `dpkg -i` 或 `rpm -U`，授权对话框由 polkit 弹出。验收时确认：授权后安装并重启到新版本；取消授权或无授权代理时显示「待安装」并在 24 小时内不重复请求，点「立即检查」可立即重试；有传输时先等传输完成，安装窗口内的新请求提示稍后重试。AppImage 首次运行前需要 `chmod +x`，系统包版本运行时先退出托盘，否则只会激活已有窗口。端到端授权更新要求两个连续的签名版本，不能在本机用未签名测试包替代。
+
+Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS` 和 `ANDROID_KEY_PASSWORD`，缺任一都会使 job 失败并阻止发布。构建先用 `apksigner` 校验，再用 `aapt2 dump badging` 核对包名 `com.meshshare.android`、arm64、`versionName` 和 `versionCode`，并在 `latest.json` 的 `android` 字段记录 `size`、`sha256` 和 `version_code`。`versionCode` 为 `major * 1000000 + minor * 1000 + patch`，同一更新链使用同一发布证书。晋级稳定版前，用同一测试密钥签名的两个递增版本验证覆盖安装：Android 10/11 确认系统弹窗，Android 12 及以上确认免确认与回退路径；复查数据保留、活跃传输延后、取消或拒绝授权后的恢复、计费网络、断网重试，以及错误签名或版本被拒绝。
+
+重跑失败任务会沿用原提交和已构建的安装包。修复发布工作流或脚本时，需要推送指向修复提交的新版本 tag。若报告存在额外附件，先在对应 Release 清理旧附件再重跑。
+
+## 文档截图
+
+根 README 的界面图存放在 `.github/assets/screenshots/`。桌面图对应 1180×780 逻辑像素窗口，手机图对应 390×844 浏览器窄视口，均按 2 倍像素采集并保存为 WebP，单张不超过 300 KB。使用虚构设备名、示例网段、模拟指标和演示剪贴板内容，检查前景与弹窗不出现真实数据。
+
+## Wayland 验收
+
+在 Ubuntu GNOME Wayland 会话确认 `loginctl show-session <id> -p Type` 返回 `Type=wayland`，记录 `WAYLAND_DISPLAY`、`DISPLAY` 和 Xwayland 状态。验证文字与 PNG 剪贴板的自动读取、远端写入、历史恢复、手动同步，以及悬浮条的拖动、隐藏和托盘恢复。
+
+MeshShare 不强制整个桌面壳切换到 X11。剪贴板优先 Wayland data-control，没有该协议时尝试 XWayland；两者都不可用时界面报告原因，设备间共享、历史和文件传输仍应可用。Wayland 不提供全局坐标、强制置顶和点击穿透的强保证，这些行为只在 X11 会话验收。
+
+## 更新代理验收
+
+把「更新代理」设为 `http://127.0.0.1:9` 后点「立即检查」，应显示连接失败原因和处置提示；改成可用代理后应检查成功，代理端能看到清单和安装包请求。
