@@ -33,6 +33,7 @@ struct Listeners {
     https: BTreeMap<Ipv4Addr, Listener>,
     failed_binds: BTreeSet<(Ipv4Addr, u16)>,
     last_candidates: BTreeSet<Ipv4Addr>,
+    last_network_rebind_generation: u64,
     http_port: u16,
     https_port: u16,
     tls: RustlsConfig,
@@ -110,6 +111,7 @@ impl Listeners {
             https: BTreeMap::from([(local, serve_https(https, app.clone(), config.clone())?)]),
             failed_binds: BTreeSet::new(),
             last_candidates: addresses.clone(),
+            last_network_rebind_generation: runtime.network_rebind_generation(),
             http_port,
             https_port,
             tls: config,
@@ -121,12 +123,17 @@ impl Listeners {
     }
 
     async fn reconcile(&mut self, runtime: &runtime::NodeRuntime, candidates: &BTreeSet<Ipv4Addr>) {
-        let network_changed =
-            needs_network_listener_restart(runtime, &self.last_candidates, candidates);
+        let network_changed = needs_network_listener_restart(
+            runtime,
+            &self.last_candidates,
+            candidates,
+            self.last_network_rebind_generation,
+        );
         if network_changed {
             self.restart_network_listeners().await;
         }
         self.last_candidates = candidates.clone();
+        self.last_network_rebind_generation = runtime.network_rebind_generation();
         self.http.retain(|ip, listener| {
             candidates.contains(ip)
                 && listener
@@ -246,8 +253,11 @@ fn needs_network_listener_restart(
     runtime: &runtime::NodeRuntime,
     previous: &BTreeSet<Ipv4Addr>,
     current: &BTreeSet<Ipv4Addr>,
+    last_network_rebind_generation: u64,
 ) -> bool {
-    runtime.is_android_profile() && previous != current
+    runtime.is_android_profile()
+        && (previous != current
+            || runtime.network_rebind_generation() != last_network_rebind_generation)
 }
 
 fn serve_http(listener: TcpListener, app: Router) -> io::Result<Listener> {
@@ -387,8 +397,11 @@ mod tests {
         .expect("create Android runtime");
         let local = BTreeSet::from([Ipv4Addr::LOCALHOST]);
         let wifi = BTreeSet::from([Ipv4Addr::LOCALHOST, Ipv4Addr::new(192, 168, 1, 20)]);
-        assert!(!needs_network_listener_restart(&runtime, &local, &local));
-        assert!(needs_network_listener_restart(&runtime, &local, &wifi));
+        assert!(!needs_network_listener_restart(&runtime, &local, &local, 0));
+        assert!(needs_network_listener_restart(&runtime, &local, &wifi, 0));
+        assert!(!needs_network_listener_restart(&runtime, &local, &local, 0));
+        runtime.request_network_rebind();
+        assert!(needs_network_listener_restart(&runtime, &local, &local, 0));
         let _ = std::fs::remove_dir_all(path);
     }
 }

@@ -174,6 +174,7 @@ pub struct NodeRuntime {
     pub mobile_sessions: RwLock<HashMap<String, MobileSession>>,
     pub mobile_transfers: RwLock<HashMap<String, MobileTransferRecord>>,
     mobile_manifest_bytes: AtomicU64,
+    network_rebind_generation: AtomicU64,
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
     pub monitor_visible: AtomicBool,
     pub monitor_locked: AtomicBool,
@@ -404,6 +405,7 @@ impl NodeRuntime {
             mobile_sessions: RwLock::new(HashMap::new()),
             mobile_transfers: RwLock::new(HashMap::new()),
             mobile_manifest_bytes: AtomicU64::new(0),
+            network_rebind_generation: AtomicU64::new(0),
             local_metrics: RwLock::new(None),
             monitor_visible: AtomicBool::new(config.monitor_visible),
             monitor_locked: AtomicBool::new(config.monitor_locked),
@@ -437,6 +439,16 @@ impl NodeRuntime {
 
     pub fn is_android_profile(&self) -> bool {
         self.profile.is_android()
+    }
+
+    pub fn network_rebind_generation(&self) -> u64 {
+        self.network_rebind_generation.load(Ordering::SeqCst)
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub fn request_network_rebind(&self) {
+        self.network_rebind_generation
+            .fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn supports_capability(&self, capability: &str) -> bool {
@@ -3130,6 +3142,16 @@ fn is_cellular_interface(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
+fn is_android_vpn_interface(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    if name.starts_with("tailscale") {
+        return false;
+    }
+    ["tun", "tap", "utun", "wg", "wireguard", "vpn", "ipsec"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 /// 物理以太网和无线地址更可能是对端可达的入口；虚拟网卡与蜂窝地址排在后面，
 /// 让公布顺序与手机、桌面互相直连时实际能用的地址一致。
 fn interface_rank(name: &str) -> u8 {
@@ -3258,6 +3280,8 @@ fn bindable_addresses(
         .into_iter()
         // 蜂窝地址在局域网内没有可达意义，Android 上也不应让节点绑定到运营商地址。
         .filter(|(name, _)| !(profile.is_android() && is_cellular_interface(name)))
+        // Android 原生插件会把进程 socket 固定到 Wi-Fi/以太网；VPN 地址不能在该网络上监听。
+        .filter(|(name, _)| !(profile.is_android() && is_android_vpn_interface(name)))
         .filter_map(|(_, ip)| match ip {
             IpAddr::V4(address) if is_network_ipv4(address) => Some(address),
             _ => None,
@@ -3437,6 +3461,23 @@ mod tests {
         assert!(desktop.contains(&Ipv4Addr::new(192, 168, 1, 20)));
         assert!(desktop.contains(&Ipv4Addr::new(10, 136, 144, 220)));
         assert!(desktop.contains(&Ipv4Addr::new(172, 20, 0, 1)));
+    }
+
+    #[test]
+    fn android_skips_vpn_interfaces_but_keeps_tailscale() {
+        let interfaces = vec![
+            (
+                "tun0".to_string(),
+                "10.8.0.2".parse::<IpAddr>().expect("VPN address"),
+            ),
+            (
+                "tailscale0".to_string(),
+                "100.64.0.2".parse::<IpAddr>().expect("Tailscale address"),
+            ),
+        ];
+        let android = bindable_addresses(NodeProfile::Android, interfaces);
+        assert!(!android.contains(&Ipv4Addr::new(10, 8, 0, 2)));
+        assert!(android.contains(&Ipv4Addr::new(100, 64, 0, 2)));
     }
 
     #[test]

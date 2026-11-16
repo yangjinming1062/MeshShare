@@ -161,6 +161,12 @@ fn node_base_url(state: State<'_, ManagedNode>) -> String {
     format!("http://127.0.0.1:{}", state.runtime.node_info().port)
 }
 
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn android_network_changed(state: State<'_, ManagedNode>) {
+    state.runtime.request_network_rebind();
+}
+
 /// 把节点 CA 写到用户选择的位置，返回实际路径；用户取消时返回 `None`。
 #[cfg(not(target_os = "android"))]
 #[tauri::command]
@@ -1096,6 +1102,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             node_base_url,
+            android_network_changed,
             clipboard_status,
             clipboard_history_settings,
             set_clipboard_history_settings,

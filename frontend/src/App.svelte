@@ -2,7 +2,7 @@
   import { onMount, tick } from 'svelte';
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { invoke, isTauri } from '@tauri-apps/api/core';
+  import { addPluginListener, invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { ApiError, apiUrl, clearClipboardHistory, completeMobileItem, createMobileSession, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restoreClipboardHistory, setApiTarget, websocketUrl } from './api';
@@ -292,6 +292,7 @@
     let monitorPositionWriteInFlight = false;
     let monitorPositionUnlisten: (() => void) | undefined;
     let updateStatusUnlisten: (() => void) | undefined;
+    let androidNetworkUnlisten: (() => void) | undefined;
     if (isDesktopWindow) {
       void listen<UpdateStatus>('update-status', ({ payload }) => {
         if (!remoteMode) updateStatus = payload;
@@ -299,6 +300,16 @@
         if (stopped) unlisten();
         else updateStatusUnlisten = unlisten;
       }).catch((error) => console.error('监听更新状态失败', error));
+    }
+    if (isAndroidApp) {
+      void addPluginListener<{ network_handle: number }>('android-network', 'network_changed', () => {
+        void invoke('android_network_changed').catch((error) => {
+          console.error('通知 Rust 网络绑定变化失败', error);
+        });
+      }).then((listener) => {
+        if (stopped) void listener.unregister();
+        else androidNetworkUnlisten = () => { void listener.unregister(); };
+      }).catch((error) => console.error('监听 Android 网络绑定变化失败', error));
     }
     const flushMonitorPosition = async () => {
       if (!pendingMonitorPosition || monitorPositionWriteInFlight) return;
@@ -384,6 +395,7 @@
       if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
       monitorPositionUnlisten?.();
       updateStatusUnlisten?.();
+      androidNetworkUnlisten?.();
       void flushMonitorPosition();
       if (stopped) window.clearTimeout(timer);
     };

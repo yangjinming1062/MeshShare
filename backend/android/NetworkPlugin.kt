@@ -115,6 +115,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         val target = if (isFullTunnelVpnActive()) selectLanNetwork() else null
         val targetHandle = target?.networkHandle
         if (targetHandle != boundNetworkHandle) {
+            val previousHandle = boundNetworkHandle
             val bound = connectivity.bindProcessToNetwork(target)
             if (bound) {
                 boundNetworkHandle = targetHandle
@@ -132,10 +133,18 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
                 }
                 boundNetworkHandle = null
             }
+            if (boundNetworkHandle != previousHandle) {
+                trigger(
+                    "network_changed",
+                    JSObject().apply {
+                        put("network_handle", boundNetworkHandle ?: 0L)
+                    },
+                )
+            }
         }
         return JSObject().apply {
-            put("mode", if (target == null) "default" else "lan")
-            put("network_handle", targetHandle ?: 0L)
+            put("mode", if (boundNetworkHandle == null) "default" else "lan")
+            put("network_handle", boundNetworkHandle ?: 0L)
         }
     }
 

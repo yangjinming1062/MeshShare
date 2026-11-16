@@ -19,6 +19,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
         .name("meshshare-mdns".to_string())
         .spawn(move || {
             let mut observed_addresses = crate::runtime::bind_addresses();
+            let mut observed_network_rebind_generation = runtime.network_rebind_generation();
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 let Ok(daemon) = ServiceDaemon::new() else {
                     thread::sleep(Duration::from_secs(1));
@@ -39,7 +40,10 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     // after a VPN/Wi-Fi change so its existing physical socket is
                     // not left on the old process network.
                     let current_addresses = crate::runtime::bind_addresses();
-                    if current_addresses != observed_addresses {
+                    let current_network_rebind_generation = runtime.network_rebind_generation();
+                    if current_addresses != observed_addresses
+                        || current_network_rebind_generation != observed_network_rebind_generation
+                    {
                         restart = true;
                         break;
                     }
@@ -101,6 +105,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     break;
                 }
                 observed_addresses = crate::runtime::bind_addresses();
+                observed_network_rebind_generation = runtime.network_rebind_generation();
                 thread::sleep(Duration::from_millis(100));
             }
         })
