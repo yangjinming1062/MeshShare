@@ -104,6 +104,8 @@
   let monitorVisible = true;
   let settingsOpen = false;
   let mobileAccessOpen = false;
+  // 打开二维码窗口时已知的网页会话；之后出现新会话说明有浏览器临时加入。
+  let mobileAccessKnownSessions = new Set<string>();
   let addDeviceOpen = false;
   let clipboardTab: 'current' | 'history' = 'current';
   let historyDetailOpen = false;
@@ -532,6 +534,10 @@
       }
     } else {
       mobileSessions = await getMobileSessions();
+      // 出现新的网页会话说明浏览器已通过该地址加入，收起二维码窗口。
+      if (mobileAccessOpen && mobileSessions.some((session) => !mobileAccessKnownSessions.has(session.session_id))) {
+        mobileAccessOpen = false;
+      }
       mobileTransfers = await getMobileTransfers();
       nextTransfers.push(...mobileTransfers.map((view) => ({ ...view.progress, direction: 'send' as const })));
       for (const view of mobileTransfers) {
@@ -822,6 +828,11 @@
     const currentRank = transferStatusRank(current.status);
     const nextRank = transferStatusRank(next.status);
     return nextRank < currentRank;
+  }
+
+  function openMobileAccess() {
+    mobileAccessKnownSessions = new Set(mobileSessions.map((session) => session.session_id));
+    mobileAccessOpen = true;
   }
 
   async function refreshQr(url: string): Promise<void> {
@@ -2721,7 +2732,7 @@
         onConnect={connectManualPeer}
         onConnectSaved={connectSavedPeer}
         onOpenPeer={openRemotePeer}
-        onMobileAccess={() => (mobileAccessOpen = true)}
+        onMobileAccess={openMobileAccess}
         onSendPeer={(peer) => startChoose(peer)}
         onSendPeerFolder={(peer) => startChoose(peer, true)}
         onDetails={selectMetricsPeer}

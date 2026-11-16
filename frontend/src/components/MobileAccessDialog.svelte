@@ -95,7 +95,7 @@
       {/each}
     </select>
     <div class="code-block">{mobileUrl}</div>
-    <p class="hint">HTTP 地址无需安装证书，打开后即可临时加入并下载文件；手机也可以扫描二维码。HTTP 不提供链路加密和完整性保护，仅适用于受信任网络。</p>
+    <p class="hint">HTTP 地址无需安装证书，打开后即可临时加入并下载文件；手机也可以扫描二维码。浏览器加入后本窗口自动关闭。HTTP 不提供链路加密和完整性保护，仅适用于受信任网络。</p>
     {#if secureUrl}
       <p class="hint">
         如需选择本地目录并直接写入，请先
