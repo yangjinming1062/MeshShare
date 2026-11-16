@@ -54,7 +54,7 @@ npx --yes @tauri-apps/cli@2 android build --apk --target aarch64
 npx --yes @tauri-apps/cli@2 android build --aab --target aarch64
 ```
 
-Android App 的本机节点提供文件传输和网络指标。`prepare_android_project.py` 将 Android 网络适配器、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源文件在 `backend/android/`。APK 的前端构建以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐 Svelte 渲染所用的 `String.replaceAll`。发送文件使用系统文件选择器，接收文件默认写入应用专属的 Download/MeshShare 目录。Android 节点验证包括启动和关闭、局域网 HTTP/WS 连接、双向文件校验、手动剪贴板操作、Wi-Fi 切换、普通全隧道 VPN 开关前后双向 mDNS/HTTP/WS 发现、Tailscale 组网连接、VPN 切换期间的 listener 重建和进程退出后的状态清理。VPN 的 lockdown 或没有 Wi‑Fi/以太网时记录系统拒绝局域网绑定的降级结果。
+Android App 的本机节点提供文件传输和网络指标。`prepare_android_project.py` 将 Android 网络适配器、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源文件在 `backend/android/`。APK 的前端构建以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐 Svelte 渲染所用的 `String.replaceAll`。发送文件使用系统文件选择器，接收文件默认写入应用专属的 Download/MeshShare 目录。Android 节点验证包括启动和关闭、局域网 HTTP/WS 连接、双向文件校验、手动剪贴板操作、Wi-Fi 切换、普通全隧道 VPN（含用 `0.0.0.0/1` 与 `128.0.0.0/1` 取代默认路由的代理类 VPN）在「先开 VPN 再开 App」和「运行中开关 VPN」两种顺序下的双向 mDNS/HTTP/WS 发现、Tailscale 组网连接、VPN 切换期间的 listener 重建和进程退出后的状态清理。VPN 的 lockdown 或没有 Wi‑Fi/以太网时记录系统拒绝局域网绑定的降级结果。
 
 构建本地调试程序，产物位于 `backend/target/debug/`。
 

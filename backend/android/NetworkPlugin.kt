@@ -18,12 +18,11 @@ import app.tauri.plugin.Plugin
 import java.net.InetAddress
 
 private const val LOG_TAG = "MeshShareNetwork"
+private const val LAN_BIND_RETRY_MS = 1_000L
 
 /**
- * Keeps MeshShare's sockets on the physical LAN when a full-tunnel VPN is the
- * Android process default network. The Rust node opens raw TCP and UDP sockets,
- * so binding the process before startup is the only common policy that also
- * covers mDNS sockets created by mdns-sd.
+ * 普通 VPN 成为进程默认网络时，把 MeshShare 的 socket 固定在物理局域网上。Rust 节点直接
+ * 创建 TCP/UDP socket，只有进程级绑定才能同时覆盖 mdns-sd 创建的组播 socket。
  */
 @TauriPlugin
 class NetworkPlugin(activity: Activity) : Plugin(activity) {
@@ -33,6 +32,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
     private val main = Handler(Looper.getMainLooper())
     private var destroyed = false
     private var boundNetworkHandle: Long? = null
+    private var bindRetryPosted = false
     private var multicastLock: WifiManager.MulticastLock? = null
 
     private val lanRequest = NetworkRequest.Builder()
@@ -47,6 +47,9 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
             scheduleRebind()
 
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
+            scheduleRebind()
+
         override fun onLost(network: Network) = scheduleRebind()
     }
 
@@ -54,6 +57,9 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         override fun onAvailable(network: Network) = scheduleRebind()
 
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
+            scheduleRebind()
+
+        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
             scheduleRebind()
 
         override fun onLost(network: Network) = scheduleRebind()
@@ -67,8 +73,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         } catch (error: Exception) {
             Log.w(LOG_TAG, "无法监听 Android 网络变化", error)
         }
-        // This runs synchronously so the Rust listeners and mDNS daemon are
-        // created with the selected network already in effect.
+        // 这里同步执行，Rust 监听器和 mDNS 守护进程会在绑定生效后才创建。
         rebindProcessNetwork()
     }
 
@@ -88,8 +93,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         try {
             connectivity.unregisterNetworkCallback(defaultNetworkCallback)
         } catch (_: Exception) {
-            // The callback may not have been registered on devices that reject
-            // network callbacks for the current profile.
+            // 部分设备或系统配置会拒绝注册网络回调，注销失败可以忽略。
         }
         try {
             connectivity.unregisterNetworkCallback(lanNetworkCallback)
@@ -108,16 +112,20 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
     }
 
     private fun scheduleRebind() {
-        if (!destroyed) main.post { if (!destroyed) rebindProcessNetwork() }
+        if (destroyed) return
+        // 每次网络事件都允许重新尝试一次绑定，重试自身不再排新的重试。
+        bindRetryPosted = false
+        main.post { if (!destroyed) rebindProcessNetwork() }
     }
 
     private fun rebindProcessNetwork(): JSObject {
-        val target = if (isFullTunnelVpnActive()) selectLanNetwork() else null
+        val lan = selectLanNetwork()
+        val target = lan?.takeIf { vpnCapturesLan(it) }
         val targetHandle = target?.networkHandle
         if (targetHandle != boundNetworkHandle) {
             val previousHandle = boundNetworkHandle
             val bound = connectivity.bindProcessToNetwork(target)
-            if (bound) {
+            if (bound && processNetworkHandle() == targetHandle) {
                 boundNetworkHandle = targetHandle
                 Log.i(
                     LOG_TAG,
@@ -132,6 +140,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
                     Log.w(LOG_TAG, "清理失败的 MeshShare 网络绑定失败", error)
                 }
                 boundNetworkHandle = null
+                scheduleBindRetry(targetHandle)
             }
             if (boundNetworkHandle != previousHandle) {
                 trigger(
@@ -148,22 +157,51 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         }
     }
 
-    private fun isFullTunnelVpnActive(): Boolean {
-        val active = connectivity.activeNetwork ?: return false
-        val capabilities = connectivity.getNetworkCapabilities(active) ?: return false
-        if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return false
+    private fun processNetworkHandle(): Long? =
+        try {
+            connectivity.getBoundNetworkForProcess()?.networkHandle
+        } catch (error: Exception) {
+            Log.w(LOG_TAG, "读取 MeshShare 网络绑定失败", error)
+            null
+        }
 
-        val linkProperties = connectivity.getLinkProperties(active)
-        if (linkProperties?.isTailscaleNetwork() == true) {
+    /** 系统可能忽略切换瞬间的绑定，每个网络事件至多重试一次，避免进程永久留在隧道网络里。 */
+    private fun scheduleBindRetry(targetHandle: Long?) {
+        if (destroyed || bindRetryPosted || targetHandle == null) return
+        bindRetryPosted = true
+        main.postDelayed({ if (!destroyed) rebindProcessNetwork() }, LAN_BIND_RETRY_MS)
+    }
+
+    /**
+     * 只有默认网络是普通 VPN、且它的路由会收走发往本机局域网地址的流量时，才需要把进程切到
+     * 物理局域网。代理类 VPN 常用 0.0.0.0/1 与 128.0.0.0/1 取代默认路由，只看前缀长度会把
+     * 这种全隧道误判成分流，因此按路由是否覆盖局域网地址判断。
+     */
+    private fun vpnCapturesLan(lan: Network): Boolean {
+        val active = connectivity.activeNetwork ?: return false
+        if (active.networkHandle == lan.networkHandle) return false
+        val capabilities = connectivity.getNetworkCapabilities(active) ?: return false
+        if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            Log.i(LOG_TAG, "默认网络不是 VPN，保持系统网络选择")
+            return false
+        }
+        val vpn = connectivity.getLinkProperties(active) ?: return true
+        if (vpn.isTailscaleNetwork()) {
             Log.i(LOG_TAG, "检测到 Tailscale 组网，保留 Tailscale 网络")
             return false
         }
-        // Only a VPN that installs a default route is treated as full-tunnel.
-        // Split-tunnel VPNs already leave LAN routes available and should not
-        // move the process away from their intended network.
-        return linkProperties?.routes?.any { route ->
-            route.destination.prefixLength == 0
-        } ?: true
+        // 读不到路由或局域网地址时按保守策略绑定，避免整个进程留在隧道网络里。
+        if (vpn.routes.isEmpty()) return true
+        val lanAddresses = connectivity.getLinkProperties(lan)
+            ?.linkAddresses
+            ?.map { address -> address.address }
+            .orEmpty()
+        if (lanAddresses.isEmpty()) return true
+        val captures = vpn.routes.any { route ->
+            lanAddresses.any { address -> route.destination.contains(address) }
+        }
+        if (!captures) Log.i(LOG_TAG, "VPN 路由不覆盖局域网地址，保持系统网络选择")
+        return captures
     }
 
     private fun LinkProperties.isTailscaleNetwork(): Boolean =

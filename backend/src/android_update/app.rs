@@ -135,12 +135,18 @@ pub(crate) struct AndroidUpdater {
     wake: Notify,
 }
 
+/// Android 插件句柄按插件分别包装托管。`App::manage` 对同一类型只保留第一个状态，
+/// 直接托管 `PluginHandle` 会让后注册的插件拿到前一个插件的句柄。
+pub(crate) struct AndroidUpdatePluginHandle(pub(crate) PluginHandle<Wry>);
+
 pub(crate) fn plugin() -> TauriPlugin<Wry> {
     tauri::plugin::Builder::new("android-update")
         .setup(|app, api| {
-            app.manage(
-                api.register_android_plugin("com.meshshare.android.update", "UpdatePlugin")?,
-            );
+            let handle =
+                api.register_android_plugin("com.meshshare.android.update", "UpdatePlugin")?;
+            if !app.manage(AndroidUpdatePluginHandle(handle)) {
+                return Err("Android 更新插件句柄已存在".into());
+            }
             Ok(())
         })
         .build()
@@ -183,7 +189,7 @@ pub(crate) fn start(app: &AppHandle, runtime: Arc<NodeRuntime>, data_dir: &Path)
     let updater = Arc::new(AndroidUpdater {
         app: app.clone(),
         runtime,
-        platform: app.state::<PluginHandle<Wry>>().inner().clone(),
+        platform: app.state::<AndroidUpdatePluginHandle>().0.clone(),
         client,
         config_path,
         cache: app.path().app_cache_dir()?.join("android-update"),
