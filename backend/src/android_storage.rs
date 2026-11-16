@@ -1,7 +1,7 @@
 //! Android 接收目录的「所有文件访问权限」桥接。
 
 use tauri::plugin::{Builder, PluginHandle, TauriPlugin};
-use tauri::Wry;
+use tauri::{Manager, Wry};
 
 /// 插件句柄按插件分别包装托管：`App::manage` 对同一类型只保留第一个状态。
 pub(crate) struct AndroidStoragePluginHandle(pub(crate) PluginHandle<Wry>);
