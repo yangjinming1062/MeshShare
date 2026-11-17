@@ -14,6 +14,7 @@ use crate::model::{
     TRANSFER_HISTORY_CAPABILITY, TRANSFER_HISTORY_LIMIT,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use futures_util::StreamExt;
 #[cfg(not(target_os = "android"))]
 use parking_lot::Condvar;
 use parking_lot::{Mutex, RwLock};
@@ -24,7 +25,7 @@ use std::net::Ipv4Addr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::io::ReaderStream;
@@ -248,6 +249,10 @@ pub struct TransferRecord {
     pub peer_name: Option<String>,
     /// 发送方向用户选择的根路径；接收与暂存发送为空。
     pub source_paths: Vec<String>,
+    /// 已提交条目的累计字节；进度展示在此基础上叠加当前条目的在途字节。
+    pub committed_bytes: u64,
+    /// 当前条目已接收但尚未提交的字节，条目提交后清空。
+    pub upload_in_flight: Option<(String, u64)>,
     pub updated_at_ms: i64,
 }
 
@@ -288,6 +293,9 @@ pub(crate) enum TransferRetryError {
 }
 
 pub(crate) const UPDATE_INSTALLING_MESSAGE: &str = "应用正在安装更新，请稍后重试";
+
+/// 单条传输进度的上报节流间隔。
+pub(crate) const TRANSFER_PROGRESS_INTERVAL: Duration = Duration::from_millis(200);
 
 struct MobileCa {
     path: PathBuf,
@@ -1789,6 +1797,8 @@ impl NodeRuntime {
                 received_items: HashSet::new(),
                 peer_name: Some(offer.source_name.clone()),
                 source_paths: Vec::new(),
+                committed_bytes: 0,
+                upload_in_flight: None,
                 updated_at_ms: now_millis(),
             },
         );
@@ -1830,6 +1840,8 @@ impl NodeRuntime {
                 received_items: HashSet::new(),
                 peer_name,
                 source_paths: Vec::new(),
+                committed_bytes: 0,
+                upload_in_flight: None,
                 updated_at_ms: now_millis(),
             },
         );
@@ -2323,6 +2335,7 @@ impl NodeRuntime {
 
     async fn put_outgoing_item(
         &self,
+        runtime: &Arc<NodeRuntime>,
         base: &str,
         transfer_id: &str,
         item: &TransferItem,
@@ -2336,11 +2349,31 @@ impl NodeRuntime {
             crate::server::encode_path_segment(transfer_id),
             crate::server::encode_path_segment(&item.item_id)
         );
+        let runtime = runtime.clone();
+        let transfer_id = transfer_id.to_string();
+        let item_id = item.item_id.clone();
+        let stream = ReaderStream::new(file).scan(
+            (0u64, Instant::now()),
+            move |(sent, last_report), chunk| {
+                if let Ok(bytes) = &chunk {
+                    *sent = sent.saturating_add(bytes.len() as u64);
+                    if last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
+                        if let Some(progress) =
+                            runtime.report_transfer_progress(&transfer_id, &item_id, *sent)
+                        {
+                            runtime.publish_event(WireMessage::TransferProgress { progress });
+                        }
+                        *last_report = Instant::now();
+                    }
+                }
+                std::future::ready(Some(chunk))
+            },
+        );
         let response = self
             .upload_http
             .put(url)
             .header(reqwest::header::CONTENT_TYPE, item.media_type.clone())
-            .body(reqwest::Body::wrap_stream(ReaderStream::new(file)))
+            .body(reqwest::Body::wrap_stream(stream))
             .send()
             .await;
         match response {
@@ -2400,7 +2433,10 @@ impl NodeRuntime {
         message
     }
 
-    pub(crate) async fn upload_outgoing_transfer(&self, transfer_id: &str) -> Result<(), String> {
+    pub(crate) async fn upload_outgoing_transfer(
+        self: &Arc<Self>,
+        transfer_id: &str,
+    ) -> Result<(), String> {
         let Some(entry) = self
             .staged_outgoing_snapshot()
             .into_iter()
@@ -2455,7 +2491,7 @@ impl NodeRuntime {
             let reported = loop {
                 attempt += 1;
                 match self
-                    .put_outgoing_item(&base, transfer_id, item, &path)
+                    .put_outgoing_item(self, &base, transfer_id, item, &path)
                     .await
                 {
                     Ok(progress) => break progress,
@@ -2475,7 +2511,14 @@ impl NodeRuntime {
             };
             match reported {
                 // 以接收端返回的进度为准，避免本地计数与对端进度叠加。
-                Some(progress) => self.update_transfer(transfer_id, progress),
+                Some(progress) => {
+                    self.acknowledge_outgoing_item(
+                        transfer_id,
+                        &item.item_id,
+                        progress.completed_bytes,
+                    );
+                    self.update_transfer(transfer_id, progress);
+                }
                 None => {
                     if let Some(progress) =
                         self.mark_outgoing_item_uploaded(transfer_id, &item.item_id, item.size)
@@ -2499,6 +2542,22 @@ impl NodeRuntime {
             self.remove_outgoing_staging(transfer_id);
         }
         Ok(())
+    }
+
+    /// 接收端确认条目后记录已提交基线。
+    ///
+    /// `upload_outgoing_transfer` 在收到条目的成功响应时调用；把条目记入
+    /// `received_items` 后，重传同一已提交条目不会再叠加在途进度。
+    fn acknowledge_outgoing_item(&self, transfer_id: &str, item_id: &str, completed_bytes: u64) {
+        let mut transfers = self.transfers.write();
+        let Some(record) = transfers.get_mut(transfer_id) else {
+            return;
+        };
+        record.received_items.insert(item_id.to_string());
+        record.committed_bytes = record
+            .committed_bytes
+            .max(completed_bytes.min(record.offer.total_bytes));
+        record.upload_in_flight = None;
     }
 
     pub fn mark_outgoing_item_uploaded(
@@ -2528,9 +2587,10 @@ impl NodeRuntime {
             return None;
         }
         if record.received_items.insert(item_id.to_string()) {
+            record.committed_bytes = record.committed_bytes.saturating_add(bytes);
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
-            record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
         }
+        record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
         record.progress.status = if record.progress.completed_items >= record.progress.total_items {
@@ -2538,6 +2598,10 @@ impl NodeRuntime {
         } else {
             TransferStatus::Uploading
         };
+        record.progress.completed_bytes = record
+            .progress
+            .completed_bytes
+            .max(record.committed_bytes.min(record.offer.total_bytes));
         let progress = record.progress.clone();
         let snapshot = record.clone();
         drop(transfers);
@@ -2556,6 +2620,12 @@ impl NodeRuntime {
             let mut transfers = self.transfers.write();
             transfers.get_mut(transfer_id).map(|record| {
                 let was_terminal = is_terminal_transfer(&record.progress.status);
+                if record.progress.direction.as_deref() == Some("send") {
+                    record.committed_bytes = record
+                        .committed_bytes
+                        .max(progress.completed_bytes.min(record.offer.total_bytes));
+                    record.upload_in_flight = None;
+                }
                 let mut next = progress.clone();
                 next.offer = Some(record.offer.clone());
                 next.direction = record.progress.direction.clone();
@@ -2633,15 +2703,20 @@ impl NodeRuntime {
         }
         item.sha256 = digest;
         if record.received_items.insert(item_id.to_string()) {
+            record.committed_bytes = record.committed_bytes.saturating_add(bytes);
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
-            record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
         }
+        record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
         if record.progress.completed_items >= record.progress.total_items {
             record.progress.status = TransferStatus::Completed;
         } else {
             record.progress.status = TransferStatus::Uploading;
         }
+        record.progress.completed_bytes = record
+            .progress
+            .completed_bytes
+            .max(record.committed_bytes.min(record.offer.total_bytes));
         record.progress.offer = Some(record.offer.clone());
         let progress = record.progress.clone();
         let snapshot = record.clone();
@@ -2690,6 +2765,7 @@ impl NodeRuntime {
         }
         record.progress.status = status;
         record.progress.error = Some(message);
+        record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
         let progress = record.progress.clone();
@@ -2734,6 +2810,7 @@ impl NodeRuntime {
         record.progress.retry_count = retry_count;
         record.progress.status = status;
         record.progress.error = None;
+        record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
         let progress = record.progress.clone();
@@ -3261,6 +3338,47 @@ impl NodeRuntime {
             return None;
         }
         record.progress.status = TransferStatus::Uploading;
+        record.updated_at_ms = now_millis();
+        record.progress.offer = Some(record.offer.clone());
+        Some(record.progress.clone())
+    }
+
+    /// 在条目提交前记录当前已接收字节并生成对外进度。
+    ///
+    /// `completed_bytes` 取已提交字节与在途字节的高水位，保证进度只增不减
+    /// 且不超过总量；`completed_items` 仍只统计已提交条目。
+    pub fn report_transfer_progress(
+        &self,
+        transfer_id: &str,
+        item_id: &str,
+        received_bytes: u64,
+    ) -> Option<TransferProgress> {
+        let mut transfers = self.transfers.write();
+        let record = transfers.get_mut(transfer_id)?;
+        if !matches!(
+            record.progress.status,
+            TransferStatus::Accepted | TransferStatus::Uploading
+        ) || record.received_items.contains(item_id)
+        {
+            return None;
+        }
+        let item_size = record
+            .offer
+            .items
+            .iter()
+            .find(|item| item.item_id == item_id)?
+            .size;
+        let received = received_bytes.min(item_size);
+        let received = match &record.upload_in_flight {
+            Some((current, bytes)) if current == item_id => (*bytes).max(received),
+            _ => received,
+        };
+        record.upload_in_flight = Some((item_id.to_string(), received));
+        let displayed = record
+            .committed_bytes
+            .saturating_add(received)
+            .min(record.offer.total_bytes);
+        record.progress.completed_bytes = record.progress.completed_bytes.max(displayed);
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
@@ -4961,6 +5079,169 @@ mod tests {
                 "0".repeat(64),
             )
             .expect("complete incoming transfer");
+    }
+
+    #[test]
+    fn transfer_progress_reports_in_flight_bytes_without_double_counting() {
+        let path = temp_data_dir();
+        let destination = path.join("received");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut offer = incoming_history_offer(&runtime, "live-progress", "peer-sender");
+        offer.items[0].size = 100;
+        offer.total_bytes = 100;
+        runtime.add_transfer(offer);
+        runtime
+            .set_transfer_acceptance("live-progress", destination)
+            .expect("accept transfer");
+        runtime
+            .begin_transfer_upload("live-progress")
+            .expect("begin upload");
+
+        for (received, expected) in [(40u64, 40u64), (60, 60), (30, 60)] {
+            let progress = runtime
+                .report_transfer_progress("live-progress", "live-progress-item", received)
+                .expect("report progress");
+            assert_eq!(progress.completed_bytes, expected);
+            assert_eq!(progress.completed_items, 0);
+            assert_eq!(progress.status, TransferStatus::Uploading);
+        }
+        let capped = runtime
+            .report_transfer_progress("live-progress", "live-progress-item", 999)
+            .expect("report capped progress");
+        assert_eq!(capped.completed_bytes, 100);
+
+        let completed = runtime
+            .mark_item_received("live-progress", "live-progress-item", 100, "0".repeat(64))
+            .expect("complete transfer");
+        assert_eq!(completed.completed_bytes, 100);
+        assert_eq!(completed.completed_items, 1);
+        assert_eq!(completed.status, TransferStatus::Completed);
+        let history = runtime.transfer_history_snapshot(None);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].completed_bytes, 100);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn transfer_progress_continues_from_committed_bytes_across_items() {
+        let path = temp_data_dir();
+        let destination = path.join("received");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut offer = incoming_history_offer(&runtime, "multi-live", "peer-sender");
+        offer.items[0].item_id = "first".to_string();
+        offer.items[0].size = 10;
+        let mut second = offer.items[0].clone();
+        second.item_id = "second".to_string();
+        second.relative_path = "second.bin".to_string();
+        second.size = 20;
+        offer.items.push(second);
+        offer.total_bytes = 30;
+        runtime.add_transfer(offer);
+        runtime
+            .set_transfer_acceptance("multi-live", destination)
+            .expect("accept transfer");
+        runtime
+            .begin_transfer_upload("multi-live")
+            .expect("begin upload");
+
+        assert_eq!(
+            runtime
+                .report_transfer_progress("multi-live", "first", 10)
+                .expect("report first")
+                .completed_bytes,
+            10
+        );
+        assert_eq!(
+            runtime
+                .report_transfer_progress("multi-live", "first", 5)
+                .expect("keep first high watermark")
+                .completed_bytes,
+            10
+        );
+        let after_first = runtime
+            .mark_item_received("multi-live", "first", 10, "0".repeat(64))
+            .expect("commit first");
+        assert_eq!(after_first.completed_bytes, 10);
+        assert_eq!(after_first.completed_items, 1);
+        assert_eq!(after_first.status, TransferStatus::Uploading);
+        assert_eq!(
+            runtime
+                .report_transfer_progress("multi-live", "second", 5)
+                .expect("report second")
+                .completed_bytes,
+            15
+        );
+        let completed = runtime
+            .mark_item_received("multi-live", "second", 20, "0".repeat(64))
+            .expect("commit second");
+        assert_eq!(completed.completed_bytes, 30);
+        assert_eq!(completed.completed_items, 2);
+        assert_eq!(completed.status, TransferStatus::Completed);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn outgoing_progress_uses_receiver_ack_as_new_baseline() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut offer = outgoing_history_offer(&runtime, "send-live", "peer-target");
+        offer.items[0].item_id = "first".to_string();
+        offer.items[0].size = 10;
+        let mut second = offer.items[0].clone();
+        second.item_id = "second".to_string();
+        second.relative_path = "second.bin".to_string();
+        second.size = 20;
+        offer.items.push(second);
+        offer.total_bytes = 30;
+        runtime.add_outgoing_transfer(offer);
+        runtime
+            .transfers
+            .write()
+            .get_mut("send-live")
+            .expect("find outgoing transfer")
+            .progress
+            .status = TransferStatus::Accepted;
+        runtime
+            .begin_transfer_upload("send-live")
+            .expect("begin upload");
+        assert_eq!(
+            runtime
+                .report_transfer_progress("send-live", "first", 10)
+                .expect("report first")
+                .completed_bytes,
+            10
+        );
+        let mut ack = runtime
+            .transfer("send-live")
+            .expect("find outgoing transfer")
+            .progress;
+        ack.completed_bytes = 10;
+        ack.completed_items = 1;
+        ack.status = TransferStatus::Uploading;
+        runtime.acknowledge_outgoing_item("send-live", "first", 10);
+        runtime.update_transfer("send-live", ack);
+        let record = runtime
+            .transfer("send-live")
+            .expect("find outgoing transfer");
+        assert_eq!(record.committed_bytes, 10);
+        assert!(record.upload_in_flight.is_none());
+        assert!(record.received_items.contains("first"));
+        assert!(runtime
+            .report_transfer_progress("send-live", "first", 5)
+            .is_none());
+        assert_eq!(
+            runtime
+                .report_transfer_progress("send-live", "second", 5)
+                .expect("report second")
+                .completed_bytes,
+            15
+        );
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

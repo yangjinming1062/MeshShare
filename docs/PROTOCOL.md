@@ -98,7 +98,7 @@
 - `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新快照，保留原始 `source_node_id`；接收端按 HLC 比较新旧并按事件 ID 去重。
 - `TransferOffer` 的 `payload.offer` 包含清单、总大小和发送节点。
 - `TransferAction` 表示接受、拒绝、取消、失败或重试，可携带失败原因和重试代次；接收目录只由接收节点本地选择，不通过消息传输。节点把长时间无进展的传输判为失败时也会发送 `fail`。
-- `TransferProgress` 的 `payload.progress` 包含状态、已完成字节、错误和可选的 `retry_count`。只有代次递增才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。
+- `TransferProgress` 的 `payload.progress` 包含状态、已完成字节、错误和可选的 `retry_count`。只有代次递增才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。传输进行中，节点本地进度与状态接口返回的 `completed_bytes` 还包含当前条目已接收但尚未提交的字节，`completed_items` 仍只统计已提交条目；两者都不回退且不超过总量。
 - `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
 - `TransferHistoryDeleted` 的 `payload.transfer_ids` 请求对端删除配对记录；接收端只接受有限数量，只删除当前 Peer 自己的记录，不反向转发。
 

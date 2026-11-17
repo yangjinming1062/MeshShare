@@ -10,7 +10,7 @@ use crate::model::{
 };
 use crate::runtime::{
     valid_history_delete_ids, validate_receive_directory, NodeRuntime, OutgoingPrepareView,
-    TransferRetryError, UPDATE_INSTALLING_MESSAGE,
+    TransferRetryError, TRANSFER_PROGRESS_INTERVAL, UPDATE_INSTALLING_MESSAGE,
 };
 use axum::body::Body;
 use axum::extract::{
@@ -100,13 +100,13 @@ fn available_disk_space(path: &Path) -> Option<u64> {
 /// 把请求体写入已打开的临时文件并计算 SHA-256。
 ///
 /// 每块数据都受 60 秒空闲超时、清单大小上限和磁盘余量约束；调用方通过
-/// `on_chunk` 检查传输或会话是否仍然有效。
+/// `on_chunk` 的块长度检查传输或会话是否仍然有效，并更新在途进度。
 async fn stream_body_to_file(
     body: Body,
     mut file: fs::File,
     limit: u64,
     disk_root: &Path,
-    mut on_chunk: impl FnMut() -> Result<(), ApiError>,
+    mut on_chunk: impl FnMut(u64) -> Result<(), ApiError>,
 ) -> Result<(u64, String), ApiError> {
     let mut stream = body.into_data_stream();
     let mut hasher = Sha256::new();
@@ -119,8 +119,8 @@ async fn stream_body_to_file(
         let Some(chunk) = chunk else {
             break;
         };
-        on_chunk()?;
         let chunk = chunk.map_err(|error| ApiError::internal(error.to_string()))?;
+        on_chunk(chunk.len() as u64)?;
         total = total
             .checked_add(chunk.len() as u64)
             .ok_or_else(|| ApiError::payload_too_large("传输内容大小溢出"))?;
@@ -2005,8 +2005,12 @@ async fn upload_mobile_item(
             return Err(ApiError::internal(message));
         }
     };
-    let stream_result =
-        stream_body_to_file(body, file, item.size, &record.staged_directory, || {
+    let stream_result = stream_body_to_file(
+        body,
+        file,
+        item.size,
+        &record.staged_directory,
+        |_chunk_bytes| {
             if state
                 .runtime
                 .touch_mobile_session(&record.session_id)
@@ -2016,8 +2020,9 @@ async fn upload_mobile_item(
             }
             state.runtime.touch_mobile_transfer_activity(&transfer_id);
             Ok(())
-        })
-        .await;
+        },
+    )
+    .await;
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
@@ -2627,7 +2632,8 @@ async fn upload_outgoing_item(
                 return Err(ApiError::internal(format!("无法创建暂存文件：{error}")));
             }
         };
-        let streamed = stream_body_to_file(body, file, item.size, &directory, || Ok(())).await;
+        let streamed =
+            stream_body_to_file(body, file, item.size, &directory, |_chunk_bytes| Ok(())).await;
         let (total, digest) = match streamed {
             Ok(value) => value,
             Err(error) => {
@@ -2800,11 +2806,26 @@ async fn upload_item(
             return Err(ApiError::internal(message));
         }
     };
-    let stream_result = stream_body_to_file(body, file, item.size, &destination, || {
+    let mut received = 0u64;
+    let mut last_report = Instant::now();
+    let stream_result = stream_body_to_file(body, file, item.size, &destination, |chunk_bytes| {
         if !state.runtime.transfer_upload_active(&transfer_id) {
             return Err(ApiError::conflict("传输已取消"));
         }
         state.runtime.touch_transfer_activity(&transfer_id);
+        received = received.saturating_add(chunk_bytes);
+        if last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
+            if let Some(progress) =
+                state
+                    .runtime
+                    .report_transfer_progress(&transfer_id, &item_id, received)
+            {
+                state
+                    .runtime
+                    .publish_event(WireMessage::TransferProgress { progress });
+            }
+            last_report = Instant::now();
+        }
         Ok(())
     })
     .await;
@@ -5563,6 +5584,142 @@ mod tests {
         .await
         .is_some());
         assert!(runtime.transfer_history_snapshot(None).is_empty());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn stream_body_to_file_reports_each_chunk_length() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-stream-chunks-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("create data directory");
+        let target = data_dir.join("body.bin");
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .await
+            .expect("open target");
+        let body = axum::body::Body::from_stream(futures_util::stream::iter(vec![
+            Ok::<_, std::io::Error>(b"abc".to_vec()),
+            Ok::<_, std::io::Error>(b"defgh".to_vec()),
+        ]));
+        let mut lengths = Vec::new();
+        let (total, digest) = super::stream_body_to_file(body, file, 8, &data_dir, |length| {
+            lengths.push(length);
+            Ok(())
+        })
+        .await
+        .expect("stream body");
+        assert_eq!(lengths, vec![3, 5]);
+        assert_eq!(total, 8);
+        assert_eq!(digest, format!("{:x}", Sha256::digest(b"abcdefgh")));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn upload_item_reports_in_flight_progress_before_commit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-live-upload-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        let destination = data_dir.join("received");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::create_dir_all(&destination).expect("create destination");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let content = b"abcdefgh";
+        let offer = TransferOffer {
+            transfer_id: "live-upload".to_string(),
+            source_node_id: "peer".to_string(),
+            source_name: "peer".to_string(),
+            target_node_id: runtime.node_id(),
+            items: vec![TransferItem {
+                item_id: "item".to_string(),
+                name: "file.bin".to_string(),
+                relative_path: "file.bin".to_string(),
+                size: content.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(content)),
+                media_type: "application/octet-stream".to_string(),
+                directory: false,
+            }],
+            total_bytes: content.len() as u64,
+            created_at_ms: crate::clock::now_millis(),
+        };
+        runtime.add_transfer(offer);
+        runtime
+            .set_transfer_acceptance("live-upload", destination)
+            .expect("accept transfer");
+
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let mut socket = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("connect upload");
+        let headers = format!(
+            "PUT /api/v1/transfers/live-upload/items/item HTTP/1.1\r\nHost: {address}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        socket
+            .write_all(headers.as_bytes())
+            .await
+            .expect("write headers");
+        // 首块在节流窗口之后到达，确保服务端产生一次在途进度。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        socket
+            .write_all(b"4\r\nabcd\r\n")
+            .await
+            .expect("write first chunk");
+        socket.flush().await.expect("flush first chunk");
+
+        let mut mid = None;
+        for _ in 0..40 {
+            let progress = runtime
+                .transfer("live-upload")
+                .expect("find transfer")
+                .progress;
+            if progress.completed_bytes == 4 {
+                mid = Some(progress);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mid = mid.expect("first chunk should report in-flight progress");
+        assert_eq!(mid.completed_bytes, 4);
+        assert_eq!(mid.completed_items, 0);
+        assert_eq!(mid.status, TransferStatus::Uploading);
+
+        socket
+            .write_all(b"4\r\nefgh\r\n0\r\n\r\n")
+            .await
+            .expect("write second chunk");
+        socket.flush().await.expect("flush second chunk");
+        let mut response = Vec::new();
+        socket
+            .read_to_end(&mut response)
+            .await
+            .expect("read upload response");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "unexpected response: {response}"
+        );
+        let completed = runtime
+            .transfer("live-upload")
+            .expect("find completed transfer")
+            .progress;
+        assert_eq!(completed.completed_bytes, 8);
+        assert_eq!(completed.completed_items, 1);
+        assert_eq!(completed.status, TransferStatus::Completed);
+        server_task.abort();
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
