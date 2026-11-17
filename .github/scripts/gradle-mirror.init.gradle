@@ -1,0 +1,22 @@
+// Maven Central 会按出口 IP 限流共享 CI runner，Gradle 收到 HTTP 429 后直接判定该仓库失败。
+// 这里把 Maven Central 镜像放在仓库列表首位，原有仓库与插件门户保留在后作为回退。
+// 由 CI 的 Android job 复制到 GRADLE_USER_HOME/init.d/，本地开发不加载。
+
+def mavenCentralMirror = 'https://maven-central.storage-download.googleapis.com/maven2/'
+
+// 主构建与 buildSrc 等嵌套构建各有自己的 Settings，插件仓库和项目仓库都在这里补齐。
+// 插件仓库声明后不再自动加默认的插件门户，所以要显式加回。
+beforeSettings { settings ->
+    settings.pluginManagement.repositories {
+        maven { url = mavenCentralMirror }
+        gradlePluginPortal()
+    }
+    settings.gradle.allprojects { project ->
+        project.buildscript.repositories {
+            maven { url = mavenCentralMirror }
+        }
+        project.repositories {
+            maven { url = mavenCentralMirror }
+        }
+    }
+}

@@ -265,6 +265,13 @@ jobs:
           } > backend/gen/android/app/android-signing.properties
           chmod 600 backend/gen/android/app/android-release.keystore backend/gen/android/app/android-signing.properties
       - run: python3 .github/scripts/prepare_android_project.py
+      - name: Configure Gradle repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle_user_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$gradle_user_home/init.d"
+          cp .github/scripts/gradle-mirror.init.gradle "$gradle_user_home/init.d/"
       - name: Build signed Android APK
         run: npx --yes @tauri-apps/cli@2 android build --config ../release-version.json --apk --target aarch64
         working-directory: backend

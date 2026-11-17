@@ -75,7 +75,7 @@ cargo clippy --manifest-path backend/Cargo.toml --all-targets --all-features --l
 cargo test --manifest-path backend/Cargo.toml --locked
 ```
 
-推送到 `main` 时，[CI 工作流](../.github/workflows/ci.yml) 运行前端检查、构建、Rust 格式与 lint，并在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行回归测试；Pull Request 不触发，需要本地按上述命令验证。Windows MSVC 的测试宿主会链接 Tauri 的原生对话框 API，因此 `backend/build.rs` 把 Common Controls v6 manifest 嵌入所有可链接目标，并关闭 `tauri-build` 的默认应用 manifest，避免测试宿主在启动前以 `STATUS_ENTRYPOINT_NOT_FOUND` 退出。
+推送到 `main` 时，[CI 工作流](../.github/workflows/ci.yml) 运行前端检查、构建、Rust 格式与 lint，在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行回归测试，并构建调试用的 Android APK；Pull Request 不触发，需要本地按上述命令验证。Android 构建由 `.github/scripts/gradle-mirror.init.gradle` 在 `GRADLE_USER_HOME/init.d` 注入 Maven Central 镜像，避免共享 runner 的出口 IP 被限流（HTTP 429），本地构建不加载该脚本。Windows MSVC 的测试宿主会链接 Tauri 的原生对话框 API，因此 `backend/build.rs` 把 Common Controls v6 manifest 嵌入所有可链接目标，并关闭 `tauri-build` 的默认应用 manifest，避免测试宿主在启动前以 `STATUS_ENTRYPOINT_NOT_FOUND` 退出。
 
 ## 发布
 
