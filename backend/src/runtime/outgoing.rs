@@ -73,16 +73,6 @@ pub(super) fn push_outgoing_source(
     Ok(())
 }
 
-pub(super) fn display_absolute_path(path: &Path) -> String {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        return format!(r"\\{rest}");
-    }
-    text.strip_prefix(r"\\?\")
-        .map(str::to_string)
-        .unwrap_or_else(|| text.into_owned())
-}
-
 /// 把用户选中的文件与文件夹展开成待发送清单，文件夹按选中目录名保留层级。
 pub(super) fn expand_outgoing_paths(
     paths: &[String],
@@ -100,7 +90,7 @@ pub(super) fn expand_outgoing_paths(
         let metadata =
             std::fs::metadata(&canonical).map_err(|error| format!("无法读取 {raw}：{error}"))?;
         if roots.len() < MAX_TRANSFER_HISTORY_PATHS {
-            let root = display_absolute_path(&canonical);
+            let root = crate::fsutil::display_absolute_path(&canonical);
             if root.len() <= 4_096 && !roots.contains(&root) {
                 roots.push(root);
             }

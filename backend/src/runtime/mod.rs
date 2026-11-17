@@ -153,6 +153,17 @@ struct PersistedConfig {
     remote_file_access: bool,
 }
 
+/// 界面使用的接收设置：配置保留规范化路径，展示时去掉 Windows 扩展长度前缀。
+fn receive_settings_view(config: &PersistedConfig) -> ReceiveSettings {
+    ReceiveSettings {
+        mode: config.receive_mode,
+        default_path: config
+            .receive_directory
+            .as_deref()
+            .map(|path| crate::fsutil::display_absolute_path(Path::new(path))),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ClipboardHistoryRecord {
     event_id: String,
@@ -1237,11 +1248,7 @@ impl NodeRuntime {
     }
 
     pub fn receive_settings(&self) -> ReceiveSettings {
-        let config = self.config.lock();
-        ReceiveSettings {
-            mode: config.receive_mode,
-            default_path: config.receive_directory.clone(),
-        }
+        receive_settings_view(&self.config.lock())
     }
 
     pub fn set_receive_settings(
@@ -1274,10 +1281,7 @@ impl NodeRuntime {
             }
             Ok(())
         })?;
-        Ok(ReceiveSettings {
-            mode: config.receive_mode,
-            default_path: config.receive_directory,
-        })
+        Ok(receive_settings_view(&config))
     }
 
     fn default_receive_directory(&self) -> Option<PathBuf> {
@@ -1766,7 +1770,7 @@ impl NodeRuntime {
         let mut progress = transfer_progress(&offer, "receive");
         let accepted_destination = self.default_receive_directory();
         if let Some(destination) = accepted_destination.as_ref() {
-            progress.destination = Some(destination.to_string_lossy().into_owned());
+            progress.destination = Some(crate::fsutil::display_absolute_path(destination));
             progress.status = TransferStatus::Accepted;
         }
         let mut transfers = self.transfers.write();
@@ -2593,7 +2597,7 @@ impl NodeRuntime {
         }
         record.accepted_destination = Some(destination.clone());
         record.updated_at_ms = now_millis();
-        record.progress.destination = Some(destination.to_string_lossy().to_string());
+        record.progress.destination = Some(crate::fsutil::display_absolute_path(&destination));
         record.progress.status = TransferStatus::Accepted;
         record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
@@ -4355,24 +4359,29 @@ mod tests {
             .set_receive_settings(ReceiveMode::Auto, Some(destination.clone()))
             .expect("save receive settings");
         assert_eq!(runtime.receive_settings().mode, ReceiveMode::Auto);
+        let default_path = runtime
+            .receive_settings()
+            .default_path
+            .expect("default receive path");
+        assert!(
+            !default_path.starts_with(r"\\?\"),
+            "接收设置不应展示扩展长度前缀：{default_path}"
+        );
         assert_eq!(
-            runtime.receive_settings().default_path,
-            Some(
-                std::fs::canonicalize(&destination)
-                    .expect("canonical destination")
-                    .to_string_lossy()
-                    .into_owned()
-            )
+            std::fs::canonicalize(&default_path).expect("canonical default path"),
+            std::fs::canonicalize(&destination).expect("canonical destination")
         );
         let offer = mobile_offer(&runtime, "auto-receive", 1);
         assert!(runtime.add_transfer(offer));
-        assert_eq!(
-            runtime
-                .transfer("auto-receive")
-                .expect("auto transfer")
-                .progress
-                .status,
-            TransferStatus::Accepted
+        let progress = runtime
+            .transfer("auto-receive")
+            .expect("auto transfer")
+            .progress;
+        assert_eq!(progress.status, TransferStatus::Accepted);
+        let saved = progress.destination.expect("auto destination");
+        assert!(
+            !saved.starts_with(r"\\?\"),
+            "接收记录不应展示扩展长度前缀：{saved}"
         );
         std::fs::remove_dir_all(&destination).expect("remove receive directory");
         let offer = mobile_offer(&runtime, "fallback-confirm", 1);

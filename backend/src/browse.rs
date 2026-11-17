@@ -1,3 +1,4 @@
+use crate::fsutil::display_absolute_path;
 use crate::runtime::file_modified_ms;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -60,12 +61,12 @@ pub fn roots() -> BrowseRoots {
         push_root(&mut roots, &mut seen, label, &path);
     }
     BrowseRoots {
-        home: home.map(|path| path.to_string_lossy().into_owned()),
+        home: home.map(|path| display_absolute_path(&path)),
         roots,
     }
 }
 
-/// 列出目录的一层内容；请求路径必须是绝对路径，返回值里的路径都已规范化。
+/// 列出目录的一层内容；请求路径必须是绝对路径，返回的路径用展示形式，可原样作为下次请求。
 pub fn list(path: &Path, offset: usize, limit: usize) -> Result<BrowseListing, BrowseError> {
     if !path.is_absolute() {
         return Err(BrowseError::NotDirectory);
@@ -83,10 +84,8 @@ pub fn list(path: &Path, offset: usize, limit: usize) -> Result<BrowseListing, B
     entries.truncate(end);
     entries.drain(..start);
     Ok(BrowseListing {
-        path: canonical.to_string_lossy().into_owned(),
-        parent: canonical
-            .parent()
-            .map(|parent| parent.to_string_lossy().into_owned()),
+        path: display_absolute_path(&canonical),
+        parent: canonical.parent().map(display_absolute_path),
         entries,
         truncated: scan_capped || total > end,
     })
@@ -109,7 +108,7 @@ fn collect_entries(directory: &Path) -> Result<(Vec<BrowseEntry>, bool), BrowseE
             .unwrap_or(false);
         let path = item.path();
         // 非 UTF-8 名称无法在 JSON 里往返寻址，跳过而不是返回占位字符。
-        let (Some(name), Some(path_text)) = (
+        let (Some(name), Some(_)) = (
             item.file_name().to_str().map(str::to_string),
             path.to_str().map(str::to_string),
         ) else {
@@ -119,7 +118,7 @@ fn collect_entries(directory: &Path) -> Result<(Vec<BrowseEntry>, bool), BrowseE
         let metadata = std::fs::metadata(&path).ok();
         entries.push(BrowseEntry {
             name,
-            path: path_text,
+            path: display_absolute_path(&path),
             directory: metadata.as_ref().is_some_and(|value| value.is_dir()),
             symlink,
             size: metadata
@@ -144,7 +143,7 @@ fn push_root(roots: &mut Vec<BrowseRoot>, seen: &mut HashSet<String>, label: Str
     if !path.is_dir() {
         return;
     }
-    let value = path.to_string_lossy().into_owned();
+    let value = display_absolute_path(path);
     if seen.insert(value.clone()) {
         roots.push(BrowseRoot { label, path: value });
     }
@@ -263,7 +262,16 @@ mod tests {
         let requested = child.join("..").join("child");
         let listing = list(&requested, 0, 10).expect("list normalized path");
         let canonical = std::fs::canonicalize(&child).expect("canonical child");
-        assert_eq!(listing.path, canonical.to_string_lossy());
+        assert_eq!(listing.path, display_absolute_path(&canonical));
+        assert!(
+            !listing.path.starts_with(r"\\?\"),
+            "目录浏览不应展示扩展长度前缀：{}",
+            listing.path
+        );
+        assert_eq!(
+            std::fs::canonicalize(&listing.path).expect("display path resolves"),
+            canonical
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

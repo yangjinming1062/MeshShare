@@ -3431,9 +3431,9 @@ mod tests {
         .0;
         assert_eq!(
             listing.path,
-            std::fs::canonicalize(&root)
-                .expect("canonical root")
-                .to_string_lossy()
+            crate::fsutil::display_absolute_path(
+                &std::fs::canonicalize(&root).expect("canonical root")
+            )
         );
         assert!(listing
             .entries

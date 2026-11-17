@@ -12,7 +12,7 @@
 - `src/clipboard.rs`：系统剪贴板读写与 PNG 校验，桌面轮询线程在此启动。
 - `src/metrics.rs`：硬件快照采集；`src/browse.rs`：远程管理目录浏览。
 - `src/updater.rs`：桌面更新调度；`src/control.rs`：设置补丁、设置快照与更新服务装配；`src/model.rs`：HTTP 与 WebSocket 共用的数据结构。
-- `src/mobile_tls.rs`：本地 CA 与服务端证书；`src/fsutil.rs`：数据文件写入。
+- `src/mobile_tls.rs`：本地 CA 与服务端证书；`src/fsutil.rs`：数据文件写入与面向界面的绝对路径展示。
 
 平台专属代码放在对应目录：`src/android/`（网络适配、存储授权、接收目录命令、`update/`）、`src/linux/`（系统包更新、登录项）、`src/macos/`（security-scoped bookmark、LaunchAgent）、`src/windows/`（注册表登录项）。`src/autostart.rs` 只保留平台路由、启动参数与 Linux/macOS 共用的启动脚本模板。共享文件里无法避免的单点平台差异继续用 `#[cfg]` 表达，不为此新建中间抽象。
 

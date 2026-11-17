@@ -10,6 +10,18 @@ pub(crate) fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{name}.tmp-{}", std::process::id()))
 }
 
+/// 面向界面的绝对路径：Windows 的 `canonicalize` 返回 `\\?\` 扩展长度前缀，
+/// 展示与跨请求往返都使用去掉前缀的形式，需要时再重新规范化。
+pub(crate) fn display_absolute_path(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    text.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or_else(|| text.into_owned())
+}
+
 /// 删除目录；目录不存在视为成功，用于启动时清空暂存区。
 pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<()> {
     match std::fs::remove_dir_all(path) {
