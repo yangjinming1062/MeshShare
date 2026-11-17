@@ -88,7 +88,7 @@
     .sort((left, right) => (right.offer?.created_at_ms ?? 0) - (left.offer?.created_at_ms ?? 0));
   $: inbox = pending.length ? null : (activeIncoming[0] ?? null);
   $: recentDownloads = mode === 'web' ? transfers.filter((transfer) =>
-    transfer.status === 'completed' && transfer.retryableDownloadItemIds?.length,
+    transfer.status === 'completed' && transfer.retryable_download_item_ids?.length,
   ) : [];
   $: acceptLabel = mode === 'android'
     ? '接收'
@@ -113,11 +113,11 @@
   }
 
   function downloaded(transfer: PhoneTransfer, item: TransferItem): boolean {
-    return transfer.downloadedItemIds?.includes(item.item_id) ?? false;
+    return transfer.downloaded_item_ids?.includes(item.item_id) ?? false;
   }
 
   function canRetryDownload(transfer: PhoneTransfer, item: TransferItem): boolean {
-    return transfer.retryableDownloadItemIds?.includes(item.item_id) ?? false;
+    return transfer.retryable_download_item_ids?.includes(item.item_id) ?? false;
   }
 
   function downloadStarted(transfer: PhoneTransfer, item: TransferItem): boolean {
@@ -125,7 +125,7 @@
   }
 
   function transferTitle(transfer: PhoneTransfer): string {
-    if (transfer.direction === 'send') return '发送到 ' + (transfer.peerName ?? '设备');
+    if (transfer.direction === 'send') return '发送到 ' + (transfer.peer_name ?? '设备');
     return '来自 ' + (transfer.offer?.source_name ?? '设备');
   }
 

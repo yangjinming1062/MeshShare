@@ -12,7 +12,6 @@
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
-    "core-js": "^3.51.0",
     "qrcode": "^1.5.4",
     "svelte": "^5.0.0"
   },

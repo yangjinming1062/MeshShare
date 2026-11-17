@@ -161,11 +161,6 @@ pub struct PeerConnectionRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TransferListQuery {
-    pub status: Option<TransferStatus>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct TransferHistoryQuery {
     pub session_id: Option<String>,
 }
@@ -1181,7 +1176,7 @@ async fn handle_wire_message_with_endpoint(
             let peer_id = current_peer?;
             if offer.source_node_id != peer_id
                 || offer.target_node_id != runtime.node_id()
-                || validate_offer(&offer).is_err()
+                || validate_offer(&offer, true).is_err()
             {
                 return Some(peer_id.to_string());
             }
@@ -1297,7 +1292,7 @@ async fn handle_wire_message_with_endpoint(
 }
 
 pub(crate) async fn replay_active_offers(runtime: &Arc<NodeRuntime>, peer_id: &str) {
-    for progress in runtime.transfers_snapshot(None) {
+    for progress in runtime.transfers_snapshot() {
         let Some(offer) = progress.offer else {
             continue;
         };
@@ -1320,7 +1315,7 @@ async fn create_transfer(
     State(state): State<AppState>,
     Json(mut offer): Json<TransferOffer>,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    validate_offer(&offer)?;
+    validate_offer(&offer, false)?;
     if offer.target_node_id != state.runtime.node_id() {
         return Err(ApiError::misdirected("地址上的设备与传输目标不匹配"));
     }
@@ -1334,11 +1329,8 @@ async fn create_transfer(
     Ok(Json(progress))
 }
 
-async fn list_transfers(
-    Query(query): Query<TransferListQuery>,
-    State(state): State<AppState>,
-) -> Json<Vec<TransferProgress>> {
-    Json(state.runtime.transfers_snapshot(query.status))
+async fn list_transfers(State(state): State<AppState>) -> Json<Vec<TransferProgress>> {
+    Json(state.runtime.transfers_snapshot())
 }
 
 async fn list_transfer_history(
@@ -1373,7 +1365,13 @@ async fn clear_transfer_history(
     }))
 }
 
-fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
+/// 清单携带摘要时必须与写入内容一致；留空时以写入内容为准。
+fn digest_matches(claimed: &str, computed: &str) -> bool {
+    claimed.is_empty() || claimed.eq_ignore_ascii_case(computed)
+}
+
+/// 摘要校验规则：非空必须合法；require_digest=false 允许留空，由节点写入文件体时计算回填。
+fn validate_offer(offer: &TransferOffer, require_digest: bool) -> Result<(), ApiError> {
     if offer.transfer_id.trim().is_empty()
         || offer.source_node_id.trim().is_empty()
         || offer.target_node_id.trim().is_empty()
@@ -1396,7 +1394,13 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
     let mut item_ids = HashSet::new();
     let mut relative_paths = HashSet::new();
     for item in &offer.items {
-        if item.item_id.trim().is_empty()
+        let digest_ok = if item.sha256.is_empty() {
+            !require_digest
+        } else {
+            is_sha256(&item.sha256)
+        };
+        if !digest_ok
+            || item.item_id.trim().is_empty()
             || item.item_id.len() > 256
             || item.name.trim().is_empty()
             || item.name.len() > 1_024
@@ -1409,7 +1413,6 @@ fn validate_offer(offer: &TransferOffer) -> Result<(), ApiError> {
             || item.name.contains('\0')
             || !item_ids.insert(item.item_id.clone())
             || !relative_paths.insert(normalize_relative_path(&item.relative_path))
-            || !is_sha256(&item.sha256)
         {
             return Err(ApiError::bad_request("传输清单包含无效项目"));
         }
@@ -1817,7 +1820,7 @@ async fn create_mobile_transfer(
     State(state): State<AppState>,
     Json(mut payload): Json<MobileTransferCreateRequest>,
 ) -> Result<Json<MobileTransferView>, ApiError> {
-    validate_offer(&payload.offer)?;
+    validate_offer(&payload.offer, false)?;
     if payload.offer.source_node_id != state.runtime.node_id() {
         return Err(ApiError::bad_request("手机下载暂只支持扫码节点上的文件"));
     }
@@ -2022,7 +2025,7 @@ async fn upload_mobile_item(
             return Err(error);
         }
     };
-    if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
+    if total != item.size || !digest_matches(&item.sha256, &digest) {
         remove_file_with_diagnostics(&temp).await;
         let _ = state
             .runtime
@@ -2050,7 +2053,7 @@ async fn upload_mobile_item(
     remove_file_with_diagnostics(&temp).await;
     let Some(progress) = state
         .runtime
-        .stage_mobile_item(&transfer_id, &item_id, total)
+        .stage_mobile_item(&transfer_id, &item_id, total, digest)
     else {
         remove_file_with_diagnostics(&target).await;
         return Err(ApiError::conflict("手机传输已取消或完成"));
@@ -2413,7 +2416,7 @@ fn is_loopback_request(connect_info: Option<&ConnectInfo<SocketAddr>>) -> bool {
 
 /// 运行时在后台准备清单时复用与 HTTP 建单一致的清单校验。
 pub(crate) fn validate_outgoing_offer(offer: &TransferOffer) -> Result<(), String> {
-    validate_offer(offer).map_err(|error| error.message)
+    validate_offer(offer, true).map_err(|error| error.message)
 }
 
 /// 桌面端按原路径直传：节点后台枚举、算摘要后自己发送清单，不再复制源文件。
@@ -2563,7 +2566,7 @@ async fn create_outgoing_staging(
     if !is_loopback_request(connect_info.as_ref()) {
         return Err(ApiError::forbidden("暂存接口只允许本机调用"));
     }
-    validate_offer(&offer)?;
+    validate_offer(&offer, false)?;
     if offer.source_node_id != state.runtime.node_id() {
         return Err(ApiError::bad_request("暂存来源必须是本机节点"));
     }
@@ -2632,7 +2635,7 @@ async fn upload_outgoing_item(
                 return Err(error);
             }
         };
-        if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
+        if total != item.size || !digest_matches(&item.sha256, &digest) {
             let _ = fs::remove_file(&temp).await;
             return Err(ApiError::bad_request("源文件校验失败"));
         }
@@ -2641,7 +2644,7 @@ async fn upload_outgoing_item(
             .map_err(|error| ApiError::internal(format!("提交暂存文件失败：{error}")))?;
         state
             .runtime
-            .mark_outgoing_item_staged(&transfer_id, &item_id);
+            .mark_outgoing_item_staged(&transfer_id, &item_id, digest);
     }
     let (staged_items, total_items) = state
         .runtime
@@ -2812,7 +2815,7 @@ async fn upload_item(
             return Err(error);
         }
     };
-    if total != item.size || !digest.eq_ignore_ascii_case(&item.sha256) {
+    if total != item.size || !digest_matches(&item.sha256, &digest) {
         temp_guard.cleanup().await;
         let message = "文件校验失败".to_string();
         let progress = state
@@ -2871,7 +2874,7 @@ async fn upload_item(
     temp_guard.mark_linked(target.clone());
     let Some(progress) = state
         .runtime
-        .mark_item_received(&transfer_id, &item_id, total)
+        .mark_item_received(&transfer_id, &item_id, total, digest)
     else {
         temp_guard.cleanup().await;
         return Err(ApiError::conflict("传输已取消或已完成"));
@@ -3815,7 +3818,30 @@ mod tests {
             total_bytes: 0,
             created_at_ms: 1,
         };
-        assert!(validate_offer(&offer).is_err());
+        assert!(validate_offer(&offer, true).is_err());
+    }
+
+    #[test]
+    fn empty_digest_allowed_only_for_page_manifests() {
+        let offer = TransferOffer {
+            transfer_id: "page".to_string(),
+            source_node_id: "source".to_string(),
+            source_name: "source".to_string(),
+            target_node_id: "target".to_string(),
+            items: vec![TransferItem {
+                item_id: "one".to_string(),
+                name: "file.txt".to_string(),
+                relative_path: "file.txt".to_string(),
+                size: 1,
+                sha256: String::new(),
+                media_type: "text/plain".to_string(),
+                directory: false,
+            }],
+            total_bytes: 1,
+            created_at_ms: 1,
+        };
+        assert!(validate_offer(&offer, false).is_ok());
+        assert!(validate_offer(&offer, true).is_err());
     }
 
     #[test]
@@ -3839,7 +3865,7 @@ mod tests {
             total_bytes: 5 * 1024 * 1024 * 1024 + 1,
             created_at_ms: 0,
         };
-        assert!(validate_offer(&large_offer).is_ok());
+        assert!(validate_offer(&large_offer, true).is_ok());
 
         let items = (0..4_097)
             .map(|index| TransferItem {
@@ -3861,7 +3887,7 @@ mod tests {
             total_bytes: 0,
             created_at_ms: 0,
         };
-        assert!(validate_offer(&many_items).is_ok());
+        assert!(validate_offer(&many_items, true).is_ok());
     }
 
     #[tokio::test]
@@ -4124,7 +4150,7 @@ mod tests {
         };
         runtime.add_transfer(offer);
         runtime
-            .mark_item_received("progress-order", "item", 0)
+            .mark_item_received("progress-order", "item", 0, "0".repeat(64))
             .expect("complete transfer");
         handle_wire_message(
             WireMessage::TransferProgress {
@@ -4425,7 +4451,12 @@ mod tests {
         std::fs::write(record.staged_directory.join("hello.txt"), bytes)
             .expect("write staged file");
         runtime
-            .stage_mobile_item("mobile-download", "item", bytes.len() as u64)
+            .stage_mobile_item(
+                "mobile-download",
+                "item",
+                bytes.len() as u64,
+                format!("{:x}", Sha256::digest(bytes)),
+            )
             .expect("stage mobile item");
 
         let app = super::router(runtime.clone(), static_root);
@@ -4585,7 +4616,12 @@ mod tests {
             let staged = record.staged_directory.join("sample.bin");
             std::fs::write(&staged, &bytes).expect("write staged file");
             runtime
-                .stage_mobile_item(id, "item", bytes.len() as u64)
+                .stage_mobile_item(
+                    id,
+                    "item",
+                    bytes.len() as u64,
+                    format!("{:x}", Sha256::digest(&bytes)),
+                )
                 .expect("stage item");
 
             let url = format!("http://{address}/api/v1/mobile/transfers/{id}/items/item/download?session_id={}&auto_complete=true", session.session_id);
@@ -5416,7 +5452,7 @@ mod tests {
             .expect("create runtime");
         runtime.add_transfer(test_offer(&runtime, "history-done"));
         runtime
-            .mark_item_received("history-done", "history-done-item", 0)
+            .mark_item_received("history-done", "history-done-item", 0, "0".repeat(64))
             .expect("complete transfer");
         runtime.add_outgoing_transfer(test_offer(&runtime, "active-one"));
         let app = super::router(runtime.clone(), static_root);
@@ -5502,7 +5538,7 @@ mod tests {
         offer.source_name = "A".to_string();
         runtime.add_transfer(offer);
         runtime
-            .mark_item_received("peer-history", "peer-history-item", 0)
+            .mark_item_received("peer-history", "peer-history-item", 0, "0".repeat(64))
             .expect("complete transfer");
         assert_eq!(runtime.transfer_history_snapshot(None).len(), 1);
 

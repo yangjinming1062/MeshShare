@@ -14,13 +14,10 @@
   export let onConnect: () => void = () => {};
   export let onConnectSaved: (address: string) => void = () => {};
   export let onMobileAccess: () => void = () => {};
-  export let showMobileAccess = true;
-  export let showMobileSessions = true;
   export let onSendPeer: (peer: PeerInfo) => void = () => {};
   export let onSendPeerFolder: (peer: PeerInfo) => void = () => {};
   export let onDetails: (peer: PeerInfo) => void = () => {};
   export let onOpenPeer: (peer: PeerInfo) => void = () => {};
-  export let allowOpen = true;
   export let allowFolderSend = true;
   export let onSendMobile: (session: MobileSession) => void = () => {};
   export let onSendMobileFolder: (session: MobileSession) => void = () => {};
@@ -29,7 +26,7 @@
   export let onDropPeer: (peer: PeerInfo, event: DragEvent) => void = () => {};
   export let onDropMobile: (session: MobileSession, event: DragEvent) => void = () => {};
 
-  $: total = peers.length + (showMobileSessions ? mobileSessions.length : 0);
+  $: total = peers.length + mobileSessions.length;
 </script>
 
 <section class="surface area-devices">
@@ -42,12 +39,10 @@
       <button type="button" class="btn-icon" aria-label="手动连接设备" title="手动连接设备" aria-expanded={addOpen} on:click={onToggleAdd}>
         <Icon name="plus" size={16} />
       </button>
-      {#if showMobileAccess}
-        <button type="button" class="btn btn-sm" on:click={onMobileAccess}>
-          <Icon name="phone" size={14} />
-          浏览器访问
-        </button>
-      {/if}
+      <button type="button" class="btn btn-sm" on:click={onMobileAccess}>
+        <Icon name="phone" size={14} />
+        浏览器访问
+      </button>
     </div>
   </div>
   {#if addOpen}
@@ -83,15 +78,13 @@
           onSendFolder={() => onSendPeerFolder(peer)}
           onDetails={() => onDetails(peer)}
           onOpen={() => onOpenPeer(peer)}
-          {allowOpen}
           {allowFolderSend}
           onDragOver={() => onDragEnter('peer:' + peer.node_id)}
           onDragLeave={() => onDragLeave('peer:' + peer.node_id)}
           onDropFile={(event) => onDropPeer(peer, event)}
         />
       {/each}
-      {#if showMobileSessions}
-        {#each mobileSessions as session (session.session_id)}
+      {#each mobileSessions as session (session.session_id)}
           <DeviceRow
             kind="mobile"
             {session}
@@ -102,8 +95,7 @@
             onDragLeave={() => onDragLeave('mobile:' + session.session_id)}
             onDropFile={(event) => onDropMobile(session, event)}
           />
-        {/each}
-      {/if}
+      {/each}
       {#if !total}
         <li class="empty">没有其他在线设备。启动另一台 MeshShare，或让其他设备通过「浏览器访问」临时加入。</li>
       {/if}

@@ -39,11 +39,9 @@ export type ReceiveSettings = {
 
 export type MobileSession = {
   session_id: string;
-  node_id: string;
   node_name: string;
   label: string;
   created_at_ms: number;
-  last_seen_ms: number;
 };
 
 export type PeerInfo = {
@@ -54,11 +52,8 @@ export type PeerInfo = {
   mobile_addresses?: AddressInfo[];
   capabilities: string[];
   online: boolean;
-  last_seen_ms: number;
   endpoint?: string;
-  source: string;
   metrics?: HardwareMetrics;
-  metrics_received_at_ms?: number;
   metrics_stale?: boolean;
 };
 
@@ -198,6 +193,7 @@ export type TransferItem = {
   name: string;
   relative_path: string;
   size: number;
+  /** 页面创建清单时留空，由节点写入文件体时计算回填；下载校验以此为准。 */
   sha256: string;
   media_type: string;
   directory: boolean;
@@ -293,9 +289,9 @@ export type MobileTransferView = {
 };
 
 export type PhoneTransfer = TransferProgress & {
-  peerName?: string;
-  downloadedItemIds?: string[];
-  retryableDownloadItemIds?: string[];
+  peer_name?: string;
+  downloaded_item_ids?: string[];
+  retryable_download_item_ids?: string[];
 };
 
 /** 远程管理页在目标机器上的目录浏览结果；路径都由目标节点规范化返回。 */

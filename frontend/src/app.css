@@ -150,7 +150,6 @@ button.device-metrics:hover { background: var(--surface-2); }
 .hw-gpu { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 3px 2px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .hw-gpu strong { color: var(--ink-2); font-size: 11px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hw-more { color: var(--muted); font-size: 11px; }
-.hw-note { color: var(--warning-ink); font-size: 11px; }
 
 .clip-tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--surface-2); }
 .clip-tab { height: 22px; padding: 0 9px; border-radius: 7px; color: var(--muted); font-size: 11px; font-weight: 600; }
@@ -274,6 +273,7 @@ button.device-metrics:hover { background: var(--surface-2); }
 .metrics-empty, .metrics-status { color: var(--muted); font-size: 12px; line-height: 1.5; }
 .metrics-status--warning { color: var(--warning-ink); }
 .metrics-sampled { color: var(--muted); font-size: 11px; text-align: right; }
+.prompt-form { display: grid; gap: 6px; }
 .confirm-text { font-size: 13px; line-height: 1.6; }
 
 .notice { position: fixed; z-index: 40; left: 50%; bottom: calc(18px + var(--phone-safe-bottom)); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 8px; max-width: calc(100vw - 32px); padding: 8px 14px; border-radius: 999px; background: rgba(15, 23, 42, .92); color: #fff; font-size: 12px; box-shadow: 0 10px 24px -12px rgba(15, 23, 42, .5); animation: toast-in 160ms var(--ease); }

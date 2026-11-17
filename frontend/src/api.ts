@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferHistoryCleared, TransferHistoryEntry, TransferOffer, TransferProgress, TransferStatus } from './types';
+import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferHistoryCleared, TransferHistoryEntry, TransferOffer, TransferProgress } from './types';
 
 let baseUrl = '';
 const SETTINGS_WRITE_TIMEOUT_MS = 30_000;
@@ -19,8 +19,8 @@ export async function initApi(): Promise<string> {
   try {
     baseUrl = await invoke<string>('node_base_url');
   } catch {
+    // 浏览器上下文没有 Tauri 桥；页面由节点提供，来源就是节点地址。
     baseUrl = window.location.origin;
-    if (baseUrl === 'null' || baseUrl.startsWith('tauri:')) baseUrl = 'http://127.0.0.1:37880';
   }
   return baseUrl.replace(/\/$/, '');
 }
@@ -42,6 +42,7 @@ export async function request<T>(path: string, options: RequestInit = {}, target
   const response = await fetch(apiUrl(path, target), {
     ...options,
     cache: 'no-store',
+    redirect: 'error',
     headers: {
       ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}),
       ...(options.headers ?? {}),
@@ -69,7 +70,7 @@ export async function requestWithTimeout<T>(path: string, options: RequestInit, 
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await request<T>(path, { ...options, redirect: 'error', signal: controller.signal }, target);
+    return await request<T>(path, { ...options, signal: controller.signal }, target);
   } finally {
     window.clearTimeout(timer);
   }
@@ -93,7 +94,7 @@ export const getClipboardHistory = (target = baseUrl) => request<ClipboardHistor
 export const getClipboardHistoryDetail = (eventId: string, target = baseUrl) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`, {}, target);
 export const restoreClipboardHistory = (eventId: string, target = baseUrl) => request<ClipboardSnapshot>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/restore`, { method: 'POST' }, target);
 export const clearClipboardHistory = (target = baseUrl) => request<{ cleared: number }>('/api/v1/clipboard/history', { method: 'DELETE' }, target);
-export const getTransfers = (status?: TransferStatus, target = baseUrl) => requestList<TransferProgress>(`/api/v1/transfers${status ? `?status=${encodeURIComponent(status)}` : ''}`, target);
+export const getTransfers = (target = baseUrl) => requestList<TransferProgress>('/api/v1/transfers', target);
 export const dismissTransfer = (transferId: string, target = baseUrl) => request<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(transferId)}`, { method: 'DELETE' }, target);
 export const getTransferHistory = (sessionId?: string, target = baseUrl) => requestList<TransferHistoryEntry>(`/api/v1/transfers/history${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, target);
 export const clearTransferHistory = (sessionId?: string, target = baseUrl) => request<TransferHistoryCleared>(`/api/v1/transfers/history${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, { method: 'DELETE' }, target);
@@ -101,7 +102,7 @@ export const dismissMobileTransfer = (transferId: string, target = baseUrl) => r
 export const createMobileSession = (label?: string, target = baseUrl) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) }, target);
 export const getMobileSessions = (target = baseUrl) => requestList<MobileSession>('/api/v1/mobile/sessions', target);
 export const getMobileTransfers = (sessionId?: string, target = baseUrl) => requestList<MobileTransferView>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, target);
-export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, target = baseUrl, options: { autoComplete?: boolean } = {}) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}${options.autoComplete ? '&auto_complete=true' : ''}`, target);
+export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, autoComplete = false) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}${autoComplete ? '&auto_complete=true' : ''}`);
 /** 原生发送：先把清单和源文件交给本机节点，之后的上传由节点负责。 */
 export const createOutgoingStaging = (offer: TransferOffer, target = baseUrl) => request<OutgoingStagingView>('/api/v1/outgoing', { method: 'POST', body: JSON.stringify(offer) }, target);
 /** 桌面端按原路径直传：节点枚举、计算摘要后自己发送清单。 */

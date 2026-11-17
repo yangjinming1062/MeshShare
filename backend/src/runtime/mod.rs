@@ -2180,8 +2180,17 @@ impl NodeRuntime {
             .is_some_and(|record| record.sources.contains_key(item_id))
     }
 
-    pub fn mark_outgoing_item_staged(&self, transfer_id: &str, item_id: &str) {
+    /// digest 是暂存上传实际写入内容的摘要，回填后随清单发给接收端。
+    pub fn mark_outgoing_item_staged(&self, transfer_id: &str, item_id: &str, digest: String) {
         if let Some(record) = self.staged_outgoing.lock().get_mut(transfer_id) {
+            if let Some(item) = record
+                .offer
+                .items
+                .iter_mut()
+                .find(|item| item.item_id == item_id)
+            {
+                item.sha256 = digest;
+            }
             record
                 .sources
                 .insert(item_id.to_string(), OutgoingItemSource::Staged);
@@ -2590,11 +2599,13 @@ impl NodeRuntime {
         Some(record.progress.clone())
     }
 
+    /// digest 是已提交文件内容的摘要，回填到清单后下载校验以它为准。
     pub fn mark_item_received(
         &self,
         transfer_id: &str,
         item_id: &str,
         bytes: u64,
+        digest: String,
     ) -> Option<TransferProgress> {
         let mut transfers = self.transfers.write();
         let record = transfers.get_mut(transfer_id)?;
@@ -2611,11 +2622,12 @@ impl NodeRuntime {
         let item = record
             .offer
             .items
-            .iter()
+            .iter_mut()
             .find(|item| item.item_id == item_id)?;
         if item.size != bytes {
             return None;
         }
+        item.sha256 = digest;
         if record.received_items.insert(item_id.to_string()) {
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
             record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
@@ -3042,17 +3054,12 @@ impl NodeRuntime {
         true
     }
 
-    pub fn transfers_snapshot(&self, status: Option<TransferStatus>) -> Vec<TransferProgress> {
+    pub fn transfers_snapshot(&self) -> Vec<TransferProgress> {
         self.prune_transfers();
         let mut transfers = self
             .transfers
             .read()
             .values()
-            .filter(|record| {
-                status
-                    .as_ref()
-                    .is_none_or(|value| &record.progress.status == value)
-            })
             .map(|record| record.progress.clone())
             .collect::<Vec<_>>();
         transfers.sort_by_key(|progress| progress.transfer_id.clone());
@@ -3640,6 +3647,7 @@ impl NodeRuntime {
         transfer_id: &str,
         item_id: &str,
         bytes: u64,
+        digest: String,
     ) -> Option<MobileTransferView> {
         let mut transfers = self.mobile_transfers.write();
         let record = transfers.get_mut(transfer_id)?;
@@ -3652,11 +3660,12 @@ impl NodeRuntime {
         let item = record
             .offer
             .items
-            .iter()
+            .iter_mut()
             .find(|item| item.item_id == item_id)?;
         if item.size != bytes {
             return None;
         }
+        item.sha256 = digest;
         if record.staged_items.insert(item_id.to_string()) {
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
             record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);
@@ -3667,6 +3676,7 @@ impl NodeRuntime {
         } else {
             TransferStatus::Uploading
         };
+        record.progress.offer = Some(record.offer.clone());
         Some(mobile_view(record))
     }
 
@@ -4935,7 +4945,12 @@ mod tests {
     fn complete_incoming(runtime: &NodeRuntime, transfer_id: &str, source_node_id: &str) {
         runtime.add_transfer(incoming_history_offer(runtime, transfer_id, source_node_id));
         runtime
-            .mark_item_received(transfer_id, &format!("{transfer_id}-item"), 4)
+            .mark_item_received(
+                transfer_id,
+                &format!("{transfer_id}-item"),
+                4,
+                "0".repeat(64),
+            )
             .expect("complete incoming transfer");
     }
 
@@ -5001,7 +5016,7 @@ mod tests {
             .set_transfer_acceptance("receive-one", destination.clone())
             .expect("accept receive");
         runtime
-            .mark_item_received("receive-one", "receive-one-item", 4)
+            .mark_item_received("receive-one", "receive-one-item", 4, "0".repeat(64))
             .expect("complete receive");
         runtime.add_outgoing_transfer(outgoing_history_offer(&runtime, "send-one", "peer-target"));
         runtime.set_transfer_source_paths(
@@ -5131,7 +5146,12 @@ mod tests {
                 .set_mobile_transfer_status(transfer_id, session_id, TransferStatus::Accepted)
                 .expect("accept mobile transfer");
             runtime
-                .stage_mobile_item(transfer_id, &format!("{transfer_id}-item"), 4)
+                .stage_mobile_item(
+                    transfer_id,
+                    &format!("{transfer_id}-item"),
+                    4,
+                    "hash".to_string(),
+                )
                 .expect("stage mobile item");
             runtime
                 .mark_mobile_item_downloaded(transfer_id, &format!("{transfer_id}-item"), false)
@@ -5261,7 +5281,7 @@ mod tests {
             .set_mobile_transfer_status("mobile-one", &session.session_id, TransferStatus::Accepted)
             .expect("accept mobile transfer");
         runtime
-            .stage_mobile_item("mobile-one", "mobile-one-item", 4)
+            .stage_mobile_item("mobile-one", "mobile-one-item", 4, "hash".to_string())
             .expect("stage mobile item");
         runtime
             .mark_mobile_item_downloaded("mobile-one", "mobile-one-item", false)
@@ -5411,7 +5431,7 @@ mod tests {
                 name: "hello.txt".to_string(),
                 relative_path: "hello.txt".to_string(),
                 size: 3,
-                sha256: "hash".to_string(),
+                sha256: String::new(),
                 media_type: "text/plain".to_string(),
                 directory: false,
             }],
@@ -5430,9 +5450,11 @@ mod tests {
             )
             .expect("accept mobile transfer");
         let ready = runtime
-            .stage_mobile_item("mobile-transfer", "item", 3)
+            .stage_mobile_item("mobile-transfer", "item", 3, "hash".to_string())
             .expect("stage item");
         assert_eq!(ready.progress.status, TransferStatus::Ready);
+        let manifest = ready.progress.offer.as_ref().expect("staged manifest");
+        assert_eq!(manifest.items[0].sha256, "hash");
         let completed = runtime
             .mark_mobile_item_downloaded("mobile-transfer", "item", false)
             .expect("mark downloaded");
@@ -5639,7 +5661,7 @@ mod tests {
             )
             .expect("accept mobile transfer");
         runtime
-            .stage_mobile_item("recent-mobile", "recent-mobile-item", 1)
+            .stage_mobile_item("recent-mobile", "recent-mobile-item", 1, "hash".to_string())
             .expect("stage mobile item");
         runtime
             .mark_mobile_item_downloaded("recent-mobile", "recent-mobile-item", false)
@@ -5696,7 +5718,7 @@ mod tests {
         assert_eq!(removed.status, TransferStatus::Failed);
         assert!(runtime.transfer("removable").is_none());
         assert!(runtime
-            .transfers_snapshot(None)
+            .transfers_snapshot()
             .iter()
             .all(|progress| progress.transfer_id != "removable"));
         assert!(runtime.remove_failed_transfer("removable").is_none());
@@ -6370,7 +6392,7 @@ mod tests {
         std::fs::create_dir_all(staged.parent().expect("staging directory"))
             .expect("create staging directory");
         std::fs::write(&staged, &payload).expect("write staged payload");
-        sender.mark_outgoing_item_staged(&offer.transfer_id, &item.item_id);
+        sender.mark_outgoing_item_staged(&offer.transfer_id, &item.item_id, item.sha256.clone());
 
         receiver.add_transfer(offer.clone());
         let destination = receiver_dir.join("received");
@@ -6594,7 +6616,7 @@ mod tests {
             runtime.outgoing_staging_counts(&offer.transfer_id),
             Some((0, 1))
         );
-        runtime.mark_outgoing_item_staged(&offer.transfer_id, &item.item_id);
+        runtime.mark_outgoing_item_staged(&offer.transfer_id, &item.item_id, item.sha256.clone());
         assert_eq!(
             runtime.outgoing_staging_counts(&offer.transfer_id),
             Some((1, 1))

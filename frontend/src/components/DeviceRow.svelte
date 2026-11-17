@@ -14,7 +14,6 @@
   export let onSendFolder: () => void = () => {};
   export let onDetails: () => void = () => {};
   export let onOpen: () => void = () => {};
-  export let allowOpen = false;
   export let allowFolderSend = true;
   export let onDragOver: () => void = () => {};
   export let onDragLeave: () => void = () => {};
@@ -33,7 +32,7 @@
   $: gpu = gpuUtilization(displayMetrics);
   $: hasSystemMetrics = cpu !== undefined || memory !== undefined;
   $: hasGpuMetrics = gpu !== undefined || !!displayMetrics?.gpus.length;
-  $: openable = allowOpen && kind === 'peer' && (isHome || !!peer?.addresses.length);
+  $: openable = kind === 'peer' && (isHome || !!peer?.addresses.length);
 
   function isInsideRow(event: DragEvent): boolean {
     const row = event.currentTarget;

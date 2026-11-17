@@ -19,7 +19,6 @@
   export let settingsDisabled = false;
   export let updateProxy = '';
   export let updateProxyBusy = false;
-  export let updateProxyReset = 0;
   export let localMode = true;
   export let receiveSettings: ReceiveSettings = { mode: 'confirm' };
   export let historySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
@@ -63,17 +62,15 @@
           <span>留空时跟随系统或环境代理；只用于检查更新和下载安装包。</span>
         </div>
         <div class="setting-actions">
-          {#key updateProxyReset + ':' + updateProxy}
-            <input
-              class="field setting-proxy"
-              type="url"
-              placeholder="http://127.0.0.1:7890"
-              value={updateProxy}
-              aria-label="更新代理地址"
-              disabled={updateProxyBusy}
-              on:change={(event) => onUpdateProxy(event.currentTarget.value)}
-            />
-          {/key}
+          <input
+            class="field setting-proxy"
+            type="url"
+            placeholder="http://127.0.0.1:7890"
+            bind:value={updateProxy}
+            aria-label="更新代理地址"
+            disabled={updateProxyBusy}
+            on:change={() => onUpdateProxy(updateProxy)}
+          />
         </div>
       </div>
     {/if}

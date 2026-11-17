@@ -1,6 +1,6 @@
 import type { ClipboardHistoryItem, ClipboardHistorySettings, DiskMetrics, HardwareMetrics, LoadAverage, PeerInfo, TransferHistoryEntry, TransferPrepare, TransferProgress, TransferStatus, UpdateFrequency, UpdateStatus } from './types';
 
-export const METRICS_STALE_AFTER_MS = 5_000;
+const METRICS_STALE_AFTER_MS = 5_000;
 
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return bytes + ' B';
