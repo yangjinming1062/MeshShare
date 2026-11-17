@@ -108,8 +108,13 @@
     return Math.max(0, Math.min(1, transfer.completed_bytes / transfer.total_bytes));
   }
 
+  /** 浏览器页面把接入节点也列成目标，本机卡片用页面已取到的指标。 */
+  function peerMetrics(peer: PeerInfo): HardwareMetrics | null {
+    return peer.metrics ?? (peer.node_id === node?.node_id ? metrics : null);
+  }
+
   function gpuValue(peer: PeerInfo): number | undefined {
-    return gpuUtilization(peer.metrics);
+    return gpuUtilization(peerMetrics(peer));
   }
 
   function downloaded(transfer: PhoneTransfer, item: TransferItem): boolean {
@@ -243,19 +248,23 @@
               <span class="device-meta">{platformLabel(peer.platform)} · {peer.addresses[0]?.address ?? '在线'}</span>
             </span>
           </div>
-          <div class="device-chips" title={peerSummary(peer)}>
+          <div class="device-metrics-lines" title={peer.node_id === node?.node_id ? '本机节点' : peerSummary(peer)}>
             {#if peer.metrics_stale}
-              <span class="metric muted">指标已过期</span>
-            {:else if peer.metrics}
-              <span class="metric">CPU <b>{formatPercent(peer.metrics.cpu_usage_percent)}</b></span>
-              <span class="metric">内存 <b>{formatPercent(memoryPercent(peer.metrics))}</b></span>
-              {#if gpuValue(peer) !== undefined}
-                <span class="metric">GPU <b>{formatPercent(gpuValue(peer))}</b></span>
-              {/if}
-              <span class="metric">↓ <b>{formatRate(peer.metrics.network_down_bytes_per_sec)}</b></span>
-              <span class="metric">↑ <b>{formatRate(peer.metrics.network_up_bytes_per_sec)}</b></span>
+              <div class="metric-line"><span class="metric-item">指标已过期</span></div>
+            {:else if peerMetrics(peer)}
+              <div class="metric-line">
+                <span class="metric-item">CPU <b>{formatPercent(peerMetrics(peer)?.cpu_usage_percent)}</b></span>
+                <span class="metric-item">内存 <b>{formatPercent(memoryPercent(peerMetrics(peer)))}</b></span>
+                {#if gpuValue(peer) !== undefined}
+                  <span class="metric-item">GPU <b>{formatPercent(gpuValue(peer))}</b></span>
+                {/if}
+              </div>
+              <div class="metric-line">
+                <span class="metric-item">↓ <b>{formatRate(peerMetrics(peer)?.network_down_bytes_per_sec)}</b></span>
+                <span class="metric-item">↑ <b>{formatRate(peerMetrics(peer)?.network_up_bytes_per_sec)}</b></span>
+              </div>
             {:else}
-              <span class="metric muted">指标采集中</span>
+              <div class="metric-line"><span class="metric-item">指标采集中</span></div>
             {/if}
           </div>
           <div class="device-actions">
@@ -317,12 +326,14 @@
         </div>
       {/if}
     {:else}
-      <textarea class="field" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
+      <textarea class="field clip-editor" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
       {#if clipboard?.image_png}
         <ClipboardImage imagePng={clipboard.image_png} />
       {/if}
       <div class="phone-actions">
         <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>
+      </div>
+      <div class="phone-actions phone-actions--split">
         <button type="button" class="btn" on:click={onReadLocal}>读取本机剪贴板</button>
         <button type="button" class="btn" on:click={onWriteLocal}>写入本机剪贴板</button>
       </div>
@@ -333,11 +344,33 @@
   <section class="phone-card">
     <div class="phone-card-head">
       <h2>传输记录</h2>
-      <span class="chip">{activeTransfers.length + prepares.length}</span>
+      <span class="chip">进行中 {activeTransfers.length + prepares.length}</span>
+      <span class="phone-history-count">历史 {historyEntries.length}</span>
       <button type="button" class="btn btn-ghost btn-sm phone-toggle" aria-expanded={transfersOpen} on:click={() => (transfersOpen = !transfersOpen)}>
         {transfersOpen ? '收起' : '展开'}
       </button>
     </div>
+    {#if failures.length}
+      <div class="phone-failures">
+        <div class="phone-card-head phone-subhead"><h3>失败任务</h3><span class="chip chip--danger">{failures.length}</span></div>
+        <div class="phone-list">
+          {#each failures as failure (failure.progress.transfer_id)}
+            <article class="transfer-card transfer-card--failure">
+              <span class="transfer-icon transfer-icon--failure" aria-hidden="true"><Icon name="close" size={14} /></span>
+              <div class="transfer-copy">
+                <strong>{failure.progress.offer?.source_name ?? '文件传输'}</strong>
+                <span>{transferItemsLabel(failure.progress)} · {formatTime(failure.failed_at_ms)}</span>
+              </div>
+              <div class="transfer-progress"><span title={failure.progress.error ?? '传输失败'}>{failure.progress.error ?? '传输失败'}</span></div>
+              <div class="transfer-actions">
+                {#if failure.retryable}<button type="button" class="btn btn-primary btn-sm" on:click={() => onRetryFailure(failure)}>重试</button>{/if}
+                <button type="button" class="btn btn-ghost btn-sm" on:click={() => onDismissFailure(failure)}>移除</button>
+              </div>
+            </article>
+          {/each}
+        </div>
+      </div>
+    {/if}
     {#if transfersOpen}
       <div class="phone-list">
         {#each prepares as prepare (prepare.prepare_id)}
@@ -417,69 +450,48 @@
           <div class="empty">还没有传输任务。</div>
         {/if}
       </div>
-    {/if}
-    {#if recentDownloads.length}
-      <div class="phone-card-head phone-subhead"><h3>最近下载</h3></div>
-      <div class="phone-list">
-        {#each recentDownloads as transfer (transfer.transfer_id)}
-          <article class="transfer-card">
-            <span class="transfer-icon" aria-hidden="true"><Icon name="arrow-down" size={14} /></span>
-            <div class="transfer-copy"><strong>{transferTitle(transfer)}</strong></div>
-            <div class="transfer-actions">
-              {#each (transfer.offer?.items ?? []).filter((item) => canRetryDownload(transfer, item)) as item (item.item_id)}
-                <button type="button" class="btn btn-sm" on:click={() => onStartDownload(transfer, item)}>重新下载 {item.name}</button>
-              {/each}
-            </div>
-          </article>
-        {/each}
-      </div>
-    {/if}
-    {#if failures.length}
-      <div class="phone-failures">
-        <div class="phone-card-head phone-subhead"><h3>失败任务</h3><span class="chip chip--danger">{failures.length}</span></div>
+      {#if recentDownloads.length}
+        <div class="phone-card-head phone-subhead"><h3>最近下载</h3></div>
         <div class="phone-list">
-          {#each failures as failure (failure.progress.transfer_id)}
-            <article class="transfer-card transfer-card--failure">
-              <span class="transfer-icon transfer-icon--failure" aria-hidden="true"><Icon name="close" size={14} /></span>
-              <div class="transfer-copy">
-                <strong>{failure.progress.offer?.source_name ?? '文件传输'}</strong>
-                <span>{transferItemsLabel(failure.progress)} · {formatTime(failure.failed_at_ms)}</span>
-              </div>
-              <div class="transfer-progress"><span title={failure.progress.error ?? '传输失败'}>{failure.progress.error ?? '传输失败'}</span></div>
+          {#each recentDownloads as transfer (transfer.transfer_id)}
+            <article class="transfer-card">
+              <span class="transfer-icon" aria-hidden="true"><Icon name="arrow-down" size={14} /></span>
+              <div class="transfer-copy"><strong>{transferTitle(transfer)}</strong></div>
               <div class="transfer-actions">
-                {#if failure.retryable}<button type="button" class="btn btn-primary btn-sm" on:click={() => onRetryFailure(failure)}>重试</button>{/if}
-                <button type="button" class="btn btn-ghost btn-sm" on:click={() => onDismissFailure(failure)}>移除</button>
+                {#each (transfer.offer?.items ?? []).filter((item) => canRetryDownload(transfer, item)) as item (item.item_id)}
+                  <button type="button" class="btn btn-sm" on:click={() => onStartDownload(transfer, item)}>重新下载 {item.name}</button>
+                {/each}
               </div>
             </article>
           {/each}
         </div>
+      {/if}
+      <div class="phone-card-head phone-subhead phone-history-head">
+        <h3>传输历史</h3>
+        <span class="chip">{historyEntries.length}</span>
+        <button type="button" class="btn btn-ghost btn-sm" disabled={transferHistoryBusy || !historyEntries.length} on:click={onClearTransferHistory}>清空</button>
       </div>
-    {/if}
-    <div class="phone-card-head phone-subhead phone-history-head">
-      <h3>传输历史</h3>
-      <span class="chip">{historyEntries.length}</span>
-      <button type="button" class="btn btn-ghost btn-sm" disabled={transferHistoryBusy || !historyEntries.length} on:click={onClearTransferHistory}>清空</button>
-    </div>
-    {#if historyEntries.length}
-      <div class="phone-list">
-        {#each historyEntries as entry (entry.transfer_id)}
-          <article class="transfer-card">
-            <span class="transfer-icon" aria-hidden="true">
-              <Icon name={entry.direction === 'receive' ? 'arrow-down' : 'arrow-up'} size={14} />
-            </span>
-            <div class="transfer-copy">
-              <strong title={entry.peer_node_id}>{transferHistoryPeerText(entry)}</strong>
-              <span title={transferHistoryPathText(entry)}>{transferHistoryPathText(entry)}</span>
-            </div>
-            <div class="transfer-progress">
-              <span>{transferHistoryStatusText(entry)}</span>
-              <span class="muted">{entry.completed_items}/{entry.total_items} 个项目 · {formatTime(entry.finished_at_ms)}</span>
-            </div>
-          </article>
-        {/each}
-      </div>
-    {:else}
-      <div class="empty">还没有传输历史。</div>
+      {#if historyEntries.length}
+        <div class="phone-list">
+          {#each historyEntries as entry (entry.transfer_id)}
+            <article class="transfer-card">
+              <span class="transfer-icon" aria-hidden="true">
+                <Icon name={entry.direction === 'receive' ? 'arrow-down' : 'arrow-up'} size={14} />
+              </span>
+              <div class="transfer-copy">
+                <strong title={entry.peer_node_id}>{transferHistoryPeerText(entry)}</strong>
+                <span title={transferHistoryPathText(entry)}>{transferHistoryPathText(entry)}</span>
+              </div>
+              <div class="transfer-progress">
+                <span>{transferHistoryStatusText(entry)}</span>
+                <span class="muted">{entry.completed_items}/{entry.total_items} 个项目 · {formatTime(entry.finished_at_ms)}</span>
+              </div>
+            </article>
+          {/each}
+        </div>
+      {:else}
+        <div class="empty">还没有传输历史。</div>
+      {/if}
     {/if}
   </section>
 

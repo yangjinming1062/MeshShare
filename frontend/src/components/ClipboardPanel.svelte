@@ -35,19 +35,19 @@
   {#if tab === 'current'}
     <div class="surface-body">
       <div class="clip-grid">
+        {#if clipboard?.image_png}
+          <ClipboardImage imagePng={clipboard.image_png} />
+        {/if}
         <textarea
           id="clipboard-editor"
           class="field clip-editor"
           bind:value={draft}
           placeholder="在任意设备复制文字或图片，这里会显示最近内容"
         ></textarea>
-        {#if clipboard?.image_png}
-          <ClipboardImage imagePng={clipboard.image_png} />
-        {/if}
       </div>
       <div class="action-row">
-        <button type="button" class="btn btn-primary btn-sm" on:click={onPublish}>立即同步当前文字</button>
-        <span class="hint">桌面端复制后会自动推送</span>
+        <button type="button" class="btn btn-primary btn-sm" disabled={!draft.trim()} on:click={onPublish}>立即同步当前文字</button>
+        <span class="hint">复制会自动推送；这里用于同步编辑后的文字</span>
       </div>
     </div>
   {:else}

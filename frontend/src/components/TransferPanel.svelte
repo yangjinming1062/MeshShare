@@ -19,6 +19,7 @@
   $: activeTransfers = transfers.filter((transfer) => isActiveTransferStatus(transfer.status));
   $: historyEntries = transferHistory.filter((entry) => !failures.some((failure) => failure.progress.transfer_id === entry.transfer_id));
   $: waiting = activeTransfers.some((transfer) => transfer.direction === 'receive' && transfer.status === 'waiting');
+  $: hasContent = prepares.length > 0 || activeTransfers.length > 0 || failures.length > 0 || historyEntries.length > 0;
 
   function ratio(transfer: TransferProgress): number {
     if (!transfer.total_bytes) return 0;
@@ -40,6 +41,7 @@
       <span class="hint">{remoteMode ? '发送由目标机器读取文件后直传' : '文件只在两台设备之间直传'}</span>
     </div>
   </div>
+  {#if hasContent}
   <div class="surface-body">
     <div class="transfer-list">
       {#each prepares as prepare (prepare.prepare_id)}
@@ -100,7 +102,7 @@
         </article>
       {/each}
       {#if !prepares.length && !activeTransfers.length}
-        <div class="empty">当前没有待处理或进行中的传输任务。</div>
+        <div class="empty">没有进行中的传输。</div>
       {/if}
     </div>
     {#if failures.length}
@@ -126,14 +128,14 @@
         </div>
       </div>
     {/if}
+    {#if historyEntries.length}
     <div class="transfer-history">
       <div class="transfer-subhead">
         <strong>传输历史</strong>
         <span class="chip">{historyEntries.length}</span>
-        <button type="button" class="btn btn-ghost btn-sm" disabled={transferHistoryBusy || !historyEntries.length} on:click={onClearTransferHistory}>清空</button>
+        <button type="button" class="btn btn-ghost btn-sm" disabled={transferHistoryBusy} on:click={onClearTransferHistory}>清空</button>
       </div>
-      {#if historyEntries.length}
-        <div class="transfer-list transfer-list--history">
+      <div class="transfer-list transfer-list--history">
           {#each historyEntries as entry (entry.transfer_id)}
             <article class="transfer-row transfer-row--history">
               <span class="transfer-icon" aria-hidden="true">
@@ -150,9 +152,8 @@
             </article>
           {/each}
         </div>
-      {:else}
-        <div class="empty">还没有传输历史。</div>
-      {/if}
-    </div>
+      </div>
+    {/if}
   </div>
+  {/if}
 </section>

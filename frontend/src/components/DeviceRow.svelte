@@ -9,6 +9,7 @@
   export let peer: PeerInfo | null = null;
   export let session: MobileSession | null = null;
   export let dragging = false;
+  export let linkActive = false;
   export let isHome = false;
   export let onSend: () => void = () => {};
   export let onSendFolder: () => void = () => {};
@@ -21,7 +22,7 @@
 
   $: name = kind === 'mobile' ? (session?.label ?? '网页设备') : (peer?.node_name ?? '设备');
   $: meta = kind === 'mobile'
-    ? (session ? session.node_name + ' · 网页加入' : '网页加入')
+    ? (session ? session.node_name + ' · 浏览器' : '浏览器')
     : (peer ? (isHome ? '本机 · ' : '') + platformLabel(peer.platform) + ' · ' + (peer.addresses[0]?.address ?? '在线') : '');
   $: metrics = kind === 'mobile' ? null : (peer?.metrics ?? null);
   $: stale = kind === 'peer' && !!peer?.metrics_stale;
@@ -30,8 +31,6 @@
   $: cpu = displayMetrics?.cpu_usage_percent;
   $: memory = memoryPercent(displayMetrics);
   $: gpu = gpuUtilization(displayMetrics);
-  $: hasSystemMetrics = cpu !== undefined || memory !== undefined;
-  $: hasGpuMetrics = gpu !== undefined || !!displayMetrics?.gpus.length;
   $: openable = kind === 'peer' && (isHome || !!peer?.addresses.length);
 
   function isInsideRow(event: DragEvent): boolean {
@@ -52,6 +51,7 @@
 <li
   class="device-row"
   class:dragging
+  data-link={linkActive ? 'active' : undefined}
   on:dragenter|preventDefault={handleDragEnter}
   on:dragover|preventDefault={() => onDragOver()}
   on:dragleave={handleDragLeave}
@@ -87,23 +87,23 @@
       title={hasMetrics && peer ? peerSummary(peer) : (stale ? '指标已过期' : '指标采集中')}
       on:click={onDetails}
     >
-      {#if hasMetrics}
-        {#if hasSystemMetrics}<Meter label="CPU" value={formatPercent(cpu)} percent={cpu} />{/if}
-        {#if hasSystemMetrics}<Meter label="内存" value={formatPercent(memory)} percent={memory} />{/if}
-        {#if hasGpuMetrics}<Meter label="GPU" value={formatPercent(gpu)} percent={gpu} />{/if}
+      {#if displayMetrics}
+        <Meter label="CPU" value={formatPercent(cpu)} percent={cpu} />
+        <Meter label="内存" value={formatPercent(memory)} percent={memory} />
+        <Meter label="GPU" value={formatPercent(gpu)} percent={gpu} />
         <span class="meter meter-net">
-          <b class="meter-value">↓ {formatRateCompact(displayMetrics?.network_down_bytes_per_sec)}</b>
-          <b class="meter-value">↑ {formatRateCompact(displayMetrics?.network_up_bytes_per_sec)}</b>
+          <b class="meter-value">↓ {formatRateCompact(displayMetrics.network_down_bytes_per_sec)}</b>
+          <b class="meter-value">↑ {formatRateCompact(displayMetrics.network_up_bytes_per_sec)}</b>
         </span>
       {:else}
-        <span class="device-metrics-empty">指标采集中</span>
+        <span class="device-metrics-empty" data-stale={stale}>{stale ? '指标已过期' : '指标采集中'}</span>
       {/if}
     </button>
   {/if}
   <div class="device-actions">
-    <button type="button" class="btn btn-primary btn-sm" on:click={onSend}>
+    <button type="button" class="btn btn-send btn-sm" title="发送文件" on:click={onSend}>
       <Icon name="send" size={13} />
-      发送
+      发送文件
     </button>
     {#if allowFolderSend}
       <button type="button" class="btn-icon" aria-label={'向 ' + name + ' 发送文件夹'} title="发送文件夹" on:click={onSendFolder}>

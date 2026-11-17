@@ -210,6 +210,14 @@
     online: true,
   } satisfies PeerInfo, ...peers] : peers;
 
+  // 链路轨只表达「这台设备正在收发」；没有 offer 的本地合成行保持静态。
+  $: activeLinkPeers = new Set(
+    [...transfers, ...mobileTransfers.map((view) => view.progress)]
+      .filter((transfer) => isActiveTransferStatus(transfer.status) && !!transfer.offer)
+      .flatMap((transfer) => [transfer.offer?.source_node_id, transfer.offer?.target_node_id])
+      .filter((id): id is string => !!id),
+  );
+
   function failureRetryable(progress: TransferProgress): boolean {
     // 服务端刷新回来的进度可能没有方向，按 offer 的来源节点判断归属即可。
     if (progress.direction === 'receive') return false;
@@ -1151,6 +1159,40 @@
     } catch {
       showTransientNotice('浏览器拒绝写入，请手动选择并复制', 6000);
     }
+  }
+
+  /** 桌面 WebView 可能没有异步剪贴板权限，退回选中复制。 */
+  function fallbackCopy(value: string): boolean {
+    const area = document.createElement('textarea');
+    area.value = value;
+    area.setAttribute('readonly', '');
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    let copied = false;
+    try {
+      copied = document.execCommand('copy');
+    } catch {
+      copied = false;
+    }
+    area.remove();
+    return copied;
+  }
+
+  async function copyAccessAddress() {
+    const target = node?.addresses[0];
+    if (!target) return;
+    const value = target.url;
+    try {
+      await navigator.clipboard.writeText(value);
+      showTransientNotice('已复制访问地址');
+      return;
+    } catch {
+      // 继续尝试旧接口，避免在没有剪贴板权限的 WebView 里给出空承诺。
+    }
+    const copied = fallbackCopy(value);
+    showTransientNotice(copied ? '已复制访问地址' : '无法复制地址，请手动选择', copied ? 2400 : 6000);
   }
 
   function startChoose(peer: PeerInfo, folder = false) {
@@ -2512,6 +2554,7 @@
       onAutostart={toggleAutostart}
       onSettings={() => (settingsOpen = true)}
       onBack={returnToLocal}
+      onCopyAddress={copyAccessAddress}
     />
     {#if isDesktopWindow && node && !clipboardStatus.available}
       <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
@@ -2520,6 +2563,7 @@
       <DevicePanel
         peers={peers}
         homeNodeId={remoteMode ? localNodeId : ''}
+        activePeerIds={activeLinkPeers}
         {mobileSessions}
         savedAddresses={savedNodeUrls}
         draggingKey={dragPeer}

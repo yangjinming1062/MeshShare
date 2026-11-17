@@ -24,7 +24,16 @@
   $: memoryCaption = stale
     ? '—'
     : formatMemory(metrics?.memory_used_bytes) + ' / ' + formatMemory(metrics?.memory_total_bytes);
-  $: gpuCaption = stale ? '—' : (gpus.length ? gpus.length + ' 个 GPU' : '未检测到可读指标');
+  $: singleGpu = gpus.length === 1 ? gpus[0] : null;
+  $: gpuCaption = stale
+    ? '—'
+    : singleGpu
+      ? (singleGpu.memory_used_bytes != null && singleGpu.memory_total_bytes != null
+        ? formatMemory(singleGpu.memory_used_bytes) + ' / ' + formatMemory(singleGpu.memory_total_bytes) + ' 显存'
+        : '显存不可读')
+      : gpus.length > 1
+        ? gpus.length + ' 个 GPU'
+        : '未检测到可读指标';
 
   function bar(value: number | undefined): number | undefined {
     if (value === undefined) return undefined;
@@ -53,10 +62,13 @@
         disabled={!canClickThrough || settingsDisabled}
         title={canClickThrough ? '锁定或解锁悬浮监控条' : '当前桌面环境不支持点击穿透，可从托盘隐藏悬浮条'}
         on:click={onToggleLock}
-      >{monitorLocked ? '解锁悬浮条' : '锁定悬浮条'}</button>
+      >{monitorLocked ? '取消点击穿透' : '开启点击穿透'}</button>
     </div>
   </div>
   <div class="surface-body">
+    {#if stale}
+      <p class="metrics-note">指标已过期，等待最新快照。</p>
+    {/if}
     <div class="hw-grid">
         <div class="hw-tile">
           <span class="hw-label">CPU</span>
@@ -83,7 +95,7 @@
           <span class="hw-caption">实时速率</span>
         </div>
     </div>
-    {#if gpus.length}
+    {#if gpus.length > 1}
       <div class="hw-gpus">
         {#each shownGpus as gpu, index (gpu.name + index)}
           <div class="hw-gpu" title={gpu.unavailable_reason}>

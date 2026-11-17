@@ -16,6 +16,13 @@
   export let onSync: () => void = () => {};
   export let onAutostart: () => void = () => {};
   export let onSettings: () => void = () => {};
+  export let onCopyAddress: () => void = () => {};
+
+  $: addressText = node?.addresses[0]
+    ? (node.addresses[0].address.includes(':')
+      ? '[' + node.addresses[0].address + ']:' + node.port
+      : node.addresses[0].address + ':' + node.port)
+    : '';
 </script>
 
 <header class="app-header">
@@ -33,9 +40,12 @@
   {#if node}
     <div class="header-chips">
       <span class="chip">{platformLabel(node.platform)}</span>
-      <span class="chip mono">:{node.port}</span>
       {#if node.addresses[0]}
-        <span class="chip mono" title={node.addresses[0].address}>{node.addresses[0].address}</span>
+        <button type="button" class="chip chip-button address-chip mono" title={'点击复制 ' + addressText} aria-label={'复制访问地址 ' + addressText} on:click={onCopyAddress}>
+          <span class="address-text">{addressText}</span>
+        </button>
+      {:else}
+        <span class="chip mono">:{node.port}</span>
       {/if}
     </div>
   {/if}
