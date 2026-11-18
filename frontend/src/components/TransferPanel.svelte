@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import { formatTime, isActiveTransferStatus, prepareProgressRatio, prepareStatusText, transferHistoryPathText, transferHistoryPeerText, transferHistoryStatusText, transferItemsLabel, transferStatusText } from '../format';
+  import { formatTime, isActiveTransferStatus, prepareProgressRatio, prepareStatusText, transferHistoryLocation, transferHistoryPathText, transferHistoryPeerText, transferHistoryStatusText, transferItemsLabel, transferStatusText } from '../format';
   import type { TransferFailure, TransferHistoryEntry, TransferPrepare, TransferProgress } from '../types';
 
   export let transfers: TransferProgress[] = [];
@@ -9,6 +9,8 @@
   export let transferHistory: TransferHistoryEntry[] = [];
   export let transferHistoryBusy = false;
   export let onClearTransferHistory: () => void = () => {};
+  export let onOpenLocation: (entry: TransferHistoryEntry) => void = () => {};
+  export let onViewLocation: (entry: TransferHistoryEntry) => void = () => {};
   export let onAccept: (transfer: TransferProgress) => void = () => {};
   export let onReject: (transfer: TransferProgress) => void = () => {};
   export let onRetry: (failure: TransferFailure) => void = () => {};
@@ -137,6 +139,7 @@
       </div>
       <div class="transfer-list transfer-list--history">
           {#each historyEntries as entry (entry.transfer_id)}
+            {@const location = transferHistoryLocation(entry)}
             <article class="transfer-row transfer-row--history">
               <span class="transfer-icon" aria-hidden="true">
                 <Icon name={entry.direction === 'receive' ? 'arrow-down' : 'arrow-up'} size={14} />
@@ -149,6 +152,19 @@
                 <span>{transferHistoryStatusText(entry)}</span>
                 <span class="transfer-history-meta">{entry.completed_items}/{entry.total_items} 个项目 · {formatTime(entry.finished_at_ms)}</span>
               </div>
+              {#if location}
+                <div class="transfer-actions">
+                  <button
+                    type="button"
+                    class="btn btn-ghost btn-sm"
+                    title={remoteMode ? '在目标机器的文件浏览中查看' : '打开所在目录'}
+                    on:click={() => (remoteMode ? onViewLocation(entry) : onOpenLocation(entry))}
+                  >
+                    <Icon name="folder" size={14} />
+                    {remoteMode ? '查看位置' : '打开所在目录'}
+                  </button>
+                </div>
+              {/if}
             </article>
           {/each}
         </div>

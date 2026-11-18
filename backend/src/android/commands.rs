@@ -67,3 +67,15 @@ pub(crate) fn android_receive_directory(app: AppHandle) -> Result<String, String
     let (directory, _) = receive_target(&app)?;
     Ok(directory.to_string_lossy().into_owned())
 }
+
+/// 在系统文件管理器里打开接收目录；只接受目录，避免把任意路径交给 Intent。
+#[tauri::command]
+pub(crate) fn android_reveal_path(app: AppHandle, path: String) -> Result<(), String> {
+    if !PathBuf::from(&path).is_dir() {
+        return Err("目录不存在或已被移动".to_string());
+    }
+    app.state::<AndroidStoragePluginHandle>()
+        .0
+        .run_mobile_plugin::<()>("revealPath", serde_json::json!({ "path": path }))
+        .map_err(|error| format!("无法打开所在目录：{error}"))
+}

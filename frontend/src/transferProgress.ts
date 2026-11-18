@@ -1,4 +1,14 @@
-import type { TransferProgress } from './types';
+import type { TransferHistoryEntry, TransferProgress } from './types';
+
+/** 首次加载建立基线，之后按传输 ID 和重试代次识别新终态。 */
+export function newestFinishedTransfer(
+  previous: readonly TransferHistoryEntry[] | null,
+  entries: readonly TransferHistoryEntry[],
+): TransferHistoryEntry | undefined {
+  if (!previous) return undefined;
+  return entries.find((entry) => !previous.some((seen) => seen.transfer_id === entry.transfer_id
+    && (seen.retry_count ?? 0) >= (entry.retry_count ?? 0)));
+}
 
 function transferStatusRank(progress: TransferProgress): number {
   if (progress.status === 'waiting') return progress.awaiting_offer_reply ? 0 : 1;

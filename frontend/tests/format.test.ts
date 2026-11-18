@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { formatHistoryTime, transferHistoryForSessionView, transferHistoryPathText, transferHistoryPeerText, transferHistoryStatusText, transferStatusText } from '../src/format.ts';
+import { formatHistoryTime, transferHistoryForSessionView, transferHistoryLocation, transferHistoryPathText, transferHistoryPeerText, transferHistoryStatusText, transferStatusText } from '../src/format.ts';
 
 const base = {
   transfer_id: 'id',
@@ -52,6 +52,32 @@ test('transfer history describes both ends and the root path', () => {
     '来源 D:/资料 等 2 处',
   );
   assert.equal(transferHistoryPathText({ ...historyBase, direction: 'send' }), '来源未知');
+});
+
+test('history entries resolve to the containing directory and the item to select', () => {
+  assert.deepEqual(transferHistoryLocation({ ...historyBase, destination: 'D:/下载' }), { directory: 'D:/下载' });
+  assert.deepEqual(transferHistoryLocation({ ...historyBase, destination: 'D:/下载', item_root: '报告.docx' }), {
+    directory: 'D:/下载',
+    select: 'D:/下载/报告.docx',
+  });
+  assert.deepEqual(transferHistoryLocation({ ...historyBase, destination: 'D:\\下载\\', item_root: '照片' }), {
+    directory: 'D:\\下载\\',
+    select: 'D:\\下载\\照片',
+  });
+  assert.equal(transferHistoryLocation(historyBase), null);
+  assert.deepEqual(
+    transferHistoryLocation({ ...historyBase, direction: 'send', source_paths: ['C:\\资料\\报告.docx'] }),
+    { directory: 'C:\\资料', select: 'C:\\资料\\报告.docx' },
+  );
+  assert.deepEqual(
+    transferHistoryLocation({ ...historyBase, direction: 'send', source_paths: ['C:/资料'] }),
+    { directory: 'C:/', select: 'C:/资料' },
+  );
+  assert.deepEqual(
+    transferHistoryLocation({ ...historyBase, direction: 'send', source_paths: ['/report.txt'] }),
+    { directory: '/', select: '/report.txt' },
+  );
+  assert.equal(transferHistoryLocation({ ...historyBase, direction: 'send' }), null);
 });
 
 test('session history is shown from the receiving page perspective', () => {

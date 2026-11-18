@@ -847,7 +847,8 @@ fn run_desktop() {
             set_remote_file_access,
             popup_monitor_menu,
             set_monitor_position,
-            links::open_project_page
+            links::open_project_page,
+            links::open_transfer_location
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")
@@ -906,6 +907,7 @@ pub fn run() {
             android::commands::android_receive_directory,
             android::commands::android_receive_storage,
             android::commands::android_request_receive_storage,
+            android::commands::android_reveal_path,
             android::update::app::android_update_status,
             android::update::app::android_set_update_frequency,
             android::update::app::android_check_for_updates,

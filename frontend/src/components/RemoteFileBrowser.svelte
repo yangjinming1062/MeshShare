@@ -6,8 +6,9 @@
   import type { BrowseEntry, BrowseRoots } from '../types';
 
   export let open = false;
-  /** send：多选文件与文件夹；directory：把当前目录作为选择结果。 */
-  export let mode: 'send' | 'directory' = 'send';
+  /** send：多选文件与文件夹；directory：把当前目录作为选择结果；view：只读浏览位置。 */
+  export let mode: 'send' | 'directory' | 'view' = 'send';
+  export let targetBase: string;
   export let targetLabel = '';
   export let startPath = '';
   export let onConfirm: (paths: string[]) => void = () => {};
@@ -26,7 +27,7 @@
   let wasOpen = false;
 
   $: label = targetLabel || '目标机器';
-  $: canConfirm = !loading && (mode === 'directory' ? !!currentPath : selected.length > 0);
+  $: canConfirm = mode !== 'view' && !loading && (mode === 'directory' ? !!currentPath : selected.length > 0);
   $: if (open !== wasOpen) {
     wasOpen = open;
     if (open) void begin();
@@ -49,13 +50,15 @@
     reset();
     loading = true;
     const seq = ++requestSeq;
+    const target = targetBase;
+    const initialPath = startPath;
     try {
-      const next = await getManagedRoots();
+      const next = await getManagedRoots(target);
       if (seq !== requestSeq) return;
       roots = next;
-      const start = startPath.trim() || next.home || next.roots[0]?.path || '';
+      const start = initialPath || next.home || next.roots[0]?.path || '';
       if (!start) throw new Error('目标机器没有可浏览的目录');
-      await load(start);
+      await load(start, target);
     } catch (cause) {
       if (seq === requestSeq) loadError = describeError(cause);
     } finally {
@@ -63,12 +66,12 @@
     }
   }
 
-  async function load(path: string) {
+  async function load(path: string, target = targetBase) {
     const seq = ++requestSeq;
     loading = true;
     loadError = '';
     try {
-      const listing = await browseManagedPath(path);
+      const listing = await browseManagedPath(path, target);
       if (seq !== requestSeq) return;
       currentPath = listing.path;
       parent = listing.parent;
@@ -107,7 +110,7 @@
 
 <Dialog
   {open}
-  title={mode === 'send' ? '从 ' + label + ' 选择要发送的文件' : '在 ' + label + ' 上选择接收目录'}
+  title={mode === 'send' ? '从 ' + label + ' 选择要发送的文件' : mode === 'view' ? '查看 ' + label + ' 上的文件' : '在 ' + label + ' 上选择接收目录'}
   width={620}
   {onClose}
 >
@@ -183,12 +186,16 @@
     {/if}
   </div>
   <svelte:fragment slot="footer">
-    {#if onFallback && mode === 'directory'}
-      <button type="button" class="btn btn-ghost" on:click={onFallback}>手动输入路径</button>
+    {#if mode === 'view'}
+      <button type="button" class="btn btn-primary" on:click={onClose}>关闭</button>
+    {:else}
+      {#if onFallback && mode === 'directory'}
+        <button type="button" class="btn btn-ghost" on:click={onFallback}>手动输入路径</button>
+      {/if}
+      <button type="button" class="btn btn-ghost" on:click={onClose}>取消</button>
+      <button type="button" class="btn btn-primary" disabled={!canConfirm} on:click={confirm}>
+        {#if mode === 'send'}发送 {selected.length} 项{:else}使用当前目录{/if}
+      </button>
     {/if}
-    <button type="button" class="btn btn-ghost" on:click={onClose}>取消</button>
-    <button type="button" class="btn btn-primary" disabled={!canConfirm} on:click={confirm}>
-      {#if mode === 'send'}发送 {selected.length} 项{:else}使用当前目录{/if}
-    </button>
   </svelte:fragment>
 </Dialog>

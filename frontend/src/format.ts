@@ -197,6 +197,39 @@ export function transferHistoryPathText(entry: TransferHistoryEntry): string {
   return '来源 ' + roots[0] + (roots.length > 1 ? ' 等 ' + roots.length + ' 处' : '');
 }
 
+export type TransferHistoryLocation = {
+  directory: string;
+  select?: string;
+};
+
+/** 历史条目对应的本机位置：接收条目到落地目录，发送条目到来源所在目录。 */
+export function transferHistoryLocation(entry: TransferHistoryEntry): TransferHistoryLocation | null {
+  if (entry.direction === 'receive') {
+    const directory = entry.destination;
+    if (!directory) return null;
+    return entry.item_root ? { directory, select: joinPath(directory, entry.item_root) } : { directory };
+  }
+  const source = entry.source_paths?.[0];
+  if (!source) return null;
+  const directory = parentPath(source);
+  return directory ? { directory, select: source } : null;
+}
+
+function joinPath(directory: string, name: string): string {
+  const separator = directory.includes('\\') && !directory.includes('/') ? '\\' : '/';
+  return directory.replace(/[\\/]+$/, '') + separator + name;
+}
+
+function parentPath(path: string): string {
+  const windows = /^[A-Za-z]:[\\/]|^\\\\/.test(path);
+  const slash = path.lastIndexOf('/');
+  const index = windows ? Math.max(slash, path.lastIndexOf('\\')) : slash;
+  if (index < 0) return '';
+  if (index === 0) return path[0];
+  const parent = path.slice(0, index);
+  return /^[A-Za-z]:$/.test(parent) ? parent + path[index] : parent;
+}
+
 /** 网页会话记录由节点以「发送到本会话」写入；会话页面需要按接收方视角展示。 */
 export function transferHistoryForSessionView(entry: TransferHistoryEntry, nodeId: string, nodeName: string): TransferHistoryEntry {
   if (!entry.session_id) return entry;

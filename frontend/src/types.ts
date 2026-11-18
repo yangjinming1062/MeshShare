@@ -246,6 +246,8 @@ export type TransferHistoryEntry = {
   total_items: number;
   source_paths?: string[];
   destination?: string;
+  /** 接收方向记录首个已提交条目的顶层名称，用于定位落地项目。 */
+  item_root?: string;
   error?: string;
   retry_count?: number;
   session_id?: string;

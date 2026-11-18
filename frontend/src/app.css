@@ -253,8 +253,19 @@ html[data-shell="web"] .clip-history-clear { min-height: 44px; }
 .transfer-icon--failure { color: var(--danger); }
 .transfer-history .transfer-subhead { color: var(--ink); }
 .transfer-history .transfer-subhead .btn { margin-left: auto; }
-.transfer-list--history { max-height: 168px; }
+.transfer-list--history { max-height: 240px; }
 .transfer-history-meta { color: var(--muted); }
+.transfer-card.history-fresh,
+.transfer-row.history-fresh { animation: history-fresh 2.2s ease-out; }
+@keyframes history-fresh {
+  0% { background: var(--primary-soft); box-shadow: inset 0 0 0 1px var(--primary); }
+  100% { background: var(--surface-2); box-shadow: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .transfer-card.history-fresh,
+  .transfer-row.history-fresh { animation: none; box-shadow: inset 0 0 0 1px var(--primary); }
+}
+.transfer-location { min-height: 44px; padding: 0 14px; }
 .phone-history-head h3 { color: var(--ink); }
 .phone-subhead .btn { margin-left: auto; }
 .chip--danger { color: var(--danger); background: var(--danger-soft); }
@@ -382,7 +393,7 @@ html[data-shell="android"] {
 .phone-shell .phone-actions--stack .btn { min-width: 0; padding: 0 10px; }
 .phone-history-count { color: var(--muted); font-size: var(--phone-fs-sm); font-variant-numeric: tabular-nums; }
 .phone-copy { color: var(--muted); font-size: 12px; line-height: 1.55; }
-.phone-shell :is(input, textarea, button, [tabindex]) { scroll-margin-top: calc(var(--phone-safe-top) + var(--phone-header-h) + 12px); }
+.phone-shell :is(input, textarea, button, [tabindex], [data-transfer-id]) { scroll-margin-top: calc(var(--phone-safe-top) + var(--phone-header-h) + 12px); }
 
 .phone-inbox { position: sticky; top: calc(var(--phone-safe-top) + var(--phone-header-h) + 8px); z-index: 15; gap: 8px; border-color: var(--line-strong); box-shadow: var(--shadow-2); }
 .phone-inbox::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 2px; border-radius: 2px; background: var(--primary); }

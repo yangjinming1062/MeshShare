@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy, tick } from 'svelte';
   import AndroidUpdatePanel from './AndroidUpdatePanel.svelte';
   import ClipboardImage from './ClipboardImage.svelte';
   import Icon from './Icon.svelte';
@@ -13,6 +14,7 @@
     platformLabel,
     prepareProgressRatio,
     prepareStatusText,
+    transferHistoryLocation,
     transferHistoryPathText,
     transferHistoryPeerText,
     transferHistoryStatusText,
@@ -21,6 +23,7 @@
     transferStatusText,
     isActiveTransferStatus,
   } from '../format';
+  import { newestFinishedTransfer } from '../transferProgress';
   import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferHistoryEntry, TransferItem, TransferPrepare } from '../types';
 
   export let mode: 'web' | 'android' = 'web';
@@ -32,8 +35,10 @@
   export let prepares: TransferPrepare[] = [];
   export let failures: TransferFailure[] = [];
   export let transferHistory: TransferHistoryEntry[] = [];
+  export let transferHistoryReady = false;
   export let transferHistoryBusy = false;
   export let onClearTransferHistory: () => void = () => {};
+  export let onOpenLocation: (entry: TransferHistoryEntry) => void = () => {};
   export let clipboard: ClipboardSnapshot | null = null;
   export let draft = '';
   export let historyCount = 0;
@@ -64,6 +69,10 @@
 
   let transfersOpen = false;
   let transfersAutoOpened = false;
+  let transferLog: HTMLElement | null = null;
+  let previousHistory: TransferHistoryEntry[] | null = null;
+  let highlightedHistory: TransferHistoryEntry | null = null;
+  let highlightTimer: number | undefined;
 
   $: pending = transfers
     .filter((transfer) => transfer.status === 'waiting' && transfer.direction !== 'send')
@@ -99,6 +108,35 @@
     if (!activeTransfers.some((transfer) => transfer.status === 'accepted' || transfer.status === 'uploading' || transfer.status === 'ready')) return;
     transfersOpen = true;
     transfersAutoOpened = true;
+  }
+
+  $: noteHistoryEntries(transferHistoryReady ? transferHistory : null);
+  onDestroy(clearHistoryHighlight);
+
+  /** 新历史条目展开传输记录并定位到可视区，刚接收完不用滚动找。 */
+  function noteHistoryEntries(entries: TransferHistoryEntry[] | null): void {
+    const fresh = entries && newestFinishedTransfer(previousHistory, entries);
+    previousHistory = entries;
+    if (!entries) clearHistoryHighlight();
+    if (fresh) void highlightHistoryEntry(fresh);
+  }
+
+  function clearHistoryHighlight(): void {
+    if (highlightTimer !== undefined) window.clearTimeout(highlightTimer);
+    highlightTimer = undefined;
+    highlightedHistory = null;
+  }
+
+  async function highlightHistoryEntry(entry: TransferHistoryEntry): Promise<void> {
+    clearHistoryHighlight();
+    transfersOpen = true;
+    highlightedHistory = entry;
+    await tick();
+    if (highlightedHistory !== entry) return;
+    transferLog
+      ?.querySelector<HTMLElement>('[data-transfer-id="' + CSS.escape(entry.transfer_id) + '"]')
+      ?.scrollIntoView({ block: 'nearest' });
+    highlightTimer = window.setTimeout(clearHistoryHighlight, 2400);
   }
 
   function ratio(transfer: PhoneTransfer): number {
@@ -231,82 +269,7 @@
     <AndroidUpdatePanel />
   {/if}
 
-  <section class="phone-card">
-    <div class="phone-card-head">
-      <h2>在线设备</h2>
-      <span class="chip">{peers.length}</span>
-    </div>
-    <ul class="phone-list" role="list">
-      {#each peers as peer (peer.node_id)}
-        <li class="device-card" data-link={linkPeers.has(peer.node_id) ? 'active' : undefined}>
-          <div class="device-card-id">
-            <span class="device-icon" aria-hidden="true"><Icon name="monitor" size={18} /></span>
-            <span class="device-id">
-              <strong title={peer.node_name}>{peer.node_name}</strong>
-              <span class="device-meta">{platformLabel(peer.platform)} · {peer.addresses[0]?.address ?? '在线'}</span>
-            </span>
-            <div class="device-actions">
-              <button type="button" class="btn btn-primary" on:click={() => onSendFile(peer)}>
-                <Icon name="send" size={14} />
-                发送文件
-              </button>
-              {#if mode === 'web'}
-                <button type="button" class="btn phone-folder" aria-label={'向 ' + peer.node_name + ' 发送文件夹'} on:click={() => onSendFolder(peer)}>
-                  <Icon name="folder" size={14} />
-                  文件夹
-                </button>
-              {/if}
-            </div>
-          </div>
-          <div class="device-metrics-lines" title={peer.node_id === node?.node_id ? '本机节点' : peerSummary(peer)}>
-            {#if peer.metrics_stale}
-              <div class="metric-item metric-item--wide"><span class="metric-label">指标已过期</span></div>
-            {:else if peerMetrics(peer)}
-              <div class="metric-item"><span class="metric-label">CPU</span><b>{formatPercent(peerMetrics(peer)?.cpu_usage_percent)}</b></div>
-              <div class="metric-item"><span class="metric-label">内存</span><b>{formatPercent(memoryPercent(peerMetrics(peer)))}</b></div>
-              <div class="metric-item metric-item--net">
-                <span class="metric-label">网络</span>
-                <span class="metric-net">
-                  <b>↓ {formatRate(peerMetrics(peer)?.network_down_bytes_per_sec)}</b>
-                  <b>↑ {formatRate(peerMetrics(peer)?.network_up_bytes_per_sec)}</b>
-                </span>
-              </div>
-              {#if gpuValue(peer) !== undefined}
-                <div class="metric-item"><span class="metric-label">GPU</span><b>{formatPercent(gpuValue(peer))}</b></div>
-              {/if}
-            {:else}
-              <div class="metric-item metric-item--wide"><span class="metric-label">指标采集中</span></div>
-            {/if}
-          </div>
-        </li>
-      {:else}
-        <li class="empty">暂时没有可发送的目标。启动另一台 MeshShare，或让更多设备通过「浏览器访问」加入。</li>
-      {/each}
-    </ul>
-  </section>
-
-  <section class="phone-card">
-    <div class="phone-card-head">
-      <h2>共享剪贴板</h2>
-      {#if mode === 'web'}
-        <button type="button" class="btn btn-ghost btn-sm phone-history-open" on:click={onOpenHistory}>历史 {historyCount}</button>
-      {:else}
-        <span class="muted">{clipboard ? clipboard.source_name + ' · ' + formatTime(clipboard.updated_at_ms) : '仅手动读取和发布'}</span>
-      {/if}
-    </div>
-    <textarea class="field clip-editor" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
-    {#if clipboard?.image_png}
-      <ClipboardImage imagePng={clipboard.image_png} />
-    {/if}
-    <div class="phone-actions phone-actions--stack">
-      <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>
-      <button type="button" class="btn" on:click={onReadLocal}>读取本机剪贴板</button>
-      <button type="button" class="btn" on:click={onWriteLocal}>写入本机剪贴板</button>
-    </div>
-    <p class="hint">不会自动监听或回写系统剪贴板</p>
-  </section>
-
-  <section class="phone-card">
+  <section class="phone-card" bind:this={transferLog}>
     <div class="phone-card-head">
       <h2>传输记录</h2>
       <span class="chip">进行中 {activeTransfers.length + prepares.length}</span>
@@ -320,7 +283,7 @@
         <div class="phone-card-head phone-subhead"><h3>失败任务</h3><span class="chip chip--danger">{failures.length}</span></div>
         <div class="phone-list">
           {#each failures as failure (failure.progress.transfer_id)}
-            <article class="transfer-card transfer-card--failure">
+            <article class="transfer-card transfer-card--failure" class:history-fresh={highlightedHistory?.transfer_id === failure.progress.transfer_id} data-transfer-id={failure.progress.transfer_id}>
               <span class="transfer-icon transfer-icon--failure" aria-hidden="true"><Icon name="close" size={14} /></span>
               <div class="transfer-copy">
                 <strong>{failure.progress.offer?.source_name ?? '文件传输'}</strong>
@@ -439,7 +402,8 @@
       {#if historyEntries.length}
         <div class="phone-list">
           {#each historyEntries as entry (entry.transfer_id)}
-            <article class="transfer-card">
+            {@const location = transferHistoryLocation(entry)}
+            <article class="transfer-card" class:history-fresh={highlightedHistory?.transfer_id === entry.transfer_id} data-transfer-id={entry.transfer_id}>
               <span class="transfer-icon" aria-hidden="true">
                 <Icon name={entry.direction === 'receive' ? 'arrow-down' : 'arrow-up'} size={14} />
               </span>
@@ -451,6 +415,14 @@
                 <span>{transferHistoryStatusText(entry)}</span>
                 <span class="muted">{entry.completed_items}/{entry.total_items} 个项目 · {formatTime(entry.finished_at_ms)}</span>
               </div>
+              {#if mode === 'android' && location}
+                <div class="transfer-actions">
+                  <button type="button" class="btn btn-ghost btn-sm transfer-location" on:click={() => onOpenLocation(entry)}>
+                    <Icon name="folder" size={14} />
+                    打开所在目录
+                  </button>
+                </div>
+              {/if}
             </article>
           {/each}
         </div>
@@ -459,6 +431,82 @@
       {/if}
     {/if}
   </section>
+
+  <section class="phone-card">
+    <div class="phone-card-head">
+      <h2>在线设备</h2>
+      <span class="chip">{peers.length}</span>
+    </div>
+    <ul class="phone-list" role="list">
+      {#each peers as peer (peer.node_id)}
+        <li class="device-card" data-link={linkPeers.has(peer.node_id) ? 'active' : undefined}>
+          <div class="device-card-id">
+            <span class="device-icon" aria-hidden="true"><Icon name="monitor" size={18} /></span>
+            <span class="device-id">
+              <strong title={peer.node_name}>{peer.node_name}</strong>
+              <span class="device-meta">{platformLabel(peer.platform)} · {peer.addresses[0]?.address ?? '在线'}</span>
+            </span>
+            <div class="device-actions">
+              <button type="button" class="btn btn-primary" on:click={() => onSendFile(peer)}>
+                <Icon name="send" size={14} />
+                发送文件
+              </button>
+              {#if mode === 'web'}
+                <button type="button" class="btn phone-folder" aria-label={'向 ' + peer.node_name + ' 发送文件夹'} on:click={() => onSendFolder(peer)}>
+                  <Icon name="folder" size={14} />
+                  文件夹
+                </button>
+              {/if}
+            </div>
+          </div>
+          <div class="device-metrics-lines" title={peer.node_id === node?.node_id ? '本机节点' : peerSummary(peer)}>
+            {#if peer.metrics_stale}
+              <div class="metric-item metric-item--wide"><span class="metric-label">指标已过期</span></div>
+            {:else if peerMetrics(peer)}
+              <div class="metric-item"><span class="metric-label">CPU</span><b>{formatPercent(peerMetrics(peer)?.cpu_usage_percent)}</b></div>
+              <div class="metric-item"><span class="metric-label">内存</span><b>{formatPercent(memoryPercent(peerMetrics(peer)))}</b></div>
+              <div class="metric-item metric-item--net">
+                <span class="metric-label">网络</span>
+                <span class="metric-net">
+                  <b>↓ {formatRate(peerMetrics(peer)?.network_down_bytes_per_sec)}</b>
+                  <b>↑ {formatRate(peerMetrics(peer)?.network_up_bytes_per_sec)}</b>
+                </span>
+              </div>
+              {#if gpuValue(peer) !== undefined}
+                <div class="metric-item"><span class="metric-label">GPU</span><b>{formatPercent(gpuValue(peer))}</b></div>
+              {/if}
+            {:else}
+              <div class="metric-item metric-item--wide"><span class="metric-label">指标采集中</span></div>
+            {/if}
+          </div>
+        </li>
+      {:else}
+        <li class="empty">暂时没有可发送的目标。启动另一台 MeshShare，或让更多设备通过「浏览器访问」加入。</li>
+      {/each}
+    </ul>
+  </section>
+
+  <section class="phone-card">
+    <div class="phone-card-head">
+      <h2>共享剪贴板</h2>
+      {#if mode === 'web'}
+        <button type="button" class="btn btn-ghost btn-sm phone-history-open" on:click={onOpenHistory}>历史 {historyCount}</button>
+      {:else}
+        <span class="muted">{clipboard ? clipboard.source_name + ' · ' + formatTime(clipboard.updated_at_ms) : '仅手动读取和发布'}</span>
+      {/if}
+    </div>
+    <textarea class="field clip-editor" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
+    {#if clipboard?.image_png}
+      <ClipboardImage imagePng={clipboard.image_png} />
+    {/if}
+    <div class="phone-actions phone-actions--stack">
+      <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>
+      <button type="button" class="btn" on:click={onReadLocal}>读取本机剪贴板</button>
+      <button type="button" class="btn" on:click={onWriteLocal}>写入本机剪贴板</button>
+    </div>
+    <p class="hint">不会自动监听或回写系统剪贴板</p>
+  </section>
+
 
   <section class="phone-card phone-meta">
     <div class="phone-card-head">

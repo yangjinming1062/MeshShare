@@ -363,6 +363,9 @@ pub struct TransferHistoryEntry {
     pub source_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
+    /// 接收方向记录首个已提交条目的顶层名称，供界面定位落地项目。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]

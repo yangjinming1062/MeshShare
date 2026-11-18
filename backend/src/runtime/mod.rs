@@ -231,6 +231,8 @@ pub struct TransferRecord {
     pub progress: TransferProgress,
     pub accepted_destination: Option<PathBuf>,
     pub received_items: HashSet<String>,
+    /// 记录首个已提交项目的目录和顶层名称，定位时须与当前接收目录相符。
+    received_location: Option<(PathBuf, String)>,
     /// 创建时快照的对端显示名。对端随后离线时历史仍能显示设备名。
     pub peer_name: Option<String>,
     /// 发送方向用户选择的根路径；接收与暂存发送为空。
@@ -1760,6 +1762,7 @@ impl NodeRuntime {
                 progress: progress.clone(),
                 accepted_destination,
                 received_items: HashSet::new(),
+                received_location: None,
                 peer_name: Some(offer.source_name.clone()),
                 source_paths: Vec::new(),
                 committed_bytes: 0,
@@ -1804,6 +1807,7 @@ impl NodeRuntime {
                 progress: progress.clone(),
                 accepted_destination: None,
                 received_items: HashSet::new(),
+                received_location: None,
                 peer_name,
                 source_paths: Vec::new(),
                 committed_bytes: 0,
@@ -2672,6 +2676,21 @@ impl NodeRuntime {
         if record.received_items.insert(item_id.to_string()) {
             record.committed_bytes = record.committed_bytes.saturating_add(bytes);
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
+            let directory = record.accepted_destination.as_ref();
+            let saved_directory = record
+                .received_location
+                .as_ref()
+                .map(|(directory, _)| directory);
+            if directory != saved_directory {
+                record.received_location = directory.and_then(|directory| {
+                    let std::path::Component::Normal(name) =
+                        Path::new(&item.relative_path).components().next()?
+                    else {
+                        return None;
+                    };
+                    Some((directory.clone(), name.to_string_lossy().into_owned()))
+                });
+            }
         }
         record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
@@ -2830,6 +2849,13 @@ impl NodeRuntime {
                     .unwrap_or_else(|| short_node_id(&record.offer.target_node_id)),
             )
         };
+        let item_root = record
+            .received_location
+            .as_ref()
+            .filter(|(directory, _)| {
+                receive && record.accepted_destination.as_ref() == Some(directory)
+            })
+            .map(|(_, name)| name.clone());
         TransferHistoryEntry {
             transfer_id: record.progress.transfer_id.clone(),
             direction,
@@ -2842,6 +2868,7 @@ impl NodeRuntime {
             total_items: record.progress.total_items,
             source_paths: record.source_paths.clone(),
             destination: record.progress.destination.clone(),
+            item_root,
             error: record.progress.error.clone(),
             retry_count: record.progress.retry_count,
             session_id: None,
@@ -2869,6 +2896,7 @@ impl NodeRuntime {
             total_items: record.progress.total_items,
             source_paths: Vec::new(),
             destination: None,
+            item_root: None,
             error: record.progress.error.clone(),
             retry_count: record.progress.retry_count,
             session_id: Some(record.session_id.clone()),
@@ -5254,6 +5282,7 @@ mod tests {
             receive.destination,
             Some(destination.to_string_lossy().into_owned())
         );
+        assert_eq!(receive.item_root.as_deref(), Some("file.bin"));
         let send = history
             .iter()
             .find(|entry| entry.transfer_id == "send-one")
@@ -5265,7 +5294,58 @@ mod tests {
             send.source_paths,
             vec!["C:/资料".to_string(), "D:/照片".to_string()]
         );
+        assert_eq!(send.item_root, None);
         assert_eq!(send.error.as_deref(), Some("网络中断"));
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn receive_history_reveals_only_committed_items() {
+        let path = temp_data_dir();
+        let destination = path.join("received");
+        std::fs::create_dir(&destination).expect("create destination");
+        std::fs::write(destination.join("file.bin"), b"existing").expect("create unrelated file");
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut offer = incoming_history_offer(&runtime, "partial", "peer-a");
+        let mut second = offer.items[0].clone();
+        second.item_id = "second".to_string();
+        second.relative_path = "folder/file.bin".to_string();
+        offer.total_bytes += second.size;
+        offer.items.push(second);
+        runtime.add_transfer(offer);
+        runtime
+            .set_transfer_acceptance("partial", destination)
+            .expect("accept transfer");
+        runtime
+            .fail_transfer("partial", "目标已存在".to_string(), TransferStatus::Failed)
+            .expect("fail before any file is committed");
+        assert_eq!(runtime.transfer_history_snapshot(None)[0].item_root, None);
+
+        runtime
+            .retry_transfer("partial", TransferStatus::Accepted, None)
+            .expect("retry in the same directory");
+        runtime
+            .mark_item_received("partial", "second", 4, "0".repeat(64))
+            .expect("commit the second item");
+        runtime
+            .fail_transfer("partial", "目标已存在".to_string(), TransferStatus::Failed)
+            .expect("fail the first item");
+        let history = runtime.transfer_history_snapshot(None);
+        assert_eq!(history[0].item_root.as_deref(), Some("folder"));
+
+        let new_destination = path.join("another-receive-directory");
+        std::fs::create_dir_all(new_destination.join("folder")).expect("create unrelated folder");
+        runtime
+            .retry_transfer("partial", TransferStatus::Waiting, None)
+            .expect("retry after losing access to the first directory");
+        runtime
+            .set_transfer_acceptance("partial", new_destination)
+            .expect("choose another receive directory");
+        runtime
+            .fail_transfer("partial", "网络中断".to_string(), TransferStatus::Failed)
+            .expect("fail before committing into the new directory");
+        assert_eq!(runtime.transfer_history_snapshot(None)[0].item_root, None);
         let _ = std::fs::remove_dir_all(path);
     }
 

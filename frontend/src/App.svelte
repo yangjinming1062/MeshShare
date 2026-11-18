@@ -11,7 +11,7 @@
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { mergeTransferProgress } from './transferProgress';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
+  import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferHistoryLocation, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
   import HardwarePanel from './components/HardwarePanel.svelte';
@@ -73,7 +73,7 @@
   let remoteFileAccess = false;
   let remoteFileAccessBusy = false;
   let browseOpen = false;
-  let browseMode: 'send' | 'directory' = 'send';
+  let browseMode: 'send' | 'directory' | 'view' = 'send';
   let browseStartPath = '';
   let browsePeer: PeerInfo | null = null;
   let browseTransfer: TransferProgress | null = null;
@@ -90,7 +90,9 @@
   let prepares: TransferPrepare[] = [];
   let failures: TransferFailure[] = [];
   let transferHistory: TransferHistoryEntry[] = [];
+  let transferHistoryReady = false;
   let transferHistoryBusy = false;
+  let transferHistoryRequestId = 0;
   let clearTransferHistoryOpen = false;
   let mobileSessions: MobileSession[] = [];
   let mobileTransfers: MobileTransferView[] = [];
@@ -268,19 +270,79 @@
     pruneFailures();
   }
 
-  /** 传输历史由节点保存；旧节点的 404 视为没有历史而不是错误。 */
-  async function loadTransferHistory(): Promise<void> {
+  /** 定时刷新和推送共用请求顺序，晚到的历史不能覆盖当前节点或会话。 */
+  async function loadTransferHistory(generation = targetGeneration, target = activeBaseUrl): Promise<void> {
+    if (pageStopped || generation !== targetGeneration || (isWeb && !mobileSessionId)) return;
+    const session = isWeb ? mobileSessionId : undefined;
+    const requestId = ++transferHistoryRequestId;
+    const current = () => !pageStopped && generation === targetGeneration
+      && requestId === transferHistoryRequestId && (!isWeb || session === mobileSessionId);
+    let entries: TransferHistoryEntry[];
     try {
-      transferHistory = await getTransferHistory(isWeb ? mobileSessionId : undefined);
+      entries = await getTransferHistory(session, target);
     } catch (error) {
-      if (!(error instanceof ApiError && error.status === 404)) throw error;
-      transferHistory = [];
+      if (!current()) return;
+      if (!(error instanceof ApiError && error.status === 404)) {
+        console.error('读取传输历史失败', error);
+        return;
+      }
+      // 旧节点没有历史接口，按空历史处理。
+      entries = [];
     }
+    if (!current()) return;
+    transferHistory = entries;
+    transferHistoryReady = true;
+  }
+
+  function resetTransferHistory(): void {
+    transferHistoryRequestId += 1;
+    transferHistory = [];
+    transferHistoryReady = false;
+    transferHistoryBusy = false;
+    clearTransferHistoryOpen = false;
   }
 
   function requestClearTransferHistory() {
     if (!transferHistory.length) return;
     clearTransferHistoryOpen = true;
+  }
+
+  /** 打开历史条目的所在目录并定位条目；Android 由系统文件管理器尽力打开。 */
+  async function openHistoryLocation(entry: TransferHistoryEntry): Promise<void> {
+    if (remoteTarget || !transferHistory.includes(entry)) return;
+    const generation = targetGeneration;
+    const location = transferHistoryLocation(entry);
+    if (!location) {
+      showTransientNotice('该记录没有可用的本地路径', 3600);
+      return;
+    }
+    try {
+      if (isAndroidApp) {
+        await invoke('android_reveal_path', { path: location.directory });
+      } else {
+        await invoke('open_transfer_location', { directory: location.directory, select: location.select ?? null });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : error;
+      if (!pageStopped && generation === targetGeneration) {
+        showTransientNotice(typeof message === 'string' && message ? message : '无法打开所在目录', 6000);
+      }
+    }
+  }
+
+  /** 远程管理页的路径在目标机器上，打开目标的文件浏览视图查看位置。 */
+  function viewHistoryLocation(entry: TransferHistoryEntry): void {
+    if (!remoteTarget || !transferHistory.includes(entry)) return;
+    const location = transferHistoryLocation(entry);
+    if (!location) {
+      showTransientNotice('该记录没有可用的路径', 3600);
+      return;
+    }
+    browsePeer = null;
+    browseTransfer = null;
+    browseMode = 'view';
+    browseStartPath = location.directory;
+    browseOpen = true;
   }
 
   async function dismissFailure(failure: TransferFailure) {
@@ -510,13 +572,6 @@
       getClipboardStatus().catch(() => clipboardStatus),
     ]);
     const nextTransfers = isWeb ? [] : await getTransfers();
-    // 目标切换时旧请求不能把上一个节点的历史写进当前界面。
-    let nextTransferHistory: TransferHistoryEntry[] = [];
-    try {
-      nextTransferHistory = await getTransferHistory(isWeb ? mobileSessionId : undefined);
-    } catch (error) {
-      if (!(error instanceof ApiError && error.status === 404)) throw error;
-    }
     if (isWeb) {
       mobileTransfers = await getMobileTransfersWithRecovery();
       for (const view of mobileTransfers) {
@@ -543,9 +598,11 @@
         }
       }
     }
-    if (requestId !== refreshRequestId || generation !== targetGeneration || target !== activeBaseUrl) return;
+    const current = () => requestId === refreshRequestId && generation === targetGeneration && target === activeBaseUrl;
+    if (!current()) return;
+    await loadTransferHistory(generation, target);
+    if (!current()) return;
     pruneFailures();
-    transferHistory = nextTransferHistory;
     node = nextNode;
     if (!remoteMode) localNodeId = nextNode.node_id;
     peers = nextPeers.filter((peer) => peer.online);
@@ -821,6 +878,7 @@
     } catch (error) {
       if (!(error instanceof ApiError && error.status === 404)) throw error;
       mobileSessionId = '';
+      resetTransferHistory();
       window.sessionStorage.removeItem('meshshare-mobile-session');
       await ensureMobileSession();
       return await getMobileTransfers(mobileSessionId);
@@ -966,18 +1024,25 @@
     void clearClipboardHistoryItems();
   }
 
-  async function confirmClearTransferHistory() {
-    if (transferHistoryBusy) return;
+  async function confirmClearTransferHistory(): Promise<void> {
+    if (!clearTransferHistoryOpen || transferHistoryBusy) return;
+    const generation = targetGeneration;
+    const target = activeBaseUrl;
+    const session = isWeb ? mobileSessionId : undefined;
+    const current = () => !pageStopped && generation === targetGeneration
+      && (!isWeb || session === mobileSessionId);
     transferHistoryBusy = true;
     try {
-      await clearTransferHistory(isWeb ? mobileSessionId : undefined);
+      await clearTransferHistory(session, target);
+      if (!current()) return;
+      transferHistoryRequestId += 1;
       transferHistory = [];
       clearTransferHistoryOpen = false;
       showTransientNotice(isWeb ? '已清空本会话的传输历史' : '已清空传输历史，对端记录会同步删除');
     } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法清空传输历史', 6000);
+      if (current()) showTransientNotice(error instanceof Error ? error.message : '无法清空传输历史', 6000);
     } finally {
-      transferHistoryBusy = false;
+      if (current()) transferHistoryBusy = false;
     }
   }
 
@@ -1438,6 +1503,7 @@
 
   function resetTargetUi() {
     targetGeneration += 1;
+    resetTransferHistory();
     settingsReady = false;
     settingsRead = null;
     closeBrowse();
@@ -2469,6 +2535,7 @@
       prepares={prepares}
       failures={phoneFailures}
       transferHistory={phoneTransferHistory}
+      {transferHistoryReady}
       {transferHistoryBusy}
       onClearTransferHistory={requestClearTransferHistory}
       {clipboard}
@@ -2497,6 +2564,7 @@
       onWriteLocal={writeMobileClipboard}
       onChooseDirectory={chooseMobileReceiveDirectory}
       onOpenHistory={openClipboardHistoryBrowser}
+      onOpenLocation={openHistoryLocation}
     />
   {:else}
     <AppHeader
@@ -2560,7 +2628,7 @@
         onPublish={publishClipboard}
         onOpenHistory={openClipboardHistoryBrowser}
       />
-      <TransferPanel {transfers} {prepares} {failures} {transferHistory} {transferHistoryBusy} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} onClearTransferHistory={requestClearTransferHistory} />
+      <TransferPanel {transfers} {prepares} {failures} {transferHistory} {transferHistoryBusy} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} onClearTransferHistory={requestClearTransferHistory} onOpenLocation={openHistoryLocation} onViewLocation={viewHistoryLocation} />
     </main>
     <SettingsDialog
       open={settingsOpen}
@@ -2603,6 +2671,7 @@
     <RemoteFileBrowser
       open={browseOpen}
       mode={browseMode}
+      targetBase={activeBaseUrl}
       targetLabel={remoteTarget?.node_name ?? ''}
       startPath={browseStartPath}
       onConfirm={confirmBrowse}
