@@ -29,6 +29,7 @@
 | `POST` | `/api/v1/clipboard` | 发布文字或 PNG，网页端发送文字 |
 | `GET` | `/api/v1/clipboard/history` | 历史元数据和保留设置 |
 | `GET` | `/api/v1/clipboard/history/{event_id}` | 单条历史的完整内容 |
+| `GET` | `/api/v1/clipboard/history/{event_id}/thumbnail` | 图片历史的 96×72 PNG 缩略图；无图片或记录不存在时返回 404 |
 | `POST` | `/api/v1/clipboard/history/{event_id}/restore` | 恢复单条历史并发布新事件 |
 | `DELETE` | `/api/v1/clipboard/history` | 清空历史，保留当前快照 |
 

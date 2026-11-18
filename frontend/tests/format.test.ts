@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { transferHistoryForSessionView, transferHistoryPathText, transferHistoryPeerText, transferHistoryStatusText, transferStatusText } from '../src/format.ts';
+import { formatHistoryTime, transferHistoryForSessionView, transferHistoryPathText, transferHistoryPeerText, transferHistoryStatusText, transferStatusText } from '../src/format.ts';
 
 const base = {
   transfer_id: 'id',
@@ -54,6 +54,15 @@ test('session history is shown from the receiving page perspective', () => {
   assert.equal(viewed.peer_node_id, 'desktop-node');
   assert.equal(viewed.peer_name, '书房电脑');
   assert.equal(transferHistoryForSessionView(historyBase, 'desktop-node', '书房电脑'), historyBase);
+});
+
+test('history timestamps label today, yesterday and older dates', () => {
+  const now = new Date(2025, 10, 18, 10, 0).getTime();
+  assert.equal(formatHistoryTime(new Date(2025, 10, 18, 9, 5).getTime(), now), '09:05');
+  assert.equal(formatHistoryTime(new Date(2025, 10, 17, 23, 59).getTime(), now), '昨天 23:59');
+  assert.equal(formatHistoryTime(new Date(2025, 10, 16, 8, 7).getTime(), now), '11-16 08:07');
+  assert.equal(formatHistoryTime(new Date(2024, 11, 31, 18, 30).getTime(), now), '2024-12-31 18:30');
+  assert.equal(formatHistoryTime(undefined, now), '');
 });
 
 test('transfer history status keeps the terminal state and failure reason', () => {

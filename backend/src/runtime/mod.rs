@@ -1472,6 +1472,15 @@ impl NodeRuntime {
             })
     }
 
+    pub fn clipboard_history_thumbnail(&self, event_id: &str) -> Option<Vec<u8>> {
+        let _update_guard = self.clipboard_update.lock();
+        let history = self.clipboard_history.lock();
+        history
+            .iter()
+            .find(|record| record.event_id == event_id)
+            .and_then(|record| load_or_create_clipboard_thumbnail(&self.data_dir, record))
+    }
+
     fn history_item(&self, record: &ClipboardHistoryRecord) -> ClipboardHistoryItem {
         let text_preview = record.text_path.as_ref().and_then(|path| {
             let path = self.data_dir.join(CLIPBOARD_PAYLOAD_DIR).join(path);
@@ -3939,7 +3948,7 @@ mod tests {
         load_or_create_config_with_hostname, mobile_ca_url, network_addresses,
         network_addresses_for_bound, parse_update_proxy,
         prune_clipboard_history_records_with_limit, sync_node_name, valid_history_delete_ids,
-        NodeProfile, NodeRuntime, UpdateFrequency, CLIPBOARD_HISTORY_FILE,
+        NodeProfile, NodeRuntime, UpdateFrequency, CLIPBOARD_HISTORY_FILE, CLIPBOARD_PAYLOAD_DIR,
         DESKTOP_TEMP_REGISTRY_FILE, MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACCEPTED_IDLE_TIMEOUT_MS,
         TRANSFER_ACTIVITY_TIMEOUT_MS, TRANSFER_HISTORY_FILE, TRANSFER_HISTORY_LIMIT,
     };
@@ -6432,6 +6441,53 @@ mod tests {
         assert_eq!(cleared, 2);
         assert!(restored.clipboard_history_list().items.is_empty());
         assert!(restored.clipboard_snapshot().is_some());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn clipboard_history_thumbnail_is_generated_and_cleaned_up() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(200, 100)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        let event = runtime
+            .create_local_clipboard_named(None, Some(png), "local".to_string())
+            .expect("create image clipboard event");
+
+        let thumbnail = runtime
+            .clipboard_history_thumbnail(&event.event_id)
+            .expect("thumbnail");
+        let decoded = image::load_from_memory(&thumbnail).expect("decode thumbnail");
+        assert_eq!((decoded.width(), decoded.height()), (96, 72));
+        assert!(runtime
+            .clipboard_history_thumbnail(&event.event_id)
+            .is_some());
+
+        let payload_dir = path.join(CLIPBOARD_PAYLOAD_DIR);
+        assert!(std::fs::read_dir(&payload_dir)
+            .expect("list payloads")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".thumb.png")));
+
+        runtime
+            .create_local_clipboard_named(Some("text".to_string()), None, "local".to_string())
+            .expect("create text clipboard event");
+        let text_event_id = runtime.clipboard_history_list().items[0].event_id.clone();
+        assert!(runtime
+            .clipboard_history_thumbnail(&text_event_id)
+            .is_none());
+        assert!(runtime.clipboard_history_thumbnail("missing").is_none());
+
+        runtime.clear_clipboard_history().expect("clear history");
+        assert_eq!(
+            std::fs::read_dir(&payload_dir)
+                .expect("list payloads after clear")
+                .count(),
+            0
+        );
         let _ = std::fs::remove_dir_all(path);
     }
 

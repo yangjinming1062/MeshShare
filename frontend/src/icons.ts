@@ -10,7 +10,8 @@ export type IconName =
   | 'arrow-down'
   | 'arrow-left'
   | 'chevron'
-  | 'file';
+  | 'file'
+  | 'search';
 
 export const ICON_PATHS: Record<IconName, string[]> = {
   monitor: [
@@ -42,5 +43,9 @@ export const ICON_PATHS: Record<IconName, string[]> = {
   file: [
     'M13 3.5H8.5A1.5 1.5 0 0 0 7 5v14A1.5 1.5 0 0 0 8.5 20.5h9A1.5 1.5 0 0 0 19 19V9z',
     'M13 3.5V9h6',
+  ],
+  search: [
+    'M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z',
+    'M20 20l-4.2-4.2',
   ],
 };

@@ -274,6 +274,10 @@ pub fn router_with_control(
             "/api/v1/clipboard/history/:id/restore",
             post(restore_clipboard_history),
         )
+        .route(
+            "/api/v1/clipboard/history/:id/thumbnail",
+            get(clipboard_history_thumbnail),
+        )
         .route("/api/v1/ws", get(websocket))
         .route("/api/v1/mobile/access", get(mobile_access))
         .route("/api/v1/mobile/ca", get(download_mobile_ca))
@@ -737,6 +741,27 @@ async fn clipboard_history_detail(
         .clipboard_history_detail(&event_id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("剪贴板历史不存在"))
+}
+
+async fn clipboard_history_thumbnail(
+    State(state): State<AppState>,
+    AxumPath(event_id): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    if event_id.is_empty() || event_id.len() > 256 {
+        return Err(ApiError::bad_request("剪贴板历史 ID 无效"));
+    }
+    let bytes = state
+        .runtime
+        .clipboard_history_thumbnail(&event_id)
+        .ok_or_else(|| ApiError::not_found("剪贴板历史缩略图不可用"))?;
+    let mut response = bytes.into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
 }
 
 async fn restore_clipboard_history(
@@ -3937,6 +3962,70 @@ mod tests {
         )
         .await;
         assert!(runtime.clipboard_snapshot().is_none());
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn clipboard_history_thumbnail_route_serves_png_and_hides_missing() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-clipboard-thumbnail-{}", Uuid::new_v4()));
+        let static_root = data_dir.join("web");
+        std::fs::create_dir_all(&static_root).expect("create static directory");
+        std::fs::write(static_root.join("index.html"), "<html></html>")
+            .expect("write static index");
+        let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create runtime");
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(200, 100)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode png");
+        let event = runtime
+            .create_local_clipboard_named(None, Some(png), "local".to_string())
+            .expect("create image clipboard event");
+        let app = super::router(runtime.clone(), static_root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener address");
+        let server_task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test router");
+        });
+
+        let response = runtime
+            .http
+            .get(format!(
+                "http://{address}/api/v1/clipboard/history/{}/thumbnail",
+                event.event_id
+            ))
+            .send()
+            .await
+            .expect("fetch thumbnail")
+            .error_for_status()
+            .expect("thumbnail response");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        let bytes = response.bytes().await.expect("thumbnail bytes");
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let thumbnail = image::load_from_memory(&bytes).expect("decode thumbnail");
+        assert_eq!((thumbnail.width(), thumbnail.height()), (96, 72));
+
+        let missing = runtime
+            .http
+            .get(format!(
+                "http://{address}/api/v1/clipboard/history/missing/thumbnail"
+            ))
+            .send()
+            .await
+            .expect("fetch missing thumbnail");
+        assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+        server_task.abort();
+        let _ = server_task.await;
         let _ = std::fs::remove_dir_all(data_dir);
     }
 

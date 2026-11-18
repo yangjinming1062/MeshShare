@@ -104,6 +104,30 @@ export function formatTime(value: number | undefined): string {
   return value ? new Date(value).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
 }
 
+function sameLocalDay(left: Date, right: Date): boolean {
+  return left.getFullYear() === right.getFullYear()
+    && left.getMonth() === right.getMonth()
+    && left.getDate() === right.getDate();
+}
+
+function padClock(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+/** 历史跨天浏览：当天只给时分，更早的补日期，避免误读。 */
+export function formatHistoryTime(value: number | undefined, now = Date.now()): string {
+  if (!value) return '';
+  const date = new Date(value);
+  const current = new Date(now);
+  const clock = padClock(date.getHours()) + ':' + padClock(date.getMinutes());
+  if (sameLocalDay(date, current)) return clock;
+  const yesterday = new Date(current.getFullYear(), current.getMonth(), current.getDate() - 1);
+  if (sameLocalDay(date, yesterday)) return '昨天 ' + clock;
+  const monthDay = padClock(date.getMonth() + 1) + '-' + padClock(date.getDate());
+  if (date.getFullYear() === current.getFullYear()) return monthDay + ' ' + clock;
+  return date.getFullYear() + '-' + monthDay + ' ' + clock;
+}
+
 export function formatConnectedSince(since: number): string {
   const minutes = Math.max(0, Math.round((Date.now() - since) / 60000));
   if (minutes < 1) return '刚刚';
@@ -184,14 +208,9 @@ export function transferHistoryStatusText(entry: TransferHistoryEntry): string {
   return entry.error ?? '失败';
 }
 
-export function clipboardHistoryPreview(item: ClipboardHistoryItem): string {
-  if (item.text_preview) return item.text_preview;
-  return item.has_image ? 'PNG 图片' : '空内容';
-}
-
 export function clipboardHistoryKind(item: ClipboardHistoryItem): string {
   if (item.has_text && item.has_image) return '文字 + 图片';
-  if (item.has_image) return 'PNG 图片';
+  if (item.has_image) return '图片';
   return '文字';
 }
 

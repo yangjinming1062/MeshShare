@@ -30,6 +30,7 @@ Svelte/TypeScript 界面，作为节点 HTTP/WebSocket 接口的客户端，覆�
 - `peers.ts`：对端地址归一、白名单校验与候选排序；网页形态的同源代理上下文以参数传入，函数本身保持纯函数。
 - `drop.ts`：拖放文件收集，目录递归展开并保留相对路径。
 - `format.ts`：状态文案、大小、进度等纯展示格式化。
+- `clipboardSearch.ts`：剪贴板历史的模糊搜索与排序，按字符子序列匹配，保持纯函数。
 - `sha256.ts` / `mobileSave.ts`：流式 SHA-256 与手机端保存、下载校验。
 - `icons.ts` / `app.css`：图标路径表与全局样式。
 - `tests/`：node:test 测试纯函数模块，断言风格跟随现有用例。

@@ -92,6 +92,7 @@ export const patchSettings = (patch: NodeSettingsPatch, target: string) => reque
 export const requestUpdateCheck = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target, SETTINGS_WRITE_TIMEOUT_MS);
 export const getClipboardHistory = (target = baseUrl) => request<ClipboardHistoryResponse>('/api/v1/clipboard/history', {}, target);
 export const getClipboardHistoryDetail = (eventId: string, target = baseUrl) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`, {}, target);
+export const clipboardHistoryThumbnailUrl = (eventId: string, target = baseUrl) => apiUrl(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/thumbnail`, target);
 export const restoreClipboardHistory = (eventId: string, target = baseUrl) => request<ClipboardSnapshot>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/restore`, { method: 'POST' }, target);
 export const clearClipboardHistory = (target = baseUrl) => request<{ cleared: number }>('/api/v1/clipboard/history', { method: 'DELETE' }, target);
 export const getTransfers = (target = baseUrl) => requestList<TransferProgress>('/api/v1/transfers', target);

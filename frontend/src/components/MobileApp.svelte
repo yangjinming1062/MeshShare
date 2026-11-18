@@ -1,11 +1,8 @@
 <script lang="ts">
   import AndroidUpdatePanel from './AndroidUpdatePanel.svelte';
   import ClipboardImage from './ClipboardImage.svelte';
-  import ClipboardPreview from './ClipboardPreview.svelte';
   import Icon from './Icon.svelte';
   import {
-    clipboardHistoryKind,
-    clipboardHistoryPreview,
     formatPercent,
     formatRate,
     formatSize,
@@ -24,7 +21,7 @@
     transferStatusText,
     isActiveTransferStatus,
   } from '../format';
-  import type { ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferHistoryEntry, TransferItem, TransferPrepare } from '../types';
+  import type { ClipboardSnapshot, HardwareMetrics, NodeInfo, PeerInfo, PhoneTransfer, TransferFailure, TransferHistoryEntry, TransferItem, TransferPrepare } from '../types';
 
   export let mode: 'web' | 'android' = 'web';
   export let node: NodeInfo | null = null;
@@ -39,9 +36,7 @@
   export let onClearTransferHistory: () => void = () => {};
   export let clipboard: ClipboardSnapshot | null = null;
   export let draft = '';
-  export let history: ClipboardHistoryItem[] = [];
-  export let historyBusy = false;
-  export let selectedHistory: ClipboardHistoryDetail | null = null;
+  export let historyCount = 0;
   export let metrics: HardwareMetrics | null = null;
   export let canChooseDirectory = false;
   export let receiveStorage: { directory: string; public_download: boolean } | null = null;
@@ -65,12 +60,8 @@
   export let onReadLocal: () => void = () => {};
   export let onWriteLocal: () => void = () => {};
   export let onChooseDirectory: () => void = () => {};
-  export let onOpenHistory: (item: ClipboardHistoryItem) => void = () => {};
-  export let onRestoreHistory: () => void = () => {};
-  export let onCloseHistory: () => void = () => {};
-  export let onClearHistory: () => void = () => {};
+  export let onOpenHistory: () => void = () => {};
 
-  let clipboardTab: 'current' | 'history' = 'current';
   let transfersOpen = false;
   let transfersAutoOpened = false;
 
@@ -298,53 +289,21 @@
     <div class="phone-card-head">
       <h2>共享剪贴板</h2>
       {#if mode === 'web'}
-        <div class="clip-tabs" role="tablist" aria-label="剪贴板视图">
-          <button type="button" class="clip-tab" role="tab" aria-selected={clipboardTab === 'current'} on:click={() => (clipboardTab = 'current')}>当前</button>
-          <button type="button" class="clip-tab" role="tab" aria-selected={clipboardTab === 'history'} on:click={() => (clipboardTab = 'history')}>历史 {history.length}</button>
-        </div>
+        <button type="button" class="btn btn-ghost btn-sm phone-history-open" on:click={onOpenHistory}>历史 {historyCount}</button>
       {:else}
         <span class="muted">{clipboard ? clipboard.source_name + ' · ' + formatTime(clipboard.updated_at_ms) : '仅手动读取和发布'}</span>
       {/if}
     </div>
-    {#if clipboardTab === 'history' && mode === 'web'}
-      {#if selectedHistory}
-        <div class="history-detail-meta">
-          <strong>{selectedHistory.item.source_name}</strong>
-          <span class="muted">{clipboardHistoryKind(selectedHistory.item)} · {formatTime(selectedHistory.item.updated_at_ms)}</span>
-        </div>
-        <ClipboardPreview snapshot={selectedHistory.snapshot} sizeBytes={selectedHistory.item.size_bytes} />
-        <div class="phone-actions">
-          <button type="button" class="btn btn-primary" on:click={onRestoreHistory} disabled={historyBusy}>恢复并同步</button>
-          <button type="button" class="btn" on:click={onCloseHistory}>返回历史列表</button>
-        </div>
-      {:else}
-        <div class="history-list">
-          {#each history as item (item.event_id)}
-            <button type="button" class="history-row" on:click={() => onOpenHistory(item)}>
-              <span class="history-kind">{item.has_image ? 'PNG' : '文字'}</span>
-              <span class="history-preview">{clipboardHistoryPreview(item)}</span>
-              <span class="history-time">{formatTime(item.updated_at_ms)}</span>
-            </button>
-          {:else}
-            <div class="empty">还没有保存的剪贴板历史。</div>
-          {/each}
-        </div>
-        <div class="phone-actions">
-          <button type="button" class="btn" on:click={onClearHistory} disabled={historyBusy || !history.length}>清空历史</button>
-        </div>
-      {/if}
-    {:else}
-      <textarea class="field clip-editor" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
-      {#if clipboard?.image_png}
-        <ClipboardImage imagePng={clipboard.image_png} />
-      {/if}
-      <div class="phone-actions phone-actions--stack">
-        <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>
-        <button type="button" class="btn" on:click={onReadLocal}>读取本机剪贴板</button>
-        <button type="button" class="btn" on:click={onWriteLocal}>写入本机剪贴板</button>
-      </div>
-      <p class="hint">不会自动监听或回写系统剪贴板</p>
+    <textarea class="field clip-editor" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
+    {#if clipboard?.image_png}
+      <ClipboardImage imagePng={clipboard.image_png} />
     {/if}
+    <div class="phone-actions phone-actions--stack">
+      <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>
+      <button type="button" class="btn" on:click={onReadLocal}>读取本机剪贴板</button>
+      <button type="button" class="btn" on:click={onWriteLocal}>写入本机剪贴板</button>
+    </div>
+    <p class="hint">不会自动监听或回写系统剪贴板</p>
   </section>
 
   <section class="phone-card">

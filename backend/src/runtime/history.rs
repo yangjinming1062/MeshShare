@@ -1,9 +1,55 @@
 use super::*;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use image::imageops::FilterType;
+use image::ImageFormat;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+
+const CLIPBOARD_THUMBNAIL_WIDTH: u32 = 96;
+const CLIPBOARD_THUMBNAIL_HEIGHT: u32 = 72;
 
 pub(super) fn clipboard_payload_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(CLIPBOARD_PAYLOAD_DIR)
+}
+
+/// 缩略图与图片载荷同目录，文件名由图片名派生，索引里不另存路径。
+pub(super) fn clipboard_thumbnail_name(image_path: &str) -> String {
+    let stem = Path::new(image_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(image_path);
+    format!("{stem}.thumb.png")
+}
+
+/// 首次请求时生成并落盘；写盘失败仍返回内存中的缩略图。
+pub(super) fn load_or_create_clipboard_thumbnail(
+    data_dir: &Path,
+    record: &ClipboardHistoryRecord,
+) -> Option<Vec<u8>> {
+    let image_name = record.image_path.as_deref()?;
+    if !safe_clipboard_payload_name(image_name, "png") {
+        return None;
+    }
+    let directory = clipboard_payload_dir(data_dir);
+    let thumb_name = clipboard_thumbnail_name(image_name);
+    if let Some(bytes) = std::fs::read(directory.join(&thumb_name))
+        .ok()
+        .filter(|bytes| crate::clipboard::is_valid_png(bytes))
+    {
+        return Some(bytes);
+    }
+    let source = std::fs::read(directory.join(image_name)).ok()?;
+    let thumbnail = crate::clipboard::decode_png(&source).ok()?.resize_to_fill(
+        CLIPBOARD_THUMBNAIL_WIDTH,
+        CLIPBOARD_THUMBNAIL_HEIGHT,
+        FilterType::Triangle,
+    );
+    let mut bytes = Vec::new();
+    thumbnail
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+        .ok()?;
+    let _ = crate::fsutil::atomic_write(&directory.join(&thumb_name), &bytes);
+    Some(bytes)
 }
 
 pub(super) fn is_clipboard_index_temp_name(name: &str, base: &str) -> bool {
@@ -193,11 +239,16 @@ pub(super) fn persist_clipboard_history(
         &data_dir.join(CLIPBOARD_HISTORY_FILE),
         &serde_json::to_vec_pretty(history)?,
     )?;
-    let referenced = history
-        .iter()
-        .flat_map(|record| [record.text_path.as_deref(), record.image_path.as_deref()])
-        .flatten()
-        .collect::<HashSet<_>>();
+    let mut referenced = HashSet::new();
+    for record in history {
+        if let Some(path) = record.text_path.as_deref() {
+            referenced.insert(path.to_string());
+        }
+        if let Some(path) = record.image_path.as_deref() {
+            referenced.insert(path.to_string());
+            referenced.insert(clipboard_thumbnail_name(path));
+        }
+    }
     let entries = match std::fs::read_dir(clipboard_payload_dir(data_dir)) {
         Ok(entries) => entries,
         Err(error) => {
@@ -310,13 +361,16 @@ pub(super) fn write_clipboard_history_record(
 
 pub(super) fn remove_clipboard_payload_set(data_dir: &Path, storage_id: &str) {
     let directory = clipboard_payload_dir(data_dir);
-    for extension in ["txt", "png"] {
-        let _ = std::fs::remove_file(directory.join(format!("{storage_id}.{extension}")));
+    let names = [
+        format!("{storage_id}.txt"),
+        format!("{storage_id}.png"),
+        format!("{storage_id}.thumb.png"),
+    ];
+    for name in &names {
+        let _ = std::fs::remove_file(directory.join(name));
     }
-    for extension in ["txt", "png"] {
-        remove_clipboard_temp_file(&crate::fsutil::temp_path(
-            &directory.join(format!("{storage_id}.{extension}")),
-        ));
+    for name in &names {
+        remove_clipboard_temp_file(&crate::fsutil::temp_path(&directory.join(name)));
     }
 }
 
@@ -359,6 +413,9 @@ pub(super) fn remove_clipboard_record_payloads(data_dir: &Path, record: &Clipboa
         .flatten()
     {
         let _ = std::fs::remove_file(directory.join(path));
+    }
+    if let Some(image_path) = record.image_path.as_deref() {
+        let _ = std::fs::remove_file(directory.join(clipboard_thumbnail_name(image_path)));
     }
 }
 

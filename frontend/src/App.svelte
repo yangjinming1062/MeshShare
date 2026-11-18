@@ -10,7 +10,7 @@
   import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, requestWithTimeout, createOutgoingPaths, getOutgoingPrepare, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
+  import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
   import HardwarePanel from './components/HardwarePanel.svelte';
@@ -20,7 +20,7 @@
   import SettingsDialog from './components/SettingsDialog.svelte';
   import RemoteFileBrowser from './components/RemoteFileBrowser.svelte';
   import MobileAccessDialog from './components/MobileAccessDialog.svelte';
-  import HistoryDetailDialog from './components/HistoryDetailDialog.svelte';
+  import ClipboardHistoryDialog from './components/ClipboardHistoryDialog.svelte';
   import MetricsDetailDialog from './components/MetricsDetailDialog.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
   import PromptDialog from './components/PromptDialog.svelte';
@@ -107,8 +107,9 @@
   // 打开二维码窗口时已知的网页会话；之后出现新会话说明有浏览器临时加入。
   let mobileAccessKnownSessions = new Set<string>();
   let addDeviceOpen = false;
-  let clipboardTab: 'current' | 'history' = 'current';
-  let historyDetailOpen = false;
+  let clipboardHistoryOpen = false;
+  let historyDetailLoading = false;
+  let historyDetailToken = 0;
   let metricsPeerOpen = false;
   let clearHistoryOpen = false;
   // window.prompt 在部分桌面 WebView（macOS）上不可用，统一走内联输入对话框。
@@ -560,6 +561,8 @@
     if (isWeb || isMonitor) clipboardHistorySettings = nextHistory.settings;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
       selectedClipboardHistory = null;
+      historyDetailToken += 1;
+      historyDetailLoading = false;
     }
     metrics = nextMetrics;
     const refreshedTransfers = nextTransfers.map((next) => {
@@ -992,6 +995,8 @@
     clipboardHistory = response.items;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
       selectedClipboardHistory = null;
+      historyDetailToken += 1;
+      historyDetailLoading = false;
     }
   }
 
@@ -1004,9 +1009,11 @@
     metricsPeerOpen = true;
   }
 
-  function closeHistoryDetail() {
+  function closeClipboardHistoryBrowser() {
+    clipboardHistoryOpen = false;
+    historyDetailToken += 1;
+    historyDetailLoading = false;
     selectedClipboardHistory = null;
-    historyDetailOpen = false;
   }
 
   function requestClearHistory() {
@@ -1075,13 +1082,29 @@
     }
   }
 
-  async function openClipboardHistory(item: ClipboardHistoryItem) {
+  function openClipboardHistoryBrowser() {
+    clipboardHistoryOpen = true;
+    void refreshClipboardHistory().catch((error) => console.error('刷新剪贴板历史失败', error));
+  }
+
+  async function selectClipboardHistory(item: ClipboardHistoryItem | null) {
+    const token = ++historyDetailToken;
+    if (!item) {
+      selectedClipboardHistory = null;
+      historyDetailLoading = false;
+      return;
+    }
+    historyDetailLoading = true;
     try {
-      selectedClipboardHistory = await getClipboardHistoryDetail(item.event_id);
-      clipboardDraft = selectedClipboardHistory.snapshot.text ?? '';
-      historyDetailOpen = true;
+      const detail = await getClipboardHistoryDetail(item.event_id);
+      if (token !== historyDetailToken) return;
+      selectedClipboardHistory = detail;
     } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法读取历史剪贴板内容', 6000);
+      if (token === historyDetailToken) {
+        showTransientNotice(error instanceof Error ? error.message : '无法读取历史剪贴板内容', 6000);
+      }
+    } finally {
+      if (token === historyDetailToken) historyDetailLoading = false;
     }
   }
 
@@ -1094,7 +1117,6 @@
       clipboardDraft = clipboard.text ?? '';
       await refreshClipboardHistory();
       showTransientNotice('已恢复并同步剪贴板内容');
-      closeHistoryDetail();
     } catch (error) {
       showTransientNotice(error instanceof Error ? error.message : '无法恢复剪贴板历史', 6000);
     } finally {
@@ -1108,6 +1130,8 @@
     try {
       await clearClipboardHistory();
       clipboardHistory = [];
+      historyDetailToken += 1;
+      historyDetailLoading = false;
       selectedClipboardHistory = null;
       clearHistoryOpen = false;
       showTransientNotice('已清空本机剪贴板历史');
@@ -1488,8 +1512,10 @@
     mobileAccessOpen = false;
     addDeviceOpen = false;
     clearHistoryOpen = false;
+    clipboardHistoryOpen = false;
+    historyDetailToken += 1;
+    historyDetailLoading = false;
     selectedClipboardHistory = null;
-    historyDetailOpen = false;
     metricsPeerOpen = false;
     selectedMetricsPeer = null;
     selectedPeer = null;
@@ -2510,9 +2536,7 @@
       onClearTransferHistory={requestClearTransferHistory}
       {clipboard}
       bind:draft={clipboardDraft}
-      history={clipboardHistory}
-      historyBusy={clipboardHistoryBusy}
-      selectedHistory={selectedClipboardHistory}
+      historyCount={clipboardHistory.length}
       {metrics}
       canChooseDirectory={mobileDirectoryPickerAvailable()}
       receiveDirectoryName={mobileReceiveDirectoryName}
@@ -2535,10 +2559,7 @@
       onReadLocal={readMobileClipboard}
       onWriteLocal={writeMobileClipboard}
       onChooseDirectory={chooseMobileReceiveDirectory}
-      onOpenHistory={openClipboardHistory}
-      onRestoreHistory={restoreClipboardHistoryItem}
-      onCloseHistory={closeHistoryDetail}
-      onClearHistory={clearClipboardHistoryItems}
+      onOpenHistory={openClipboardHistoryBrowser}
     />
   {:else}
     <AppHeader
@@ -2597,12 +2618,9 @@
       <ClipboardPanel
         {clipboard}
         bind:draft={clipboardDraft}
-        history={clipboardHistory}
-        bind:tab={clipboardTab}
-        busy={clipboardHistoryBusy}
+        historyCount={clipboardHistory.length}
         onPublish={publishClipboard}
-        onOpenHistory={openClipboardHistory}
-        onClearHistory={requestClearHistory}
+        onOpenHistory={openClipboardHistoryBrowser}
       />
       <TransferPanel {transfers} {prepares} {failures} {transferHistory} {transferHistoryBusy} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} onClearTransferHistory={requestClearTransferHistory} />
     </main>
@@ -2642,13 +2660,6 @@
       onSelect={(url) => (selectedAddress = url)}
       onClose={() => (mobileAccessOpen = false)}
     />
-    <HistoryDetailDialog
-      open={historyDetailOpen}
-      detail={selectedClipboardHistory}
-      busy={clipboardHistoryBusy}
-      onRestore={restoreClipboardHistoryItem}
-      onClose={closeHistoryDetail}
-    />
     <MetricsDetailDialog
       open={metricsPeerOpen && !!selectedMetricsPeer}
       peer={selectedMetricsPeer}
@@ -2670,15 +2681,27 @@
       onSubmit={(value) => resolvePathPrompt(value)}
       onClose={() => resolvePathPrompt(null)}
     />
-    <ConfirmDialog
-      open={clearHistoryOpen}
-      title="清空剪贴板历史"
-      message="本机保存的全部剪贴板历史会被删除，已同步到其他设备的内容不受影响。"
-      confirmLabel="清空"
-      onConfirm={confirmClearHistory}
-      onCancel={cancelClearHistory}
-    />
   {/if}
+  <ClipboardHistoryDialog
+    open={clipboardHistoryOpen}
+    items={clipboardHistory}
+    selected={selectedClipboardHistory}
+    detailLoading={historyDetailLoading}
+    busy={clipboardHistoryBusy}
+    retentionLabel={clipboardHistoryRetentionLabel(clipboardHistorySettings)}
+    onSelect={selectClipboardHistory}
+    onRestore={restoreClipboardHistoryItem}
+    onClear={requestClearHistory}
+    onClose={closeClipboardHistoryBrowser}
+  />
+  <ConfirmDialog
+    open={clearHistoryOpen}
+    title="清空剪贴板历史"
+    message="本机保存的全部剪贴板历史会被删除，已同步到其他设备的内容不受影响。"
+    confirmLabel="清空"
+    onConfirm={confirmClearHistory}
+    onCancel={cancelClearHistory}
+  />
   <ConfirmDialog
     open={clearTransferHistoryOpen}
     title="清空传输历史"

@@ -4,13 +4,17 @@
   export let open = false;
   export let title = '';
   export let width = 520;
+  export let bodyClass = '';
   export let onClose: () => void = () => {};
+  export let onOpened: () => void = () => {};
 
   let dialogEl: HTMLDialogElement;
 
   $: if (dialogEl) {
-    if (open && !dialogEl.open) dialogEl.showModal();
-    else if (!open && dialogEl.open) dialogEl.close();
+    if (open && !dialogEl.open) {
+      dialogEl.showModal();
+      onOpened();
+    } else if (!open && dialogEl.open) dialogEl.close();
   }
 
   function handleCancel(event: Event) {
@@ -30,7 +34,7 @@
       <Icon name="close" size={16} />
     </button>
   </div>
-  <div class="sheet-body">
+  <div class="sheet-body {bodyClass}">
     <slot />
   </div>
   <div class="sheet-foot">
