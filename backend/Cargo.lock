@@ -2556,13 +2556,17 @@ dependencies = [
  "base64 0.22.1",
  "core-foundation 0.10.1",
  "core-foundation-sys",
+ "core-graphics",
  "futures-util",
+ "gtk",
  "hostname",
  "http-body-util",
  "if-addrs",
  "image",
  "libc",
  "mdns-sd",
+ "objc2",
+ "objc2-app-kit",
  "parking_lot",
  "pem 3.0.6",
  "raw-window-handle",
@@ -2587,6 +2591,8 @@ dependencies = [
  "walkdir",
  "windows-registry",
  "windows-result 0.4.1",
+ "windows-sys 0.61.2",
+ "x11rb",
 ]
 
 [[package]]

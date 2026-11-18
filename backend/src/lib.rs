@@ -14,6 +14,8 @@ mod macos;
 mod metrics;
 mod mobile_tls;
 mod model;
+#[cfg(not(target_os = "android"))]
+mod monitor;
 mod runtime;
 mod server;
 mod updater;
@@ -24,8 +26,6 @@ mod windows;
 use anyhow::Context;
 #[cfg(not(target_os = "android"))]
 use model::MonitorPosition;
-#[cfg(target_os = "linux")]
-use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
 use runtime::NodeRuntime;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -35,7 +35,7 @@ use std::time::Duration;
 use tauri::menu::{Menu, MenuItem};
 #[cfg(not(target_os = "android"))]
 use tauri::tray::{MouseButton, TrayIconEvent};
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "android"))]
 use tauri::RunEvent;
 use tauri::{AppHandle, Manager, State};
 #[cfg(not(target_os = "android"))]
@@ -128,30 +128,11 @@ fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilit
 }
 
 #[cfg(not(target_os = "android"))]
-fn monitor_backend<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) -> MonitorBackend {
-    #[cfg(target_os = "linux")]
-    {
-        match window.display_handle().ok().map(|handle| handle.as_raw()) {
-            Some(RawDisplayHandle::Wayland(_)) => MonitorBackend::Wayland,
-            Some(RawDisplayHandle::Xlib(_)) | Some(RawDisplayHandle::Xcb(_)) => MonitorBackend::X11,
-            Some(_) => MonitorBackend::Other,
-            None => MonitorBackend::Unknown,
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = window;
-        MonitorBackend::Other
-    }
-}
-
-#[cfg(not(target_os = "android"))]
 pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabilities {
     #[cfg(target_os = "linux")]
     {
-        app.get_webview_window("monitor")
-            .map(|window| monitor_capabilities_for_backend(monitor_backend(&window)))
-            .unwrap_or_else(MonitorCapabilities::unknown)
+        app.try_state::<MonitorCapabilities>()
+            .map_or_else(MonitorCapabilities::unknown, |caps| *caps.inner())
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -258,19 +239,10 @@ pub(crate) fn apply_monitor_locked(
     if locked && !capabilities.can_click_through {
         return Err("当前桌面环境不支持悬浮条点击穿透，请从托盘隐藏悬浮条".to_string());
     }
-    let previous = runtime.monitor_locked();
-    if let Some(window) = app.get_webview_window("monitor") {
-        window
-            .set_ignore_cursor_events(locked)
-            .map_err(|error| format!("无法更新监控条鼠标状态：{error}"))?;
-    }
-    if let Err(error) = runtime.set_monitor_locked(locked) {
-        if let Some(window) = app.get_webview_window("monitor") {
-            let _ = window.set_ignore_cursor_events(previous);
-        }
-        return Err(error.to_string());
-    }
-    sync_tray_labels(app);
+    runtime
+        .set_monitor_locked(locked)
+        .map_err(|error| error.to_string())?;
+    monitor::refresh(app)?;
     Ok(locked)
 }
 
@@ -431,21 +403,6 @@ fn handle_tray_icon_event(app: &AppHandle, event: TrayIconEvent) {
 }
 
 #[cfg(not(target_os = "android"))]
-pub(crate) fn set_monitor_window_visible(app: &AppHandle, visible: bool, locked: bool) {
-    let Some(window) = app.get_webview_window("monitor") else {
-        return;
-    };
-    let locked = visible && locked && current_monitor_capabilities(app).can_click_through;
-    let _ = window.set_ignore_cursor_events(locked);
-    if visible {
-        let _ = window.show();
-    } else {
-        let _ = window.hide();
-    }
-    sync_tray_labels(app);
-}
-
-#[cfg(not(target_os = "android"))]
 pub(crate) fn apply_monitor_visible(
     app: &AppHandle,
     runtime: &NodeRuntime,
@@ -454,8 +411,7 @@ pub(crate) fn apply_monitor_visible(
     runtime
         .set_monitor_visible(visible)
         .map_err(|error| error.to_string())?;
-    set_monitor_window_visible(app, visible, effective_monitor_locked(app, runtime));
-    Ok(())
+    monitor::refresh(app)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -469,9 +425,6 @@ fn hide_monitor_persisted(app: &AppHandle) {
 
 #[cfg(target_os = "android")]
 pub(crate) fn sync_tray_labels(_app: &AppHandle) {}
-
-#[cfg(target_os = "android")]
-pub(crate) fn set_monitor_window_visible(_app: &AppHandle, _visible: bool, _locked: bool) {}
 
 #[cfg(target_os = "android")]
 pub(crate) fn apply_monitor_visible(
@@ -595,11 +548,8 @@ fn clamp_position_to_work_area(
 }
 
 #[cfg(not(target_os = "android"))]
-fn position_monitor_window<R: tauri::Runtime>(
-    window: &tauri::WebviewWindow<R>,
-    runtime: &NodeRuntime,
-) {
-    if !monitor_capabilities_for_backend(monitor_backend(window)).can_persist_position {
+fn position_monitor_window(window: &tauri::WebviewWindow, runtime: &NodeRuntime) {
+    if !current_monitor_capabilities(window.app_handle()).can_persist_position {
         return;
     }
     let Ok(outer_size) = window.outer_size() else {
@@ -637,10 +587,12 @@ fn position_monitor_window<R: tauri::Runtime>(
         (position, monitor)
     });
     let position = clamp_monitor_position(position, &monitor, window_width, window_height);
-    if window
-        .set_position(PhysicalPosition::new(position.x, position.y))
-        .is_ok()
-    {
+    let physical = PhysicalPosition::new(position.x, position.y);
+    #[cfg(target_os = "linux")]
+    let moved = linux::fullscreen::set_initial_position(window, physical);
+    #[cfg(not(target_os = "linux"))]
+    let moved = window.set_position(physical);
+    if moved.is_ok() {
         if let Err(error) = runtime.set_monitor_position(position) {
             eprintln!("保存监控条位置失败：{error}");
         }
@@ -810,11 +762,25 @@ fn run_desktop() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let autostart_launch = is_autostart_launch();
+            app.manage(monitor::Controller::default());
             app.manage(MainWindowVisibility::new(
                 app.get_webview_window("main")
                     .and_then(|window| window.is_visible().ok())
                     .unwrap_or(false),
             ));
+            let monitor_window = app.get_webview_window("monitor");
+            #[cfg(target_os = "linux")]
+            {
+                let backend = monitor_window
+                    .as_ref()
+                    .map_or(MonitorBackend::Unknown, |window| {
+                        linux::fullscreen::prepare(window).unwrap_or_else(|error| {
+                            eprintln!("准备悬浮条原生窗口失败：{error:#}");
+                            MonitorBackend::Unknown
+                        })
+                    });
+                app.manage(monitor_capabilities_for_backend(backend));
+            }
             let data_dir = app
                 .path()
                 .app_data_dir()
@@ -834,15 +800,11 @@ fn run_desktop() {
             updater.start();
             sync_autostart_registration(runtime.as_ref());
             setup_tray_menu(app.handle())?;
-            if let Some(window) = app.get_webview_window("monitor") {
-                normalize_monitor_size(&window);
-                position_monitor_window(&window, runtime.as_ref());
+            if let Some(window) = monitor_window.as_ref() {
+                normalize_monitor_size(window);
+                position_monitor_window(window, runtime.as_ref());
             }
-            set_monitor_window_visible(
-                app.handle(),
-                runtime.monitor_visible(),
-                effective_monitor_locked(app.handle(), runtime.as_ref()),
-            );
+            monitor::start(app.handle().clone(), runtime.clone())?;
             if let Some(window) = app.get_webview_window("monitor") {
                 let app_for_menu = app.handle().clone();
                 window.on_menu_event(move |_window, event| match event.id().as_ref() {
@@ -894,13 +856,18 @@ fn run_desktop() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")
-        .run(|app, event| {
-            #[cfg(target_os = "macos")]
-            if let RunEvent::Reopen { .. } = event {
-                show_main_window(app);
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+                if let Some(state) = app.try_state::<ManagedNode>() {
+                    state
+                        .runtime
+                        .stopping
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
             }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app, event);
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => show_main_window(app),
+            _ => {}
         });
 }
 
