@@ -37,7 +37,7 @@
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/transfers` | 创建清单和待确认任务 |
+| `POST` | `/api/v1/transfers` | 创建接收任务并返回接收端状态 |
 | `GET` | `/api/v1/transfers` | 查询本机任务 |
 | `GET` | `/api/v1/transfers/history` | 最近 10 条终态历史，可用 `session_id` 过滤 |
 | `DELETE` | `/api/v1/transfers/history` | 清空历史并同步删除对端配对记录 |
@@ -104,6 +104,8 @@
 - `TransferProgress` 的 `payload.progress` 包含状态、已完成字节、错误和可选的 `retry_count`。只有代次递增才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。传输进行中，节点本地进度与状态接口返回的 `completed_bytes` 还包含当前条目已接收但尚未提交的字节，`completed_items` 仍只统计已提交条目；两者都不回退且不超过总量。
 - `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
 - `TransferHistoryDeleted` 的 `payload.transfer_ids` 请求对端删除配对记录；接收端只接受有限数量，只删除当前 Peer 自己的记录，不反向转发。
+
+发送端的本地出站进度在收到清单回复前为 `waiting`，同时标记 `awaiting_offer_reply: true`。接收节点通过 HTTP 建单响应或 WebSocket 进度返回任务状态，`accepted` 表示已确定接收目录，`waiting` 表示仍需确认。该标记只用于发送端本地的建立阶段，收到任务状态后清除。旧节点缺少该字段时按 `false` 处理。
 
 能力声明决定消息是否发送：`clipboard.text` 表示接收剪贴板事件并允许写入本机系统剪贴板，`clipboard.view` 表示只展示快照；发送端跳过未声明两者的对端。Android 声明 `clipboard.view`，但通过本地 HTTP 主动发布的文字仍会发给声明 `clipboard.text` 的桌面节点。`transfer.history.v1` 表示可处理 `TransferHistoryDeleted`；旧节点反序列化未知消息会关闭连接，因此只对声明该能力的对端发送。对端离线时待删除标识写入节点数据目录，重连后补发；已知不支持时丢弃队列。
 

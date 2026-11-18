@@ -3347,8 +3347,9 @@ mod tests {
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, DiskMetrics, HardwareMetrics, Hlc, NodeInfo, PeerInfo,
-        TransferHistoryEntry, TransferItem, TransferOffer, TransferProgress, TransferStatus,
-        WireMessage, CLIPBOARD_TEXT_LIMIT, METRICS_SYSTEM_CAPABILITY, PROTOCOL_VERSION,
+        ReceiveMode, TransferHistoryEntry, TransferItem, TransferOffer, TransferProgress,
+        TransferStatus, WireMessage, CLIPBOARD_TEXT_LIMIT, METRICS_SYSTEM_CAPABILITY,
+        PROTOCOL_VERSION,
     };
     use crate::runtime::{NodeProfile, NodeRuntime};
     use axum::http::{HeaderValue, Request};
@@ -3821,6 +3822,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(data_dir);
     }
 
+    #[tokio::test]
+    async fn outgoing_progress_tracks_the_receivers_decision_for_each_offer() {
+        let data_dir =
+            std::env::temp_dir().join(format!("meshshare-offer-reply-{}", Uuid::new_v4()));
+        let sender = NodeRuntime::new(data_dir.join("sender"), 0, env!("CARGO_PKG_VERSION").into())
+            .expect("create sender");
+        let receiver = NodeRuntime::new(
+            data_dir.join("receiver"),
+            0,
+            env!("CARGO_PKG_VERSION").into(),
+        )
+        .expect("create receiver");
+        let sender_id = sender.node_id();
+        let receiver_id = receiver.node_id();
+        let (tx, mut replies) = mpsc::channel(8);
+        assert!(receiver.add_peer_channel(sender_id.clone(), tx));
+
+        let new_offer = |id, expected_status| {
+            let offer = TransferOffer {
+                target_node_id: receiver_id.clone(),
+                ..test_offer(&sender, id)
+            };
+            let initial = sender.add_outgoing_transfer(offer.clone());
+            assert_eq!(initial.status, TransferStatus::Waiting);
+            assert!(initial.awaiting_offer_reply);
+            (offer, expected_status)
+        };
+        let mut relay = async |(offer, expected_status): (TransferOffer, TransferStatus)| {
+            let id = offer.transfer_id.clone();
+            handle_wire_message(
+                WireMessage::TransferOffer { offer },
+                &receiver,
+                Some(&sender_id),
+            )
+            .await;
+            let reply = replies.try_recv().expect("receiver reports task status");
+            assert!(matches!(
+                &reply,
+                WireMessage::TransferProgress { progress }
+                    if progress.status == expected_status && !progress.awaiting_offer_reply
+            ));
+            handle_wire_message(reply, &sender, Some(&receiver_id)).await;
+            let progress = sender.transfer(&id).expect("outgoing task").progress;
+            assert_eq!(progress.status, expected_status);
+            assert_eq!(progress.direction.as_deref(), Some("send"));
+            assert!(!progress.awaiting_offer_reply);
+            while let Ok(message) = replies.try_recv() {
+                handle_wire_message(message, &sender, Some(&receiver_id)).await;
+            }
+        };
+
+        let manual = new_offer("manual", TransferStatus::Waiting);
+        relay(manual.clone()).await;
+        let destination = data_dir.join("received");
+        std::fs::create_dir(&destination).expect("create receive directory");
+        receiver
+            .set_receive_settings(ReceiveMode::Auto, Some(destination.clone()))
+            .expect("enable auto receive");
+        relay(manual).await;
+        relay(new_offer("auto", TransferStatus::Accepted)).await;
+        std::fs::remove_dir(&destination).expect("make directory unavailable");
+        relay(new_offer("fallback", TransferStatus::Waiting)).await;
+        std::fs::create_dir(&destination).expect("restore receive directory");
+        relay(new_offer("restored", TransferStatus::Accepted)).await;
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
     #[test]
     fn rejects_parent_and_absolute_paths() {
         assert!(has_parent_component("../secret.txt"));
@@ -4268,6 +4336,7 @@ mod tests {
                     transfer_id: "progress-order".to_string(),
                     retry_count: 0,
                     status: TransferStatus::Waiting,
+                    awaiting_offer_reply: false,
                     completed_bytes: 0,
                     total_bytes: 0,
                     completed_items: 0,
@@ -4331,6 +4400,7 @@ mod tests {
                     transfer_id: "retry-progress".to_string(),
                     retry_count: 1,
                     status: TransferStatus::Accepted,
+                    awaiting_offer_reply: false,
                     completed_bytes: 0,
                     total_bytes: 0,
                     completed_items: 0,

@@ -390,6 +390,7 @@ fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress
         transfer_id: offer.transfer_id.clone(),
         retry_count: 0,
         status: TransferStatus::Waiting,
+        awaiting_offer_reply: false,
         completed_bytes: 0,
         total_bytes: offer.total_bytes,
         completed_items: 0,
@@ -1788,13 +1789,14 @@ impl NodeRuntime {
         if let Some(record) = transfers.get(&offer.transfer_id) {
             return record.progress.clone();
         }
-        let progress = transfer_progress(&offer, "send");
+        let mut progress = transfer_progress(&offer, "send");
         if !evict_terminal_transfer_if_needed(&mut transfers) {
             let mut failed = progress;
             failed.status = TransferStatus::Failed;
             failed.error = Some("节点传输记录资源暂时不足，请稍后重试".to_string());
             return failed;
         }
+        progress.awaiting_offer_reply = true;
         transfers.insert(
             offer.transfer_id.clone(),
             TransferRecord {
@@ -2590,9 +2592,10 @@ impl NodeRuntime {
                         .max(progress.completed_bytes.min(record.offer.total_bytes));
                     record.upload_in_flight = None;
                 }
-                let mut next = progress.clone();
+                let mut next = progress;
                 next.offer = Some(record.offer.clone());
                 next.direction = record.progress.direction.clone();
+                next.awaiting_offer_reply = false;
                 record.progress = next;
                 record.updated_at_ms = now_millis();
                 (record.clone(), was_terminal)
@@ -2728,6 +2731,7 @@ impl NodeRuntime {
             return Some(record.progress.clone());
         }
         record.progress.status = status;
+        record.progress.awaiting_offer_reply = false;
         record.progress.error = Some(message);
         record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
@@ -2773,6 +2777,7 @@ impl NodeRuntime {
         }
         record.progress.retry_count = retry_count;
         record.progress.status = status;
+        record.progress.awaiting_offer_reply = false;
         record.progress.error = None;
         record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
@@ -3137,6 +3142,7 @@ impl NodeRuntime {
             };
             if now.saturating_sub(record.updated_at_ms) > idle_timeout {
                 record.progress.status = TransferStatus::Failed;
+                record.progress.awaiting_offer_reply = false;
                 record.progress.error = Some(
                     if accepted {
                         "接收端已确认，但发送端没有开始上传，已自动失败"
@@ -3235,6 +3241,7 @@ impl NodeRuntime {
             return Some(record.progress.clone());
         }
         record.progress.status = TransferStatus::Accepted;
+        record.progress.awaiting_offer_reply = false;
         record.updated_at_ms = now_millis();
         record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())

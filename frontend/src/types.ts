@@ -215,6 +215,8 @@ export type TransferProgress = {
   transfer_id: string;
   retry_count?: number;
   status: TransferStatus;
+  /** 出站任务正在等待接收端返回清单对应的状态。 */
+  awaiting_offer_reply?: boolean;
   completed_bytes: number;
   total_bytes: number;
   completed_items: number;

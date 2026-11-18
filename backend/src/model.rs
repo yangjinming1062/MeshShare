@@ -318,6 +318,9 @@ pub struct TransferProgress {
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub retry_count: u32,
     pub status: TransferStatus,
+    /// 出站任务还在等待接收端返回清单对应的状态。
+    #[serde(default)]
+    pub awaiting_offer_reply: bool,
     pub completed_bytes: u64,
     pub total_bytes: u64,
     pub completed_items: usize,
@@ -534,6 +537,7 @@ mod tests {
                         transfer_id: "transfer-1".to_string(),
                         retry_count: 0,
                         status: TransferStatus::Waiting,
+                        awaiting_offer_reply: false,
                         completed_bytes: 0,
                         total_bytes: 5,
                         completed_items: 0,

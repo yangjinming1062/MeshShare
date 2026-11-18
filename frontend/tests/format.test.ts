@@ -22,6 +22,13 @@ test('other transfer states keep their existing wording', () => {
   assert.equal(transferStatusText({ ...base, status: 'cancelled' }, 'desktop'), '已取消');
 });
 
+test('waiting for an offer reply is distinct from waiting for manual confirmation', () => {
+  const outgoing = { ...base, status: 'waiting' as const, direction: 'send' as const };
+  assert.equal(transferStatusText({ ...outgoing, awaiting_offer_reply: true }, 'desktop'), '正在建立传输');
+  assert.equal(transferStatusText({ ...outgoing, awaiting_offer_reply: false }, 'android'), '等待确认');
+  assert.equal(transferStatusText({ ...outgoing, direction: 'receive' }, 'web'), '等待确认');
+});
+
 const historyBase = {
   transfer_id: 'history',
   direction: 'receive' as const,

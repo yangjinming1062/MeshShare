@@ -9,6 +9,7 @@
   import { peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
   import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, requestWithTimeout, createOutgoingPaths, getOutgoingPrepare, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
+  import { mergeTransferProgress } from './transferProgress';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
   import AppHeader from './components/AppHeader.svelte';
@@ -208,7 +209,6 @@
     capabilities: node.capabilities,
     online: true,
   } satisfies PeerInfo, ...peers] : peers;
-
   // 链路轨只表达「这台设备正在收发」；没有 offer 的本地合成行保持静态。
   $: activeLinkPeers = new Set(
     [...transfers, ...mobileTransfers.map((view) => view.progress)]
@@ -564,10 +564,7 @@
     metrics = nextMetrics;
     const refreshedTransfers = nextTransfers.map((next) => {
       const current = transfers.find((item) => item.transfer_id === next.transfer_id);
-      if (current && shouldKeepTransferProgress(current, next)) {
-        return { ...next, ...current, offer: next.offer ?? current.offer };
-      }
-      return { ...current, ...next, offer: next.offer ?? current?.offer };
+      return mergeTransferProgress(current, next);
     });
     transfers = [
       ...refreshedTransfers,
@@ -786,70 +783,20 @@
       }
       return;
     }
-    // 网页会话的任务集合由页面发起发送与会话下载构成；节点自身的对端传输
-    // 只在桌面/安卓界面展示，否则会混进网页的传输记录与失败列表。
-    if (isWeb && (type === 'TransferOffer' || type === 'TransferProgress')) return;
-    if (type === 'TransferOffer') {
-      const offer = payload.offer;
-      const existing = transfers.find((item) => item.transfer_id === offer.transfer_id);
-      // An auto-accepted transfer can deliver its offer after the accepted
-      // progress event during reconnect. Keep the newest known lifecycle
-      // state instead of turning it back into a confirmation request.
-      const next = existing
-        ? {
-            ...existing,
-            offer: existing.offer ?? offer,
-            total_bytes: existing.total_bytes || offer.total_bytes,
-            total_items: existing.total_items || offer.items.length,
-          }
-        : {
-            transfer_id: offer.transfer_id,
-            status: 'waiting' as const,
-            completed_bytes: 0,
-            total_bytes: offer.total_bytes,
-            completed_items: 0,
-            total_items: offer.items.length,
-            offer,
-            direction: 'receive' as const,
-          };
-      transfers = [{
-        ...next,
-      }, ...transfers.filter((item) => item.transfer_id !== offer.transfer_id)];
-      return;
-    }
     if (type === 'TransferHistoryDeleted') {
       void loadTransferHistory();
       return;
     }
-    if (type === 'TransferProgress') {
+    // 进度同时携带清单与接收状态。网页只展示页面发起的发送和会话下载。
+    if (type === 'TransferProgress' && !isWeb) {
       const progress = payload.progress;
       const existing = transfers.find((item) => item.transfer_id === progress.transfer_id);
-      const next = existing && shouldKeepTransferProgress(existing, progress)
-        ? { ...progress, ...existing, offer: progress.offer ?? existing.offer }
-        : { ...existing, ...progress, offer: progress.offer ?? existing?.offer };
+      const next = mergeTransferProgress(existing, progress);
       // 先把记录放进列表，失败行才能在计算可重试性时看到节点上的记录。
       transfers = [next, ...transfers.filter((item) => item.transfer_id !== progress.transfer_id)];
       observeFailure(next);
       if (!isActiveTransferStatus(next.status)) void loadTransferHistory();
     }
-  }
-
-  function transferStatusRank(status: TransferProgress['status']): number {
-    if (status === 'waiting') return 0;
-    if (status === 'accepted') return 1;
-    if (status === 'uploading') return 2;
-    if (status === 'ready') return 3;
-    if (status === 'completed') return 5;
-    return 4;
-  }
-
-  function shouldKeepTransferProgress(current: TransferProgress, next: TransferProgress): boolean {
-    const currentRetry = current.retry_count ?? 0;
-    const nextRetry = next.retry_count ?? 0;
-    if (nextRetry !== currentRetry) return nextRetry < currentRetry;
-    const currentRank = transferStatusRank(current.status);
-    const nextRank = transferStatusRank(next.status);
-    return nextRank < currentRank;
   }
 
   function openMobileAccess() {
@@ -1308,7 +1255,7 @@
         status: (transferId) => getOutgoingPrepare(transferId),
         cancel: (transferId) => cancelOutgoingStaging(transferId),
       },
-      '已交给本机节点，等待接收端确认',
+      '已交给本机节点',
     );
   }
 
@@ -1321,7 +1268,7 @@
         status: (transferId) => getManagedOutgoingPrepare(transferId),
         cancel: (transferId) => cancelManagedOutgoingPrepare(transferId),
       },
-      '已交给目标机器，等待接收端确认',
+      '已交给目标机器',
     );
   }
 
@@ -1780,11 +1727,14 @@
       }
       if (generation !== targetGeneration) return;
       const progress = await startOutgoingStaging(offer.transfer_id);
+      if (generation !== targetGeneration) return;
+      const existing = transfers.find((item) => item.transfer_id === progress.transfer_id);
+      const next = mergeTransferProgress(existing, { ...progress, offer: progress.offer ?? offer, direction: 'send' });
       transfers = [
-        { ...progress, offer: progress.offer ?? offer, direction: 'send' },
-        ...transfers.filter((item) => item.transfer_id !== offer!.transfer_id),
+        next,
+        ...transfers.filter((item) => item.transfer_id !== next.transfer_id),
       ];
-      showTransientNotice('已交给本机节点，等待接收端确认', 3600);
+      showTransientNotice('已交给本机节点', 3600);
       await refresh();
     } catch (error) {
       if (isPrepareCancelled(error)) {
@@ -1835,9 +1785,9 @@
         throw new Error(created.error ?? '无法创建传输');
       }
       pendingUploads.set(offer.transfer_id, pending);
-      transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
+      transfers = [{ ...created, offer: created.offer ?? offer, direction: 'send' }, ...transfers];
       void watchTransfer(offer.transfer_id, pending);
-      showTransientNotice('已发送传输请求，等待接收端确认', 3600);
+      showTransientNotice('已发送传输请求', 3600);
     } catch (error) {
       const message = describeTransferFailure(error, peer.node_name, candidates.join('、'));
       observeFailure({
@@ -1916,9 +1866,7 @@
         if (!view) throw new Error('网页端传输任务不存在');
         const progress = { ...view.progress, direction: 'send' as const };
         const existing = transfers.find((item) => item.transfer_id === id);
-        const nextProgress = existing && shouldKeepTransferProgress(existing, progress)
-          ? { ...progress, ...existing, offer: progress.offer ?? existing.offer, direction: 'send' as const }
-          : { ...existing, ...progress, direction: 'send' as const, offer: progress.offer ?? existing?.offer };
+        const nextProgress = mergeTransferProgress(existing, progress);
         observeFailure(nextProgress);
         transfers = [nextProgress, ...transfers.filter((item) => item.transfer_id !== id)];
         if (['accepted', 'uploading'].includes(nextProgress.status) && !mobileUploading.has(id) && !mobileUploadStopped.has(id)) {
@@ -2081,9 +2029,7 @@
           return;
         }
         const existing = transfers.find((item) => item.transfer_id === id);
-        const nextProgress = existing && shouldKeepTransferProgress(existing, progress)
-          ? { ...progress, ...existing, offer: progress.offer ?? existing.offer }
-          : { ...existing, ...progress, offer: progress.offer ?? existing?.offer };
+        const nextProgress = mergeTransferProgress(existing, { ...progress, direction: 'send' });
         observeFailure(nextProgress);
         transfers = [nextProgress, ...transfers.filter((item) => item.transfer_id !== id)];
         if (['accepted', 'uploading'].includes(nextProgress.status) && !uploading.has(id) && !uploadStopped.has(id)) await uploadTransfer(id);

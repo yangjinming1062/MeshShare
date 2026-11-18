@@ -166,7 +166,9 @@ export function transferStatusText(transfer: TransferProgress, surface: 'desktop
   const ratio = transfer.total_bytes
     ? Math.max(0, Math.min(1, transfer.completed_bytes / transfer.total_bytes))
     : 0;
-  if (transfer.status === 'waiting') return '等待确认';
+  if (transfer.status === 'waiting') {
+    return transfer.direction === 'send' && transfer.awaiting_offer_reply ? '正在建立传输' : '等待确认';
+  }
   if (transfer.status === 'accepted') {
     return transfer.direction === 'send' ? '等待发送' : '准备接收';
   }
