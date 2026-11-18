@@ -87,6 +87,13 @@
     .filter((transfer) => transfer.direction !== 'send' && (transfer.status === 'accepted' || transfer.status === 'uploading' || transfer.status === 'ready'))
     .sort((left, right) => (right.offer?.created_at_ms ?? 0) - (left.offer?.created_at_ms ?? 0));
   $: inbox = pending.length ? null : (activeIncoming[0] ?? null);
+  // 模板表达式只订阅静态引用，函数体内的 transfers 不会被追踪，活跃节点先算成集合供导轨使用。
+  $: linkPeers = new Set(
+    transfers
+      .filter((transfer) => isActiveTransferStatus(transfer.status) && !!transfer.offer)
+      .flatMap((transfer) => [transfer.offer?.source_node_id, transfer.offer?.target_node_id])
+      .filter((id): id is string => !!id),
+  );
   $: recentDownloads = mode === 'web' ? transfers.filter((transfer) =>
     transfer.status === 'completed' && transfer.retryable_download_item_ids?.length,
   ) : [];
@@ -148,7 +155,7 @@
   <img class="phone-logo" src="/meshshare.svg" width="22" height="22" alt="" />
   <div class="phone-title">
     <strong title={node?.node_name}>{node?.node_name ?? 'MeshShare 节点'}</strong>
-    <span class="phone-sub">{mode === 'web' ? '临时加入' : '手机节点'}{node?.addresses[0] ? ' · ' + node.addresses[0].address : ''}</span>
+    <span class="phone-sub">{mode === 'web' ? '临时加入' : '手机节点'}</span>
   </div>
   {#if node}
     <div class="phone-chips">
@@ -240,43 +247,44 @@
     </div>
     <ul class="phone-list" role="list">
       {#each peers as peer (peer.node_id)}
-        <li class="device-card">
+        <li class="device-card" data-link={linkPeers.has(peer.node_id) ? 'active' : undefined}>
           <div class="device-card-id">
             <span class="device-icon" aria-hidden="true"><Icon name="monitor" size={18} /></span>
             <span class="device-id">
               <strong title={peer.node_name}>{peer.node_name}</strong>
               <span class="device-meta">{platformLabel(peer.platform)} · {peer.addresses[0]?.address ?? '在线'}</span>
             </span>
+            <div class="device-actions">
+              <button type="button" class="btn btn-primary" on:click={() => onSendFile(peer)}>
+                <Icon name="send" size={14} />
+                发送文件
+              </button>
+              {#if mode === 'web'}
+                <button type="button" class="btn phone-folder" aria-label={'向 ' + peer.node_name + ' 发送文件夹'} on:click={() => onSendFolder(peer)}>
+                  <Icon name="folder" size={14} />
+                  文件夹
+                </button>
+              {/if}
+            </div>
           </div>
           <div class="device-metrics-lines" title={peer.node_id === node?.node_id ? '本机节点' : peerSummary(peer)}>
             {#if peer.metrics_stale}
-              <div class="metric-line"><span class="metric-item">指标已过期</span></div>
+              <div class="metric-item metric-item--wide"><span class="metric-label">指标已过期</span></div>
             {:else if peerMetrics(peer)}
-              <div class="metric-line">
-                <span class="metric-item">CPU <b>{formatPercent(peerMetrics(peer)?.cpu_usage_percent)}</b></span>
-                <span class="metric-item">内存 <b>{formatPercent(memoryPercent(peerMetrics(peer)))}</b></span>
-                {#if gpuValue(peer) !== undefined}
-                  <span class="metric-item">GPU <b>{formatPercent(gpuValue(peer))}</b></span>
-                {/if}
+              <div class="metric-item"><span class="metric-label">CPU</span><b>{formatPercent(peerMetrics(peer)?.cpu_usage_percent)}</b></div>
+              <div class="metric-item"><span class="metric-label">内存</span><b>{formatPercent(memoryPercent(peerMetrics(peer)))}</b></div>
+              <div class="metric-item metric-item--net">
+                <span class="metric-label">网络</span>
+                <span class="metric-net">
+                  <b>↓ {formatRate(peerMetrics(peer)?.network_down_bytes_per_sec)}</b>
+                  <b>↑ {formatRate(peerMetrics(peer)?.network_up_bytes_per_sec)}</b>
+                </span>
               </div>
-              <div class="metric-line">
-                <span class="metric-item">↓ <b>{formatRate(peerMetrics(peer)?.network_down_bytes_per_sec)}</b></span>
-                <span class="metric-item">↑ <b>{formatRate(peerMetrics(peer)?.network_up_bytes_per_sec)}</b></span>
-              </div>
+              {#if gpuValue(peer) !== undefined}
+                <div class="metric-item"><span class="metric-label">GPU</span><b>{formatPercent(gpuValue(peer))}</b></div>
+              {/if}
             {:else}
-              <div class="metric-line"><span class="metric-item">指标采集中</span></div>
-            {/if}
-          </div>
-          <div class="device-actions">
-            <button type="button" class="btn btn-primary" on:click={() => onSendFile(peer)}>
-              <Icon name="send" size={14} />
-              发送文件
-            </button>
-            {#if mode === 'web'}
-              <button type="button" class="btn phone-folder" aria-label={'向 ' + peer.node_name + ' 发送文件夹'} on:click={() => onSendFolder(peer)}>
-                <Icon name="folder" size={14} />
-                文件夹
-              </button>
+              <div class="metric-item metric-item--wide"><span class="metric-label">指标采集中</span></div>
             {/if}
           </div>
         </li>
@@ -330,10 +338,8 @@
       {#if clipboard?.image_png}
         <ClipboardImage imagePng={clipboard.image_png} />
       {/if}
-      <div class="phone-actions">
+      <div class="phone-actions phone-actions--stack">
         <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>
-      </div>
-      <div class="phone-actions phone-actions--split">
         <button type="button" class="btn" on:click={onReadLocal}>读取本机剪贴板</button>
         <button type="button" class="btn" on:click={onWriteLocal}>写入本机剪贴板</button>
       </div>
@@ -346,8 +352,8 @@
       <h2>传输记录</h2>
       <span class="chip">进行中 {activeTransfers.length + prepares.length}</span>
       <span class="phone-history-count">历史 {historyEntries.length}</span>
-      <button type="button" class="btn btn-ghost btn-sm phone-toggle" aria-expanded={transfersOpen} on:click={() => (transfersOpen = !transfersOpen)}>
-        {transfersOpen ? '收起' : '展开'}
+      <button type="button" class="btn-icon phone-toggle" aria-expanded={transfersOpen} aria-label={transfersOpen ? '收起传输记录' : '展开传输记录'} on:click={() => (transfersOpen = !transfersOpen)}>
+        <Icon name="chevron" size={16} />
       </button>
     </div>
     {#if failures.length}

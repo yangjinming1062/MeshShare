@@ -132,10 +132,11 @@
   .update-card { display: block; padding-block: 0; }
   summary { min-height: 48px; padding-block: 12px; cursor: pointer; overflow-wrap: anywhere; }
   summary .muted { margin-inline-start: 8px; }
+  summary strong { font-size: var(--phone-fs-lg); font-weight: 650; }
   .update-body { display: grid; gap: 12px; padding-block-end: 12px; }
   .update-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; }
   .update-controls label { flex: 1 1 112px; display: grid; gap: 4px; }
-  .update-card button, .update-card select { min-height: 48px; font-size: inherit; }
+  .update-card button, .update-card select { min-height: 44px; font-size: var(--phone-fs-md); }
   .update-body > button { justify-self: start; }
   progress { width: 100%; accent-color: var(--primary); }
   .update-error { color: var(--danger); margin: 0; overflow-wrap: anywhere; }

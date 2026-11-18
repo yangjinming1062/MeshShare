@@ -221,7 +221,7 @@ button.device-metrics:hover { background: var(--surface-2); }
 .chip--danger { color: var(--danger); background: var(--danger-soft); }
 .phone-failures { min-width: 0; }
 .phone-subhead { margin-bottom: 6px; }
-.phone-subhead h3 { margin: 0 auto 0 0; font-size: 12px; color: var(--danger); }
+.phone-subhead h3 { margin: 0 auto 0 0; font-size: var(--phone-fs-md); color: var(--danger); }
 .transfer-card--failure { background: var(--danger-soft); }
 
 .empty { padding: 18px 12px; color: var(--muted); font-size: 12px; text-align: center; }
@@ -306,17 +306,23 @@ button.device-metrics:hover { background: var(--surface-2); }
   --phone-safe-top: env(safe-area-inset-top, 0px);
   --phone-safe-bottom: env(safe-area-inset-bottom, 0px);
   --phone-header-h: 56px;
+  --phone-fs-xs: 11px;
+  --phone-fs-sm: 12px;
+  --phone-fs-md: 14px;
+  --phone-fs-metric: 15px;
+  --phone-fs-lg: 16px;
+  --phone-fs-xl: 20px;
 }
 html[data-shell="android"] {
   /* Tauri 安卓边到边渲染，状态栏与手势区要预留；env() 取不到时按常见值兜底 */
   --phone-safe-top: max(env(safe-area-inset-top, 0px), 28px);
   --phone-safe-bottom: max(env(safe-area-inset-bottom, 0px), 20px);
 }
-.phone-shell { min-height: 100vh; min-height: 100dvh; background: var(--bg); font-size: 15px; }
+.phone-shell { min-height: 100vh; min-height: 100dvh; background: var(--bg); font-size: var(--phone-fs-md); }
 .phone-header { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 10px; min-height: calc(var(--phone-safe-top) + var(--phone-header-h)); padding: calc(var(--phone-safe-top) + 8px) 16px 8px; background: var(--surface); border-bottom: 1px solid var(--line); }
 .phone-logo { flex: 0 0 auto; }
 .phone-title { flex: 1; min-width: 0; max-height: 40px; display: grid; gap: 1px; align-content: center; overflow: hidden; }
-.phone-title strong { font-size: 15px; font-weight: 650; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.phone-title strong { font-size: var(--phone-fs-lg); font-weight: 650; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .phone-sub { color: var(--muted); font-size: 12px; line-height: 1.3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .phone-chips { display: none; align-items: center; gap: 6px; flex: 0 0 auto; }
 .phone-status { flex: 0 0 auto; max-width: 40%; }
@@ -324,23 +330,27 @@ html[data-shell="android"] {
 .phone-main { max-width: 720px; margin: 0 auto; display: grid; gap: 12px; padding: 12px 14px calc(24px + var(--phone-safe-bottom)); }
 .phone-card { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-1); }
 .phone-card-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.phone-card-head h2 { flex: 0 0 auto; }
+.phone-card-head h2 { flex: 0 0 auto; font-size: var(--phone-fs-lg); font-weight: 650; letter-spacing: -.01em; }
 .phone-card-head .muted { min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.phone-toggle { margin-left: auto; }
+.phone-toggle { margin-left: auto; flex: 0 0 auto; }
+.phone-toggle svg { transition: transform 160ms var(--ease); }
+.phone-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
 .phone-list { margin: 0; padding: 0; list-style: none; display: grid; gap: 10px; }
 .phone-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .phone-actions .btn-primary { flex: 1 1 160px; }
-.phone-actions--split { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
-.phone-shell .phone-actions--split .btn { min-width: 0; padding: 0 10px; }
-.phone-history-count { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.phone-actions--stack { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.phone-actions--stack > :first-child { grid-column: 1 / -1; }
+.phone-shell .phone-actions--stack .btn { min-width: 0; padding: 0 10px; }
+.phone-history-count { color: var(--muted); font-size: var(--phone-fs-sm); font-variant-numeric: tabular-nums; }
 .phone-copy { color: var(--muted); font-size: 12px; line-height: 1.55; }
 .phone-shell :is(input, textarea, button, [tabindex]) { scroll-margin-top: calc(var(--phone-safe-top) + var(--phone-header-h) + 12px); }
 
 .phone-inbox { position: sticky; top: calc(var(--phone-safe-top) + var(--phone-header-h) + 8px); z-index: 15; gap: 8px; border-color: var(--line-strong); box-shadow: var(--shadow-2); }
+.phone-inbox::before { content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 2px; border-radius: 2px; background: var(--primary); }
 .inbox-head { display: flex; align-items: center; gap: 10px; }
 .inbox-icon { display: grid; place-items: center; width: 34px; height: 34px; flex: 0 0 auto; border-radius: 12px; background: var(--primary-soft); color: var(--primary); }
 .inbox-title { min-width: 0; display: grid; gap: 1px; }
-.inbox-title strong { font-size: 14px; font-weight: 650; }
+.inbox-title strong { font-size: var(--phone-fs-lg); font-weight: 650; }
 .inbox-title span { font-size: 12px; }
 .inbox-item { display: grid; gap: 10px; padding: 10px 12px; border-radius: var(--r-md); background: var(--surface-2); }
 .inbox-copy { min-width: 0; display: grid; gap: 2px; }
@@ -350,29 +360,38 @@ html[data-shell="android"] {
 .inbox-actions .btn-primary { flex: 1; }
 .inbox-more { font-size: 12px; line-height: 1.45; }
 
-.device-card { display: grid; gap: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); }
+.device-card { position: relative; display: grid; gap: 8px; padding: 10px 12px 10px 14px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface); }
+.device-card::before { content: ""; position: absolute; left: 0; top: 12px; bottom: 12px; width: 2px; border-radius: 2px; background: var(--line-strong); transition: background 160ms var(--ease), box-shadow 160ms var(--ease); }
+.device-card:hover::before, .device-card:active::before, .device-card:focus-within::before { background: var(--primary); }
+.device-card[data-link="active"]::before { background: var(--positive); box-shadow: 0 0 0 3px var(--positive-glow); animation: link-pulse 1.8s var(--ease) infinite; }
 .device-card-id { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.device-metrics-lines { display: grid; gap: 2px; min-width: 0; }
-.metric-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 12px; }
-.metric-item { display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap; color: var(--muted); font-size: 11px; font-weight: 600; }
-.metric-item b { color: var(--ink); font-family: var(--font-data); font-size: 12px; font-weight: 650; }
-.device-actions .btn-primary { flex: 1; }
+.device-metrics-lines { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; min-width: 0; }
+.metric-item { display: grid; gap: 2px; min-width: 0; }
+.metric-label { color: var(--muted); font-size: var(--phone-fs-xs); font-weight: 600; }
+.metric-item b { color: var(--ink); font-family: var(--font-data); font-size: var(--phone-fs-metric); font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.metric-item--wide { grid-column: 1 / -1; }
+.metric-item--wide .metric-label { font-size: var(--phone-fs-sm); }
+.metric-net { display: flex; flex-wrap: wrap; gap: 2px 10px; }
+.device-card .device-actions { margin-left: auto; flex: 0 0 auto; }
 .phone-folder { display: none; }
 
 .transfer-card { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 8px 10px; padding: 10px; border-radius: var(--r-sm); background: var(--surface-2); }
 .transfer-card .transfer-progress { grid-column: 1 / -1; }
 .transfer-card .transfer-actions { grid-column: 1 / -1; flex-wrap: wrap; gap: 8px; }
+.transfer-card .transfer-copy strong { font-size: var(--phone-fs-md); }
 
 .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 .meta-tile { display: grid; gap: 2px; padding: 10px 12px; border-radius: 12px; background: var(--surface-2); }
 .meta-label { color: var(--muted); font-size: 11px; font-weight: 600; }
-.meta-tile strong { font-size: 16px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.meta-tile strong { font-family: var(--font-data); font-size: var(--phone-fs-xl); font-weight: 650; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .meta-rows { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 12px; font-size: 12px; }
 .meta-rows strong { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
 
 .phone-shell .clip-editor { min-height: 128px; max-height: 40dvh; field-sizing: content; }
 .phone-shell .history-list { max-height: 320px; }
 .phone-shell .history-row { min-height: 44px; }
+.phone-shell .history-preview { font-size: var(--phone-fs-md); }
+.phone-shell .clip-tab { height: 32px; padding: 0 12px; font-size: var(--phone-fs-md); }
 
 @media (min-width: 720px) {
   .phone-main { max-width: 1120px; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
@@ -384,11 +403,12 @@ html[data-shell="android"] {
   .phone-folder { display: inline-flex; }
 }
 
-@media (max-width: 719px), (pointer: coarse) {
-  .phone-shell .btn { height: auto; min-height: 44px; padding: 0 16px; font-size: 15px; border-radius: 12px; }
-  .phone-shell .btn-sm { height: auto; min-height: 40px; font-size: 14px; }
-  .phone-shell .btn-icon { width: 44px; height: 44px; border-radius: 12px; }
-  .phone-shell textarea.field, .phone-shell input.field { font-size: 16px; }
+.phone-shell .btn { height: auto; min-height: 44px; padding: 0 16px; font-size: var(--phone-fs-md); border-radius: 12px; }
+.phone-shell .btn-sm { height: auto; min-height: 40px; padding: 0 12px; font-size: var(--phone-fs-md); }
+.phone-shell .btn-icon { width: 44px; height: 44px; border-radius: 12px; }
+.phone-shell textarea.field, .phone-shell input.field { font-size: 16px; }
+@media (pointer: coarse) {
+  .phone-shell .btn-sm, .phone-shell .clip-tab { min-height: 44px; }
 }
 html[data-window="monitor"], html[data-window="monitor"] body { background: transparent; min-width: 0; }
 .monitor-shell { min-height: 0; height: 50px; overflow: hidden; background: transparent; }
