@@ -897,6 +897,14 @@
     );
   }
 
+  async function openProjectPage() {
+    try {
+      await invoke('open_project_page');
+    } catch (error) {
+      showTransientNotice(error instanceof Error ? error.message : String(error), 6000);
+    }
+  }
+
   async function setUpdateFrequency(next: UpdateFrequency) {
     await saveSettings(
       (target) => patchSettings({ update_frequency: next }, target),
@@ -2557,6 +2565,7 @@
       onSync={toggleSync}
       onAutostart={toggleAutostart}
       onSettings={() => (settingsOpen = true)}
+      onOpenProject={openProjectPage}
       onBack={returnToLocal}
       onCopyAddress={copyAccessAddress}
     />

@@ -16,6 +16,7 @@
   export let onSync: () => void = () => {};
   export let onAutostart: () => void = () => {};
   export let onSettings: () => void = () => {};
+  export let onOpenProject: () => void = () => {};
   export let onCopyAddress: () => void = () => {};
 
   $: addressText = node?.addresses[0]
@@ -54,6 +55,9 @@
     <TogglePill active={autostartEnabled} label="开机自启" pressedLabel="自启已关闭" disabled={settingsDisabled} onToggle={onAutostart} />
     <button type="button" class="btn-icon" aria-label="设置" title="设置" disabled={!settingsReady} on:click={onSettings}>
       <Icon name="settings" size={17} />
+    </button>
+    <button type="button" class="btn-icon" aria-label="GitHub 项目主页" title="GitHub 项目主页" on:click={onOpenProject}>
+      <Icon name="github" size={17} />
     </button>
   </div>
 </header>

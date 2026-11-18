@@ -7,6 +7,8 @@ mod clock;
 mod control;
 mod discovery;
 mod fsutil;
+#[cfg(not(target_os = "android"))]
+mod links;
 mod linux;
 mod listeners;
 #[cfg(target_os = "macos")]
@@ -844,7 +846,8 @@ fn run_desktop() {
             remote_file_access,
             set_remote_file_access,
             popup_monitor_menu,
-            set_monitor_position
+            set_monitor_position,
+            links::open_project_page
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")

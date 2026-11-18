@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { ICON_PATHS, type IconName } from '../icons';
+  import { ICON_FILLED, ICON_PATHS, type IconName } from '../icons';
 
   export let name: IconName;
   export let size = 16;
   export let stroke = 1.75;
+
+  $: filled = ICON_FILLED.has(name);
 </script>
 
 <svg
@@ -11,8 +13,8 @@
   width={size}
   height={size}
   viewBox="0 0 24 24"
-  fill="none"
-  stroke="currentColor"
+  fill={filled ? 'currentColor' : 'none'}
+  stroke={filled ? 'none' : 'currentColor'}
   stroke-width={stroke}
   stroke-linecap="round"
   stroke-linejoin="round"
