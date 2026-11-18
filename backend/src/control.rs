@@ -123,16 +123,6 @@ impl ControlPlane {
             .unwrap_or_else(|| self.runtime.update_settings().0.as_str().to_string())
     }
 
-    pub fn update_proxy(&self) -> Option<String> {
-        self.runtime.update_proxy()
-    }
-
-    pub fn set_update_proxy(&self, proxy: Option<String>) -> Result<Option<String>, String> {
-        self.runtime
-            .set_update_proxy(proxy)
-            .map_err(|error| error.to_string())
-    }
-
     fn monitor_capabilities(&self) -> crate::MonitorCapabilities {
         self.app.as_ref().map_or_else(
             crate::MonitorCapabilities::unknown,

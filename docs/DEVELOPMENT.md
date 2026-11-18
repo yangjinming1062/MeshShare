@@ -122,7 +122,3 @@ Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSW
 在 Ubuntu GNOME Wayland 会话确认 `loginctl show-session <id> -p Type` 返回 `Type=wayland`，记录 `WAYLAND_DISPLAY`、`DISPLAY` 和 Xwayland 状态。验证文字与 PNG 剪贴板的自动读取、远端写入、历史恢复、手动同步，以及悬浮条的拖动、隐藏和托盘恢复。
 
 MeshShare 不强制整个桌面壳切换到 X11。剪贴板优先 Wayland data-control，没有该协议时尝试 XWayland；两者都不可用时界面报告原因，设备间共享、历史和文件传输仍应可用。Wayland 不提供全局坐标、强制置顶和点击穿透的强保证，这些行为只在 X11 会话验收；Wayland 全屏应用不应触发自动隐藏。
-
-## 更新代理验收
-
-把「更新代理」设为 `http://127.0.0.1:9` 后点「立即检查」，应显示连接失败原因和处置提示；改成可用代理后应检查成功，代理端能看到清单和安装包请求。

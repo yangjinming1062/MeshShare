@@ -63,8 +63,6 @@
   let autostartEnabled = true;
   let updateFrequency: UpdateFrequency = 'weekly';
   let updateStatus: UpdateStatus | null = null;
-  let updateProxy = '';
-  let updateProxyBusy = false;
   const UNKNOWN_MONITOR_CAPABILITIES: MonitorCapabilities = { backend: 'unknown', can_persist_position: false, can_click_through: false, can_keep_above: false };
   let monitorCapabilities: MonitorCapabilities = UNKNOWN_MONITOR_CAPABILITIES;
   let receiveSettings: ReceiveSettings = { mode: 'confirm' };
@@ -426,7 +424,6 @@
         localBaseUrl = base;
         if (!activeBaseUrl) activeBaseUrl = base;
         if (isDesktopWindow) {
-          updateProxy = (await invoke<string | null>('update_proxy').catch(() => null)) ?? '';
           remoteFileAccess = await invoke<boolean>('remote_file_access').catch(() => remoteFileAccess);
         }
         if (isAndroidApp) void refreshAndroidReceiveStorage();
@@ -906,20 +903,6 @@
       next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`,
       '无法更新自动更新设置',
     );
-  }
-
-  async function setUpdateProxy(value: string) {
-    const next = value.trim();
-    updateProxyBusy = true;
-    try {
-      updateProxy = (await invoke<string | null>('set_update_proxy', { proxy: next ? next : null })) ?? '';
-      showTransientNotice(updateProxy ? '更新代理已保存，下次检查生效' : '已改为跟随系统代理');
-    } catch (error) {
-      showTransientNotice(typeof error === 'string' ? error : error instanceof Error ? error.message : '无法保存更新代理', 6000);
-      updateProxy = (await invoke<string | null>('update_proxy').catch(() => updateProxy || null)) ?? '';
-    } finally {
-      updateProxyBusy = false;
-    }
   }
 
   async function setReceiveMode(mode: ReceiveMode) {
@@ -2630,8 +2613,6 @@
       {updateFrequency}
       {updateStatus}
       {settingsDisabled}
-      bind:updateProxy
-      {updateProxyBusy}
       localMode={!remoteMode}
       {receiveSettings}
       historySettings={clipboardHistorySettings}
@@ -2639,7 +2620,6 @@
       {remoteFileAccessBusy}
       onFrequency={setUpdateFrequency}
       onCheckUpdates={checkForUpdates}
-      onUpdateProxy={setUpdateProxy}
       onReceiveMode={setReceiveMode}
       onChooseDirectory={() => chooseReceiveDirectory()}
       onHistoryMode={setClipboardHistoryMode}

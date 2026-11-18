@@ -48,7 +48,6 @@ use updater::UpdateCoordinator;
 #[derive(Clone)]
 struct ManagedNode {
     runtime: Arc<NodeRuntime>,
-    control: Arc<control::ControlPlane>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -223,19 +222,6 @@ async fn save_ca_certificate(
     })
     .await
     .map_err(|_| "无法打开保存对话框".to_string())?
-}
-
-#[tauri::command]
-fn update_proxy(state: State<'_, ManagedNode>) -> Option<String> {
-    state.control.update_proxy()
-}
-
-#[tauri::command]
-fn set_update_proxy(
-    state: State<'_, ManagedNode>,
-    proxy: Option<String>,
-) -> Result<Option<String>, String> {
-    state.control.set_update_proxy(proxy)
 }
 
 #[cfg(not(target_os = "android"))]
@@ -802,7 +788,6 @@ fn run_desktop() {
             ))?;
             app.manage(ManagedNode {
                 runtime: runtime.clone(),
-                control: control.clone(),
             });
             let updater = UpdateCoordinator::new(app.handle().clone(), runtime.clone());
             control.install_updater(updater.clone())?;
@@ -856,8 +841,6 @@ fn run_desktop() {
         .invoke_handler(tauri::generate_handler![
             node_base_url,
             save_ca_certificate,
-            update_proxy,
-            set_update_proxy,
             remote_file_access,
             set_remote_file_access,
             popup_monitor_menu,
@@ -898,7 +881,7 @@ pub fn run() {
                 .path()
                 .app_data_dir()
                 .unwrap_or_else(|_| PathBuf::from(".meshshare"));
-            let (runtime, control) = tauri::async_runtime::block_on(start_node(
+            let (runtime, _control) = tauri::async_runtime::block_on(start_node(
                 data_dir.clone(),
                 static_root(app.handle()),
                 app.package_info().version.to_string(),
@@ -909,7 +892,7 @@ pub fn run() {
             {
                 eprintln!("启动 Android 更新服务失败：{error:#}");
             }
-            app.manage(ManagedNode { runtime, control });
+            app.manage(ManagedNode { runtime });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

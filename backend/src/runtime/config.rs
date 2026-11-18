@@ -115,7 +115,6 @@ pub(super) fn load_or_create_config_with_hostname(
         update_frequency: UpdateFrequency::default(),
         update_last_checked_at_ms: None,
         pending_update_version: None,
-        update_proxy: None,
         clipboard_history_mode: ClipboardHistoryMode::default(),
         clipboard_history_count: default_clipboard_history_count(),
         clipboard_history_days: default_clipboard_history_days(),

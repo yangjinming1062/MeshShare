@@ -211,11 +211,7 @@ impl UpdateCoordinator {
         }
 
         self.set_status(UpdateState::Checking, None, 0, None, None);
-        let proxy = self.runtime.update_proxy_url();
-        let mut builder = self.app.updater_builder().timeout(CHECK_TIMEOUT);
-        if let Some(proxy) = proxy.clone() {
-            builder = builder.proxy(proxy);
-        }
+        let builder = self.app.updater_builder().timeout(CHECK_TIMEOUT);
         let updater = match builder.build() {
             Ok(updater) => updater,
             Err(error) => {
@@ -245,10 +241,7 @@ impl UpdateCoordinator {
         // 清单请求沿用短超时，安装包下载则改用 updater 的普通流式请求，
         // 使其不受该超时约束。
         // 大安装包下载耗时更长属于正常情况。
-        let mut builder = self.app.updater_builder();
-        if let Some(proxy) = proxy {
-            builder = builder.proxy(proxy);
-        }
+        let builder = self.app.updater_builder();
         let update = match builder
             .build()
             .and_then(|updater| updater.restore_update(checked_update.raw_json.clone()))
