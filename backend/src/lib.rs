@@ -84,6 +84,8 @@ impl MainWindowVisibility {
 enum MonitorBackend {
     Wayland,
     X11,
+    /// Linux 之外的桌面（Windows、macOS）统一归入此值。
+    #[cfg(not(target_os = "linux"))]
     Other,
     Unknown,
 }
@@ -99,11 +101,26 @@ pub(crate) struct MonitorCapabilities {
 impl MonitorCapabilities {
     /// 无法判定桌面后端时按“不支持全局控制”处理。
     pub(crate) const fn unknown() -> Self {
+        Self::without_controls(MonitorBackend::Unknown)
+    }
+
+    const fn without_controls(backend: MonitorBackend) -> Self {
         Self {
-            backend: MonitorBackend::Unknown,
+            backend,
             can_persist_position: false,
             can_click_through: false,
             can_keep_above: false,
+        }
+    }
+
+    /// 支持窗口定位、点击穿透与置顶的原生桌面。
+    #[cfg(not(target_os = "android"))]
+    const fn global_controls(backend: MonitorBackend) -> Self {
+        Self {
+            backend,
+            can_persist_position: true,
+            can_click_through: true,
+            can_keep_above: true,
         }
     }
 }
@@ -111,18 +128,10 @@ impl MonitorCapabilities {
 #[cfg(not(target_os = "android"))]
 fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilities {
     match backend {
-        MonitorBackend::Wayland => MonitorCapabilities {
-            backend,
-            can_persist_position: false,
-            can_click_through: false,
-            can_keep_above: false,
-        },
-        MonitorBackend::X11 | MonitorBackend::Other => MonitorCapabilities {
-            backend,
-            can_persist_position: true,
-            can_click_through: true,
-            can_keep_above: true,
-        },
+        MonitorBackend::Wayland => MonitorCapabilities::without_controls(backend),
+        MonitorBackend::X11 => MonitorCapabilities::global_controls(backend),
+        #[cfg(not(target_os = "linux"))]
+        MonitorBackend::Other => MonitorCapabilities::global_controls(backend),
         MonitorBackend::Unknown => MonitorCapabilities::unknown(),
     }
 }
@@ -977,7 +986,11 @@ mod tests {
 
     #[test]
     fn non_wayland_monitor_capabilities_allow_global_controls() {
-        for backend in [MonitorBackend::Other, MonitorBackend::X11] {
+        #[cfg(not(target_os = "linux"))]
+        let supported = [MonitorBackend::X11, MonitorBackend::Other];
+        #[cfg(target_os = "linux")]
+        let supported = [MonitorBackend::X11];
+        for backend in supported {
             let capabilities = monitor_capabilities_for_backend(backend);
             assert!(capabilities.can_persist_position);
             assert!(capabilities.can_click_through);
