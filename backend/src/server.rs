@@ -2833,13 +2833,16 @@ async fn upload_item(
     };
     let mut received = 0u64;
     let mut last_report = Instant::now();
+    let mut reported = false;
     let stream_result = stream_body_to_file(body, file, item.size, &destination, |chunk_bytes| {
         if !state.runtime.transfer_upload_active(&transfer_id) {
             return Err(ApiError::conflict("传输已取消"));
         }
         state.runtime.touch_transfer_activity(&transfer_id);
         received = received.saturating_add(chunk_bytes);
-        if last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
+        // 首个数据块立即上报，其余按节流窗口刷新，
+        // 进度不必等窗口到期才离开起点。
+        if !reported || last_report.elapsed() >= TRANSFER_PROGRESS_INTERVAL {
             if let Some(progress) =
                 state
                     .runtime
@@ -2849,6 +2852,7 @@ async fn upload_item(
                     .runtime
                     .publish_event(WireMessage::TransferProgress { progress });
             }
+            reported = true;
             last_report = Instant::now();
         }
         Ok(())
@@ -5831,8 +5835,6 @@ mod tests {
             .write_all(headers.as_bytes())
             .await
             .expect("write headers");
-        // 首块在节流窗口之后到达，确保服务端产生一次在途进度。
-        tokio::time::sleep(Duration::from_millis(300)).await;
         socket
             .write_all(b"4\r\nabcd\r\n")
             .await
