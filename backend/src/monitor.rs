@@ -118,7 +118,7 @@ fn log_change(previous: &mut Option<String>, error: Option<String>, context: &st
 }
 
 /// 仅在主线程调用；不要用 GTK 的 is_visible() 判断异步 show/hide 是否完成。
-fn reconcile(app: &AppHandle) {
+fn reconcile(app: &AppHandle, reapply: bool) {
     let (Some(controller), Some(node), Some(window)) = (
         app.try_state::<Controller>(),
         app.try_state::<crate::ManagedNode>(),
@@ -138,6 +138,9 @@ fn reconcile(app: &AppHandle) {
         node.runtime.monitor_visible(),
         crate::effective_monitor_locked(app, &node.runtime),
     );
+    if reapply {
+        state.applied = None;
+    }
     if state.applied == Some(desired) {
         return;
     }
@@ -173,7 +176,9 @@ fn reconcile(app: &AppHandle) {
 
 pub(crate) fn refresh(app: &AppHandle) -> Result<(), String> {
     let handle = app.clone();
-    app.run_on_main_thread(move || reconcile(&handle))
+    // Windows 的实际窗口层级可能与上次应用的状态不同，手动操作应重新提交。
+    let reapply = cfg!(target_os = "windows");
+    app.run_on_main_thread(move || reconcile(&handle, reapply))
         .map_err(|error| error.to_string())?;
     crate::sync_tray_labels(app);
     Ok(())
@@ -244,7 +249,7 @@ pub(crate) fn start(app: AppHandle, runtime: Arc<NodeRuntime>) -> Result<()> {
                         return;
                     }
                     drop(state);
-                    reconcile(app);
+                    reconcile(app, false);
                 }) {
                     if !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                         eprintln!("应用悬浮条检测结果失败，任务已停止：{error:#}");

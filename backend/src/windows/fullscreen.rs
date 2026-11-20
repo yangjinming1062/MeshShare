@@ -10,9 +10,9 @@ use windows_sys::Win32::Graphics::Gdi::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetClientRect, GetLayeredWindowAttributes, GetWindowLongW,
-    GetWindowRect, IsIconic, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, LWA_ALPHA, SWP_HIDEWINDOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WS_EX_LAYERED,
-    WS_EX_TOOLWINDOW,
+    GetWindowRect, IsIconic, IsWindowVisible, SetWindowPos, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA,
+    SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    WS_EX_LAYERED, WS_EX_TOOLWINDOW,
 };
 
 fn rect(value: RECT) -> Rect {
@@ -26,14 +26,14 @@ fn rect(value: RECT) -> Rect {
 
 pub(crate) fn set_visible(window: &tauri::WebviewWindow, visible: bool) -> Result<()> {
     let hwnd = window.hwnd()?.0 as HWND;
-    let visibility = if visible {
-        SWP_SHOWWINDOW
+    let (insert_after, visibility) = if visible {
+        (HWND_TOPMOST, SWP_SHOWWINDOW)
     } else {
-        SWP_HIDEWINDOW
+        (std::ptr::null_mut(), SWP_HIDEWINDOW | SWP_NOZORDER)
     };
-    let flags = visibility | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER;
-    // 悬浮条由主线程显隐。强制保留前台焦点，尤其是从全屏恢复时。
-    let applied = unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, 0, 0, flags) };
+    let flags = visibility | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
+    // 可见窗口仍可能被压在普通窗口后面，显示时显式恢复置顶。
+    let applied = unsafe { SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags) };
     anyhow::ensure!(applied != 0, std::io::Error::last_os_error());
     Ok(())
 }
