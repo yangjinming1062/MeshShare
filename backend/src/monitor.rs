@@ -86,6 +86,13 @@ struct Presentation {
 pub(crate) struct Controller(Mutex<Presentation>);
 
 impl Presentation {
+    #[cfg(target_os = "windows")]
+    fn reset_placement(&mut self) {
+        self.applied = None;
+        self.target = None;
+        self.fullscreen = FullscreenState::default();
+    }
+
     fn observe_sample(
         &mut self,
         expected: Option<Target>,
@@ -93,7 +100,7 @@ impl Presentation {
         result: Result<bool, String>,
         now: Instant,
     ) -> bool {
-        if expected.is_some() && expected != current {
+        if expected != current {
             return false;
         }
         if self.target != expected {
@@ -208,10 +215,24 @@ fn on_main<T: Send + 'static>(
     }
 }
 
-fn capture(app: &AppHandle) -> Result<Option<Target>> {
+fn capture(app: &AppHandle, restore_position: bool) -> Result<Option<Target>> {
     let window = app
         .get_webview_window("monitor")
         .context("悬浮条窗口不存在")?;
+    #[cfg(target_os = "windows")]
+    if restore_position && platform::needs_repositioning(&window)? {
+        let controller = app
+            .try_state::<Controller>()
+            .context("悬浮条控制器不存在")?;
+        let node = app
+            .try_state::<crate::ManagedNode>()
+            .context("本机节点不存在")?;
+        // 重新定位后，即使仍是同一块屏幕，也要重新检测后再显示。
+        controller.0.lock().reset_placement();
+        crate::position_monitor_window(&window, &node.runtime).context("恢复悬浮条位置")?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = restore_position;
     platform::capture(&window)
 }
 
@@ -222,7 +243,7 @@ pub(crate) fn start(app: AppHandle, runtime: Arc<NodeRuntime>) -> Result<()> {
             let mut probe = platform::Probe::default();
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 let started = Instant::now();
-                let captured = match on_main(&app, &runtime, capture) {
+                let captured = match on_main(&app, &runtime, |app| capture(app, true)) {
                     Ok(value) => value,
                     Err(error) => {
                         if !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
@@ -243,7 +264,7 @@ pub(crate) fn start(app: AppHandle, runtime: Arc<NodeRuntime>) -> Result<()> {
                         return;
                     };
                     // 拖到另一屏或改变显示布局时，不能应用旧屏幕的检测结果。
-                    let current = capture(app).ok().flatten();
+                    let current = capture(app, false).ok().flatten();
                     let mut state = controller.0.lock();
                     if !state.observe_sample(target, current, result, Instant::now()) {
                         return;
@@ -409,6 +430,32 @@ mod tests {
         assert!(state.fullscreen.suppressed);
         assert!(state.observe_sample(Some(second), Some(second), Ok(false), now));
         assert!(!state.fullscreen.suppressed);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn repositioning_requires_a_fresh_sample_on_the_same_display() {
+        let target = Some(Target {
+            window_id: 1,
+            screen: SCREEN,
+            fullscreen_area: SCREEN,
+            maximized_area: None,
+        });
+        let now = Instant::now();
+        let mut state = Presentation::default();
+        assert!(state.observe_sample(target, target, Ok(false), now));
+        state.applied = Some((true, true));
+
+        state.reset_placement();
+        assert!(state.applied.is_none());
+        assert_eq!(state.fullscreen.presentation(true, true), (false, false));
+        assert!(!state.observe_sample(None, target, Err("窗口原先在屏幕外".into()), now));
+        assert!(state.observe_sample(target, target, Ok(true), now));
+        assert_eq!(state.fullscreen.presentation(true, true), (false, false));
+        assert!(state.observe_sample(target, target, Ok(false), now + SAMPLE_INTERVAL));
+        assert!(state.observe_sample(target, target, Ok(false), now + SAMPLE_INTERVAL * 2));
+        assert_eq!(state.fullscreen.presentation(true, true), (true, true));
+        assert_eq!(state.fullscreen.presentation(false, true), (false, false));
     }
 
     #[test]

@@ -41,7 +41,7 @@ use tauri::tray::{MouseButton, TrayIconEvent};
 use tauri::RunEvent;
 use tauri::{AppHandle, Manager, State};
 #[cfg(not(target_os = "android"))]
-use tauri::{LogicalSize, PhysicalPosition, WindowEvent};
+use tauri::{LogicalSize, PhysicalRect, PhysicalSize, WindowEvent};
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_dialog::DialogExt;
 #[cfg(not(target_os = "android"))]
@@ -278,9 +278,24 @@ fn set_monitor_position(
     if !current_monitor_capabilities(&app).can_persist_position {
         return Err("当前桌面环境不支持保存悬浮条全局坐标".to_string());
     }
+    let position = MonitorPosition { x, y };
+    #[cfg(target_os = "windows")]
+    {
+        let window = app
+            .get_webview_window("monitor")
+            .ok_or_else(|| "悬浮条窗口不存在".to_string())?;
+        let current =
+            windows::fullscreen::on_screen_position(&window).map_err(|error| error.to_string())?;
+        // WebView 会延迟提交移动事件。只保存当前仍在屏幕上的实际位置。
+        if current.as_ref() != Some(&position)
+            || state.runtime.monitor_position().as_ref() == Some(&position)
+        {
+            return Ok(());
+        }
+    }
     state
         .runtime
-        .set_monitor_position(MonitorPosition { x, y })
+        .set_monitor_position(position)
         .map_err(|error| error.to_string())
 }
 
@@ -484,7 +499,7 @@ const MONITOR_WIDTH: f64 = 220.0;
 #[cfg(not(target_os = "android"))]
 const MONITOR_HEIGHT: f64 = 50.0;
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "windows")))]
 fn normalize_monitor_size<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
     if let Err(error) = window.set_size(LogicalSize::new(MONITOR_WIDTH, MONITOR_HEIGHT)) {
         eprintln!("设置监控条尺寸失败：{error}");
@@ -492,8 +507,7 @@ fn normalize_monitor_size<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
 }
 
 #[cfg(not(target_os = "android"))]
-fn point_is_in_work_area(position: &MonitorPosition, monitor: &tauri::Monitor) -> bool {
-    let area = monitor.work_area();
+fn point_is_in_work_area(position: &MonitorPosition, area: &PhysicalRect<i32, u32>) -> bool {
     let left = i64::from(area.position.x);
     let top = i64::from(area.position.y);
     let right = left + i64::from(area.size.width);
@@ -504,98 +518,74 @@ fn point_is_in_work_area(position: &MonitorPosition, monitor: &tauri::Monitor) -
 }
 
 #[cfg(not(target_os = "android"))]
-fn clamp_monitor_position(
-    position: MonitorPosition,
-    monitor: &tauri::Monitor,
-    window_width: i32,
-    window_height: i32,
-) -> MonitorPosition {
-    let area = monitor.work_area();
-    clamp_position_to_work_area(
-        position,
-        area.position.x,
-        area.position.y,
-        area.size.width,
-        area.size.height,
-        window_width,
-        window_height,
-    )
-}
-
-#[cfg(not(target_os = "android"))]
 fn clamp_position_to_work_area(
-    position: MonitorPosition,
-    area_x: i32,
-    area_y: i32,
-    area_width: u32,
-    area_height: u32,
-    window_width: i32,
-    window_height: i32,
+    position: Option<MonitorPosition>,
+    area: &PhysicalRect<i32, u32>,
+    size: PhysicalSize<u32>,
 ) -> MonitorPosition {
-    let left = i64::from(area_x) + i64::from(MONITOR_MARGIN_PX);
-    let top = i64::from(area_y) + i64::from(MONITOR_MARGIN_PX);
-    let right = i64::from(area_x) + i64::from(area_width)
-        - i64::from(window_width)
-        - i64::from(MONITOR_MARGIN_PX);
-    let bottom = i64::from(area_y) + i64::from(area_height)
-        - i64::from(window_height)
-        - i64::from(MONITOR_MARGIN_PX);
+    let margin = i64::from(MONITOR_MARGIN_PX);
+    let (x, y) = (i64::from(area.position.x), i64::from(area.position.y));
+    let left = x + margin;
+    let top = y + margin;
+    let right = (x + i64::from(area.size.width) - i64::from(size.width) - margin).max(left);
+    let bottom = (y + i64::from(area.size.height) - i64::from(size.height) - margin).max(top);
+    let (x, y) = position
+        .map(|position| (i64::from(position.x), i64::from(position.y)))
+        .unwrap_or((right, bottom));
     MonitorPosition {
-        x: position.x.clamp(left as i32, right.max(left) as i32),
-        y: position.y.clamp(top as i32, bottom.max(top) as i32),
+        x: x.clamp(left, right) as i32,
+        y: y.clamp(top, bottom) as i32,
     }
 }
 
 #[cfg(not(target_os = "android"))]
-fn position_monitor_window(window: &tauri::WebviewWindow, runtime: &NodeRuntime) {
+fn position_monitor_window(
+    window: &tauri::WebviewWindow,
+    runtime: &NodeRuntime,
+) -> anyhow::Result<()> {
     if !current_monitor_capabilities(window.app_handle()).can_persist_position {
-        return;
+        return Ok(());
     }
-    let Ok(outer_size) = window.outer_size() else {
-        return;
-    };
-    let window_width = i32::try_from(outer_size.width).unwrap_or(i32::MAX);
-    let window_height = i32::try_from(outer_size.height).unwrap_or(i32::MAX);
-    let Ok(monitors) = window.available_monitors() else {
-        return;
-    };
-    if monitors.is_empty() {
-        return;
-    }
+    let monitors = window.available_monitors()?;
+    let first = monitors.first().context("未找到活动显示器")?;
     let saved = runtime.monitor_position().and_then(|position| {
         monitors
             .iter()
-            .find(|item| point_is_in_work_area(&position, item))
-            .map(|item| (position, item.clone()))
+            .find(|item| point_is_in_work_area(&position, item.work_area()))
+            .map(|item| (Some(position), item.clone()))
     });
     let (position, monitor) = saved.unwrap_or_else(|| {
         let monitor = window
             .primary_monitor()
             .ok()
             .flatten()
-            .unwrap_or_else(|| monitors[0].clone());
-        let area = monitor.work_area();
-        let position = MonitorPosition {
-            x: (i64::from(area.position.x) + i64::from(area.size.width)
-                - i64::from(window_width)
-                - i64::from(MONITOR_MARGIN_PX)) as i32,
-            y: (i64::from(area.position.y) + i64::from(area.size.height)
-                - i64::from(window_height)
-                - i64::from(MONITOR_MARGIN_PX)) as i32,
-        };
-        (position, monitor)
+            .unwrap_or_else(|| first.clone());
+        (None, monitor)
     });
-    let position = clamp_monitor_position(position, &monitor, window_width, window_height);
-    let physical = PhysicalPosition::new(position.x, position.y);
+    let area = monitor.work_area();
+    anyhow::ensure!(
+        area.size.width > 0 && area.size.height > 0,
+        "显示器工作区尚未就绪"
+    );
+    #[cfg(target_os = "windows")]
+    let size = LogicalSize::new(MONITOR_WIDTH, MONITOR_HEIGHT).to_physical(monitor.scale_factor());
+    #[cfg(not(target_os = "windows"))]
+    let size = window.outer_size()?;
+    let position = clamp_position_to_work_area(position, area, size);
+    #[cfg(target_os = "windows")]
+    let position = windows::fullscreen::place_hidden(window, position, size)?;
+    #[cfg(not(target_os = "windows"))]
+    let physical = tauri::PhysicalPosition::new(position.x, position.y);
     #[cfg(target_os = "linux")]
-    let moved = linux::fullscreen::set_initial_position(window, physical);
-    #[cfg(not(target_os = "linux"))]
-    let moved = window.set_position(physical);
-    if moved.is_ok() {
+    linux::fullscreen::set_initial_position(window, physical)?;
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    window.set_position(physical)?;
+    if runtime.monitor_position().as_ref() != Some(&position) {
         if let Err(error) = runtime.set_monitor_position(position) {
-            eprintln!("保存监控条位置失败：{error}");
+            eprintln!("保存悬浮条位置失败：{error}");
         }
     }
+    Ok(())
 }
 
 async fn start_node(
@@ -799,8 +789,11 @@ fn run_desktop() {
             sync_autostart_registration(runtime.as_ref());
             setup_tray_menu(app.handle())?;
             if let Some(window) = monitor_window.as_ref() {
+                #[cfg(not(target_os = "windows"))]
                 normalize_monitor_size(window);
-                position_monitor_window(window, runtime.as_ref());
+                if let Err(error) = position_monitor_window(window, runtime.as_ref()) {
+                    eprintln!("设置悬浮条初始位置失败：{error:#}");
+                }
             }
             monitor::start(app.handle().clone(), runtime.clone())?;
             if let Some(window) = app.get_webview_window("monitor") {
@@ -932,37 +925,69 @@ pub fn cleanup_autostart() {
 mod tests {
     use super::{
         clamp_position_to_work_area, clipboard_sync_toggle_label, monitor_capabilities_for_backend,
-        monitor_lock_toggle_label, monitor_toggle_label, window_toggle_label, MainWindowVisibility,
-        MonitorBackend,
+        monitor_lock_toggle_label, monitor_toggle_label, point_is_in_work_area,
+        window_toggle_label, MainWindowVisibility, MonitorBackend, MONITOR_HEIGHT, MONITOR_WIDTH,
     };
     use crate::autostart::launched_from_args;
     use crate::model::MonitorPosition;
+    use tauri::{LogicalSize, PhysicalPosition, PhysicalRect, PhysicalSize};
 
     #[test]
     fn monitor_position_is_clamped_inside_work_area() {
+        let work_area = PhysicalRect {
+            position: PhysicalPosition::new(0, 0),
+            size: PhysicalSize::new(1920, 1080),
+        };
+        let size = PhysicalSize::new(440, 42);
         assert_eq!(
             clamp_position_to_work_area(
-                MonitorPosition { x: -500, y: -500 },
-                0,
-                0,
-                1920,
-                1080,
-                440,
-                42
+                Some(MonitorPosition { x: -500, y: -500 }),
+                &work_area,
+                size,
             ),
             MonitorPosition { x: 16, y: 16 }
         );
         assert_eq!(
             clamp_position_to_work_area(
-                MonitorPosition { x: 4000, y: 4000 },
-                0,
-                0,
-                1920,
-                1080,
-                440,
-                42
+                Some(MonitorPosition { x: 4000, y: 4000 }),
+                &work_area,
+                size,
             ),
             MonitorPosition { x: 1464, y: 1022 }
+        );
+    }
+
+    #[test]
+    fn monitor_position_preserves_a_negative_display_and_falls_back_at_destination_scale() {
+        let secondary = PhysicalRect {
+            position: PhysicalPosition::new(-1920, -160),
+            size: PhysicalSize::new(1920, 1040),
+        };
+        let primary = PhysicalRect {
+            position: PhysicalPosition::new(0, 0),
+            size: PhysicalSize::new(5120, 2100),
+        };
+        let saved = MonitorPosition { x: -800, y: -50 };
+        let parked = MonitorPosition {
+            x: -32000,
+            y: -32000,
+        };
+        let logical_size = LogicalSize::new(MONITOR_WIDTH, MONITOR_HEIGHT);
+        assert!(point_is_in_work_area(&saved, &secondary));
+        assert!(!point_is_in_work_area(&saved, &primary));
+        assert!(!point_is_in_work_area(&parked, &secondary));
+        assert!(!point_is_in_work_area(&parked, &primary));
+        assert_eq!(
+            clamp_position_to_work_area(
+                Some(saved.clone()),
+                &secondary,
+                logical_size.to_physical(1.5),
+            ),
+            saved,
+        );
+        assert_eq!(
+            clamp_position_to_work_area(None, &primary, logical_size.to_physical(1.25)),
+            MonitorPosition { x: 4829, y: 2021 },
         );
     }
 

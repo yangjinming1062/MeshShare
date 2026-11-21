@@ -1,12 +1,14 @@
+use crate::model::MonitorPosition;
 use crate::monitor::{visible_fullscreen, Rect, Target, Window};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::mem::size_of;
+use tauri::{PhysicalSize, WebviewWindow};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
 use windows_sys::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    ClientToScreen, GetMonitorInfoW, MonitorFromRect, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONULL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetClientRect, GetLayeredWindowAttributes, GetWindowLongW,
@@ -24,9 +26,85 @@ fn rect(value: RECT) -> Rect {
     }
 }
 
-pub(crate) fn set_visible(window: &tauri::WebviewWindow, visible: bool) -> Result<()> {
+struct Placement {
+    bounds: RECT,
+    monitor: HMONITOR,
+}
+
+impl Placement {
+    fn is_on_screen(&self) -> bool {
+        !self.monitor.is_null()
+            && self.bounds.left < self.bounds.right
+            && self.bounds.top < self.bounds.bottom
+    }
+
+    fn position(&self) -> MonitorPosition {
+        MonitorPosition {
+            x: self.bounds.left,
+            y: self.bounds.top,
+        }
+    }
+}
+
+fn placement(hwnd: HWND) -> Result<Option<Placement>> {
+    let mut bounds = RECT::default();
+    // 最小化时的实际矩形是系统临时坐标，等窗口恢复后再判断位置。
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            GetWindowRect(hwnd, &mut bounds) != 0,
+            std::io::Error::last_os_error()
+        );
+        let monitor = MonitorFromRect(&bounds, MONITOR_DEFAULTTONULL);
+        Ok(Some(Placement { bounds, monitor }))
+    }
+}
+
+fn on_screen(hwnd: HWND) -> Result<Placement> {
+    placement(hwnd)?
+        .filter(Placement::is_on_screen)
+        .context("悬浮条尚未位于活动显示器上")
+}
+
+pub(crate) fn needs_repositioning(window: &WebviewWindow) -> Result<bool> {
+    Ok(placement(window.hwnd()?.0 as HWND)?.is_some_and(|placement| !placement.is_on_screen()))
+}
+
+pub(crate) fn on_screen_position(window: &WebviewWindow) -> Result<Option<MonitorPosition>> {
+    Ok(placement(window.hwnd()?.0 as HWND)?
+        .filter(Placement::is_on_screen)
+        .map(|placement| placement.position()))
+}
+
+pub(crate) fn place_hidden(
+    window: &WebviewWindow,
+    position: MonitorPosition,
+    size: PhysicalSize<u32>,
+) -> Result<MonitorPosition> {
+    let hwnd = window.hwnd()?.0 as HWND;
+    let (width, height) = (i32::try_from(size.width)?, i32::try_from(size.height)?);
+    // 切屏后系统可能同时改变窗口尺寸。恢复时保持隐藏，等待新位置的全屏采样。
+    let placed = unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            position.x,
+            position.y,
+            width,
+            height,
+            SWP_HIDEWINDOW | SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+    };
+    anyhow::ensure!(placed != 0, std::io::Error::last_os_error());
+    Ok(on_screen(hwnd)?.position())
+}
+
+pub(crate) fn set_visible(window: &WebviewWindow, visible: bool) -> Result<()> {
     let hwnd = window.hwnd()?.0 as HWND;
     let (insert_after, visibility) = if visible {
+        on_screen(hwnd)?;
         (HWND_TOPMOST, SWP_SHOWWINDOW)
     } else {
         (std::ptr::null_mut(), SWP_HIDEWINDOW | SWP_NOZORDER)
@@ -38,15 +116,15 @@ pub(crate) fn set_visible(window: &tauri::WebviewWindow, visible: bool) -> Resul
     Ok(())
 }
 
-pub(crate) fn capture(window: &tauri::WebviewWindow) -> Result<Option<Target>> {
+pub(crate) fn capture(window: &WebviewWindow) -> Result<Option<Target>> {
     let hwnd = window.hwnd()?.0 as HWND;
+    let monitor = on_screen(hwnd)?.monitor;
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     // HWND 来自仍存活的 Tauri 窗口；输出缓冲区按 Win32 类型和大小初始化。
     unsafe {
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         anyhow::ensure!(
             GetMonitorInfoW(monitor, &mut info) != 0,
             std::io::Error::last_os_error()
