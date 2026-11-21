@@ -22,6 +22,8 @@ use tokio::time::{self, Instant, MissedTickBehavior};
 const SCAN_INTERVAL: Duration = Duration::from_secs(20);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+// Leave time for the CLI status lookup before the next scan.
+const PROBE_ROUND_BUDGET: Duration = Duration::from_secs(16);
 const MAX_CONCURRENT_PROBES: usize = 8;
 const MAX_INFO_BYTES: usize = 128 * 1024;
 
@@ -86,15 +88,11 @@ struct PeerProbe {
 #[derive(Default)]
 struct TailnetDiscovery {
     probes: HashMap<SocketAddrV4, PeerProbe>,
+    last_started: Option<SocketAddrV4>,
 }
 
 impl TailnetDiscovery {
-    async fn refresh(
-        &mut self,
-        runtime: &Arc<NodeRuntime>,
-        client: &reqwest::Client,
-        endpoints: BTreeSet<SocketAddrV4>,
-    ) {
+    fn retain_endpoints(&mut self, runtime: &NodeRuntime, endpoints: &BTreeSet<SocketAddrV4>) {
         self.probes.retain(|address, probe| {
             if endpoints.contains(address) {
                 return true;
@@ -104,8 +102,19 @@ impl TailnetDiscovery {
             }
             false
         });
+    }
+
+    async fn refresh(
+        &mut self,
+        runtime: &Arc<NodeRuntime>,
+        client: &reqwest::Client,
+        endpoints: BTreeSet<SocketAddrV4>,
+        budget: Duration,
+    ) {
         let now = Instant::now();
-        let due: Vec<_> = endpoints
+        let deadline = now + budget;
+        self.retain_endpoints(runtime, &endpoints);
+        let mut due: Vec<_> = endpoints
             .into_iter()
             .filter(|address| {
                 self.probes.get(address).is_none_or(|probe| {
@@ -117,12 +126,24 @@ impl TailnetDiscovery {
                 })
             })
             .collect();
+        if let Some(last_started) = self.last_started {
+            let start = due.partition_point(|address| *address <= last_started);
+            due.rotate_left(start);
+        }
         let own_id = runtime.node_id();
         let own_id = own_id.as_str();
+        // Give every admitted request its full timeout and resume after the last one started.
+        let due = due
+            .into_iter()
+            .take_while(|_| deadline.saturating_duration_since(Instant::now()) >= PROBE_TIMEOUT);
+        let last_started = &mut self.last_started;
         let mut probes = stream::iter(due)
-            .map(|address| async move { (address, probe_node(client, own_id, address).await) })
+            .map(|address| {
+                *last_started = Some(address);
+                async move { (address, probe_node(client, own_id, address).await) }
+            })
             .buffer_unordered(MAX_CONCURRENT_PROBES);
-        while let Some((address, found)) = probes.next().await {
+        while let Ok(Some((address, found))) = time::timeout_at(deadline, probes.next()).await {
             if runtime.stopping.load(Ordering::SeqCst) {
                 break;
             }
@@ -201,10 +222,11 @@ pub(super) async fn discover(runtime: Arc<NodeRuntime>) {
                     .into_iter()
                     .map(|ip| SocketAddrV4::new(ip, DEFAULT_NODE_PORT))
                     .collect(),
+                PROBE_ROUND_BUDGET,
             )
             .await;
     }
-    discovery.refresh(&runtime, &client, BTreeSet::new()).await;
+    discovery.retain_endpoints(&runtime, &BTreeSet::new());
 }
 
 fn probe_client() -> reqwest::Result<reqwest::Client> {
@@ -262,6 +284,13 @@ fn cli_path() -> Option<PathBuf> {
     ));
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let installed: Option<PathBuf> = None;
+    // Finder launches may omit the Homebrew installation directories from PATH.
+    #[cfg(target_os = "macos")]
+    let fallback = ["/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]
+        .into_iter()
+        .map(PathBuf::from);
+    #[cfg(not(target_os = "macos"))]
+    let fallback = std::iter::empty();
     let executable = if cfg!(windows) {
         "tailscale.exe"
     } else {
@@ -271,6 +300,7 @@ fn cli_path() -> Option<PathBuf> {
     installed
         .into_iter()
         .chain(std::env::split_paths(&path).map(|directory| directory.join(executable)))
+        .chain(fallback)
         .find(|candidate| candidate.is_absolute() && candidate.is_file())
 }
 
@@ -346,6 +376,44 @@ mod tests {
             panic!("expected IPv4 listener");
         };
         address
+    }
+
+    #[tokio::test]
+    async fn probe_round_leaves_time_for_status_and_resumes_later_addresses() {
+        let data =
+            std::env::temp_dir().join(format!("meshshare-tailnet-budget-{}", Uuid::new_v4()));
+        let runtime =
+            NodeRuntime::new_with_profile(data.clone(), 0, "test".into(), NodeProfile::Android)
+                .expect("create runtime");
+        let mut listeners = Vec::new();
+        for _ in 0..=MAX_CONCURRENT_PROBES {
+            // Keep these ports open without sending an HTTP response.
+            listeners.push(
+                TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .await
+                    .expect("bind"),
+            );
+        }
+        let endpoints: BTreeSet<_> = listeners.iter().map(listen_address).collect();
+        let last = *endpoints.last().expect("last address");
+        let client = probe_client().expect("probe client");
+        let mut discovery = TailnetDiscovery::default();
+        let one_wave = PROBE_TIMEOUT + Duration::from_secs(1);
+        discovery
+            .refresh(&runtime, &client, endpoints.clone(), one_wave)
+            .await;
+        assert_eq!(discovery.probes.len(), MAX_CONCURRENT_PROBES);
+        assert!(!discovery.probes.contains_key(&last));
+
+        // Once the earlier peers are due again, the remaining peer still gets a turn first.
+        for probe in discovery.probes.values_mut() {
+            probe.retry_at = None;
+        }
+        discovery
+            .refresh(&runtime, &client, endpoints, one_wave)
+            .await;
+        assert!(discovery.probes.contains_key(&last));
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[tokio::test]
@@ -463,6 +531,7 @@ mod tests {
                 &runtime,
                 &probe_client().expect("client"),
                 BTreeSet::from([address]),
+                PROBE_ROUND_BUDGET,
             )
             .await;
         time::timeout(Duration::from_secs(5), disconnected.notified())
@@ -532,7 +601,12 @@ mod tests {
         let client = probe_client().expect("probe client");
         let mut discovery = TailnetDiscovery::default();
         discovery
-            .refresh(&local, &client, BTreeSet::from([address]))
+            .refresh(
+                &local,
+                &client,
+                BTreeSet::from([address]),
+                PROBE_ROUND_BUDGET,
+            )
             .await;
 
         let expected_base = format!("http://{address}");
@@ -542,7 +616,9 @@ mod tests {
         })
         .await;
         assert_eq!(local.peers_snapshot().len(), 1);
-        discovery.refresh(&local, &client, BTreeSet::new()).await;
+        discovery
+            .refresh(&local, &client, BTreeSet::new(), PROBE_ROUND_BUDGET)
+            .await;
         assert_eq!(
             local.peer_http_base(&id).as_deref(),
             Some(expected_base.as_str())
@@ -568,7 +644,12 @@ mod tests {
             .await
         });
         discovery
-            .refresh(&local, &client, BTreeSet::from([address]))
+            .refresh(
+                &local,
+                &client,
+                BTreeSet::from([address]),
+                PROBE_ROUND_BUDGET,
+            )
             .await;
         wait_for("tailnet peer rediscovered", || {
             local.peer_http_base(&id).as_deref() == Some(&expected_base)

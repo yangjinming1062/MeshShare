@@ -125,7 +125,7 @@ Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSW
 2. 确认两端都能访问对方的 MeshShare 监听端口（默认 `TCP 37880`），再验证双向小文件传输。每次传输都由发送端向接收端发起独立的 HTTP 上传请求。
 3. 断开并恢复 Tailscale，确认设备重新上线。回归同一物理局域网下的 mDNS 和手动连接。
 
-Windows、macOS 和 Linux 分别确认安装版能调用本机 Tailscale CLI。
+Windows、macOS 和 Linux 分别确认安装版能调用本机 Tailscale CLI。macOS 从 Finder 启动安装版，分别验证官方客户端和 Homebrew 安装的命令行版本。
 
 ## Wayland 验收
 

@@ -333,7 +333,11 @@ async fn run_peer_session(
     let Ok(WireMessage::Hello { node }) = serde_json::from_str(&body) else {
         return false;
     };
-    if node.node_id != node_id || runtime.stopping.load(Ordering::SeqCst) || !is_candidate() {
+    // An mDNS dial can finish validation when a newer advertisement replaces its address.
+    if node.node_id != node_id
+        || runtime.stopping.load(Ordering::SeqCst)
+        || (endpoint.source != PeerEndpointSource::Mdns && !is_candidate())
+    {
         return false;
     }
     #[cfg(not(target_os = "android"))]
@@ -421,10 +425,15 @@ async fn run_peer_session(
 #[cfg(test)]
 mod tests {
     use super::{dial_peer, normalize_http_base_url, websocket_endpoint};
+    use crate::model::WireMessage;
     use crate::runtime::{NodeProfile, NodeRuntime, PeerEndpoint, PeerEndpointSource};
     use crate::server;
+    use futures_util::{SinkExt, StreamExt};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
     use uuid::Uuid;
 
     #[test]
@@ -465,6 +474,73 @@ mod tests {
         assert!(normalize_http_base_url("http://8.8.8.8").is_err());
         assert!(normalize_http_base_url("http://[::1]").is_err());
         assert!(normalize_http_base_url("http://meshshare.example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn mdns_rediscovery_preserves_a_handshake_in_progress() {
+        let data = std::env::temp_dir().join(format!("meshshare-mdns-hello-{}", Uuid::new_v4()));
+        let runtime =
+            NodeRuntime::new_with_profile(data.clone(), 0, "test".into(), NodeProfile::Android)
+                .expect("create runtime");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind peer");
+        let address = listener.local_addr().expect("peer address");
+        let unavailable = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stale route");
+        let stale_address = unavailable.local_addr().expect("stale address");
+        let working_url = format!("ws://{address}/api/v1/ws");
+        let mut peer = runtime.node_info();
+        peer.node_id = Uuid::new_v4().to_string();
+        peer.port = address.port();
+        let peer_id = peer.node_id.clone();
+        let candidates = runtime
+            .offer_peer_endpoint(
+                &peer_id,
+                PeerEndpoint {
+                    source: PeerEndpointSource::Mdns,
+                    url: working_url.clone(),
+                },
+            )
+            .expect("start dialer");
+        let dialer = tokio::spawn(dial_peer(runtime.clone(), peer_id.clone(), candidates));
+        let mut socket = timeout(Duration::from_secs(5), async {
+            let (stream, _) = listener.accept().await.expect("accept TCP connection");
+            accept_async(stream).await.expect("upgrade WebSocket")
+        })
+        .await
+        .expect("connect to initial address");
+
+        assert!(runtime
+            .offer_peer_endpoint(
+                &peer_id,
+                PeerEndpoint {
+                    source: PeerEndpointSource::Mdns,
+                    url: format!("ws://{stale_address}/api/v1/ws"),
+                },
+            )
+            .is_none());
+        let hello =
+            serde_json::to_string(&WireMessage::Hello { node: peer }).expect("encode hello");
+        socket.send(Message::Text(hello)).await.expect("send hello");
+        let reply = timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("dialer responds to hello");
+        let Some(Ok(Message::Text(body))) = reply else {
+            panic!("expected hello response, got {reply:?}");
+        };
+        let WireMessage::Hello { node } = serde_json::from_str(&body).expect("decode hello") else {
+            panic!("expected a hello message");
+        };
+        assert_eq!(node.node_id, runtime.node_id());
+        assert_eq!(
+            runtime.peer(&peer_id).and_then(|peer| peer.endpoint),
+            Some(working_url)
+        );
+
+        runtime.stopping.store(true, Ordering::SeqCst);
+        dialer.abort();
+        let _ = dialer.await;
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[tokio::test]
