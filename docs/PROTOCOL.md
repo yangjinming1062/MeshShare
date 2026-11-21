@@ -17,7 +17,7 @@
 | `POST` | `/api/v1/settings/update-check` | 让目标节点立即检查更新 |
 | `GET` | `/api/v1/mobile/access` | 网页 HTTP/HTTPS 地址和 CA 指纹 |
 | `GET` | `/api/v1/mobile/ca` | 下载接入节点的本地 CA |
-| `POST` | `/api/v1/peers/connect` | 通过手动地址加入节点 |
+| `POST` | `/api/v1/peers/connect` | 通过手动地址发起连接 |
 
 设置中的 `monitor.visible` 表示保存的用户显示偏好，不表示窗口当前一定可见。全屏自动隐藏仅在桌面壳内临时生效，不修改该字段；全屏期间设置为 `true` 后仍需等全屏条件解除才显示，设置为 `false` 则解除后也不会自动显示。
 
@@ -97,7 +97,7 @@
 
 消息使用 `{ "type": "VariantName", "payload": ... }`，结构以 `backend/src/model.rs` 中的 `WireMessage` 为准。
 
-- `Hello` 携带节点身份、能力和 `protocol_version`；版本不一致不会建立会话。
+- `Hello` 携带节点身份、能力和 `protocol_version`。会话注册要求双方协议版本一致。注册后节点出现在设备列表。
 - `Ping` / `Pong` 用于保活。
 - `ClipboardUpdate` 的 `payload.event` 包含事件 ID、原始来源节点、HLC 和内容。接收端用当前 Peer Channel 确认发送方；多跳转发时来源可以与当前发送方不同。
 - `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新快照，保留原始 `source_node_id`；接收端按 HLC 比较新旧并按事件 ID 去重。

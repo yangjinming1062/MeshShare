@@ -1,26 +1,36 @@
 use crate::model::{NodeInfo, PeerInfo, WireMessage, PROTOCOL_VERSION};
-use crate::runtime::NodeRuntime;
+use crate::runtime::{NodeRuntime, PeerEndpoint, PeerEndpointSource};
 use crate::server;
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, watch};
+use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
+
+#[cfg(not(target_os = "android"))]
+mod tailscale;
+
+type PeerSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 const SERVICE_TYPE: &str = "_meshshare._tcp.local.";
 
 pub fn start(runtime: Arc<NodeRuntime>) {
-    let handle = tokio::runtime::Handle::current();
+    let handle = Handle::current();
+    #[cfg(not(target_os = "android"))]
+    handle.spawn(tailscale::discover(runtime.clone()));
     thread::Builder::new()
         .name("meshshare-mdns".to_string())
         .spawn(move || {
             let mut observed_addresses = crate::runtime::bind_addresses();
             let mut observed_network_rebind_generation = runtime.network_rebind_generation();
-            while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            while !runtime.stopping.load(Ordering::SeqCst) {
                 let Ok(daemon) = ServiceDaemon::new() else {
                     thread::sleep(Duration::from_secs(1));
                     continue;
@@ -35,7 +45,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     continue;
                 };
                 let mut restart = false;
-                while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                while !runtime.stopping.load(Ordering::SeqCst) {
                     // mdns-sd 为每个接口持有一个 socket。
                     // 网络变化（VPN/Wi-Fi）后重建守护进程，
                     // 避免它原有的物理 socket 留在旧的进程网络绑定上。
@@ -72,7 +82,10 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                         // 在 Wi-Fi、VPN 与访客网络之间，mDNS 可见性可能是不对称的。
                         // 因此允许任意一方发起拨号；add_peer_channel 会拒绝重复会话，
                         // 同时发现也能收敛到一条稳定的 WebSocket 通道。
-                        if node_id == node.node_id {
+                        if node_id == node.node_id
+                            || node_id.trim().is_empty()
+                            || node_id.len() > 256
+                        {
                             continue;
                         }
                         let Some(address) = info.get_addresses().iter().find_map(|address| {
@@ -84,16 +97,15 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                             continue;
                         };
                         let endpoint = format!("ws://{}:{}/api/v1/ws", address, info.get_port());
-                        let remote_name = properties
-                            .iter()
-                            .find_map(|item| {
-                                (item.key() == "node_name").then(|| item.val_str().to_string())
-                            })
-                            .unwrap_or_else(|| node_id.clone());
-                        let runtime = runtime.clone();
-                        handle.spawn(async move {
-                            connect_peer(runtime, node_id, remote_name, endpoint).await;
-                        });
+                        queue_peer_connection(
+                            &handle,
+                            &runtime,
+                            node_id,
+                            PeerEndpoint {
+                                source: PeerEndpointSource::Mdns,
+                                url: endpoint,
+                            },
+                        );
                     }
                 }
                 if let Ok(status) = daemon.shutdown() {
@@ -167,52 +179,20 @@ pub async fn connect_manual(
         ));
     }
     let endpoint = websocket_endpoint(&base_url)?;
-    let mut peer = PeerInfo {
-        node_id: node.node_id.clone(),
-        node_name: node.node_name.clone(),
-        platform: node.platform.clone(),
-        addresses: node.addresses.clone(),
-        mobile_addresses: node.mobile_addresses.clone(),
-        capabilities: node.capabilities.clone(),
-        online: true,
-        last_seen_ms: crate::clock::now_millis(),
-        endpoint: Some(endpoint.clone()),
-        source: "manual".to_string(),
-        metrics: None,
-        metrics_received_at_ms: None,
-        metrics_stale: false,
-    };
-    peer.addresses.retain(|address| {
-        address
-            .address
-            .parse::<IpAddr>()
-            .ok()
-            .is_some_and(|address| match address {
-                IpAddr::V4(address) => is_allowed_ipv4(address),
-                IpAddr::V6(_) => false,
-            })
-    });
-    peer.mobile_addresses.retain(|address| {
-        address
-            .url
-            .starts_with(&format!("https://{}:", address.address))
-            && address
-                .address
-                .parse::<IpAddr>()
-                .ok()
-                .is_some_and(|address| match address {
-                    IpAddr::V4(address) => is_allowed_ipv4(address),
-                    IpAddr::V6(_) => false,
-                })
-    });
-    runtime.set_peer(peer.clone());
-    let runtime_for_task = runtime.clone();
-    tokio::spawn(async move {
-        connect_peer(runtime_for_task, node.node_id, node.node_name, endpoint).await;
-    });
-    Ok(peer)
+    let mut peer = server::peer_from_hello(node, &runtime, Some(endpoint.clone()))
+        .ok_or_else(|| "节点信息无效".to_string())?;
+    peer.source = "manual".to_string();
+    queue_peer_connection(
+        &Handle::current(),
+        &runtime,
+        peer.node_id.clone(),
+        PeerEndpoint {
+            source: PeerEndpointSource::Manual,
+            url: endpoint,
+        },
+    );
+    Ok(runtime.peer(&peer.node_id).unwrap_or(peer))
 }
-
 fn normalize_http_base_url(value: &str) -> Result<String, String> {
     let candidate = value
         .trim()
@@ -249,243 +229,199 @@ fn websocket_endpoint(base_url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
-pub(crate) async fn connect_peer(
+fn queue_peer_connection(
+    handle: &Handle,
+    runtime: &Arc<NodeRuntime>,
+    node_id: String,
+    endpoint: PeerEndpoint,
+) {
+    if let Some(candidates) = runtime.offer_peer_endpoint(&node_id, endpoint) {
+        handle.spawn(dial_peer(runtime.clone(), node_id, candidates));
+    }
+}
+
+async fn dial_peer(
     runtime: Arc<NodeRuntime>,
     node_id: String,
-    node_name: String,
-    endpoint: String,
+    mut candidates: watch::Receiver<Vec<PeerEndpoint>>,
 ) {
-    let mut attempt = 0u32;
-    if !runtime.begin_peer_connection(&node_id) {
-        return;
-    }
+    let mut failures = 0u32;
+    let mut last_connected = None;
+    let mut last_connected_mdns = None;
     loop {
-        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
+        let mut endpoints = candidates.borrow_and_update().clone();
+        // A new mDNS advertisement can replace a working address during an active session.
+        endpoints.extend(last_connected_mdns.iter().cloned());
+        if runtime.stopping.load(Ordering::SeqCst) || endpoints.is_empty() {
+            if runtime.retire_peer_dialer(&node_id) {
+                return;
+            }
+            continue;
         }
-        let connected =
-            match tokio::time::timeout(Duration::from_secs(5), connect_async(&endpoint)).await {
-                Ok(Ok((socket, _))) => {
-                    let Some(connected) =
-                        run_peer_session(&runtime, &node_id, &node_name, &endpoint, socket).await
-                    else {
-                        // 另一个 socket 在连接守卫与握手之间赢得了竞态。
-                        // 当前发现任务继续作为观察者存活，
-                        // 以便获胜通道之后消失时能恢复拨号。
-                        // 胜出的 socket 注册时会清掉原来的守卫；
-                        // 因此等待之前要释放所有剩余标记，
-                        // 让本观察者在该 socket 关闭后
-                        // 能够恢复拨号。
-                        runtime.cancel_peer_connection(&node_id);
-                        while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst)
-                            && runtime.has_peer_channel(&node_id)
-                        {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst)
-                            || !runtime.begin_peer_connection(&node_id)
-                        {
-                            return;
-                        }
-                        attempt = 0;
-                        continue;
-                    };
-                    connected
-                }
-                Ok(Err(error)) => {
-                    if attempt < 3 {
-                        eprintln!("连接 {endpoint} 失败：{error}");
-                    }
-                    false
-                }
-                Err(_) => {
-                    if attempt < 3 {
-                        eprintln!("连接 {endpoint} 超时");
-                    }
-                    false
-                }
+        if runtime.has_peer_channel(&node_id) {
+            failures = 0;
+            // An incoming session can win while discovery is in progress.
+            tokio::select! {
+                _ = candidates.changed() => {}
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+            continue;
+        }
+
+        endpoints.sort_by_key(|endpoint| {
+            (
+                last_connected.as_ref() != Some(&endpoint.url),
+                endpoint.source,
+            )
+        });
+        let mut attempted = HashSet::new();
+        let mut connected = false;
+        for endpoint in endpoints {
+            if runtime.stopping.load(Ordering::SeqCst) || runtime.has_peer_channel(&node_id) {
+                break;
+            }
+            let is_candidate = || {
+                last_connected_mdns.as_ref() == Some(&endpoint)
+                    || candidates.borrow().contains(&endpoint)
             };
-        // 连接槽位保留到本任务退出。对端离线期间 mDNS 可能反复解析到它；
-        // 若在休眠之前释放槽位，
-        // 重试退避就会失效。
-        runtime.remove_peer_for_retry(&node_id);
-        if connected {
-            attempt = 0;
+            if !is_candidate() || !attempted.insert(endpoint.url.clone()) {
+                continue;
+            }
+            match tokio::time::timeout(Duration::from_secs(5), connect_async(&endpoint.url)).await {
+                Ok(Ok((socket, _))) => {
+                    if run_peer_session(&runtime, &node_id, &endpoint, is_candidate, socket).await {
+                        if endpoint.source == PeerEndpointSource::Mdns {
+                            last_connected_mdns = Some(endpoint.clone());
+                        }
+                        last_connected = Some(endpoint.url);
+                        connected = true;
+                        break;
+                    }
+                }
+                Ok(Err(error)) if failures < 3 => eprintln!("连接 {} 失败：{error}", endpoint.url),
+                Err(_) if failures < 3 => eprintln!("连接 {} 超时", endpoint.url),
+                _ => {}
+            }
+        }
+        failures = if connected {
+            0
         } else {
-            attempt = attempt.saturating_add(1);
-        }
-        if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        let backoff = 1u64 << attempt.min(5);
+            failures.saturating_add(1)
+        };
+        let backoff = (1u64 << failures.min(5)) * 1_000;
         let jitter = (Uuid::new_v4().as_u128() % 400) as u64;
-        tokio::time::sleep(Duration::from_millis(backoff * 1_000 + jitter)).await;
+        tokio::select! {
+            _ = candidates.changed() => {}
+            _ = tokio::time::sleep(Duration::from_millis(backoff + jitter)) => {}
+        }
     }
-    runtime.cancel_peer_connection(&node_id);
 }
 
 async fn run_peer_session(
     runtime: &Arc<NodeRuntime>,
     node_id: &str,
-    node_name: &str,
-    endpoint: &str,
-    socket: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-) -> Option<bool> {
+    endpoint: &PeerEndpoint,
+    is_candidate: impl FnOnce() -> bool,
+    socket: PeerSocket,
+) -> bool {
     let (mut writer, mut reader) = socket.split();
-    let (tx, mut rx) = mpsc::channel::<WireMessage>(64);
-    if !runtime.add_peer_channel(node_id.to_string(), tx) {
-        return None;
+    let Ok(Some(Ok(Message::Text(body)))) =
+        tokio::time::timeout(Duration::from_secs(10), reader.next()).await
+    else {
+        return false;
+    };
+    let Ok(WireMessage::Hello { node }) = serde_json::from_str(&body) else {
+        return false;
+    };
+    if node.node_id != node_id || runtime.stopping.load(Ordering::SeqCst) || !is_candidate() {
+        return false;
     }
-    // `add_peer_channel` 会清掉握手守卫。
-    // 为拨号方的整个会话重新占住它，
-    // 使断连后 mDNS 无法绕过重连退避。
-    runtime.reserve_peer_connection(node_id);
+    #[cfg(not(target_os = "android"))]
+    if endpoint.source == PeerEndpointSource::Tailscale && !tailscale::is_desktop_node(&node) {
+        return false;
+    }
+    let Some(peer) = server::peer_from_hello(node, runtime, Some(endpoint.url.clone())) else {
+        return false;
+    };
+    let (tx, mut rx) = mpsc::channel::<WireMessage>(64);
+    let Some(_session) = runtime.attach_peer_session(peer, tx) else {
+        return false;
+    };
+    let hello = WireMessage::Hello {
+        node: runtime.node_info(),
+    };
     if !matches!(
         tokio::time::timeout(
             Duration::from_secs(10),
-            writer.send(tokio_tungstenite::tungstenite::Message::Text(
-                serde_json::to_string(&WireMessage::Hello {
-                    node: runtime.node_info(),
-                })
-                .unwrap_or_default(),
+            writer.send(Message::Text(
+                serde_json::to_string(&hello).unwrap_or_default()
             )),
         )
         .await,
         Ok(Ok(()))
     ) {
-        return Some(false);
+        return false;
     }
-    // 手动连接与 mDNS 发现可能已有完整对端信息，拨号成功只更新连接状态。
-    let peer = runtime.peer(node_id).map_or_else(
-        || PeerInfo {
-            node_id: node_id.to_string(),
-            node_name: node_name.to_string(),
-            platform: "unknown".to_string(),
-            addresses: Vec::new(),
-            mobile_addresses: Vec::new(),
-            capabilities: Vec::new(),
-            online: true,
-            last_seen_ms: crate::clock::now_millis(),
-            endpoint: Some(endpoint.to_string()),
-            source: "mdns".to_string(),
-            metrics: None,
-            metrics_received_at_ms: None,
-            metrics_stale: false,
-        },
-        |peer| PeerInfo {
-            online: true,
-            last_seen_ms: crate::clock::now_millis(),
-            endpoint: Some(endpoint.to_string()),
-            ..peer
-        },
-    );
-    runtime.set_peer(peer);
+    server::sync_peer_state(runtime, node_id).await;
+
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
     let mut clipboard_resync = tokio::time::interval(Duration::from_secs(1));
     let mut last_pong = tokio::time::Instant::now();
-    let mut received_hello = false;
-    let handshake_deadline = tokio::time::sleep(Duration::from_secs(10));
-    tokio::pin!(handshake_deadline);
-    loop {
+    while !runtime.stopping.load(Ordering::SeqCst) {
         tokio::select! {
-            _ = &mut handshake_deadline, if !received_hello => break,
-            _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
-                    break;
-                }
-            }
             _ = heartbeat.tick() => {
                 if last_pong.elapsed() > Duration::from_secs(30) {
                     break;
                 }
                 let body = serde_json::to_string(&WireMessage::Ping { at_ms: crate::clock::now_millis() }).unwrap_or_default();
                 if !matches!(
-                    tokio::time::timeout(
-                        Duration::from_secs(10),
-                        writer.send(tokio_tungstenite::tungstenite::Message::Text(body)),
-                    )
-                    .await,
+                    tokio::time::timeout(Duration::from_secs(10), writer.send(Message::Text(body))).await,
                     Ok(Ok(()))
                 ) { break; }
             }
             _ = clipboard_resync.tick() => {
                 let _ = runtime.flush_clipboard_resync(node_id);
-                if received_hello {
-                    let _ = runtime.flush_history_deletions(node_id);
-                }
+                let _ = runtime.flush_history_deletions(node_id);
             }
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break };
                 let Ok(body) = serde_json::to_string(&message) else { break };
                 if !matches!(
-                    tokio::time::timeout(
-                        Duration::from_secs(10),
-                        writer.send(tokio_tungstenite::tungstenite::Message::Text(body)),
-                    )
-                    .await,
+                    tokio::time::timeout(Duration::from_secs(10), writer.send(Message::Text(body))).await,
                     Ok(Ok(()))
                 ) { break; }
             }
             inbound = reader.next() => {
                 match inbound {
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(body))) => {
+                    Some(Ok(Message::Text(body))) => {
                         if let Ok(message) = serde_json::from_str::<WireMessage>(&body) {
-                            if let WireMessage::Hello { node } = &message {
-                                if node.node_id != node_id {
-                                    break;
-                                }
+                            if matches!(message, WireMessage::Pong { .. }) {
+                                last_pong = tokio::time::Instant::now();
                             }
-                            if matches!(message, WireMessage::Pong { .. }) { last_pong = tokio::time::Instant::now(); }
                             let is_hello = matches!(&message, WireMessage::Hello { .. });
-                            let handled =
-                                server::handle_wire_message(message, runtime, Some(node_id)).await;
-                            if is_hello && handled.is_none() {
+                            if server::handle_wire_message(message, runtime, Some(node_id)).await.is_none() && is_hello {
                                 break;
-                            }
-                            if is_hello && !received_hello {
-                                received_hello = true;
-                                if runtime.peer_supports_clipboard(node_id) {
-                                    if let Some(snapshot) = runtime.clipboard_snapshot() {
-                                        let _ = runtime
-                                            .send_to_peer_with_retry(
-                                                node_id,
-                                                WireMessage::ClipboardSnapshot { snapshot },
-                                            )
-                                            .await;
-                                    }
-                                }
-                                server::replay_active_offers(runtime, node_id).await;
-                                // 对端离线期间排队的传输历史删除，在 Hello 之后补发。
-                                let _ = runtime.flush_history_deletions(node_id);
                             }
                         }
                     }
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Ping(payload))) => {
+                    Some(Ok(Message::Ping(payload))) => {
                         if !matches!(
-                            tokio::time::timeout(
-                                Duration::from_secs(10),
-                                writer.send(tokio_tungstenite::tungstenite::Message::Pong(payload)),
-                            )
-                            .await,
+                            tokio::time::timeout(Duration::from_secs(10), writer.send(Message::Pong(payload))).await,
                             Ok(Ok(()))
                         ) { break; }
                     }
-                    Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
                     Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
                 }
             }
         }
     }
-    Some(true)
+    true
 }
-
 #[cfg(test)]
 mod tests {
-    use super::{connect_peer, normalize_http_base_url, websocket_endpoint};
-    use crate::runtime::{NodeProfile, NodeRuntime};
+    use super::{dial_peer, normalize_http_base_url, websocket_endpoint};
+    use crate::runtime::{NodeProfile, NodeRuntime, PeerEndpoint, PeerEndpointSource};
     use crate::server;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -532,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_reconnects_after_server_restart() {
+    async fn peer_reconnects_to_last_working_mdns_address() {
         let server_data =
             std::env::temp_dir().join(format!("meshshare-reconnect-server-{}", Uuid::new_v4()));
         let client_data =
@@ -565,11 +501,20 @@ mod tests {
                 .expect("serve server router");
         });
         let peer_id = server_runtime.node_id();
-        let client_task = tokio::spawn(connect_peer(
+        let working_url = format!("ws://{address}/api/v1/ws");
+        let candidates = client_runtime
+            .offer_peer_endpoint(
+                &peer_id,
+                PeerEndpoint {
+                    source: PeerEndpointSource::Mdns,
+                    url: working_url.clone(),
+                },
+            )
+            .expect("start dialer");
+        let client_task = tokio::spawn(dial_peer(
             client_runtime.clone(),
             peer_id.clone(),
-            "server".to_string(),
-            format!("ws://{address}/api/v1/ws"),
+            candidates,
         ));
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -587,6 +532,23 @@ mod tests {
         })
         .await
         .expect("peer should connect");
+
+        for ip in ["127.0.0.2", "127.0.0.3"] {
+            assert!(client_runtime
+                .offer_peer_endpoint(
+                    &peer_id,
+                    PeerEndpoint {
+                        source: PeerEndpointSource::Mdns,
+                        url: format!("ws://{ip}:{}/api/v1/ws", address.port()),
+                    },
+                )
+                .is_none());
+        }
+
+        assert_eq!(
+            client_runtime.peer(&peer_id).and_then(|peer| peer.endpoint),
+            Some(working_url.clone()),
+        );
 
         client_runtime
             .create_local_clipboard_named(
@@ -641,7 +603,18 @@ mod tests {
             }
         })
         .await
-        .expect("peer should reconnect");
+        .expect("peer should reconnect to the last working mDNS address");
+
+        assert_eq!(
+            client_runtime.peer(&peer_id).and_then(|peer| peer.endpoint),
+            Some(working_url),
+        );
+
+        let peer = super::connect_manual(client_runtime.clone(), format!("http://{address}"))
+            .await
+            .expect("manual connection resolves the same peer");
+        assert_eq!(peer.node_id, peer_id);
+        assert_eq!(client_runtime.peers_snapshot().len(), 1);
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {

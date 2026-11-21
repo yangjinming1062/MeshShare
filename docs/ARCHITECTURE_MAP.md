@@ -4,7 +4,7 @@
 
 ```mermaid
 flowchart LR
-  A["桌面节点 A（Rust + Tauri）"] <-->|mDNS / WebSocket| B["桌面节点 B（Rust + Tauri）"]
+  A["桌面节点 A（Rust + Tauri）"] <-->|mDNS 或 Tailscale 发现 / WebSocket| B["桌面节点 B（Rust + Tauri）"]
   A <-->|HTTP 文件直传| B
   P["网页端浏览器"] -->|HTTP 零安装 / HTTPS 增强| A
   P -.->|文件直传路径| B

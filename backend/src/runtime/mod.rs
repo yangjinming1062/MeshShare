@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -44,7 +44,11 @@ use outgoing::*;
 
 pub(crate) use config::file_modified_ms;
 pub use network::bind_addresses;
-pub(crate) use network::{is_network_ipv4, normalize_peer_http_base};
+#[cfg(not(target_os = "android"))]
+pub(crate) use network::is_tailscale_ipv4;
+pub(crate) use network::{
+    is_network_ipv4, node_http_client, normalize_peer_http_base, PeerEndpoint, PeerEndpointSource,
+};
 pub use outgoing::validate_receive_directory;
 
 fn default_autostart_enabled() -> bool {
@@ -321,7 +325,7 @@ pub struct NodeRuntime {
     seen_events: Mutex<HashMap<String, i64>>,
     peer_channels: Mutex<HashMap<String, mpsc::Sender<WireMessage>>>,
     pending_clipboard_resync: Mutex<HashSet<String>>,
-    connecting_peers: Mutex<HashSet<String>>,
+    peer_dials: Mutex<HashMap<String, watch::Sender<Vec<PeerEndpoint>>>>,
     transfer_locks: Mutex<HashSet<(String, String)>>,
     desktop_temp_files: Mutex<HashSet<PathBuf>>,
     staged_outgoing: Mutex<HashMap<String, StagedOutgoing>>,
@@ -338,6 +342,23 @@ pub struct NodeRuntime {
     transfer_update_gate: Mutex<()>,
     /// 最近 10 条终态传输的摘要，以及等待对端重连后补发的删除。
     transfer_history: Mutex<TransferHistoryStore>,
+}
+
+pub(crate) struct PeerSession<'a> {
+    runtime: &'a NodeRuntime,
+    node_id: String,
+}
+
+impl PeerSession<'_> {
+    pub(crate) fn node_id(&self) -> &str {
+        &self.node_id
+    }
+}
+
+impl Drop for PeerSession<'_> {
+    fn drop(&mut self) {
+        self.runtime.remove_peer(&self.node_id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -615,7 +636,7 @@ impl NodeRuntime {
             seen_events: Mutex::new(HashMap::new()),
             peer_channels: Mutex::new(HashMap::new()),
             pending_clipboard_resync: Mutex::new(HashSet::new()),
-            connecting_peers: Mutex::new(HashSet::new()),
+            peer_dials: Mutex::new(HashMap::new()),
             transfer_locks: Mutex::new(HashSet::new()),
             desktop_temp_files: Mutex::new(desktop_temp_files),
             staged_outgoing: Mutex::new(HashMap::new()),
@@ -625,18 +646,15 @@ impl NodeRuntime {
             sync_enabled: AtomicBool::new(true),
             stopping: AtomicBool::new(false),
             update_installing: AtomicBool::new(false),
-            http: reqwest::Client::builder()
+            http: node_http_client()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .timeout(std::time::Duration::from_secs(15))
-                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
-            proxy_http: reqwest::Client::builder()
+            proxy_http: node_http_client()
                 .connect_timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
-            upload_http: reqwest::Client::builder()
+            upload_http: node_http_client()
                 .connect_timeout(std::time::Duration::from_secs(8))
-                .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             transfer_update_gate: Mutex::new(()),
         }))
@@ -886,13 +904,13 @@ impl NodeRuntime {
         self.events.subscribe()
     }
 
+    #[cfg(test)]
     pub fn add_peer_channel(&self, node_id: String, channel: mpsc::Sender<WireMessage>) -> bool {
         let mut channels = self.peer_channels.lock();
         if channels.contains_key(&node_id) {
             return false;
         }
-        channels.insert(node_id.clone(), channel);
-        self.connecting_peers.lock().remove(&node_id);
+        channels.insert(node_id, channel);
         true
     }
 
@@ -900,39 +918,28 @@ impl NodeRuntime {
         self.peer_channels.lock().contains_key(node_id)
     }
 
-    pub fn remove_peer_channel(&self, node_id: &str) {
-        self.peer_channels.lock().remove(node_id);
-        self.connecting_peers.lock().remove(node_id);
-        self.pending_clipboard_resync.lock().remove(node_id);
-    }
-
-    /// 移除拨号方当前的通道，同时保留其连接槽位。
-    ///
-    /// 发现任务在重连退避期间持有该槽位。
-    /// 保持占用可防止一波 mDNS 解析同时开出多个并行 socket，
-    /// 绕过断连后的指数重试延迟。
-    pub fn remove_peer_for_retry(&self, node_id: &str) {
-        self.peers.write().remove(node_id);
-        self.peer_channels.lock().remove(node_id);
-        self.pending_clipboard_resync.lock().remove(node_id);
-        self.connecting_peers.lock().insert(node_id.to_string());
-    }
-
-    pub fn cancel_peer_connection(&self, node_id: &str) {
-        self.connecting_peers.lock().remove(node_id);
-    }
-
-    pub fn begin_peer_connection(&self, node_id: &str) -> bool {
-        let channels = self.peer_channels.lock();
-        if channels.contains_key(node_id) {
-            return false;
+    pub(crate) fn attach_peer_session(
+        &self,
+        peer: PeerInfo,
+        channel: mpsc::Sender<WireMessage>,
+    ) -> Option<PeerSession<'_>> {
+        let node_id = peer.node_id.clone();
+        {
+            let mut peers = self.peers.write();
+            let mut channels = self.peer_channels.lock();
+            if channels.contains_key(&node_id) {
+                return None;
+            }
+            channels.insert(node_id.clone(), channel);
+            peers.insert(node_id.clone(), peer);
         }
-        drop(channels);
-        self.connecting_peers.lock().insert(node_id.to_string())
-    }
-
-    pub fn reserve_peer_connection(&self, node_id: &str) {
-        self.connecting_peers.lock().insert(node_id.to_string());
+        self.publish_event(WireMessage::Hello {
+            node: self.node_info(),
+        });
+        Some(PeerSession {
+            runtime: self,
+            node_id,
+        })
     }
 
     pub fn send_to_peer(&self, node_id: &str, message: WireMessage) -> bool {
@@ -1056,9 +1063,12 @@ impl NodeRuntime {
         });
     }
 
-    pub fn remove_peer(&self, node_id: &str) {
-        self.peers.write().remove(node_id);
-        self.remove_peer_channel(node_id);
+    fn remove_peer(&self, node_id: &str) {
+        let mut peers = self.peers.write();
+        let mut channels = self.peer_channels.lock();
+        self.pending_clipboard_resync.lock().remove(node_id);
+        channels.remove(node_id);
+        peers.remove(node_id);
     }
 
     pub fn touch_peer(&self, node_id: &str) {
@@ -3937,8 +3947,8 @@ mod tests {
         is_cellular_interface, is_placeholder_node_name, load_or_create_config,
         load_or_create_config_with_hostname, mobile_ca_url, network_addresses,
         network_addresses_for_bound, prune_clipboard_history_records_with_limit, sync_node_name,
-        valid_history_delete_ids, NodeProfile, NodeRuntime, UpdateFrequency,
-        CLIPBOARD_HISTORY_FILE, CLIPBOARD_PAYLOAD_DIR, DESKTOP_TEMP_REGISTRY_FILE,
+        valid_history_delete_ids, NodeProfile, NodeRuntime, PeerEndpoint, PeerEndpointSource,
+        UpdateFrequency, CLIPBOARD_HISTORY_FILE, CLIPBOARD_PAYLOAD_DIR, DESKTOP_TEMP_REGISTRY_FILE,
         MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACCEPTED_IDLE_TIMEOUT_MS,
         TRANSFER_ACTIVITY_TIMEOUT_MS, TRANSFER_HISTORY_FILE, TRANSFER_HISTORY_LIMIT,
     };
@@ -5657,32 +5667,53 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_connection_guard_can_be_released_after_handshake_race() {
+    fn duplicate_discovery_keeps_one_dialer_and_updates_its_candidates() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        assert!(runtime.begin_peer_connection("peer"));
-        assert!(!runtime.begin_peer_connection("peer"));
-        runtime.cancel_peer_connection("peer");
-        assert!(runtime.begin_peer_connection("peer"));
+        let mdns = PeerEndpoint {
+            source: PeerEndpointSource::Mdns,
+            url: "ws://192.168.1.20:37880/api/v1/ws".to_string(),
+        };
+        let candidates = runtime
+            .offer_peer_endpoint("peer", mdns.clone())
+            .expect("dialer");
+        assert!(runtime.offer_peer_endpoint("peer", mdns.clone()).is_none());
+        assert!(!candidates.has_changed().expect("dialer still registered"));
+        let manual = PeerEndpoint {
+            source: PeerEndpointSource::Manual,
+            url: "ws://100.64.0.20:37880/api/v1/ws".to_string(),
+        };
+        assert!(runtime
+            .offer_peer_endpoint("peer", manual.clone())
+            .is_none());
+        assert_eq!(&*candidates.borrow(), &[mdns, manual]);
+        assert!(!runtime.retire_peer_dialer("peer"));
         let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]
-    fn retry_cleanup_keeps_connection_slot_reserved_until_backoff_ends() {
+    fn competing_peer_session_preserves_the_active_endpoint() {
         let path = temp_data_dir();
         let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
             .expect("create runtime");
-        assert!(runtime.begin_peer_connection("peer"));
-        let (tx, _rx) = mpsc::channel(1);
-        assert!(runtime.add_peer_channel("peer".to_string(), tx));
-
-        runtime.remove_peer_for_retry("peer");
-
+        let mut first = test_peer("peer", Vec::new());
+        first.endpoint = Some("ws://100.64.0.20:37880/api/v1/ws".to_string());
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        let session = runtime
+            .attach_peer_session(first.clone(), first_tx)
+            .expect("first session");
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        assert!(runtime
+            .attach_peer_session(test_peer("peer", Vec::new()), second_tx)
+            .is_none());
+        assert_eq!(
+            runtime.peer("peer").expect("active peer").endpoint,
+            first.endpoint
+        );
+        drop(session);
         assert!(!runtime.has_peer_channel("peer"));
-        assert!(!runtime.begin_peer_connection("peer"));
-        runtime.cancel_peer_connection("peer");
-        assert!(runtime.begin_peer_connection("peer"));
+        assert!(runtime.peer("peer").is_none());
         let _ = std::fs::remove_dir_all(path);
     }
 

@@ -47,6 +47,8 @@ use tauri_plugin_dialog::DialogExt;
 #[cfg(not(target_os = "android"))]
 use updater::UpdateCoordinator;
 
+const DEFAULT_NODE_PORT: u16 = 37880;
+
 #[derive(Clone)]
 struct ManagedNode {
     runtime: Arc<NodeRuntime>,
@@ -605,7 +607,7 @@ async fn start_node(
     let preferred_port = std::env::var("MESHSHARE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(37880u16);
+        .unwrap_or(DEFAULT_NODE_PORT);
     let (runtime, control) =
         listeners::start_with_app(data_dir, static_root, version, preferred_port, app).await?;
     let cleanup_runtime = runtime.clone();

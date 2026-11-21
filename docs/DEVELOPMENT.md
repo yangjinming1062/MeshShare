@@ -117,6 +117,16 @@ Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSW
 
 检查检测失败日志不重复刷屏，持续失败解除临时隐藏后仍可通过托盘控制；退出程序后检测线程应停止。纯状态与遮挡回归位于后端模块内，跨平台 CI 验证条件编译；真实全屏、窗口管理器和硬件组合仍须在目标平台手工验收，不能用静态检查替代。
 
+## Tailscale 发现验收
+
+让两台桌面节点使用不同物理网络并接入同一 Tailscale 组网。
+
+1. 至少允许一端访问对端的 `TCP 37880`。确认双方的「在线设备」各显示对端一次，并验证双向剪贴板同步。
+2. 确认两端都能访问对方的 MeshShare 监听端口（默认 `TCP 37880`），再验证双向小文件传输。每次传输都由发送端向接收端发起独立的 HTTP 上传请求。
+3. 断开并恢复 Tailscale，确认设备重新上线。回归同一物理局域网下的 mDNS 和手动连接。
+
+Windows、macOS 和 Linux 分别确认安装版能调用本机 Tailscale CLI。
+
 ## Wayland 验收
 
 在 Ubuntu GNOME Wayland 会话确认 `loginctl show-session <id> -p Type` 返回 `Type=wayland`，记录 `WAYLAND_DISPLAY`、`DISPLAY` 和 Xwayland 状态。验证文字与 PNG 剪贴板的自动读取、远端写入、历史恢复、手动同步，以及悬浮条的拖动、隐藏和托盘恢复。

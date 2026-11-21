@@ -1,12 +1,93 @@
 use super::*;
 use std::net::{IpAddr, Ipv4Addr};
 
-pub(super) fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
+pub(crate) fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
     (u32::from(address) & 0xffc00000) == 0x64400000
 }
 
 pub(crate) fn is_network_ipv4(address: Ipv4Addr) -> bool {
     address.is_private() || address.is_link_local() || is_tailscale_ipv4(address)
+}
+
+pub(crate) fn node_http_client() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PeerEndpointSource {
+    Manual,
+    Mdns,
+    #[cfg(not(target_os = "android"))]
+    Tailscale,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeerEndpoint {
+    pub source: PeerEndpointSource,
+    pub url: String,
+}
+
+impl NodeRuntime {
+    /// The first endpoint starts a dialer. Later candidates update its watch channel.
+    pub(crate) fn offer_peer_endpoint(
+        &self,
+        node_id: &str,
+        endpoint: PeerEndpoint,
+    ) -> Option<watch::Receiver<Vec<PeerEndpoint>>> {
+        let mut dials = self.peer_dials.lock();
+        if self.stopping.load(Ordering::SeqCst) {
+            return None;
+        }
+        if let Some(sender) = dials.get(node_id).filter(|sender| !sender.is_closed()) {
+            sender.send_if_modified(|endpoints| {
+                if endpoints.contains(&endpoint) {
+                    return false;
+                }
+                if matches!(
+                    endpoint.source,
+                    PeerEndpointSource::Manual | PeerEndpointSource::Mdns
+                ) {
+                    endpoints.retain(|previous| previous.source != endpoint.source);
+                }
+                endpoints.push(endpoint);
+                true
+            });
+            return None;
+        }
+        let (sender, receiver) = watch::channel(vec![endpoint]);
+        dials.insert(node_id.to_string(), sender);
+        Some(receiver)
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn forget_tailscale_endpoint(&self, node_id: &str, url: &str) {
+        if let Some(sender) = self.peer_dials.lock().get(node_id) {
+            sender.send_if_modified(|endpoints| {
+                let count = endpoints.len();
+                endpoints.retain(|endpoint| {
+                    endpoint.source != PeerEndpointSource::Tailscale || endpoint.url != url
+                });
+                endpoints.len() != count
+            });
+        }
+    }
+
+    /// Retiring under the registration lock lets a concurrent discovery reuse the dialer
+    /// or start its replacement, even if it arrives just as the last candidate expires.
+    pub(crate) fn retire_peer_dialer(&self, node_id: &str) -> bool {
+        let mut dials = self.peer_dials.lock();
+        if !self.stopping.load(Ordering::SeqCst)
+            && dials
+                .get(node_id)
+                .is_some_and(|sender| !sender.borrow().is_empty())
+        {
+            return false;
+        }
+        dials.remove(node_id);
+        true
+    }
 }
 
 pub(crate) fn normalize_peer_http_base(raw: &str) -> Option<String> {

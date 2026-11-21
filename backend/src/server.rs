@@ -10,7 +10,7 @@ use crate::model::{
 };
 use crate::runtime::{
     valid_history_delete_ids, validate_receive_directory, NodeRuntime, OutgoingPrepareView,
-    TransferRetryError, TRANSFER_PROGRESS_INTERVAL, UPDATE_INSTALLING_MESSAGE,
+    PeerSession, TransferRetryError, TRANSFER_PROGRESS_INTERVAL, UPDATE_INSTALLING_MESSAGE,
 };
 use axum::body::Body;
 use axum::extract::{
@@ -894,8 +894,7 @@ async fn handle_socket(
     ) {
         return;
     }
-    let mut peer_id: Option<String> = None;
-    let mut owns_peer_channel = false;
+    let mut peer_session = None;
     let mut ui_client = false;
     let mut clipboard_resync = tokio::time::interval(std::time::Duration::from_secs(1));
     // 客户端必须尽快表明身份。未认证的连接一旦保留，
@@ -905,83 +904,48 @@ async fn handle_socket(
     tokio::pin!(handshake_deadline);
 
     loop {
+        let peer_id = peer_session.as_ref().map(PeerSession::node_id);
         tokio::select! {
             _ = &mut handshake_deadline, if peer_id.is_none() && !ui_client => break,
             incoming = receiver.next() => {
                 match incoming {
                     Some(Ok(axum::extract::ws::Message::Text(text))) => {
-                        match serde_json::from_str::<WireMessage>(&text) {
-                            Ok(message) => {
-                                if let WireMessage::Ping { at_ms } = &message {
-                                    if peer_id.is_none() {
-                                        // 浏览器客户端不会以对端节点身份注册。
-                                        // 它的应用层心跳仍需要应答，
-                                        // 同时必须避免握手截止时间
-                                        // 把这个 UI 通道关闭。
-                                        ui_client = true;
-                                        let pong = serde_json::to_string(
-                                            &WireMessage::Pong { at_ms: *at_ms },
-                                        )
-                                        .unwrap_or_default();
-                                        if !matches!(
-                                            tokio::time::timeout(
-                                                Duration::from_secs(10),
-                                                sender.send(
-                                                    axum::extract::ws::Message::Text(pong),
-                                                ),
-                                            )
-                                            .await,
-                                            Ok(Ok(()))
-                                        ) {
-                                            break;
-                                        }
-                                        continue;
-                                    }
-                                }
-                                if let WireMessage::Hello { node } = &message {
-                                    if peer_id
-                                        .as_deref()
-                                        .is_some_and(|current| current != node.node_id)
-                                    {
-                                        break;
-                                    }
-                                }
-                                let is_hello = matches!(&message, WireMessage::Hello { .. });
-                                let identified = handle_wire_message_with_endpoint(
-                                    message,
-                                    &runtime,
-                                    peer_id.as_deref(),
-                                    remote_address,
-                                )
-                                .await;
-                                if is_hello && identified.is_none() {
+                        let Ok(message) = serde_json::from_str::<WireMessage>(&text) else {
+                            break;
+                        };
+                        match message {
+                            WireMessage::Ping { at_ms } if peer_id.is_none() => {
+                                // UI 通道用 Ping 表明身份，并继续接收本地事件。
+                                ui_client = true;
+                                let pong = serde_json::to_string(&WireMessage::Pong { at_ms })
+                                    .unwrap_or_default();
+                                if !matches!(
+                                    tokio::time::timeout(
+                                        Duration::from_secs(10),
+                                        sender.send(axum::extract::ws::Message::Text(pong)),
+                                    )
+                                    .await,
+                                    Ok(Ok(()))
+                                ) {
                                     break;
                                 }
-                                if let Some(identified) = identified {
-                                    match peer_id.as_deref() {
-                                        None => {
-                                            if !runtime.add_peer_channel(identified.clone(), outgoing_tx.clone()) {
-                                                break;
-                                            }
-                                            peer_id = Some(identified.clone());
-                                            owns_peer_channel = true;
-                                            if let Some(snapshot) = runtime.clipboard_snapshot() {
-                                                let _ = runtime
-                                                    .send_to_peer_with_retry(
-                                                        &identified,
-                                                        WireMessage::ClipboardSnapshot { snapshot },
-                                                    )
-                                                    .await;
-                                            }
-                                            replay_active_offers(&runtime, &identified).await;
-                                            let _ = runtime.flush_history_deletions(&identified);
-                                        }
-                                        Some(current) if current == identified => {}
-                                        Some(_) => break,
-                                    }
+                            }
+                            WireMessage::Hello { node } if peer_id.is_none() => {
+                                let Some(peer) = incoming_peer_from_hello(node, &runtime, remote_address) else {
+                                    break;
+                                };
+                                let Some(session) = runtime.attach_peer_session(peer, outgoing_tx.clone()) else {
+                                    break;
+                                };
+                                sync_peer_state(&runtime, session.node_id()).await;
+                                peer_session = Some(session);
+                            }
+                            message => {
+                                let is_hello = matches!(&message, WireMessage::Hello { .. });
+                                if handle_wire_message(message, &runtime, peer_id).await.is_none() && is_hello {
+                                    break;
                                 }
                             }
-                            Err(_) => break,
                         }
                     }
                     Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
@@ -1007,7 +971,7 @@ async fn handle_socket(
                 if runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
-                if let Some(peer_id) = peer_id.as_deref() {
+                if let Some(peer_id) = peer_id {
                     if runtime
                         .peers
                         .read()
@@ -1045,11 +1009,6 @@ async fn handle_socket(
             }
         }
     }
-    if owns_peer_channel {
-        if let Some(peer_id) = peer_id {
-            runtime.remove_peer(&peer_id);
-        }
-    }
 }
 
 /// 接受远端剪贴板内容。能写系统剪贴板的节点同时向其他对端转发，只读节点仅更新本地快照。
@@ -1074,80 +1033,91 @@ fn accept_remote_clipboard(
     }
 }
 
+fn incoming_peer_from_hello(
+    node: NodeInfo,
+    runtime: &NodeRuntime,
+    remote_address: Option<SocketAddr>,
+) -> Option<PeerInfo> {
+    let endpoint = remote_address
+        .filter(|address| is_allowed_peer_address(address.ip()))
+        .map(|address| format!("http://{}:{}/api/v1/ws", address.ip(), node.port));
+    peer_from_hello(node, runtime, endpoint)
+}
+
+pub(crate) fn peer_from_hello(
+    node: NodeInfo,
+    runtime: &NodeRuntime,
+    endpoint: Option<String>,
+) -> Option<PeerInfo> {
+    if !validate_node_info(&node)
+        || node.node_id == runtime.node_id()
+        || node.protocol_version != crate::model::PROTOCOL_VERSION
+    {
+        return None;
+    }
+    let mobile_addresses = node.mobile_addresses;
+    let addresses = node
+        .addresses
+        .into_iter()
+        .filter_map(|mut address| {
+            is_allowed_advertised_address(&address).then(|| {
+                address.url = format!("http://{}:{}", address.address, node.port);
+                address
+            })
+        })
+        .collect::<Vec<_>>();
+    let endpoint = endpoint.or_else(|| {
+        addresses
+            .first()
+            .map(|address| format!("{}/api/v1/ws", address.url))
+    });
+    Some(PeerInfo {
+        node_id: node.node_id,
+        node_name: node.node_name,
+        platform: node.platform,
+        addresses,
+        mobile_addresses,
+        capabilities: node.capabilities,
+        online: true,
+        last_seen_ms: crate::clock::now_millis(),
+        endpoint,
+        source: "websocket".to_string(),
+        metrics: None,
+        metrics_received_at_ms: None,
+        metrics_stale: false,
+    })
+}
+
+pub(crate) async fn sync_peer_state(runtime: &Arc<NodeRuntime>, node_id: &str) {
+    if let Some(snapshot) = runtime.clipboard_snapshot() {
+        let _ = runtime
+            .send_to_peer_with_retry(node_id, WireMessage::ClipboardSnapshot { snapshot })
+            .await;
+    }
+    replay_active_offers(runtime, node_id).await;
+    let _ = runtime.flush_history_deletions(node_id);
+}
+
 pub(crate) async fn handle_wire_message(
     message: WireMessage,
     runtime: &Arc<NodeRuntime>,
     current_peer: Option<&str>,
-) -> Option<String> {
-    handle_wire_message_with_endpoint(message, runtime, current_peer, None).await
-}
-
-async fn handle_wire_message_with_endpoint(
-    message: WireMessage,
-    runtime: &Arc<NodeRuntime>,
-    current_peer: Option<&str>,
-    remote_address: Option<SocketAddr>,
 ) -> Option<String> {
     if let Some(peer_id) = current_peer {
         runtime.touch_peer(peer_id);
     }
     match message {
         WireMessage::Hello { node } => {
-            if !validate_node_info(&node) || node.node_id == runtime.node_id() {
+            if current_peer.map_or_else(
+                || runtime.has_peer_channel(&node.node_id),
+                |peer_id| peer_id != node.node_id,
+            ) {
                 return None;
             }
-            if node.protocol_version != crate::model::PROTOCOL_VERSION {
-                return None;
-            }
-            // 先拒绝重复的入站连接，再更新对端元数据；
-            // 已有通道仍是唯一权威来源。
-            if current_peer.is_none() && runtime.has_peer_channel(&node.node_id) {
-                return None;
-            }
-            let mobile_addresses = node
-                .mobile_addresses
-                .into_iter()
-                .filter(|address| {
-                    is_allowed_advertised_address(address)
-                        && address
-                            .url
-                            .starts_with(&format!("https://{}:", address.address))
-                })
-                .collect::<Vec<_>>();
-            let addresses = node
-                .addresses
-                .into_iter()
-                .filter_map(|mut address| {
-                    is_allowed_advertised_address(&address).then(|| {
-                        address.url = format!("http://{}:{}", address.address, node.port);
-                        address
-                    })
-                })
-                .collect::<Vec<_>>();
-            let endpoint = remote_address
-                .filter(|address| is_allowed_peer_address(address.ip()))
-                .map(|address| format!("http://{}:{}/api/v1/ws", address.ip(), node.port))
-                .or_else(|| {
-                    addresses
-                        .first()
-                        .map(|address| format!("{}/api/v1/ws", address.url))
-                });
-            runtime.set_peer(PeerInfo {
-                node_id: node.node_id.clone(),
-                node_name: node.node_name,
-                platform: node.platform,
-                addresses,
-                mobile_addresses,
-                capabilities: node.capabilities,
-                online: true,
-                last_seen_ms: crate::clock::now_millis(),
-                endpoint,
-                source: "websocket".to_string(),
-                metrics: None,
-                metrics_received_at_ms: None,
-                metrics_stale: false,
-            });
-            Some(node.node_id)
+            let peer = peer_from_hello(node, runtime, None)?;
+            let node_id = peer.node_id.clone();
+            runtime.set_peer(peer);
+            Some(node_id)
         }
         WireMessage::Ping { at_ms } => {
             if let Some(peer_id) = current_peer {
@@ -1533,7 +1503,7 @@ fn validate_metrics(metrics: &HardwareMetrics) -> bool {
         })
 }
 
-fn validate_node_info(node: &NodeInfo) -> bool {
+pub(crate) fn validate_node_info(node: &NodeInfo) -> bool {
     !node.node_id.trim().is_empty()
         && node.node_id.len() <= 256
         && node.node_name.len() <= 256
@@ -3346,8 +3316,8 @@ fn content_disposition_filename(raw: &str) -> (String, String) {
 mod tests {
     use super::{
         content_disposition_filename, encode_path_segment, handle_wire_message,
-        handle_wire_message_with_endpoint, has_parent_component, is_allowed_origin,
-        validate_metrics, validate_offer, MobileSessionRequest, PEER_HANDSHAKE_TIMEOUT,
+        has_parent_component, incoming_peer_from_hello, is_allowed_origin, validate_metrics,
+        validate_offer, MobileSessionRequest, PEER_HANDSHAKE_TIMEOUT,
     };
     use crate::model::{
         ClipboardEvent, ClipboardSnapshot, DiskMetrics, HardwareMetrics, Hlc, NodeInfo, PeerInfo,
@@ -3740,14 +3710,17 @@ mod tests {
         node.node_id = "incoming-peer".to_string();
         node.port = 37880;
         node.addresses.reverse();
-        let identified = handle_wire_message_with_endpoint(
-            WireMessage::Hello { node },
+        let peer = incoming_peer_from_hello(
+            node,
             &runtime,
-            None,
             Some("100.64.0.8:43122".parse().expect("remote socket address")),
         )
-        .await;
-        assert_eq!(identified.as_deref(), Some("incoming-peer"));
+        .expect("valid incoming hello");
+        let (tx, _rx) = mpsc::channel(1);
+        let session = runtime
+            .attach_peer_session(peer, tx)
+            .expect("attach incoming peer");
+        assert_eq!(session.node_id(), "incoming-peer");
         assert_eq!(
             runtime
                 .peers_snapshot()
