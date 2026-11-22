@@ -369,8 +369,15 @@ mod tests {
         #[cfg(unix)]
         let command = CommandBuilder::new("/bin/sh");
         #[cfg(windows)]
-        let command = CommandBuilder::new("cmd.exe");
+        let command = {
+            let mut cmd = CommandBuilder::new("cmd.exe");
+            cmd.arg("/d");
+            cmd.env("MESH_TEST_PREFIX", "MESH_");
+            cmd
+        };
         let mut io = open(command, 80, 24, ()).unwrap();
+        #[cfg(windows)]
+        crate::terminal::tests::wait_for_windows_prompt(&mut io).await;
         io.input
             .send(Input::Resize { cols: 96, rows: 33 })
             .await
@@ -378,7 +385,7 @@ mod tests {
         #[cfg(unix)]
         let script = b"stty size; printf 'MESH_%s\\n' PTY_OK; exit 0\r".as_slice();
         #[cfg(windows)]
-        let script = b"set mark=MESH_\recho %mark%PTY_OK\rexit 0\r".as_slice();
+        let script = b"echo %MESH_TEST_PREFIX%PTY_OK&exit 0\r".as_slice();
         io.input.send(Input::Data(script.to_vec())).await.unwrap();
         let bytes = collect(&mut io).await;
         let output = String::from_utf8_lossy(&bytes);

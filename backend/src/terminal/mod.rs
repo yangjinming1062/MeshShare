@@ -189,6 +189,64 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    // portable-pty 以继承光标模式创建 ConPTY。无界面的测试也要像 xterm 一样
+    // 应答启动查询，等 cmd 或 PowerShell 显示提示符后再发送按键和尺寸。
+    pub(super) async fn wait_for_windows_prompt(io: &mut SessionIo) {
+        let mut seen = Vec::new();
+        let ready = tokio::time::timeout(Duration::from_secs(12), async {
+            while let Some(message) = io.output.recv().await {
+                let bytes = match message {
+                    Output::Data(bytes) => bytes,
+                    Output::Exit { reason } => panic!("shell exited during startup: {reason}"),
+                };
+                for byte in bytes {
+                    seen.push(byte);
+                    let reply: &[u8] = if seen.ends_with(b"\x1b[6n") {
+                        b"\x1b[1;1R"
+                    } else if seen.ends_with(b"\x1b[c") || seen.ends_with(b"\x1b[0c") {
+                        b"\x1b[?1;2c"
+                    } else if byte == b'>' && !seen.ends_with(b"\x1b[>") {
+                        return;
+                    } else {
+                        continue;
+                    };
+                    io.input.send(Input::Data(reply.to_vec())).await.unwrap();
+                }
+            }
+            panic!("terminal output closed during startup");
+        })
+        .await;
+        assert!(
+            ready.is_ok(),
+            "waiting for Windows prompt: {:?}",
+            String::from_utf8_lossy(&seen)
+        );
+    }
+
+    #[tokio::test]
+    async fn headless_windows_terminal_answers_fragmented_startup_queries() {
+        let (input, mut replies) = mpsc::channel(2);
+        let (screen, output) = mpsc::channel(1);
+        let mut io = SessionIo {
+            input,
+            output,
+            cancel: CancellationToken::new(),
+        };
+        let console = async {
+            for chunk in [b"\x1b[".as_slice(), b"6n\x1b", b"[c"] {
+                screen.send(Output::Data(chunk.to_vec())).await.unwrap();
+            }
+            for reply in [b"\x1b[1;1R".as_slice(), b"\x1b[?1;2c"] {
+                assert!(matches!(replies.recv().await, Some(Input::Data(bytes)) if bytes == reply));
+            }
+            screen
+                .send(Output::Data(b"PS C:\\>".to_vec()))
+                .await
+                .unwrap();
+        };
+        tokio::join!(wait_for_windows_prompt(&mut io), console);
+    }
+
     #[tokio::test]
     async fn output_waits_for_its_own_render_acknowledgement() {
         let sessions = TerminalSessions::default();

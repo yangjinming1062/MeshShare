@@ -38,6 +38,8 @@ async fn idle_and_backpressured_shell_survives_until_silent_link_loss() {
     approve(&client.ssh, Direction::Outgoing, &host_key).await;
     approve(&host.ssh, Direction::Incoming, &client_key).await;
     let mut session = opening.await.unwrap().unwrap();
+    #[cfg(windows)]
+    crate::terminal::tests::wait_for_windows_prompt(&mut session).await;
 
     tokio::time::sleep(KEEPALIVE * 6).await;
     assert!(host.update_has_active_work(), "idle shell must stay active");
