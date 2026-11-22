@@ -250,8 +250,14 @@ pub fn router_with_control(
         control,
         static_root,
     };
-    Router::new()
-        .route("/api/v1/info", get(info))
+    let app = Router::new();
+    #[cfg(not(target_os = "android"))]
+    let app = if state.runtime.is_android_profile() {
+        app
+    } else {
+        app.route("/api/v1/terminal/ssh", get(terminal_upgrade))
+    };
+    app.route("/api/v1/info", get(info))
         .route("/api/v1/peers", get(peers))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/settings", get(settings).patch(patch_settings))
@@ -411,6 +417,19 @@ pub fn router_with_control(
         )
         .layer(from_fn(origin_guard))
         .with_state(state)
+}
+
+#[cfg(not(target_os = "android"))]
+async fn terminal_upgrade(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+) -> AxumResponse {
+    state
+        .runtime
+        .ssh
+        .clone()
+        .upgrade(request, state.runtime)
+        .await
 }
 
 async fn origin_guard(request: axum::http::Request<Body>, next: Next) -> AxumResponse {
@@ -3355,6 +3374,37 @@ mod tests {
             "https://evil.example"
         )));
         assert!(!is_allowed_origin(&HeaderValue::from_static("null")));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn terminal_upgrade_rejects_browser_origins_including_localhost() {
+        let dir =
+            std::env::temp_dir().join(format!("meshshare-terminal-origin-{}", Uuid::new_v4()));
+        let runtime = NodeRuntime::new(dir.clone(), 0, "test".into()).unwrap();
+        let state = super::AppState {
+            control: super::ControlPlane::runtime_only(runtime.clone()),
+            runtime,
+            static_root: dir.clone(),
+        };
+        for origin in [
+            "http://localhost",
+            "tauri://localhost",
+            "https://192.168.1.42",
+            "null",
+        ] {
+            let req = Request::builder()
+                .header("Origin", origin)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert_eq!(
+                super::terminal_upgrade(super::State(state.clone()), req)
+                    .await
+                    .status(),
+                super::StatusCode::FORBIDDEN
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

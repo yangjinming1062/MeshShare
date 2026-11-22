@@ -14,6 +14,7 @@
   export let onSend: () => void = () => {};
   export let onSendFolder: () => void = () => {};
   export let onDetails: () => void = () => {};
+  export let onTerminal: (() => void) | null = null;
   export let onOpen: () => void = () => {};
   export let allowFolderSend = true;
   export let onDragOver: () => void = () => {};
@@ -101,6 +102,9 @@
     </button>
   {/if}
   <div class="device-actions">
+    {#if onTerminal}
+      <button type="button" class="btn-icon" aria-label={'打开 ' + name + ' 的终端'} title={'打开 ' + name + ' 的终端'} on:click={onTerminal}><Icon name="terminal" size={16} /></button>
+    {/if}
     <button type="button" class="btn btn-send btn-sm" title="发送文件" on:click={onSend}>
       <Icon name="send" size={13} />
       发送文件

@@ -18,6 +18,8 @@
 | 流式下载、摘要与本地目录保存 | `src/mobileSave.ts`、`src/sha256.ts` |
 | 传输进度与显示格式 | `src/transferProgress.ts`、`src/format.ts` |
 | 历史预览的子序列匹配与排序 | `src/clipboardSearch.ts` |
+| 桌面终端标签与配对 | `src/components/TerminalWorkspace.svelte`、`src/components/TerminalAccess.svelte` |
+| 终端输入输出 | `src/terminal.ts` 每个会话独立排队，通过 `src/terminalNative.ts` 调用本机 IPC。xterm 渲染完数据块后确认序号。 |
 | 图标与共享样式 | `src/icons.ts`、`src/app.css` |
 
-`tests/` 使用 `node:test` 验证纯函数。启动、类型检查、测试与打包命令统一见[开发指南](../docs/DEVELOPMENT.md)。
+`tests/` 使用 `node:test` 验证数据处理与客户端状态。启动、类型检查、测试与打包命令统一见[开发指南](../docs/DEVELOPMENT.md)。

@@ -1,4 +1,5 @@
 export type IconName =
+  | 'terminal'
   | 'monitor'
   | 'phone'
   | 'send'
@@ -18,6 +19,7 @@ export type IconName =
 export const ICON_FILLED: ReadonlySet<IconName> = new Set<IconName>(['github']);
 
 export const ICON_PATHS: Record<IconName, string[]> = {
+  terminal: ['M3 4h18v16H3z', 'm6.5 8 3.5 3.5L6.5 15', 'M12.5 15h4'],
   monitor: [
     'M3.5 5.5A1.5 1.5 0 0 1 5 4h14a1.5 1.5 0 0 1 1.5 1.5v9A1.5 1.5 0 0 1 19 16H5a1.5 1.5 0 0 1-1.5-1.5z',
     'M9 20h6',

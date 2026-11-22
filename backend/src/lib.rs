@@ -20,6 +20,8 @@ mod model;
 mod monitor;
 mod runtime;
 mod server;
+#[cfg(not(target_os = "android"))]
+mod terminal;
 mod updater;
 #[cfg(target_os = "windows")]
 mod windows;
@@ -749,6 +751,15 @@ fn run_desktop() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_page_load(|webview, payload| {
+            if webview.label() == "main"
+                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+            {
+                if let Some(state) = webview.try_state::<ManagedNode>() {
+                    state.runtime.terminals.close_all();
+                }
+            }
+        })
         .setup(|app| {
             let autostart_launch = is_autostart_launch();
             app.manage(monitor::Controller::default());
@@ -843,7 +854,17 @@ fn run_desktop() {
             popup_monitor_menu,
             set_monitor_position,
             links::open_project_page,
-            links::open_transfer_location
+            links::open_transfer_location,
+            terminal::commands::terminal_open,
+            terminal::commands::terminal_close,
+            terminal::commands::terminal_resize,
+            terminal::commands::terminal_write,
+            terminal::commands::terminal_ack,
+            terminal::commands::terminal_settings,
+            terminal::commands::terminal_set_enabled,
+            terminal::commands::terminal_pair,
+            terminal::commands::terminal_decide,
+            terminal::commands::terminal_revoke
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")
@@ -854,6 +875,11 @@ fn run_desktop() {
                         .runtime
                         .stopping
                         .store(true, std::sync::atomic::Ordering::SeqCst);
+                    state.runtime.terminals.close_all();
+                    state.runtime.ssh.shutdown();
+                    if matches!(event, RunEvent::Exit) {
+                        state.runtime.wait_for_terminal_shutdown();
+                    }
                 }
             }
             #[cfg(target_os = "macos")]

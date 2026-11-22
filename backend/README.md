@@ -8,6 +8,7 @@
 - `src/listeners.rs`：按网卡维护 HTTP/HTTPS 监听，网卡增减时重建，HTTPS 证书随地址热更新。
 - `src/discovery.rs` 负责 mDNS 广播与浏览、手动连接和共享拨号。`src/discovery/tailscale.rs` 负责桌面端 Tailscale 客户端查询和对端探测。
 - `src/clipboard.rs`：系统剪贴板读写与 PNG 校验，桌面轮询线程在此启动。
+- `src/terminal/`：桌面伪终端、带流控的主窗口 IPC，以及同端口的 SSH 认证和设备配对。网络接入与界面各自拥有会话，创建前先通过运行时的更新安装检查。
 - `src/metrics.rs`：硬件快照采集；`src/browse.rs`：远程管理目录浏览。
 - `src/monitor.rs`：桌面悬浮条临时显隐、全屏抑制与遮挡判定；各平台的 `fullscreen.rs` 读取原生窗口信息。
 - `src/updater.rs`：桌面更新调度；`src/control.rs`：设置补丁、设置快照与更新服务装配；`src/model.rs`：HTTP 与 WebSocket 共用的数据结构。
@@ -18,6 +19,8 @@
 ## 设置与持久化
 
 新增设置项的链路：`model.rs` 的结构 → `runtime/config.rs` 的 `PersistedConfig` → `control.rs` 的补丁与快照 → 界面读取 `GET /api/v1/settings`。只在本机生效、不能远程读取的设置（远程文件访问）不进设置快照。
+
+桌面终端授权保存在 `terminal-access.json`，包含开关及两个方向的公钥指纹，由系统凭据库中的设备私钥签名。首次使用默认关闭接入。凭据库锁定时解锁后重试。若设备私钥已丢失或授权文件已损坏，退出应用，将授权文件移到备份位置，重新开启远程终端并配对。
 
 数据目录保存 `node.json`、`clipboard-history.json` 与 payload 目录、`clipboard-current.json`、`transfer-history.json`、`desktop-transfer-temp-files.json`、`mobile-tls/`，Android 另有 `android-update.json`。
 

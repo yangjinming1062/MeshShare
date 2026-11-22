@@ -29,6 +29,7 @@
   export let onHistoryMode: (value: ClipboardHistoryMode) => void = () => {};
   export let onHistoryValue: (value: number) => void = () => {};
   export let onRemoteFileAccess: (value: boolean) => void = () => {};
+  export let onTerminalSettings: () => void = () => {};
   export let onClose: () => void = () => {};
 
   $: historyValue = historySettings.mode === 'count' ? historySettings.count : historySettings.days;
@@ -42,7 +43,7 @@
     <div class="setting">
       <div class="setting-copy">
         <strong>自动更新</strong>
-        <span>只获取 GitHub 稳定版 Release；安装会等待当前文件传输完成，系统包需要本机授权。</span>
+        <span>只获取 GitHub 稳定版 Release；安装会等待文件传输与终端会话结束，系统包需要本机授权。</span>
       </div>
       <div class="setting-actions">
         <div class="segmented" role="radiogroup" aria-label="自动更新检查频率">
@@ -77,6 +78,12 @@
   </div>
 
   {#if localMode}
+    <div class="setting-block">
+      <div class="setting">
+        <div class="setting-copy"><strong>本机终端授权</strong><span>允许指定的桌面设备使用本机终端，可随时撤销。</span></div>
+        <button class="btn btn-sm" type="button" on:click={onTerminalSettings}>管理授权</button>
+      </div>
+    </div>
     <div class="setting-block">
       <div class="setting">
         <div class="setting-copy">

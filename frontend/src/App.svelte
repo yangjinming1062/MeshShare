@@ -12,6 +12,9 @@
   import { mergeTransferProgress } from './transferProgress';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferHistoryLocation, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
+  import TerminalWorkspace from './components/TerminalWorkspace.svelte';
+  import TerminalAccess from './components/TerminalAccess.svelte';
+  import { TERMINAL_CAPABILITY } from './terminal';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
   import HardwarePanel from './components/HardwarePanel.svelte';
@@ -104,6 +107,17 @@
   let monitorLocked = false;
   let monitorVisible = true;
   let settingsOpen = false;
+  let terminalWorkspace: TerminalWorkspace;
+  let terminalVisible = false;
+  let terminalCount = 0;
+  let terminalConnecting = false;
+  let terminalSettingsOpen = false;
+
+  function openPeerTerminal(peer: PeerInfo) {
+    if (!remoteMode && peer.online && peer.capabilities.includes(TERMINAL_CAPABILITY)) {
+      terminalWorkspace.openSession({ peerId: peer.node_id, name: peer.node_name });
+    }
+  }
   let mobileAccessOpen = false;
   // 打开二维码窗口时已知的网页会话；之后出现新会话说明有浏览器临时加入。
   let mobileAccessKnownSessions = new Set<string>();
@@ -2579,6 +2593,9 @@
       onSync={toggleSync}
       onAutostart={toggleAutostart}
       onSettings={() => (settingsOpen = true)}
+      {terminalCount}
+      {terminalVisible}
+      onTerminal={() => { if (terminalVisible) terminalVisible = false; else terminalWorkspace.showWorkspace(); }}
       onOpenProject={openProjectPage}
       onBack={returnToLocal}
       onCopyAddress={copyAccessAddress}
@@ -2586,7 +2603,9 @@
     {#if isDesktopWindow && node && !clipboardStatus.available}
       <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
     {/if}
-    <main class="app-main">
+    <TerminalAccess bind:open={terminalSettingsOpen} connecting={terminalConnecting} peers={remoteMode ? [] : peers} />
+    <TerminalWorkspace bind:this={terminalWorkspace} bind:visible={terminalVisible} bind:count={terminalCount} bind:remoteConnecting={terminalConnecting} />
+    <main class="app-main" hidden={terminalVisible}>
       <DevicePanel
         peers={peers}
         homeNodeId={remoteMode ? localNodeId : ''}
@@ -2600,6 +2619,7 @@
         onConnect={connectManualPeer}
         onConnectSaved={connectSavedPeer}
         onOpenPeer={openRemotePeer}
+        onTerminal={remoteMode ? null : openPeerTerminal}
         onMobileAccess={openMobileAccess}
         onSendPeer={(peer) => startChoose(peer)}
         onSendPeerFolder={(peer) => startChoose(peer, true)}
@@ -2648,6 +2668,7 @@
       onHistoryMode={setClipboardHistoryMode}
       onHistoryValue={setClipboardHistoryValue}
       onRemoteFileAccess={setRemoteFileAccess}
+      onTerminalSettings={() => { settingsOpen = false; terminalSettingsOpen = true; }}
       onClose={() => (settingsOpen = false)}
     />
 

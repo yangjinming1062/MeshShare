@@ -287,13 +287,13 @@ impl UpdateCoordinator {
             None,
         );
 
-        if self.runtime.has_active_transfers() {
+        if self.runtime.update_has_active_work() {
             self.set_status(
                 UpdateState::Deferred,
                 Some(available_version),
                 0,
                 None,
-                Some("等待当前文件传输完成".to_string()),
+                Some("等待活动文件传输和终端会话结束".to_string()),
             );
             return CheckResult::Deferred;
         }
@@ -344,7 +344,7 @@ impl UpdateCoordinator {
                 Some(update.version),
                 0,
                 None,
-                Some("等待当前文件传输完成".to_string()),
+                Some("等待活动文件传输和终端会话结束".to_string()),
             );
             return CheckResult::Deferred;
         };

@@ -12,6 +12,9 @@
   export let settingsReady = false;
   export let settingsDisabled = false;
   export let remote = false;
+  export let terminalCount = 0;
+  export let terminalVisible = false;
+  export let onTerminal: () => void = () => {};
   export let onBack: () => void = () => {};
   export let onSync: () => void = () => {};
   export let onAutostart: () => void = () => {};
@@ -51,6 +54,10 @@
     </div>
   {/if}
   <div class="header-actions">
+    <button type="button" class="btn btn-sm" on:click={onTerminal} aria-pressed={terminalVisible}>
+      <Icon name={terminalVisible ? 'monitor' : 'terminal'} size={16} />
+      {terminalVisible ? '设备概览' : terminalCount ? '终端 · ' + terminalCount : '本机终端'}
+    </button>
     <TogglePill active={syncEnabled} label="自动同步" pressedLabel="同步已暂停" disabled={settingsDisabled} onToggle={onSync} />
     <TogglePill active={autostartEnabled} label="开机自启" pressedLabel="自启已关闭" disabled={settingsDisabled} onToggle={onAutostart} />
     <button type="button" class="btn-icon" aria-label="设置" title="设置" disabled={!settingsReady} on:click={onSettings}>

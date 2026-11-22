@@ -106,6 +106,7 @@ select.field { cursor: pointer; }
 .header-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 
 .app-main { flex: 1; min-height: 0; display: grid; gap: var(--gap); padding: 0 var(--pad) var(--pad); grid-template-columns: minmax(0, 1fr) clamp(320px, 33%, 400px); grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "devices hardware" "devices clipboard" "transfers transfers"; }
+.app-main[hidden] { display: none; }
 .devices-column { grid-area: devices; display: flex; flex-direction: column; gap: 8px; min-height: 0; }
 .device-panel { flex: 0 1 auto; min-height: 0; }
 .panel-footnote { margin: 0; padding: 0 4px; max-width: 46ch; color: var(--muted); font-size: 12px; line-height: 1.55; }

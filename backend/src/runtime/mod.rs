@@ -300,7 +300,30 @@ struct ClipboardState {
     pending_system_write: bool,
 }
 
+#[cfg(not(target_os = "android"))]
+pub(crate) struct TerminalActivity(std::sync::Weak<NodeRuntime>);
+
+#[cfg(not(target_os = "android"))]
+impl Drop for TerminalActivity {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.0.upgrade() {
+            let _gate = runtime.transfer_update_gate.lock();
+            if runtime.terminal_count.fetch_sub(1, Ordering::SeqCst) == 1 {
+                runtime.terminals_stopped.notify_all();
+            }
+        }
+    }
+}
+
 pub struct NodeRuntime {
+    #[cfg(not(target_os = "android"))]
+    pub(crate) ssh: Arc<crate::terminal::ssh::SshService>,
+    #[cfg(not(target_os = "android"))]
+    pub(crate) terminals: crate::terminal::commands::WindowTerminals,
+    #[cfg(not(target_os = "android"))]
+    terminal_count: AtomicU64,
+    #[cfg(not(target_os = "android"))]
+    terminals_stopped: Condvar,
     profile: NodeProfile,
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
@@ -393,6 +416,7 @@ impl NodeProfile {
                 METRICS_NETWORK_CAPABILITY.to_string(),
                 REMOTE_MANAGEMENT_CAPABILITY.to_string(),
                 REMOTE_FILES_CAPABILITY.to_string(),
+                crate::model::TERMINAL_SSH_CAPABILITY.to_string(),
                 TRANSFER_HISTORY_CAPABILITY.to_string(),
             ],
             Self::Android => vec![
@@ -607,6 +631,17 @@ impl NodeRuntime {
         };
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
+            #[cfg(not(target_os = "android"))]
+            ssh: Arc::new(crate::terminal::ssh::SshService::new(
+                data_dir.clone(),
+                node.node_id.clone(),
+            )),
+            #[cfg(not(target_os = "android"))]
+            terminals: Default::default(),
+            #[cfg(not(target_os = "android"))]
+            terminal_count: AtomicU64::new(0),
+            #[cfg(not(target_os = "android"))]
+            terminals_stopped: Condvar::new(),
             profile,
             clock,
             node: RwLock::new(node),
@@ -1494,9 +1529,47 @@ impl NodeRuntime {
                 .any(|record| is_active_transfer(&record.progress.status))
     }
 
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn reserve_terminal(self: &Arc<Self>) -> anyhow::Result<Arc<TerminalActivity>> {
+        let _gate = self.transfer_update_gate.lock();
+        anyhow::ensure!(!self.stopping.load(Ordering::SeqCst), "节点正在退出");
+        anyhow::ensure!(
+            !self.update_installing.load(Ordering::SeqCst),
+            "{}",
+            UPDATE_INSTALLING_MESSAGE
+        );
+        anyhow::ensure!(
+            self.terminal_count.load(Ordering::SeqCst) < 32,
+            "终端会话已满"
+        );
+        self.terminal_count.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(TerminalActivity(Arc::downgrade(self))))
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn wait_for_terminal_shutdown(&self) {
+        let mut gate = self.transfer_update_gate.lock();
+        let wait = self.terminals_stopped.wait_while_for(
+            &mut gate,
+            |_| self.terminal_count.load(Ordering::SeqCst) != 0,
+            Duration::from_secs(5),
+        );
+        if wait.timed_out() {
+            eprintln!("退出时等待终端进程清理超时");
+        }
+    }
+
+    pub(crate) fn update_has_active_work(&self) -> bool {
+        #[cfg(not(target_os = "android"))]
+        if self.terminal_count.load(Ordering::SeqCst) != 0 {
+            return true;
+        }
+        self.has_active_transfers()
+    }
+
     pub fn begin_update_install(&self) -> bool {
         let _update_gate = self.transfer_update_gate.lock();
-        if self.update_installing.load(Ordering::SeqCst) || self.has_active_transfers() {
+        if self.update_installing.load(Ordering::SeqCst) || self.update_has_active_work() {
             return false;
         }
         self.update_installing.store(true, Ordering::SeqCst);
@@ -4614,6 +4687,32 @@ mod tests {
             Some(UpdateFrequency::Disabled)
         );
         assert_eq!(UpdateFrequency::parse("monthly"), None);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn terminal_reservation_and_update_install_exclude_each_other() {
+        let path = temp_data_dir();
+        let runtime = NodeRuntime::new(path.clone(), 0, "test".into()).unwrap();
+        let local = runtime.reserve_terminal().unwrap();
+        let remote = runtime.reserve_terminal().unwrap();
+        assert!(!runtime.begin_update_install());
+        drop(local);
+        assert!(runtime.update_has_active_work());
+        drop(remote);
+        assert!(runtime.begin_update_install());
+        assert!(runtime.reserve_terminal().is_err());
+        runtime.end_update_install();
+        assert!(runtime.reserve_terminal().is_ok());
+        assert!(NodeProfile::Desktop
+            .capabilities()
+            .iter()
+            .any(|item| item == crate::model::TERMINAL_SSH_CAPABILITY));
+        assert!(!NodeProfile::Android
+            .capabilities()
+            .iter()
+            .any(|item| item == crate::model::TERMINAL_SSH_CAPABILITY));
+        std::fs::remove_dir_all(path).unwrap();
     }
 
     #[test]
