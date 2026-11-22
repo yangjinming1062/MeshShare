@@ -4,6 +4,18 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#edf0f5" />
+    <script src="/window.js"></script>
+    <style>
+      html[data-window="monitor"], html[data-window="monitor"] body, html[data-window="monitor"] #app {
+        height: 100%;
+        min-width: 0;
+        margin: 0;
+        overflow: hidden;
+        background: transparent;
+      }
+      /* 开发时只在主窗口显示 Vite 可滚动的错误面板。 */
+      html[data-window="monitor"] vite-error-overlay { display: none; }
+    </style>
     <link rel="icon" href="/meshshare.svg" type="image/svg+xml" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <title>MeshShare · 局域网共享</title>

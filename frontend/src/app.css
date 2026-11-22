@@ -457,12 +457,6 @@ html[data-shell="android"] {
 @media (pointer: coarse) {
   .phone-shell .btn-sm { min-height: 44px; }
 }
-html[data-window="monitor"], html[data-window="monitor"] body, html[data-window="monitor"] #app {
-  min-width: 0;
-  height: 100%;
-  overflow: hidden;
-  background: transparent;
-}
 .monitor-shell { height: 100%; }
 .monitor-main {
   /* 切屏时 WebView 的实际视口可能暂时小于窗口的标称尺寸。 */

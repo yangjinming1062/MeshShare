@@ -27,6 +27,8 @@ npx --yes @tauri-apps/cli@2 icon frontend/public/meshshare.svg --output backend/
 
 ## 启动与构建
 
+开发启动会在运行 Vite 前按前端锁文件补齐依赖，优先使用 npm 本地缓存。
+
 ```bash
 npx --yes @tauri-apps/cli@2 dev -- --locked
 ```
@@ -119,7 +121,7 @@ Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSW
 | Tailscale | 两台桌面分处不同物理网络，验证单向端口可达时发现与双向剪贴板、双向可达时互传文件。断开再连接，不重复列出设备。macOS 从 Finder 启动，分别验证官方与 Homebrew CLI。另测同一 LAN 的 mDNS 与手动连接。 |
 | 桌面终端 | Windows、macOS、Linux 各自验证本机 shell、中文输入、Tab、Ctrl+C、全屏程序和缩放。两台桌面通过 LAN 和 Tailscale 分别配对、重启、再次连接；核对两个并行标签的目录和输入彼此独立，隐藏主窗口不丢会话。验证拒绝配对、换钥、撤销和断网后的远端进程回收，以及活动终端延后更新。 |
 | Android 网络与存储 | 真机验证打开、退出、切换 Wi‑Fi、双向文件校验、两种保存目录及手动剪贴板。普通 VPN 要覆盖先开 VPN 再开 App、运行中切换与两条 `/1` 分流路由；核对发现和监听重建。另测 Tailscale、无物理网络与 VPN lockdown 下的降级。 |
-| Windows / macOS / X11 悬浮条 | 同屏全屏约半秒隐藏，退出约一秒恢复；覆盖另一屏、部分与完全遮挡、最大化、虚拟桌面及启动时已全屏。验证位置、穿透、焦点与手动隐藏偏好；检测失败不刷日志，退出后停止检测。 |
+| Windows / macOS / X11 悬浮条 | 启动及切屏时检查悬浮条无横纵滚动条。开发时前端编译报错应在主窗口可见。同屏全屏约半秒隐藏，退出约一秒恢复；覆盖另一屏、部分与完全遮挡、最大化、虚拟桌面及启动时已全屏。验证位置、穿透、焦点与手动隐藏偏好；检测失败不刷日志，退出后停止检测。 |
 | 多屏与系统差异 | 测负坐标、混合 DPI、断开显示器、跨屏拖动。Windows 从 `(-32000, -32000)` 和运行中离屏恢复，缩放后两行均可见；macOS 覆盖全屏 Space、刘海屏及无预留工作区，不新增权限请求；X11 长时间切换后文件描述符与连接数稳定。 |
 | Wayland | 在 GNOME 用 `loginctl show-session <id> -p Type` 确认会话类型，记录 XWayland 状态。分别测文字、PNG、历史恢复及系统剪贴板不可用时的节点共享；悬浮条可拖动、手动隐藏与托盘恢复，全屏不触发自动隐藏。 |
 | Linux 更新 | 用连续签名版本测试：系统包授权后安装，取消或缺少 polkit 代理时保持待安装，24 小时内不重复请求；手动检查可重试。验证活动传输延后安装、安装期间不接新任务，以及 AppImage 更新。 |

@@ -30,8 +30,7 @@
   import ConfirmDialog from './components/ConfirmDialog.svelte';
   import PromptDialog from './components/PromptDialog.svelte';
 
-  const isMonitor = new URLSearchParams(window.location.search).get('window') === 'monitor';
-  if (isMonitor) document.documentElement.dataset.window = 'monitor';
+  const isMonitor = document.documentElement.dataset.window === 'monitor';
   const inTauri = isTauri();
   const isAndroidApp = inTauri && /Android/i.test(navigator.userAgent);
   // 浏览器访问（根地址或 /mobile）一律渲染网页临时加入界面，Tauri 窗口按窗口类型区分
