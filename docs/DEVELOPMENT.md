@@ -50,17 +50,13 @@ npx --yes @tauri-apps/cli@2 android build --apk --target aarch64
 npx --yes @tauri-apps/cli@2 android build --aab --target aarch64
 ```
 
-`prepare_android_project.py` 把网络适配器、存储插件、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源码在 `backend/android/`。APK 前端以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐了 Svelte 所需的 `String.replaceAll`。发送使用系统文件选择器，接收默认写入应用私有目录，授予「所有文件访问权限」后写入公共 `Download/MeshShare`。
-
-Android 验收覆盖启动与关闭、局域网 HTTP/WS 双向传输与校验、手动剪贴板操作、Wi‑Fi 切换、普通全隧道 VPN（含用 `0.0.0.0/1` 与 `128.0.0.0/1` 代替默认路由的代理类 VPN）在「先开 VPN 再开 App」和「运行中开关」两种顺序下的 mDNS/HTTP/WS 发现、Tailscale 连接、监听器重建和退出清理。VPN lockdown 或无物理网络时记录系统拒绝绑定的降级结果。
+`prepare_android_project.py` 把网络适配器、存储插件、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源码在 `backend/android/`。APK 前端以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐了 Svelte 所需的 `String.replaceAll`。
 
 调试构建产物位于 `backend/target/debug/`：
 
 ```bash
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 ```
-
-开发模式和调试构建不会写入系统登录启动项；调试界面仍显示开关，切换时提示该行为不生效。开机自启需在正式安装包中验证：首次启动默认注册，登录后主窗口隐藏且可从托盘打开，重复启动只激活已有窗口；Windows 还应确认左键双击托盘切换显隐、单击不切换、右键菜单可用。Windows NSIS/MSI 和 Linux deb/rpm 卸载钩子会清理自启动注册。
 
 ## 检查
 
@@ -75,7 +71,7 @@ cargo clippy --manifest-path backend/Cargo.toml --all-targets --all-features --l
 cargo test --manifest-path backend/Cargo.toml --locked
 ```
 
-推送到 `main` 时，[CI 工作流](../.github/workflows/ci.yml) 运行前端检查、构建、Rust 格式与 lint，在 Windows x64、macOS Intel、macOS Apple Silicon 和 Linux x64 上运行回归测试，并构建调试用的 Android APK；Pull Request 不触发，需要本地按上述命令验证。Android 构建由 `.github/scripts/gradle-mirror.init.gradle` 在 `GRADLE_USER_HOME/init.d` 注入 Maven Central 镜像，避免共享 runner 的出口 IP 被限流（HTTP 429），本地构建不加载该脚本。Windows MSVC 的测试宿主会链接 Tauri 的原生对话框 API，因此 `backend/build.rs` 把 Common Controls v6 manifest 嵌入所有可链接目标，并关闭 `tauri-build` 的默认应用 manifest，避免测试宿主在启动前以 `STATUS_ENTRYPOINT_NOT_FOUND` 退出。
+推送到 `main` 时，[CI](../.github/workflows/ci.yml) 在桌面平台运行回归检查，并构建 Android 调试 APK。Pull Request 不触发这套检查，请在本地执行上述命令。
 
 ## 发布
 
@@ -97,11 +93,9 @@ npx --yes @tauri-apps/cli@2 signer generate --write-keys ~/.tauri/meshshare-upda
 
 私钥 Secret 只填文件里的单行 base64 值，不要填路径、密码、URL 编码、引号或命令输出。工作流在构建前校验格式；私钥丢失只能重新生成并同步公钥，已发布版本不会接受新公钥。签名文件只用于构建产物，不进入公开 Release。清单覆盖 NSIS、MSI、macOS `.app` 和 Linux AppImage/deb/rpm，使 updater 能匹配当前安装介质。发布任务在所有安装包上传后解除草稿并保持 prerelease；人工验证后取消 prerelease 才会进入 `releases/latest` 并允许客户端自动更新，已晋级的稳定版不会被重跑覆盖。
 
-macOS 当前使用 ad-hoc 签名，不需要 Apple Developer 账号；工作流以上传前验证 `.app` 签名和 DMG 校验。由于没有公证，首次从浏览器下载后需要用户在「隐私与安全性」中选择「仍要打开」。以后启用 Developer ID 时，需要扩展 `MACOS_SIGNING_MODE` 为证书签名、公证和 stapling，不能把 ad-hoc 包描述为已公证。
+macOS 发布包使用 ad-hoc 签名；发布前校验 `.app` 签名与 DMG 完整性，不声明已公证。
 
-Linux 系统包由 `pkexec` 调用 `dpkg -i` 或 `rpm -U`，授权对话框由 polkit 弹出。验收时确认：授权后安装并重启到新版本；取消授权或无授权代理时显示「待安装」并在 24 小时内不重复请求，点「立即检查」可立即重试；有传输时先等传输完成，安装窗口内的新请求提示稍后重试。AppImage 首次运行前需要 `chmod +x`，系统包版本运行时先退出托盘，否则只会激活已有窗口。端到端授权更新要求两个连续的签名版本，不能在本机用未签名测试包替代。
-
-Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS` 和 `ANDROID_KEY_PASSWORD`，缺任一都会使 job 失败并阻止发布。构建先用 `apksigner` 校验，再用 `aapt2 dump badging` 核对包名 `com.meshshare.android`、arm64、`versionName` 和 `versionCode`，并在 `latest.json` 的 `android` 字段记录 `size`、`sha256` 和 `version_code`。`versionCode` 为 `major * 1000000 + minor * 1000 + patch`，同一更新链使用同一发布证书。晋级稳定版前，用同一测试密钥签名的两个递增版本验证覆盖安装：Android 10/11 确认系统弹窗，Android 12 及以上确认免确认与回退路径；复查数据保留、活跃传输延后、取消或拒绝授权后的恢复、计费网络、断网重试，以及错误签名或版本被拒绝。
+Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS` 和 `ANDROID_KEY_PASSWORD`，缺任一都会使 job 失败并阻止发布。构建先用 `apksigner` 校验，再用 `aapt2 dump badging` 核对包名 `com.meshshare.android`、arm64、`versionName` 和 `versionCode`，并在 `latest.json` 的 `android` 字段记录 `size`、`sha256` 和 `version_code`。`versionCode` 为 `major * 1000000 + minor * 1000 + patch`，同一更新链使用同一发布证书。
 
 重跑失败任务会沿用原提交和已构建的安装包。修复发布工作流或脚本时，需要推送指向修复提交的新版本 tag。若报告存在额外附件，先在对应 Release 清理旧附件再重跑。
 
@@ -109,28 +103,17 @@ Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSW
 
 根 README 的界面图存放在 `.github/assets/screenshots/`。桌面图对应 1180×780 逻辑像素窗口，手机图对应 390×844 浏览器窄视口，均按 2 倍像素采集并保存为 WebP，单张不超过 300 KB。使用虚构设备名、示例网段、模拟指标和演示剪贴板内容，检查前景与弹窗不出现真实数据。
 
-## 悬浮条验收
+## 平台验收
 
-在 Windows、macOS 和 Linux X11 分别验证浏览器全屏视频、播放器与无边框游戏：同屏约半秒内隐藏，退出全屏或最小化后约一秒内恢复，普通最大化不隐藏。双屏时把焦点切到另一屏，全屏画面仍可见则保持隐藏；另一屏全屏不得隐藏本屏悬浮条。普通窗口仅部分遮挡全屏应用时仍隐藏，完全遮挡后恢复，切换虚拟桌面也应重新判断。
+源码检查不能替代安装包、真实设备与窗口管理器上的验证。
 
-验证启动时保存位置所在屏幕已有全屏画面时，悬浮条保持隐藏。检查隐藏前后的拖动位置和点击穿透，确认自动隐藏期间手动关闭显示后，退出全屏也不会重新显示。检查负坐标屏幕、混合 DPI/Retina、拖动跨屏、显示器断开及分辨率变化。macOS 额外检查刘海屏、全屏 Space 与没有菜单栏或 Dock 预留区的副屏。工作区与整屏重合等无法区分最大化的情况应保持显示，且不出现新的系统权限请求。X11 长时间运行并反复切换全屏、查询设置，确认 X server 连接数和进程文件描述符数保持稳定。
-
-Windows 用独立配置分别以旧坐标 `(-32000, -32000)` 启动和在运行中将原生悬浮条窗口置于屏幕外。确认启动与运行中都能恢复，保存坐标有效，同时保留锁定、前台焦点和手动隐藏偏好。切换显示输出时，分别检查保留原位置和退回主屏两种结果，核对目标屏幕缩放下的尺寸，并验证回屏前会重新检测全屏。WebView 视口随缩放变窄或变矮时，确认两行指标完整显示且没有滚动条。
-
-检查检测失败日志不重复刷屏，持续失败解除临时隐藏后仍可通过托盘控制；退出程序后检测线程应停止。纯状态与遮挡回归位于后端模块内，跨平台 CI 验证条件编译；真实全屏、窗口管理器和硬件组合仍须在目标平台手工验收，不能用静态检查替代。
-
-## Tailscale 发现验收
-
-让两台桌面节点使用不同物理网络并接入同一 Tailscale 组网。
-
-1. 至少允许一端访问对端的 `TCP 37880`。确认双方的「在线设备」各显示对端一次，并验证双向剪贴板同步。
-2. 确认两端都能访问对方的 MeshShare 监听端口（默认 `TCP 37880`），再验证双向小文件传输。每次传输都由发送端向接收端发起独立的 HTTP 上传请求。
-3. 断开并恢复 Tailscale，确认设备重新上线。回归同一物理局域网下的 mDNS 和手动连接。
-
-Windows、macOS 和 Linux 分别确认安装版能调用本机 Tailscale CLI。macOS 从 Finder 启动安装版，分别验证官方客户端和 Homebrew 安装的命令行版本。
-
-## Wayland 验收
-
-在 Ubuntu GNOME Wayland 会话确认 `loginctl show-session <id> -p Type` 返回 `Type=wayland`，记录 `WAYLAND_DISPLAY`、`DISPLAY` 和 Xwayland 状态。验证文字与 PNG 剪贴板的自动读取、远端写入、历史恢复、手动同步，以及悬浮条的拖动、隐藏和托盘恢复。
-
-MeshShare 不强制整个桌面壳切换到 X11。剪贴板优先 Wayland data-control，没有该协议时尝试 XWayland；两者都不可用时界面报告原因，设备间共享、历史和文件传输仍应可用。Wayland 不提供全局坐标、强制置顶和点击穿透的强保证，这些行为只在 X11 会话验收；Wayland 全屏应用不应触发自动隐藏。
+| 环境 | 操作与通过条件 |
+| --- | --- |
+| 桌面安装与登录 | 调试构建不注册登录项；正式包首次启动注册，登录后可从托盘打开，重复启动不增加实例。Windows 验证单击、双击与右键菜单；NSIS/MSI、deb/rpm 卸载后检查登录项清理。 |
+| Tailscale | 两台桌面分处不同物理网络，验证单向端口可达时发现与双向剪贴板、双向可达时互传文件。断开再连接，不重复列出设备。macOS 从 Finder 启动，分别验证官方与 Homebrew CLI。另测同一 LAN 的 mDNS 与手动连接。 |
+| Android 网络与存储 | 真机验证打开、退出、切换 Wi‑Fi、双向文件校验、两种保存目录及手动剪贴板。普通 VPN 要覆盖先开 VPN 再开 App、运行中切换与两条 `/1` 分流路由；核对发现和监听重建。另测 Tailscale、无物理网络与 VPN lockdown 下的降级。 |
+| Windows / macOS / X11 悬浮条 | 同屏全屏约半秒隐藏，退出约一秒恢复；覆盖另一屏、部分与完全遮挡、最大化、虚拟桌面及启动时已全屏。验证位置、穿透、焦点与手动隐藏偏好；检测失败不刷日志，退出后停止检测。 |
+| 多屏与系统差异 | 测负坐标、混合 DPI、断开显示器、跨屏拖动。Windows 从 `(-32000, -32000)` 和运行中离屏恢复，缩放后两行均可见；macOS 覆盖全屏 Space、刘海屏及无预留工作区，不新增权限请求；X11 长时间切换后文件描述符与连接数稳定。 |
+| Wayland | 在 GNOME 用 `loginctl show-session <id> -p Type` 确认会话类型，记录 XWayland 状态。分别测文字、PNG、历史恢复及系统剪贴板不可用时的节点共享；悬浮条可拖动、手动隐藏与托盘恢复，全屏不触发自动隐藏。 |
+| Linux 更新 | 用连续签名版本测试：系统包授权后安装，取消或缺少 polkit 代理时保持待安装，24 小时内不重复请求；手动检查可重试。验证活动传输延后安装、安装期间不接新任务，以及 AppImage 更新。 |
+| Android 更新 | 用同一测试证书签名的两个递增版本验证覆盖安装和数据保留。Android 10/11 检查系统弹窗，12 及以上检查免确认及回退；覆盖计费网络、断网、活跃传输、拒绝授权与错误签名或版本。 |

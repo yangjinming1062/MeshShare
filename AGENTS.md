@@ -1,16 +1,14 @@
-# AGENTS.md
+# 维护导航
 
-## 任务入口
+先读[项目维护规则](RULES.md)，再按问题选择入口：
 
-先阅读 [`RULES.md`](RULES.md) 了解协作、文档、代码和验证规则，再按任务范围读取对应文档：
+| 要解决的问题 | 文档 |
+| --- | --- |
+| 项目有什么用，如何安装并连接？ | [项目首页](README.md) |
+| 用户如何操作，各平台有哪些限制？ | [使用指南](docs/DESIGN.md) |
+| 谁拥有状态，数据如何流动，哪里需要授权？ | [架构](docs/ARCHITECTURE.md) |
+| 客户端如何调用接口、解释事件和恢复传输？ | [节点协议](docs/PROTOCOL.md) |
+| 如何启动、检查、发布和验收？ | [开发指南](docs/DEVELOPMENT.md) |
+| 代码入口与模块约束在哪里？ | [Rust/Tauri 节点](backend/README.md) · [Svelte 客户端](frontend/README.md) |
 
-- 产品介绍、安装和上手见 [`README.md`](README.md)
-- 源码启动、构建和验证见 [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
-- 模块边界、状态权威、信任边界和平台：[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- 拓扑、同步序列和部署图：[`docs/ARCHITECTURE_MAP.md`](docs/ARCHITECTURE_MAP.md)
-- 用户可见行为、限制和验收：[`docs/DESIGN.md`](docs/DESIGN.md)
-- 节点 HTTP 接口、WebSocket 消息和传输约束见 [`docs/PROTOCOL.md`](docs/PROTOCOL.md)
-- Rust/Tauri 节点与桌面入口：`backend/`，模块职责、并发与传输约束见 [`backend/README.md`](backend/README.md)
-- Svelte/TypeScript 桌面和移动客户端：`frontend/`
-
-实现改动前确认生产方、消费方和恢复路径；改动公开 API、持久化 schema 或文件生命周期时同步架构文档和相关验证。不要向仓库提交为临时验证创建的测试代码；正式检查放在现有测试入口。
+改动前核对生产方、消费方与恢复路径。公开接口、持久化结构或文件生命周期变动时，同步所属文档与正式检查；临时验证代码不入库。
