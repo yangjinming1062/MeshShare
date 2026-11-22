@@ -189,28 +189,34 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    // portable-pty 以继承光标模式创建 ConPTY。无界面的测试也要像 xterm 一样
-    // 应答启动查询，等 cmd 或 PowerShell 显示提示符后再发送按键和尺寸。
-    pub(super) async fn wait_for_windows_prompt(io: &mut SessionIo) {
+    pub(super) const WINDOWS_SHELL_READY: &str = "MESH_SHELL_READY";
+
+    // ConPTY 继承光标时会查询终端。持续应答，直到测试 shell 的启动命令输出标记。
+    pub(super) async fn wait_for_windows_shell(io: &mut SessionIo) {
         let mut seen = Vec::new();
-        let ready = tokio::time::timeout(Duration::from_secs(12), async {
+        let ready = tokio::time::timeout(Duration::from_secs(60), async {
             while let Some(message) = io.output.recv().await {
                 let bytes = match message {
                     Output::Data(bytes) => bytes,
                     Output::Exit { reason } => panic!("shell exited during startup: {reason}"),
                 };
+                let mut started = false;
                 for byte in bytes {
                     seen.push(byte);
+                    if seen.ends_with(WINDOWS_SHELL_READY.as_bytes()) {
+                        started = true;
+                    }
                     let reply: &[u8] = if seen.ends_with(b"\x1b[6n") {
                         b"\x1b[1;1R"
                     } else if seen.ends_with(b"\x1b[c") || seen.ends_with(b"\x1b[0c") {
                         b"\x1b[?1;2c"
-                    } else if byte == b'>' && !seen.ends_with(b"\x1b[>") {
-                        return;
                     } else {
                         continue;
                     };
                     io.input.send(Input::Data(reply.to_vec())).await.unwrap();
+                }
+                if started {
+                    return;
                 }
             }
             panic!("terminal output closed during startup");
@@ -218,7 +224,7 @@ mod tests {
         .await;
         assert!(
             ready.is_ok(),
-            "waiting for Windows prompt: {:?}",
+            "waiting for {WINDOWS_SHELL_READY}: {:?}",
             String::from_utf8_lossy(&seen)
         );
     }
@@ -233,18 +239,30 @@ mod tests {
             cancel: CancellationToken::new(),
         };
         let console = async {
-            for chunk in [b"\x1b[".as_slice(), b"6n\x1b", b"[c"] {
+            for chunk in [
+                b"\x1b[".as_slice(),
+                b"6n\x1b[?9001h\x1b[?1004h\x1b]0;build > powershell.exe\x07\x1b",
+                b"[c",
+            ] {
                 screen.send(Output::Data(chunk.to_vec())).await.unwrap();
             }
             for reply in [b"\x1b[1;1R".as_slice(), b"\x1b[?1;2c"] {
                 assert!(matches!(replies.recv().await, Some(Input::Data(bytes)) if bytes == reply));
             }
-            screen
-                .send(Output::Data(b"PS C:\\>".to_vec()))
-                .await
-                .unwrap();
+            for chunk in [
+                b"Windows PowerShell 5.1\r\nMESH_SHELL_".as_slice(),
+                b"READY\r\n\x1b[0c",
+            ] {
+                screen.send(Output::Data(chunk.to_vec())).await.unwrap();
+            }
+            assert!(
+                matches!(replies.recv().await, Some(Input::Data(bytes)) if bytes == b"\x1b[?1;2c")
+            );
         };
-        tokio::join!(wait_for_windows_prompt(&mut io), console);
+        tokio::join!(
+            async move { wait_for_windows_shell(&mut io).await },
+            console
+        );
     }
 
     #[tokio::test]

@@ -120,7 +120,7 @@ async fn authenticated_loopback_pair_reconnect_and_revoke() {
     approve(&host.ssh, Direction::Incoming, &local_key).await;
     let mut session = opening.await.unwrap().unwrap();
     #[cfg(windows)]
-    crate::terminal::tests::wait_for_windows_prompt(&mut session).await;
+    crate::terminal::tests::wait_for_windows_shell(&mut session).await;
     session
         .input
         .send(Input::Resize {
@@ -132,7 +132,8 @@ async fn authenticated_loopback_pair_reconnect_and_revoke() {
     expect_shell_response(&mut session).await;
     let mut second = connect().await.unwrap().unwrap();
     #[cfg(windows)]
-    crate::terminal::tests::wait_for_windows_prompt(&mut second).await;
+    crate::terminal::tests::wait_for_windows_shell(&mut second).await;
+    expect_shell_response(&mut second).await;
     assert!(
         !host.begin_update_install(),
         "inbound shell holds update gate"

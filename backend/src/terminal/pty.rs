@@ -15,6 +15,15 @@ pub(crate) fn spawn_pty(cols: u16, rows: u16, activity: impl Send + 'static) -> 
             .join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
         CommandBuilder::new(powershell)
     };
+    #[cfg(all(windows, test))]
+    {
+        // 回环测试使用真实 PowerShell，启动命令给无界面客户端一个确定的就绪信号。
+        command.env("MESH_TEST_READY", super::tests::WINDOWS_SHELL_READY);
+        command.args([
+            "-NoLogo", "-NoProfile", "-NoExit", "-Command",
+            "Remove-Module PSReadLine -ErrorAction SilentlyContinue; [Console]::WriteLine($env:MESH_TEST_READY)",
+        ]);
+    }
     command.env("TERM", "xterm-256color");
     open(command, cols, rows, activity)
 }
@@ -371,13 +380,17 @@ mod tests {
         #[cfg(windows)]
         let command = {
             let mut cmd = CommandBuilder::new("cmd.exe");
-            cmd.arg("/d");
+            cmd.args(["/d", "/k", "echo", "%MESH_TEST_READY%"]);
+            cmd.env(
+                "MESH_TEST_READY",
+                crate::terminal::tests::WINDOWS_SHELL_READY,
+            );
             cmd.env("MESH_TEST_PREFIX", "MESH_");
             cmd
         };
         let mut io = open(command, 80, 24, ()).unwrap();
         #[cfg(windows)]
-        crate::terminal::tests::wait_for_windows_prompt(&mut io).await;
+        crate::terminal::tests::wait_for_windows_shell(&mut io).await;
         io.input
             .send(Input::Resize { cols: 96, rows: 33 })
             .await
