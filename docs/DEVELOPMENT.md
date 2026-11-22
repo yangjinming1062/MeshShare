@@ -52,7 +52,7 @@ npx --yes @tauri-apps/cli@2 android build --apk --target aarch64
 npx --yes @tauri-apps/cli@2 android build --aab --target aarch64
 ```
 
-`prepare_android_project.py` 把网络适配器、存储插件、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源码在 `backend/android/`。APK 前端以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐了 Svelte 所需的 `String.replaceAll`。
+`prepare_android_project.py` 把网络适配器、存储插件、更新插件和安装权限写入可再生的 `backend/gen/android`，插件源码在 `backend/android/`。APK 前端以 Android 10 自带的 Chromium 74 WebView 为目标，入口补齐了 Svelte 模板使用的 `String.prototype.replaceAll` 和异步加载资源使用的 `Promise.allSettled`。首次打开终端时补齐 xterm 使用的 `Element.replaceChildren`。
 
 调试构建产物位于 `backend/target/debug/`：
 
@@ -76,7 +76,7 @@ cargo test --manifest-path backend/Cargo.toml --locked
 在已解锁系统凭据库的桌面登录会话中，可运行真实密钥保存与恢复检查。检查使用独立的临时身份，结束后清理凭据。
 
 ```bash
-cargo test --manifest-path backend/Cargo.toml --locked native_vault_restores_device_identity_and_signed_grant -- --ignored
+cargo test --manifest-path backend/Cargo.toml --locked native_vault_restores_host_key_and_signed_terminal_switch -- --ignored
 ```
 
 推送到 `main` 时，[CI](../.github/workflows/ci.yml) 在桌面平台运行回归检查，并构建 Android 调试 APK。Pull Request 不触发这套检查，请在本地执行上述命令。
@@ -119,7 +119,8 @@ Android 发布使用 Secrets `ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSW
 | --- | --- |
 | 桌面安装与登录 | 调试构建不注册登录项；正式包首次启动注册，登录后可从托盘打开，重复启动不增加实例。Windows 验证单击、双击与右键菜单；NSIS/MSI、deb/rpm 卸载后检查登录项清理。 |
 | Tailscale | 两台桌面分处不同物理网络，验证单向端口可达时发现与双向剪贴板、双向可达时互传文件。断开再连接，不重复列出设备。macOS 从 Finder 启动，分别验证官方与 Homebrew CLI。另测同一 LAN 的 mDNS 与手动连接。 |
-| 桌面终端 | Windows、macOS、Linux 各自验证本机 shell、中文输入、Tab、Ctrl+C、全屏程序和缩放。两台桌面通过 LAN 和 Tailscale 分别配对、重启、再次连接；核对两个并行标签的目录和输入彼此独立，隐藏主窗口不丢会话。验证拒绝配对、换钥、撤销和断网后的远端进程回收，以及活动终端延后更新。 |
+| 桌面终端 | Windows、macOS、Linux 验证本机 shell、中文输入、全屏程序和缩放。在 LAN 和 Tailscale 验证两台电脑首次直连，覆盖目标主动与被动建立节点连接。开关切换后观察两端设备列表。关闭时核对并行标签、握手和目标进程均已回收，本机和出站标签仍可操作。单独断开节点 WebSocket，核对相应的 SSH 退出，其他节点的 shell 仍可操作。验证旧设置迁移、关闭后锁定凭据库再登录无需解锁，以及活动终端延后更新安装。 |
+| Android 远程终端 | 真机连接已开启终端的电脑，确认设备按钮随开关出现、消失。在 Android 10 旧 WebView 检查返回按钮和快捷键避开系统栏。验证中文软键盘、Ctrl+C、Tab、Esc、横竖屏、返回后重进标签、断线重连和退出清理。用手机浏览器访问同一节点，验证只展示网页操作。 |
 | Android 网络与存储 | 真机验证打开、退出、切换 Wi‑Fi、双向文件校验、两种保存目录及手动剪贴板。普通 VPN 要覆盖先开 VPN 再开 App、运行中切换与两条 `/1` 分流路由；核对发现和监听重建。另测 Tailscale、无物理网络与 VPN lockdown 下的降级。 |
 | Windows / macOS / X11 悬浮条 | 启动及切屏时检查悬浮条无横纵滚动条。开发时前端编译报错应在主窗口可见。同屏全屏约半秒隐藏，退出约一秒恢复；覆盖另一屏、部分与完全遮挡、最大化、虚拟桌面及启动时已全屏。验证位置、穿透、焦点与手动隐藏偏好；检测失败不刷日志，退出后停止检测。 |
 | 多屏与系统差异 | 测负坐标、混合 DPI、断开显示器、跨屏拖动。Windows 从 `(-32000, -32000)` 和运行中离屏恢复，缩放后两行均可见；macOS 覆盖全屏 Space、刘海屏及无预留工作区，不新增权限请求；X11 长时间切换后文件描述符与连接数稳定。 |

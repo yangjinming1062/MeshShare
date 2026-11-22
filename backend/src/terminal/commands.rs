@@ -1,10 +1,7 @@
 //! 只有本地主窗口拥有交互终端。网络入站会话由 SSH 服务独立持有。
-use super::{
-    ssh::{Direction, Settings},
-    TerminalEvent, TerminalSessions,
-};
+use super::{TerminalEvent, TerminalSessions};
 use crate::runtime::NodeRuntime;
-use anyhow::{ensure, Context};
+use anyhow::ensure;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -113,25 +110,17 @@ async fn open(
     let pending = runtime.terminals.begin(id)?;
     let opening = async {
         if let Some(peer_id) = peer_id {
-            {
-                let peers = runtime.peers.read();
-                let peer = peers
-                    .get(&peer_id)
-                    .filter(|peer| peer.online)
-                    .context("目标节点已离线")?;
-                ensure!(
-                    peer.capabilities
-                        .iter()
-                        .any(|cap| cap == crate::model::TERMINAL_SSH_CAPABILITY),
-                    "目标节点未提供终端能力"
-                );
-            }
-            let bases = runtime.peer_http_bases(&peer_id);
-            runtime.ssh.connect(peer_id, bases, cols, rows).await
+            runtime.connect_terminal(peer_id, cols, rows).await
         } else {
-            let shell_activity = activity.clone();
-            tokio::task::spawn_blocking(move || super::spawn_pty(cols, rows, shell_activity))
-                .await?
+            #[cfg(not(target_os = "android"))]
+            {
+                ensure!(!runtime.is_android_profile(), "Android 仅支持连接远程终端");
+                let shell_activity = activity.clone();
+                tokio::task::spawn_blocking(move || super::spawn_pty(cols, rows, shell_activity))
+                    .await?
+            }
+            #[cfg(target_os = "android")]
+            anyhow::bail!("Android 仅支持连接远程终端")
         }
     };
     let io = tokio::select! {
@@ -190,33 +179,23 @@ pub(crate) fn terminal_ack(main: MainTerminal, id: String, sequence: u64) -> Res
         .map_err(describe)
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
-pub(crate) async fn terminal_settings(main: MainTerminal) -> Settings {
-    main.0.ssh.state().await
+pub(crate) async fn terminal_settings(main: MainTerminal) -> Result<bool, String> {
+    main.0.ssh.host_settings(None).await.map_err(describe)
 }
 
+#[cfg(not(target_os = "android"))]
 #[tauri::command]
-pub(crate) async fn terminal_set_enabled(main: MainTerminal, enabled: bool) -> Result<(), String> {
-    main.0.ssh.set_enabled(enabled).await.map_err(describe)
-}
-
-#[tauri::command]
-pub(crate) async fn terminal_pair(main: MainTerminal) -> Result<(), String> {
-    main.0.ssh.begin_pairing().await.map_err(describe)
-}
-
-#[tauri::command]
-pub(crate) fn terminal_decide(main: MainTerminal, id: String, allow: bool) -> Result<(), String> {
-    main.0.ssh.decide(&id, allow).map_err(describe)
-}
-
-#[tauri::command]
-pub(crate) async fn terminal_revoke(
+pub(crate) async fn terminal_set_enabled(
     main: MainTerminal,
-    direction: Direction,
-    node_id: String,
-) -> Result<(), String> {
-    main.0.ssh.revoke(direction, &node_id).map_err(describe)
+    enabled: bool,
+) -> Result<bool, String> {
+    main.0
+        .ssh
+        .host_settings(Some(enabled))
+        .await
+        .map_err(describe)
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
-// Android 10 的系统 WebView 缺少 Svelte 渲染模板所需的 replaceAll。
+// Android 10 WebView 需要这两个方法来加载终端的异步资源和渲染 Svelte 模板。
+import 'core-js/es/promise/all-settled';
 import 'core-js/es/string/replace-all';
 import App from './App.svelte';
 import './app.css';

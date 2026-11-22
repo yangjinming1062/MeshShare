@@ -5,6 +5,8 @@ export type AddressInfo = {
   kind: string;
 };
 
+export type TerminalKeys = { client_fingerprint: string; host_fingerprint?: string };
+
 export type NodeInfo = {
   node_id: string;
   node_name: string;
@@ -15,6 +17,7 @@ export type NodeInfo = {
   addresses: AddressInfo[];
   mobile_addresses: AddressInfo[];
   capabilities: string[];
+  terminal?: TerminalKeys;
 };
 
 export type UpdateFrequency = 'daily' | 'weekly' | 'disabled';
@@ -51,6 +54,7 @@ export type PeerInfo = {
   addresses: AddressInfo[];
   mobile_addresses: AddressInfo[];
   capabilities: string[];
+  terminal?: TerminalKeys;
   online: boolean;
   endpoint?: string;
   metrics?: HardwareMetrics;

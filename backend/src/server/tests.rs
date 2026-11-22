@@ -856,6 +856,7 @@ async fn oversized_remote_metrics_payload_is_ignored() {
         platform: "test".to_string(),
         addresses: Vec::new(),
         mobile_addresses: Vec::new(),
+        terminal: None,
         capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
         online: true,
         last_seen_ms: crate::clock::now_millis(),
@@ -913,6 +914,33 @@ fn invalid_extended_metrics_values_are_rejected() {
     assert!(!validate_metrics(&metrics));
 }
 
+#[test]
+fn terminal_hello_requires_consistent_host_and_client_keys() {
+    use super::socket::validate_node_info;
+    use crate::model::TERMINAL_SSH_CAPABILITY;
+    let dir = std::env::temp_dir().join(format!("meshshare-hello-keys-{}", Uuid::new_v4()));
+    let runtime = NodeRuntime::new(dir.clone(), 0, "test".into()).unwrap();
+    let mut info = runtime.node_info();
+    info.platform = "linux".to_owned();
+    assert!(validate_node_info(&info));
+    info.capabilities.push(TERMINAL_SSH_CAPABILITY.to_owned());
+    assert!(!validate_node_info(&info));
+    let pin = info.terminal.as_ref().unwrap().client_fingerprint.clone();
+    info.terminal.as_mut().unwrap().host_fingerprint = Some(pin);
+    assert!(validate_node_info(&info));
+    info.platform = "android".to_owned();
+    assert!(!validate_node_info(&info));
+    info.terminal.as_mut().unwrap().host_fingerprint = None;
+    info.capabilities
+        .retain(|cap| cap != TERMINAL_SSH_CAPABILITY);
+    info.node_id.push('\n');
+    assert!(!validate_node_info(&info));
+    info.node_id.pop();
+    info.terminal.as_mut().unwrap().client_fingerprint = "invalid".to_owned();
+    assert!(!validate_node_info(&info));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn invalid_hello_does_not_register_a_peer() {
     let data_dir = std::env::temp_dir().join(format!("meshshare-invalid-hello-{}", Uuid::new_v4()));
@@ -930,6 +958,7 @@ async fn invalid_hello_does_not_register_a_peer() {
                 port: 0,
                 addresses: Vec::new(),
                 mobile_addresses: Vec::new(),
+                terminal: None,
                 capabilities: Vec::new(),
             },
         },
@@ -959,6 +988,7 @@ async fn duplicate_hello_does_not_replace_existing_peer_metadata() {
             port: 0,
             addresses: Vec::new(),
             mobile_addresses: Vec::new(),
+            terminal: None,
             capabilities: Vec::new(),
         },
     };
@@ -1908,6 +1938,7 @@ async fn remote_metrics_update_is_not_rebroadcast() {
         platform: "test".to_string(),
         addresses: Vec::new(),
         mobile_addresses: Vec::new(),
+        terminal: None,
         capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
         online: true,
         last_seen_ms: crate::clock::now_millis(),
@@ -1962,6 +1993,7 @@ async fn forwarded_clipboard_events_keep_their_original_source() {
         platform: "test".to_string(),
         addresses: Vec::new(),
         mobile_addresses: Vec::new(),
+        terminal: None,
         capabilities: Vec::new(),
         online: true,
         last_seen_ms: crate::clock::now_millis(),
@@ -2069,6 +2101,7 @@ async fn websocket_keeps_one_channel_for_normal_peer_messages() {
         port: 0,
         addresses: Vec::new(),
         mobile_addresses: Vec::new(),
+        terminal: None,
         capabilities: vec![METRICS_SYSTEM_CAPABILITY.to_string()],
     };
     socket

@@ -60,15 +60,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .on_page_load(|webview, payload| {
-            if webview.label() == "main"
-                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
-            {
-                if let Some(state) = webview.try_state::<Arc<NodeRuntime>>() {
-                    state.terminals.close_all();
-                }
-            }
-        })
+        .on_page_load(crate::terminal_page_load)
         .setup(|app| {
             let autostart_launch = autostart::launched_from_args(std::env::args());
             app.manage(monitor::Controller::default());
@@ -163,25 +155,13 @@ pub fn run() {
             terminal::commands::terminal_write,
             terminal::commands::terminal_ack,
             terminal::commands::terminal_settings,
-            terminal::commands::terminal_set_enabled,
-            terminal::commands::terminal_pair,
-            terminal::commands::terminal_decide,
-            terminal::commands::terminal_revoke
+            terminal::commands::terminal_set_enabled
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")
         .run(|app, event| match event {
             RunEvent::ExitRequested { .. } | RunEvent::Exit => {
-                if let Some(state) = app.try_state::<Arc<NodeRuntime>>() {
-                    state
-                        .stopping
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    state.terminals.close_all();
-                    state.ssh.shutdown();
-                    if matches!(event, RunEvent::Exit) {
-                        state.wait_for_terminal_shutdown();
-                    }
-                }
+                crate::stop_node(app, matches!(event, RunEvent::Exit));
             }
             #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => set_main_window_visible(app, true),

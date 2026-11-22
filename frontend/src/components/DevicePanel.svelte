@@ -1,6 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
-  import { TERMINAL_CAPABILITY } from '../terminal';
+  import { canOpenTerminal } from '../terminal';
   import DeviceRow from './DeviceRow.svelte';
   import type { MobileSession, PeerInfo } from '../types';
 
@@ -83,7 +83,7 @@
             onSendFolder={() => onSendPeerFolder(peer)}
             onDetails={() => onDetails(peer)}
             onOpen={() => onOpenPeer(peer)}
-            onTerminal={onTerminal && peer.online && peer.capabilities.includes(TERMINAL_CAPABILITY) ? () => onTerminal?.(peer) : null}
+            onTerminal={onTerminal && canOpenTerminal(peer) ? () => onTerminal?.(peer) : null}
             {allowFolderSend}
             onDragOver={() => onDragEnter('peer:' + peer.node_id)}
             onDragLeave={() => onDragLeave('peer:' + peer.node_id)}

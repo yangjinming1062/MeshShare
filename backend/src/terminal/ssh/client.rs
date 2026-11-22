@@ -1,13 +1,13 @@
 use super::*;
+use crate::runtime::NodeRuntime;
 use crate::terminal::{Input, Output, SessionIo};
 use russh::keys::{Algorithm, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{client as ssh, Channel, ChannelMsg};
 use tokio::sync::mpsc;
 
 struct Controller {
-    service: Arc<SshService>,
+    runtime: Arc<NodeRuntime>,
     peer: String,
-    connection: CancellationToken,
 }
 
 impl ssh::Handler for Controller {
@@ -21,11 +21,14 @@ impl ssh::Handler for Controller {
             "目标终端主机密钥类型不匹配"
         );
         let pin = key.fingerprint(HashAlg::Sha256).to_string();
-        let grant = self
-            .service
-            .authorize(Direction::Outgoing, &self.peer, &pin, &self.connection)
-            .await?;
-        bind_grant(grant, self.connection.clone());
+        let host = self
+            .runtime
+            .terminal_peer_keys(&self.peer)
+            .and_then(|keys| keys.host_fingerprint);
+        ensure!(
+            host.as_ref() == Some(&pin),
+            "目标终端密钥与当前节点连接不一致，或目标已关闭终端"
+        );
         Ok(true)
     }
 }
@@ -73,9 +76,6 @@ async fn upgrade(peer: &str, bases: Vec<String>) -> Result<reqwest::Upgraded> {
                 return Ok(res.upgrade().await?);
             }
             reqwest::StatusCode::FORBIDDEN => bail!("目标机尚未开启远程终端"),
-            reqwest::StatusCode::SERVICE_UNAVAILABLE => {
-                bail!("目标机的终端凭据不可用，请在目标机检查设置")
-            }
             reqwest::StatusCode::TOO_MANY_REQUESTS => bail!("目标机的终端连接已满"),
             status => last = anyhow!("目标节点返回 {status}"),
         }
@@ -90,28 +90,33 @@ async fn accepted(channel: &mut Channel<ssh::Msg>) -> Result<()> {
     }
 }
 
-impl SshService {
-    pub(crate) async fn connect(
+impl NodeRuntime {
+    pub(crate) async fn connect_terminal(
         self: &Arc<Self>,
         peer_id: String,
-        bases: Vec<String>,
         cols: u16,
         rows: u16,
     ) -> Result<SessionIo> {
         crate::terminal::validate_size(cols, rows)?;
-        let key = self.identity().await?.clone();
-        let connection = self.stopped.child_token();
+        ensure!(
+            self.terminal_peer_keys(&peer_id)
+                .and_then(|keys| keys.host_fingerprint)
+                .is_some(),
+            "目标节点已离线或未开启远程终端"
+        );
+        let bases = self.peer_http_bases(&peer_id);
+        let key = self.ssh.client_key.clone();
+        let connection = self.ssh.stopped.child_token();
         let transport_guard = connection.clone().drop_guard();
         let upgraded =
             tokio::time::timeout(Duration::from_secs(15), upgrade(&peer_id, bases)).await??;
         let stream = cancellable_stream(upgraded, connection.clone());
         let handler = Controller {
-            service: self.clone(),
+            runtime: self.clone(),
             peer: peer_id,
-            connection: connection.clone(),
         };
         let config = ssh::Config {
-            // russh 的配置心跳从握手开始。等待用户核对指纹期间只能发送认证消息。
+            // 交互通道就绪后才启动 SSH 心跳。
             keepalive_interval: None,
             inactivity_timeout: None,
             ..Default::default()
@@ -119,12 +124,9 @@ impl SshService {
         let opening = async {
             let mut client = ssh::connect_stream(Arc::new(config), stream, handler).await?;
             let auth = client
-                .authenticate_publickey(&self.node_id, PrivateKeyWithHashAlg::new(key, None))
+                .authenticate_publickey(&self.ssh.node_id, PrivateKeyWithHashAlg::new(key, None))
                 .await?;
-            ensure!(
-                auth.success(),
-                "目标机拒绝终端授权，请在目标机打开配对窗口并核对设备指纹"
-            );
+            ensure!(auth.success(), "目标机未接受当前节点连接的终端密钥");
             let mut channel = client.channel_open_session().await?;
             channel
                 .request_pty(true, "xterm-256color", cols.into(), rows.into(), 0, 0, &[])
@@ -134,8 +136,7 @@ impl SshService {
             accepted(&mut channel).await?;
             Ok::<_, anyhow::Error>((client, channel))
         };
-        let (client, channel) =
-            tokio::time::timeout(PAIR_WINDOW * 2 + Duration::from_secs(15), opening).await??;
+        let (client, channel) = tokio::time::timeout(OPEN_TIMEOUT, opening).await??;
         let (mut reader, writer) = channel.split();
         let (input, mut inputs) = mpsc::channel(16);
         let (output, outputs) = mpsc::channel(16);

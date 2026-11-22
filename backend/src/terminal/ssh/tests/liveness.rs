@@ -1,13 +1,86 @@
 use super::*;
 use tokio::{io, net::TcpListener};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn inbound_shells_end_with_the_authenticated_peer_session_or_client_key() {
+    use crate::model::WireMessage;
+    use futures_util::SinkExt;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    let dir = std::env::temp_dir().join(format!("meshshare-ssh-peer-{}", uuid::Uuid::new_v4()));
+    let host = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
+    let client = NodeRuntime::new(dir.join("client"), 0, "test".into()).unwrap();
+    let other = NodeRuntime::new(dir.join("other"), 0, "test".into()).unwrap();
+    inject_host_key(&host);
+    host.ssh.host_settings(Some(true)).await.unwrap();
+    let (addr, server) = serve_host(&host, &dir).await;
+    connect_nodes(&other, &host, addr).await;
+    let mut independent = open_shell(&other, &host).await;
+
+    // 手动驱动该客户端的节点 WebSocket，SSH 仍走完整的客户端、主机和 PTY。
+    let url = format!("ws://{addr}/api/v1/ws");
+    let target =
+        crate::server::peer_from_hello(host.node_info(), &client, Some(url.clone())).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let _target = client.attach_peer_session(target, tx).unwrap();
+    let hello = |node| Message::Text(serde_json::to_string(&WireMessage::Hello { node }).unwrap());
+    let connect = || async {
+        let (mut ws, _) = connect_async(&url).await.unwrap();
+        ws.send(hello(client.node_info())).await.unwrap();
+        wait_for_peer(&host, &client, client.ssh.host_fingerprint().is_some()).await;
+        ws
+    };
+    let mut ws = connect().await;
+    let mut first = open_shell(&client, &host).await;
+    // 只改变客户端自己的接入开关，不影响它在另一台电脑上已打开的 shell。
+    inject_host_key(&client);
+    client.ssh.host_settings(Some(true)).await.unwrap();
+    ws.send(hello(client.node_info())).await.unwrap();
+    wait_for_peer(&host, &client, true).await;
+    expect_shell_response(&mut first).await;
+
+    let mut rotated = client.node_info();
+    rotated.terminal.as_mut().unwrap().client_fingerprint = other.ssh.client_fingerprint();
+    ws.send(hello(rotated)).await.unwrap();
+    ws.send(hello(client.node_info())).await.unwrap();
+    wait_disconnected(&mut first).await;
+    wait_for_peer(&host, &client, true).await;
+    let mut second = open_shell(&client, &host).await;
+
+    ws.close(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while host.has_peer_channel(&client.node_id()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the old node WebSocket must be removed");
+    let mut replacement = connect().await;
+    wait_disconnected(&mut second).await;
+    drop(open_shell(&client, &host).await);
+    replacement.close(None).await.unwrap();
+    expect_shell_response(&mut independent).await;
+    drop(independent);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while host.update_has_active_work() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all host PTYs must release their update reservations");
+    other
+        .stopping
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    server.abort();
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_and_backpressured_shell_survives_until_silent_link_loss() {
     let dir = std::env::temp_dir().join(format!("meshshare-ssh-idle-{}", uuid::Uuid::new_v4()));
     let host = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
     let client = NodeRuntime::new(dir.join("client"), 0, "test".into()).unwrap();
-    let host_key = inject_identity(&host.ssh);
-    let client_key = inject_identity(&client.ssh);
+    inject_host_key(&host);
     let (host_addr, server) = serve_host(&host, &dir).await;
 
     let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -30,14 +103,15 @@ async fn idle_and_backpressured_shell_survives_until_silent_link_loss() {
         );
     });
 
-    host.ssh.set_enabled(true).await.unwrap();
-    host.ssh.begin_pairing().await.unwrap();
-    let target = host.node_id();
-    let ssh = client.ssh.clone();
-    let opening = tokio::spawn(async move { ssh.connect(target, vec![base], 80, 25).await });
-    approve(&client.ssh, Direction::Outgoing, &host_key).await;
-    approve(&host.ssh, Direction::Incoming, &client_key).await;
-    let mut session = opening.await.unwrap().unwrap();
+    host.ssh.host_settings(Some(true)).await.unwrap();
+    let host_id = host.node_id();
+    connect_nodes(&client, &host, host_addr).await;
+    // 节点连接仍直连，只有 SSH 走可独立断流的中继。
+    client.peers.write().get_mut(&host_id).unwrap().endpoint = Some(format!(
+        "ws://{}/api/v1/ws",
+        base.trim_start_matches("http://")
+    ));
+    let mut session = client.connect_terminal(host_id, 80, 25).await.unwrap();
     #[cfg(windows)]
     crate::terminal::tests::wait_for_windows_shell(&mut session).await;
 

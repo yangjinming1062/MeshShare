@@ -1,4 +1,5 @@
 pub(crate) mod commands;
+#[cfg(not(target_os = "android"))]
 mod pty;
 pub(crate) mod ssh;
 
@@ -10,6 +11,7 @@ use tauri::ipc::Channel;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(not(target_os = "android"))]
 pub(crate) use pty::spawn_pty;
 
 pub(crate) enum Input {
@@ -184,7 +186,7 @@ impl Drop for TerminalSessions {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "android")))]
 mod tests {
     use super::*;
     use std::time::Duration;

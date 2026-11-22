@@ -1,6 +1,7 @@
 use super::*;
 use crate::runtime::NodeRuntime;
 use crate::terminal::{spawn_pty, validate_size, Input, Output};
+use anyhow::Context;
 use axum::{
     extract::Request as HttpRequest,
     http::{header, StatusCode},
@@ -12,12 +13,10 @@ use tokio::sync::{watch, Notify};
 use tokio_util::io::InspectReader;
 
 struct Host {
-    service: Arc<SshService>,
     runtime: Arc<NodeRuntime>,
     connection: CancellationToken,
-    grant: Option<CancellationToken>,
+    authenticated_peer: Option<CancellationToken>,
     started: watch::Sender<bool>,
-    channel_opened: bool,
 }
 
 impl SshService {
@@ -51,31 +50,22 @@ impl SshService {
         {
             return StatusCode::MISDIRECTED_REQUEST.into_response();
         }
-        let Ok(slot) = self.sockets.clone().try_acquire_owned() else {
+        let Some((key, connection)) = self.host.accept() else {
+            return StatusCode::FORBIDDEN.into_response();
+        };
+        let Ok(slot) = self.host.sockets.clone().try_acquire_owned() else {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         };
-        if self.key.get().is_none() && !self.restore_enabled {
-            return StatusCode::FORBIDDEN.into_response();
-        }
-        let Ok(Ok(key)) = tokio::time::timeout(Duration::from_secs(8), self.identity()).await
-        else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        let key = key.clone();
-        let connection = {
-            let access = self.access.lock();
-            if self.stopped.is_cancelled() || !access.policy.enabled {
-                return StatusCode::FORBIDDEN.into_response();
-            }
-            access.listener.child_token()
-        };
         let upgrade = hyper::upgrade::on(&mut req);
-        let service = self.clone();
         tokio::spawn(async move {
             let _slot = slot;
             let _close = connection.clone().drop_guard();
-            let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(8), upgrade).await else {
-                return;
+            let stream = tokio::select! {
+                _ = connection.cancelled() => return,
+                result = tokio::time::timeout(Duration::from_secs(8), upgrade) => match result {
+                    Ok(Ok(stream)) => stream,
+                    _ => return,
+                }
             };
             let received = Arc::new(AtomicBool::new(false));
             let activity = received.clone();
@@ -96,12 +86,10 @@ impl SshService {
             };
             let (started, mut state) = watch::channel(false);
             let host = Host {
-                service,
                 runtime,
                 connection: connection.clone(),
-                grant: None,
+                authenticated_peer: None,
                 started,
-                channel_opened: false,
             };
             let Ok(Ok(mut session)) = tokio::time::timeout(
                 Duration::from_secs(8),
@@ -111,11 +99,11 @@ impl SshService {
             else {
                 return;
             };
-            // 建立终端前限制握手和配对时间；空闲 shell 建立后只由心跳判断断线。
+            // 建立终端前限制握手时间。空闲 shell 建立后由心跳判断断线。
             tokio::select! {
                 _ = &mut session => return,
                 _ = connection.cancelled() => return,
-                _ = tokio::time::sleep(PAIR_WINDOW * 2 + Duration::from_secs(10)) => return,
+                _ = tokio::time::sleep(OPEN_TIMEOUT) => return,
                 opened = state.changed() => if opened.is_err() { return },
             }
             // 客户端定期发送加密的 SSH ping。只统计从客户端收到的流量，
@@ -150,22 +138,24 @@ impl ssh::Handler for Host {
         user: &str,
         key: ssh::VerifiedPublicKey<'_>,
     ) -> Result<ssh::Auth> {
-        if key.public_key.algorithm() != russh::keys::Algorithm::Ed25519 {
+        if self.connection.is_cancelled()
+            || key.public_key.algorithm() != russh::keys::Algorithm::Ed25519
+        {
             return Ok(ssh::Auth::reject());
         }
         let pin = key.public_key.fingerprint(HashAlg::Sha256).to_string();
-        match self
-            .service
-            .authorize(Direction::Incoming, user, &pin, &self.connection)
-            .await
-        {
-            Ok(grant) => {
-                bind_grant(grant.clone(), self.connection.clone());
-                self.grant = Some(grant);
-                Ok(ssh::Auth::Accept)
+        let Some(peer) = self.runtime.authorize_terminal_client(user, &pin) else {
+            return Ok(ssh::Auth::reject());
+        };
+        self.authenticated_peer = Some(peer.clone());
+        let connection = self.connection.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = peer.cancelled() => connection.cancel(),
+                _ = connection.cancelled() => (),
             }
-            Err(_) => Ok(ssh::Auth::reject()),
-        }
+        });
+        Ok(ssh::Auth::Accept)
     }
 
     async fn channel_open_session(
@@ -174,13 +164,13 @@ impl ssh::Handler for Host {
         reply: ssh::ChannelOpenHandle,
         session: &mut ssh::Session,
     ) -> Result<()> {
-        let Some(grant) = self.grant.clone() else {
+        // 每次公钥认证只允许打开一个交互通道。
+        let Some(peer) = self.authenticated_peer.take() else {
             return Ok(());
         };
-        if self.channel_opened || grant.is_cancelled() {
+        if self.connection.is_cancelled() || peer.is_cancelled() {
             return Ok(());
         }
-        self.channel_opened = true;
         let runtime = self.runtime.clone();
         let handle = session.handle();
         let connection = self.connection.clone();
@@ -188,14 +178,14 @@ impl ssh::Handler for Host {
         reply.accept().await;
         tokio::spawn(async move {
             tokio::select! {
-                result = serve_channel(channel, handle, runtime, started) => {
+                biased;
+                _ = connection.cancelled() => (),
+                result = serve_channel(channel, handle, runtime, started, connection.clone(), peer) => {
                     // 每条连接只承载一个终端。通道异常退出时，断开传输也能唤醒等待结束通知的对端。
                     if result.is_err() {
                         connection.cancel();
                     }
                 }
-                _ = connection.cancelled() => (),
-                _ = grant.cancelled() => (),
             }
         });
         Ok(())
@@ -213,6 +203,8 @@ async fn serve_channel(
     handle: ssh::Handle,
     runtime: Arc<NodeRuntime>,
     started: watch::Sender<bool>,
+    connection: CancellationToken,
+    peer: CancellationToken,
 ) -> Result<()> {
     let id = channel.id();
     let dimensions = match channel.wait().await {
@@ -238,6 +230,8 @@ async fn serve_channel(
         return Ok(());
     }
     let creation = tokio::task::spawn_blocking(move || {
+        ensure!(!connection.is_cancelled(), "远程终端已关闭");
+        ensure!(!peer.is_cancelled(), "发起端节点连接已失效");
         let activity = runtime.reserve_terminal()?;
         spawn_pty(cols, rows, activity)
     })

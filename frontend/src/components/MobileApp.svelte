@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, tick } from 'svelte';
+  import TerminalWorkspace from './TerminalWorkspace.svelte';
+  import { canOpenTerminal } from '../terminal';
   import AndroidUpdatePanel from './AndroidUpdatePanel.svelte';
   import ClipboardImage from './ClipboardImage.svelte';
   import Icon from './Icon.svelte';
@@ -67,6 +69,9 @@
   export let onChooseDirectory: () => void = () => {};
   export let onOpenHistory: () => void = () => {};
 
+  let terminalWorkspace: TerminalWorkspace;
+  let terminalVisible = false;
+  let terminalCount = 0;
   let transfersOpen = false;
   let transfersAutoOpened = false;
   let transferLog: HTMLElement | null = null;
@@ -177,13 +182,15 @@
   }
 </script>
 
-<header class="phone-header">
+<header class="phone-header" hidden={terminalVisible}>
   <img class="phone-logo" src="/meshshare.svg" width="22" height="22" alt="" />
   <div class="phone-title">
     <strong title={node?.node_name}>{node?.node_name ?? 'MeshShare 节点'}</strong>
     <span class="phone-sub">{mode === 'web' ? '临时加入' : '手机节点'}</span>
   </div>
-  {#if node}
+  {#if mode === 'android' && terminalCount}
+    <button type="button" class="btn btn-sm" on:click={() => terminalWorkspace.showWorkspace()}>终端 · {terminalCount}</button>
+  {:else if node}
     <div class="phone-chips">
       <span class="chip">{platformLabel(node.platform)}</span>
       <span class="chip mono">:{node.port}</span>
@@ -195,7 +202,10 @@
   </span>
 </header>
 
-<main class="phone-main">
+{#if mode === 'android'}
+  <TerminalWorkspace mobile {peers} bind:this={terminalWorkspace} bind:visible={terminalVisible} bind:count={terminalCount} />
+{/if}
+<main class="phone-main" hidden={terminalVisible}>
   {#if pending.length || inbox}
     <section class="phone-card phone-inbox" aria-label={pending.length ? '待接收文件' : '正在接收文件'}>
       <div class="inbox-head">
@@ -444,6 +454,9 @@
               <span class="device-meta">{platformLabel(peer.platform)} · {peer.addresses[0]?.address ?? '在线'}</span>
             </span>
             <div class="device-actions">
+              {#if mode === 'android' && canOpenTerminal(peer)}
+                <button type="button" class="btn-icon" aria-label={'打开 ' + peer.node_name + ' 的终端'} on:click={() => terminalWorkspace.openSession({ peerId: peer.node_id, name: peer.node_name })}><Icon name="terminal" size={18} /></button>
+              {/if}
               <button type="button" class="btn btn-primary" on:click={() => onSendFile(peer)}>
                 <Icon name="send" size={14} />
                 发送文件

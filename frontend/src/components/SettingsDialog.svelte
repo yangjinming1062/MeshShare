@@ -1,5 +1,6 @@
 <script lang="ts">
   import Dialog from './Dialog.svelte';
+  import TerminalAccess from './TerminalAccess.svelte';
   import TogglePill from './TogglePill.svelte';
   import { clipboardHistoryRetentionLabel, updateStatusLabel } from '../format';
   import type {
@@ -29,7 +30,6 @@
   export let onHistoryMode: (value: ClipboardHistoryMode) => void = () => {};
   export let onHistoryValue: (value: number) => void = () => {};
   export let onRemoteFileAccess: (value: boolean) => void = () => {};
-  export let onTerminalSettings: () => void = () => {};
   export let onClose: () => void = () => {};
 
   $: historyValue = historySettings.mode === 'count' ? historySettings.count : historySettings.days;
@@ -78,12 +78,7 @@
   </div>
 
   {#if localMode}
-    <div class="setting-block">
-      <div class="setting">
-        <div class="setting-copy"><strong>本机终端授权</strong><span>允许指定的桌面设备使用本机终端，可随时撤销。</span></div>
-        <button class="btn btn-sm" type="button" on:click={onTerminalSettings}>管理授权</button>
-      </div>
-    </div>
+    {#if open}<TerminalAccess />{/if}
     <div class="setting-block">
       <div class="setting">
         <div class="setting-copy">

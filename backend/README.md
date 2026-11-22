@@ -9,14 +9,14 @@
 | 请求与会话 | `src/server.rs` 负责 HTTP 路由、来源校验与文件流。`src/server/socket.rs` 处理 WebSocket 握手与消息。`src/model.rs` 定义线协议。 |
 | 节点状态 | `src/runtime/mod.rs` 管理生命周期。`config.rs`、`history.rs`、`transfer_history.rs` 分别持有配置、剪贴板历史、传输历史。`peers.rs` 管理会话，`network.rs` 管理地址。`outgoing.rs`、`transfer.rs`、`mobile.rs` 分别处理发送、直传任务和网页暂存。 |
 | 本机系统能力 | `src/clipboard.rs` 读写系统剪贴板，`src/metrics.rs` 采样，`src/monitor.rs` 判定全屏和显隐，`src/browse.rs` 浏览授权目录。平台实现位于 `src/{android,linux,macos,windows}/`。 |
-| 终端 | `src/terminal/` 管理伪终端、主窗口 IPC、SSH 接入与设备配对。 |
+| 终端 | `src/terminal/` 管理桌面伪终端、主窗口 IPC、桌面 SSH 接入和跨平台 SSH 客户端。 |
 | 设置与更新 | `src/control.rs` 处理设置快照与补丁。`src/updater/desktop.rs` 调度桌面更新，`src/android/update/` 调度 Android 更新。 |
 
 ## 设置与持久化
 
 共享设置由 `runtime/config.rs` 的 `PersistedConfig` 落盘，经 `control.rs` 的补丁与快照提供给界面。远程文件访问开关仅由本机原生命令读写。
 
-桌面终端授权保存在 `terminal-access.json`，包含开关及两个方向的公钥指纹，由系统凭据库中的设备私钥签名。首次使用默认关闭接入。凭据库锁定时解锁后重试。若设备私钥已丢失或授权文件已损坏，退出应用，将授权文件移到备份位置，重新开启远程终端并配对。
+桌面将终端开关保存在 `terminal-access.json`，由系统凭据库中的主机私钥签名。启动或查看设置时，若文件缺失或开关为关闭，接入保持关闭，无需访问凭据库。首次从磁盘恢复已开启的接入，或重启后首次主动开启时，先读取主机密钥并验证已有策略的完整签名。旧配对格式在验证后原子迁移，只保留开关。回退到配对版本时可恢复升级前的授权文件备份，或先移走新文件，再在旧版重新授权。新安装在首次开启接入时才创建主机凭据。恢复失败时终端保持关闭，可在本机设置查看原因。若已丢失主机密钥或授权文件损坏，退出应用，将该文件移到备份位置，再打开设置重新开启。
 
 数据目录保存 `node.json`、`clipboard-history.json` 与 payload 目录、`clipboard-current.json`、`transfer-history.json`、`desktop-transfer-temp-files.json`、`mobile-tls/`，Android 另有 `android-update.json`。
 

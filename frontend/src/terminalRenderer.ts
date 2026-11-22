@@ -3,6 +3,19 @@ import { FitAddon } from '@xterm/addon-fit';
 import '@xterm/xterm/css/xterm.css';
 
 export function createRenderer(container: HTMLElement) {
+  // Android 10 的系统 WebView 缺少 xterm DOM 渲染器使用的 replaceChildren。
+  if (!Element.prototype.replaceChildren) {
+    Object.defineProperty(Element.prototype, 'replaceChildren', {
+      configurable: true,
+      writable: true,
+      value(this: Element, ...nodes: (Node | string)[]) {
+        const content = this.ownerDocument.createDocumentFragment();
+        content.append(...nodes);
+        this.textContent = '';
+        this.appendChild(content);
+      },
+    });
+  }
   const term = new Terminal({
     cursorBlink: true,
     disableStdin: true,

@@ -364,12 +364,19 @@ html[data-shell="web"] .clip-history-clear { min-height: 44px; }
   --phone-fs-xl: 20px;
 }
 html[data-shell="android"] {
-  /* Tauri 安卓边到边渲染，状态栏与手势区要预留；env() 取不到时按常见值兜底 */
-  --phone-safe-top: max(env(safe-area-inset-top, 0px), 28px);
-  --phone-safe-bottom: max(env(safe-area-inset-bottom, 0px), 20px);
+  /* 旧 WebView 无法计算 max()，为状态栏和三键导航栏预留固定空间。 */
+  --phone-safe-top: 28px;
+  --phone-safe-bottom: 48px;
+}
+@supports (padding-top: max(0px, 1px)) {
+  html[data-shell="android"] {
+    --phone-safe-top: max(env(safe-area-inset-top, 0px), 28px);
+    --phone-safe-bottom: max(env(safe-area-inset-bottom, 0px), 20px);
+  }
 }
 .phone-shell { min-height: 100vh; min-height: 100dvh; background: var(--bg); font-size: var(--phone-fs-md); }
 .phone-header { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; gap: 10px; min-height: calc(var(--phone-safe-top) + var(--phone-header-h)); padding: calc(var(--phone-safe-top) + 8px) 16px 8px; background: var(--surface); border-bottom: 1px solid var(--line); }
+.phone-main[hidden], .phone-header[hidden] { display: none; }
 .phone-logo { flex: 0 0 auto; }
 .phone-title { flex: 1; min-width: 0; max-height: 40px; display: grid; gap: 1px; align-content: center; overflow: hidden; }
 .phone-title strong { font-size: var(--phone-fs-lg); font-weight: 650; line-height: 1.25; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

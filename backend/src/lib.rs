@@ -21,7 +21,6 @@ mod model;
 mod monitor;
 mod runtime;
 mod server;
-#[cfg(not(target_os = "android"))]
 mod terminal;
 mod updater;
 #[cfg(target_os = "windows")]
@@ -175,6 +174,29 @@ fn refresh_monitor(_app: &AppHandle) -> Result<(), String> {
 #[cfg(not(target_os = "android"))]
 use monitor::refresh as refresh_monitor;
 
+fn terminal_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
+    if webview.label() == "main"
+        && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+    {
+        if let Some(runtime) = webview.try_state::<Arc<NodeRuntime>>() {
+            runtime.terminals.close_all();
+        }
+    }
+}
+
+fn stop_node(app: &AppHandle, wait: bool) {
+    if let Some(runtime) = app.try_state::<Arc<NodeRuntime>>() {
+        runtime
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        runtime.terminals.close_all();
+        runtime.ssh.shutdown();
+        if wait {
+            runtime.wait_for_terminal_shutdown();
+        }
+    }
+}
+
 async fn start_node(
     app: &AppHandle,
     data_dir: PathBuf,
@@ -216,6 +238,15 @@ async fn start_node(
     });
     clipboard::start_monitor(runtime.clone());
     metrics::start(runtime.clone());
+    #[cfg(not(target_os = "android"))]
+    {
+        let ssh = runtime.ssh.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = ssh.host_settings(None).await {
+                eprintln!("恢复远程终端开关失败：{error:#}");
+            }
+        });
+    }
     discovery::start(runtime.clone());
     app.manage(runtime.clone());
     Ok((runtime, control))
@@ -240,6 +271,7 @@ fn node_data_dir(app: &AppHandle) -> PathBuf {
 #[tauri::mobile_entry_point]
 pub fn run() {
     tauri::Builder::default()
+        .on_page_load(terminal_page_load)
         .plugin(android::network::plugin())
         .plugin(android::storage::plugin())
         .plugin(tauri_plugin_dialog::init())
@@ -256,6 +288,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             node_base_url,
             android_network_changed,
+            terminal::commands::terminal_open,
+            terminal::commands::terminal_close,
+            terminal::commands::terminal_resize,
+            terminal::commands::terminal_write,
+            terminal::commands::terminal_ack,
             remote_file_access,
             set_remote_file_access,
             android::commands::android_receive_storage,
@@ -266,8 +303,16 @@ pub fn run() {
             android::update::app::android_check_for_updates,
             android::update::app::android_continue_update
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running MeshShare");
+        .build(tauri::generate_context!())
+        .expect("error while building MeshShare")
+        .run(|app, event| {
+            if matches!(
+                event,
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+            ) {
+                stop_node(app, matches!(event, tauri::RunEvent::Exit));
+            }
+        });
 }
 
 pub fn cleanup_autostart() {

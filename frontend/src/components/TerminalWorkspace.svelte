@@ -1,12 +1,15 @@
 <script lang="ts">
   import { tick } from 'svelte';
+  import { onBackButtonPress } from '@tauri-apps/api/app';
+  import type { PeerInfo } from '../types';
   import Icon from './Icon.svelte';
   import TerminalPane from './TerminalPane.svelte';
-  import { terminalSessionId, type TerminalState, type TerminalTarget } from '../terminal';
+  import { canOpenTerminal, terminalSessionId, type TerminalState, type TerminalTarget } from '../terminal';
 
   export let visible = false;
   export let count = 0;
-  export let remoteConnecting = false;
+  export let mobile = false;
+  export let peers: PeerInfo[] | null = null;
   const local: TerminalTarget = { peerId: null, name: '本机' };
   type Tab = { id: string; target: TerminalTarget; label: string; state: TerminalState };
   let tabs: Tab[] = [];
@@ -14,9 +17,42 @@
   let tabList: HTMLDivElement;
 
   $: count = tabs.length;
-  $: remoteConnecting = tabs.some((tab) => tab.target.peerId && tab.state === 'connecting');
+  $: available = peers && new Set(peers.filter(canOpenTerminal).map((peer) => peer.node_id));
+
+  function phoneViewport(element: HTMLElement) {
+    if (!mobile) return;
+    const viewport = window.visualViewport;
+    const fit = () => {
+      element.style.height = (viewport?.height ?? window.innerHeight) + 'px';
+      element.style.top = (viewport?.offsetTop ?? 0) + 'px';
+    };
+    fit();
+    viewport?.addEventListener('resize', fit);
+    viewport?.addEventListener('scroll', fit);
+    window.addEventListener('resize', fit);
+    return {
+      destroy() {
+        viewport?.removeEventListener('resize', fit);
+        viewport?.removeEventListener('scroll', fit);
+        window.removeEventListener('resize', fit);
+      },
+    };
+  }
+
+  // 只在终端页接管系统返回键，设备列表继续使用系统导航。
+  function phoneBack(_button: HTMLButtonElement) {
+    const listener = onBackButtonPress(() => { visible = false; }).catch((error) => {
+      console.error('监听 Android 返回键失败', error);
+    });
+    return {
+      destroy() {
+        void listener.then((entry) => entry?.unregister()).catch((error) => console.error('移除 Android 返回键监听失败', error));
+      },
+    };
+  }
 
   export function openSession(target: TerminalTarget = local) {
+    if (mobile && !target.peerId) return;
     const base = target.peerId ? '远程 · ' + target.name : '本机';
     let label = base;
     let number = 1;
@@ -63,8 +99,11 @@
   }
 </script>
 
-<section class="terminal-workspace" aria-label="终端" hidden={!visible}>
+<section class="terminal-workspace" class:mobile use:phoneViewport aria-label="终端" hidden={!visible}>
   <div class="toolbar">
+    {#if mobile && visible}
+      <button type="button" class="btn-icon" aria-label="返回设备列表" title="返回设备列表" use:phoneBack on:click={() => visible = false}><Icon name="arrow-left" size={18} /></button>
+    {/if}
     <div class="tabs" role="tablist" aria-label="终端会话" bind:this={tabList}>
       {#each tabs as tab, index (tab.id)}
         <div class="session-tab" class:selected={tab.id === active} role="presentation">
@@ -76,17 +115,19 @@
         </div>
       {/each}
     </div>
-    <button type="button" class="btn-icon" aria-label="新建本机终端" title="新建本机终端" on:click={() => openSession()}><Icon name="plus" size={16} /></button>
+    {#if !mobile}<button type="button" class="btn-icon" aria-label="新建本机终端" title="新建本机终端" on:click={() => openSession()}><Icon name="plus" size={16} /></button>{/if}
   </div>
   {#each tabs as tab (tab.id)}
     <div class="pane-wrapper" role="tabpanel" id={'pane-' + tab.id} aria-labelledby={'tab-' + tab.id} hidden={tab.id !== active}>
-      <TerminalPane id={tab.id} target={tab.target} visible={visible && tab.id === active} onState={(state) => updateState(tab.id, state)} onReconnect={() => openSession(tab.target)} />
+      <TerminalPane {mobile} canReconnect={!tab.target.peerId || !available || available.has(tab.target.peerId)} id={tab.id} target={tab.target} visible={visible && tab.id === active} onState={(state) => updateState(tab.id, state)} onReconnect={() => openSession(tab.target)} />
     </div>
   {/each}
 </section>
 
 <style>
   .terminal-workspace { flex: 1; display: flex; flex-direction: column; min-height: 0; margin: 0 var(--pad) var(--pad); overflow: hidden; border: 1px solid var(--line); border-radius: var(--r-lg); }
+  .terminal-workspace.mobile { position: fixed; left: 0; right: 0; z-index: 25; margin: 0; border: 0; border-radius: 0; padding: var(--phone-safe-top) 0 var(--phone-safe-bottom); background: var(--surface); }
+  .mobile .tabs { flex: 1; min-width: 0; }
   .terminal-workspace[hidden], .pane-wrapper[hidden] { display: none; }
   .pane-wrapper { min-height: 0; display: flex; flex: 1; }
   .toolbar { min-height: 42px; display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-bottom: 1px solid var(--line); background: var(--surface); }

@@ -1,4 +1,22 @@
 use super::*;
+#[cfg(not(target_os = "android"))]
+use tokio_util::sync::{CancellationToken, DropGuard};
+
+pub(super) struct PeerChannel {
+    sender: mpsc::Sender<WireMessage>,
+    #[cfg(not(target_os = "android"))]
+    terminal_client: DropGuard,
+}
+
+impl PeerChannel {
+    fn new(sender: mpsc::Sender<WireMessage>) -> Self {
+        Self {
+            sender,
+            #[cfg(not(target_os = "android"))]
+            terminal_client: CancellationToken::new().drop_guard(),
+        }
+    }
+}
 
 impl NodeRuntime {
     pub fn publish_metrics(&self, metrics: HardwareMetrics) {
@@ -42,7 +60,9 @@ impl NodeRuntime {
                 outgoing.network_up_bytes_per_sec = None;
                 outgoing.network_down_bytes_per_sec = None;
             }
-            let _ = channel.try_send(WireMessage::MetricsUpdate { metrics: outgoing });
+            let _ = channel
+                .sender
+                .try_send(WireMessage::MetricsUpdate { metrics: outgoing });
         }
     }
 
@@ -52,7 +72,7 @@ impl NodeRuntime {
         if channels.contains_key(&node_id) {
             return false;
         }
-        channels.insert(node_id, channel);
+        channels.insert(node_id, PeerChannel::new(channel));
         true
     }
 
@@ -72,7 +92,7 @@ impl NodeRuntime {
             if channels.contains_key(&node_id) {
                 return None;
             }
-            channels.insert(node_id.clone(), channel);
+            channels.insert(node_id.clone(), PeerChannel::new(channel));
             peers.insert(node_id.clone(), peer);
         }
         self.publish_event(WireMessage::Hello {
@@ -90,7 +110,7 @@ impl NodeRuntime {
             self.pending_clipboard_resync.lock().remove(node_id);
             return true;
         }
-        let channel = self.peer_channels.lock().get(node_id).cloned();
+        let channel = self.peer_sender(node_id);
         let Some(channel) = channel else {
             return false;
         };
@@ -150,7 +170,7 @@ impl NodeRuntime {
             self.pending_clipboard_resync.lock().remove(node_id);
             return false;
         };
-        let Some(channel) = self.peer_channels.lock().get(node_id).cloned() else {
+        let Some(channel) = self.peer_sender(node_id) else {
             return false;
         };
         match channel.try_send(WireMessage::ClipboardSnapshot { snapshot }) {
@@ -170,6 +190,19 @@ impl NodeRuntime {
         let mut peers = self.peers.write();
         let mut peer = peer;
         if let Some(previous) = peers.get(&peer.node_id) {
+            #[cfg(not(target_os = "android"))]
+            if previous.online != peer.online
+                || previous
+                    .terminal
+                    .as_ref()
+                    .map(|keys| &keys.client_fingerprint)
+                    != peer.terminal.as_ref().map(|keys| &keys.client_fingerprint)
+            {
+                if let Some(channel) = self.peer_channels.lock().get_mut(&peer.node_id) {
+                    // 更换守卫会撤销旧指纹下的全部入站终端，即使下一条 Hello 又换回原指纹。
+                    channel.terminal_client = CancellationToken::new().drop_guard();
+                }
+            }
             peer.metrics = peer.metrics.or_else(|| previous.metrics.clone());
             peer.metrics_received_at_ms = peer
                 .metrics_received_at_ms
@@ -202,6 +235,37 @@ impl NodeRuntime {
             peer.online = true;
             peer.last_seen_ms = now_millis();
         }
+    }
+
+    fn peer_sender(&self, node_id: &str) -> Option<mpsc::Sender<WireMessage>> {
+        self.peer_channels
+            .lock()
+            .get(node_id)
+            .map(|channel| channel.sender.clone())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn authorize_terminal_client(
+        &self,
+        node_id: &str,
+        fingerprint: &str,
+    ) -> Option<CancellationToken> {
+        let peers = self.peers.read();
+        let peer = peers.get(node_id)?;
+        if !peer.online || peer.terminal.as_ref()?.client_fingerprint != fingerprint {
+            return None;
+        }
+        let channels = self.peer_channels.lock();
+        Some(channels.get(node_id)?.terminal_client.token().clone())
+    }
+
+    pub(crate) fn terminal_peer_keys(&self, node_id: &str) -> Option<crate::model::TerminalKeys> {
+        let peers = self.peers.read();
+        let peer = peers.get(node_id)?;
+        if !peer.online || !self.has_peer_channel(node_id) {
+            return None;
+        }
+        peer.terminal.clone()
     }
 
     pub fn peer_supports(&self, node_id: &str, capability: &str) -> bool {

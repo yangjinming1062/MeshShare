@@ -14,8 +14,7 @@
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferHistoryLocation, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
   import TerminalWorkspace from './components/TerminalWorkspace.svelte';
-  import TerminalAccess from './components/TerminalAccess.svelte';
-  import { TERMINAL_CAPABILITY } from './terminal';
+  import { canOpenTerminal } from './terminal';
   import AppHeader from './components/AppHeader.svelte';
   import DevicePanel from './components/DevicePanel.svelte';
   import HardwarePanel from './components/HardwarePanel.svelte';
@@ -109,11 +108,9 @@
   let terminalWorkspace: TerminalWorkspace;
   let terminalVisible = false;
   let terminalCount = 0;
-  let terminalConnecting = false;
-  let terminalSettingsOpen = false;
 
   function openPeerTerminal(peer: PeerInfo) {
-    if (!remoteMode && peer.online && peer.capabilities.includes(TERMINAL_CAPABILITY)) {
+    if (!remoteMode && canOpenTerminal(peer)) {
       terminalWorkspace.openSession({ peerId: peer.node_id, name: peer.node_name });
     }
   }
@@ -2145,8 +2142,7 @@
     {#if isDesktopWindow && node && !clipboardStatus.available}
       <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
     {/if}
-    <TerminalAccess bind:open={terminalSettingsOpen} connecting={terminalConnecting} peers={remoteMode ? [] : peers} />
-    <TerminalWorkspace bind:this={terminalWorkspace} bind:visible={terminalVisible} bind:count={terminalCount} bind:remoteConnecting={terminalConnecting} />
+    <TerminalWorkspace bind:this={terminalWorkspace} bind:visible={terminalVisible} bind:count={terminalCount} peers={remoteMode ? null : peers} />
     <main class="app-main" hidden={terminalVisible}>
       <DevicePanel
         peers={peers}
@@ -2210,7 +2206,6 @@
       onHistoryMode={setClipboardHistoryMode}
       onHistoryValue={setClipboardHistoryValue}
       onRemoteFileAccess={setRemoteFileAccess}
-      onTerminalSettings={() => { settingsOpen = false; terminalSettingsOpen = true; }}
       onClose={() => (settingsOpen = false)}
     />
 

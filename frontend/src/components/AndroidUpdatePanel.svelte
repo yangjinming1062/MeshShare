@@ -10,7 +10,7 @@
     disabled: '自动更新已关闭',
     checking: '正在检查',
     no_update: '暂无可用更新',
-    waiting_for_transfers: '等待文件传输完成',
+    waiting_for_transfers: '等待文件传输或终端会话结束',
     waiting_for_network: '等待网络连接',
     metered: '等待非计费网络',
     downloading: '正在下载',

@@ -1,7 +1,21 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setImmediate as flush } from 'node:timers/promises';
-import { TerminalSession, type TerminalEvent, type TerminalTransport } from '../src/terminal.ts';
+import { canOpenTerminal, TerminalSession, type TerminalEvent, type TerminalTransport } from '../src/terminal.ts';
+import type { PeerInfo } from '../src/types.ts';
+
+test('the terminal button requires an online peer offering a ready v3 host', () => {
+  const peer: PeerInfo = {
+    node_id: 'desktop', node_name: 'Desktop', platform: 'linux', online: true, metrics_stale: false,
+    addresses: [], mobile_addresses: [], capabilities: ['terminal.ssh.v3'],
+    terminal: { client_fingerprint: 'client', host_fingerprint: 'host' },
+  };
+  assert.ok(canOpenTerminal(peer));
+  assert.equal(canOpenTerminal({ ...peer, online: false }), false);
+  assert.equal(canOpenTerminal({ ...peer, capabilities: ['terminal.ssh.v2'], terminal: undefined }), false);
+  assert.equal(canOpenTerminal({ ...peer, terminal: { client_fingerprint: 'client' } }), false);
+  assert.equal(canOpenTerminal({ ...peer, capabilities: [] }), false);
+});
 
 function deferred() {
   let resolve!: () => void;

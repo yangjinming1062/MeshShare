@@ -1,4 +1,8 @@
-export const TERMINAL_CAPABILITY = 'terminal.ssh.v2';
+import type { PeerInfo } from './types';
+
+export function canOpenTerminal(peer: PeerInfo): boolean {
+  return peer.online && peer.capabilities.includes('terminal.ssh.v3') && !!peer.terminal?.host_fingerprint;
+}
 
 export function terminalSessionId(): string {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -15,19 +19,6 @@ export type TerminalState = 'connecting' | 'connected' | 'ended';
 export type TerminalEvent =
   | { type: 'data'; sequence: number; data: number[] }
   | { type: 'exit'; reason: string };
-
-export type TrustDirection = 'incoming' | 'outgoing';
-export type TerminalIdentity = { node_id: string; fingerprint: string };
-export type PairRequest = TerminalIdentity & { id: string; direction: TrustDirection };
-export type TerminalSettings = {
-  enabled: boolean;
-  fingerprint: string | null;
-  pairing_until_ms: number | null;
-  incoming: TerminalIdentity[];
-  outgoing: TerminalIdentity[];
-  pending: PairRequest[];
-  error: string | null;
-};
 
 export interface TerminalTransport {
   open(cols: number, rows: number, receive: (event: TerminalEvent) => void): Promise<void>;

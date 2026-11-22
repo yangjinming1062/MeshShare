@@ -422,6 +422,7 @@ mod tests {
             port: address.port(),
             addresses: Vec::new(),
             mobile_addresses: Vec::new(),
+            terminal: None,
             capabilities: Vec::new(),
         };
         for invalid in [

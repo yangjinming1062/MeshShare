@@ -10,6 +10,7 @@ use axum::{
         ws::{Message, WebSocket},
         ConnectInfo, State, WebSocketUpgrade,
     },
+    http::{header, HeaderMap},
     response::IntoResponse,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
@@ -44,12 +45,18 @@ async fn send_message(writer: &mut SplitSink<WebSocket, Message>, message: WireM
 pub(super) async fn websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    headers: HeaderMap,
     connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> impl IntoResponse {
     ws.max_message_size(32 * 1024 * 1024)
         .max_frame_size(32 * 1024 * 1024)
         .on_upgrade(move |socket| {
-            handle_socket(socket, state.runtime, connect_info.map(|info| info.0))
+            handle_socket(
+                socket,
+                state.runtime,
+                connect_info.map(|info| info.0),
+                !headers.contains_key(header::ORIGIN),
+            )
         })
 }
 
@@ -57,10 +64,12 @@ async fn handle_socket(
     socket: WebSocket,
     runtime: Arc<NodeRuntime>,
     remote_address: Option<SocketAddr>,
+    native_peer: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<WireMessage>(64);
     let mut events = runtime.subscribe();
+    let mut host_changes = runtime.ssh.subscribe_host();
     let hello = WireMessage::Hello {
         node: runtime.node_info(),
     };
@@ -94,6 +103,7 @@ async fn handle_socket(
                                     break;
                                 }
                             }
+                            WireMessage::Hello { .. } if !native_peer || ui_client => break,
                             WireMessage::Hello { node } if peer_id.is_none() => {
                                 let Some(peer) = incoming_peer_from_hello(node, &runtime, remote_address) else {
                                     break;
@@ -116,6 +126,9 @@ async fn handle_socket(
                     Some(Ok(_)) => {}
                     Some(Err(_)) => break,
                 }
+            }
+            _ = host_changes.changed(), if peer_id.is_some() || ui_client => {
+                if !send_message(&mut sender, WireMessage::Hello { node: runtime.node_info() }).await { break; }
             }
             outbound = outgoing_rx.recv() => {
                 let Some(message) = outbound else { break };
@@ -225,6 +238,7 @@ pub(crate) fn peer_from_hello(
         addresses,
         mobile_addresses,
         capabilities: node.capabilities,
+        terminal: node.terminal,
         online: true,
         last_seen_ms: crate::clock::now_millis(),
         endpoint,
@@ -472,6 +486,29 @@ pub(super) fn validate_metrics(metrics: &HardwareMetrics) -> bool {
         })
 }
 
+fn valid_terminal_keys(node: &NodeInfo) -> bool {
+    let offers_terminal = node
+        .capabilities
+        .iter()
+        .any(|cap| cap == crate::model::TERMINAL_SSH_CAPABILITY);
+    let Some(keys) = &node.terminal else {
+        return !offers_terminal;
+    };
+    let valid_pin = |pin: &str| {
+        pin.len() == 50
+            && pin
+                .parse::<russh::keys::ssh_key::Fingerprint>()
+                .is_ok_and(|fp| fp.algorithm() == russh::keys::HashAlg::Sha256)
+    };
+    !node.node_id.chars().any(char::is_control)
+        && valid_pin(&keys.client_fingerprint)
+        && offers_terminal == keys.host_fingerprint.is_some()
+        && keys
+            .host_fingerprint
+            .as_deref()
+            .is_none_or(|pin| node.platform != "android" && valid_pin(pin))
+}
+
 pub(crate) fn validate_node_info(node: &NodeInfo) -> bool {
     !node.node_id.trim().is_empty()
         && node.node_id.len() <= 256
@@ -481,6 +518,7 @@ pub(crate) fn validate_node_info(node: &NodeInfo) -> bool {
         && node.addresses.len() <= 32
         && node.mobile_addresses.len() <= 32
         && node.capabilities.len() <= 64
+        && valid_terminal_keys(node)
         && node.addresses.iter().all(|address| {
             address.address.len() <= 64
                 && address.url.len() <= 512

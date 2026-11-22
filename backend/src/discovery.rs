@@ -37,6 +37,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                 };
                 let node = runtime.node_info();
                 let mut registered_address = register_service(&daemon, &node);
+                let mut registered_capabilities = node.capabilities.clone();
                 let Ok(receiver) = daemon.browse(SERVICE_TYPE) else {
                     if let Ok(status) = daemon.shutdown() {
                         let _ = status.recv_timeout(Duration::from_secs(1));
@@ -60,10 +61,13 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     let event = receiver.recv_timeout(Duration::from_secs(1));
                     let current_node = runtime.node_info();
                     let current_address = service_address(&current_node);
-                    if current_address != registered_address {
+                    if current_address != registered_address
+                        || current_node.capabilities != registered_capabilities
+                    {
                         // 地址变化直接重新注册：mdns-sd 对同一实例名做更新，
                         // 且 fullname 由 "<实例>.<服务类型>" 组成，手动拼接容易漏分隔点。
                         registered_address = register_service(&daemon, &current_node);
+                        registered_capabilities = current_node.capabilities;
                     }
                     if let Ok(ServiceEvent::ServiceResolved(info)) = event {
                         let Some(node_id) = info.get_property_val_str("node_id") else {
@@ -355,6 +359,7 @@ async fn run_peer_session(
     let Some(_session) = runtime.attach_peer_session(peer, tx) else {
         return false;
     };
+    let mut host_changes = runtime.ssh.subscribe_host();
     let hello = WireMessage::Hello {
         node: runtime.node_info(),
     };
@@ -381,6 +386,11 @@ async fn run_peer_session(
                 let _ = runtime.flush_clipboard_resync(node_id);
                 let _ = runtime.flush_history_deletions(node_id);
                 continue;
+            }
+            _ = host_changes.changed() => {
+                let hello = WireMessage::Hello { node: runtime.node_info() };
+                let Ok(body) = serde_json::to_string(&hello) else { break };
+                Message::Text(body)
             }
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break };

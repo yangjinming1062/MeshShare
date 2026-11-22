@@ -14,7 +14,6 @@ use crate::model::{
     TRANSFER_HISTORY_CAPABILITY, TRANSFER_HISTORY_LIMIT,
 };
 use futures_util::StreamExt;
-#[cfg(not(target_os = "android"))]
 use parking_lot::Condvar;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -80,10 +79,8 @@ struct ClipboardState {
     pending_system_write: bool,
 }
 
-#[cfg(not(target_os = "android"))]
 pub(crate) struct TerminalActivity(std::sync::Weak<NodeRuntime>);
 
-#[cfg(not(target_os = "android"))]
 impl Drop for TerminalActivity {
     fn drop(&mut self) {
         if let Some(runtime) = self.0.upgrade() {
@@ -96,13 +93,9 @@ impl Drop for TerminalActivity {
 }
 
 pub struct NodeRuntime {
-    #[cfg(not(target_os = "android"))]
     pub(crate) ssh: Arc<crate::terminal::ssh::SshService>,
-    #[cfg(not(target_os = "android"))]
     pub(crate) terminals: crate::terminal::commands::WindowTerminals,
-    #[cfg(not(target_os = "android"))]
     terminal_count: AtomicU64,
-    #[cfg(not(target_os = "android"))]
     terminals_stopped: Condvar,
     profile: NodeProfile,
     pub node: RwLock<NodeInfo>,
@@ -124,7 +117,7 @@ pub struct NodeRuntime {
     data_dir: PathBuf,
     clipboard_update: Mutex<()>,
     seen_events: Mutex<HashMap<String, i64>>,
-    peer_channels: Mutex<HashMap<String, mpsc::Sender<WireMessage>>>,
+    peer_channels: Mutex<HashMap<String, peers::PeerChannel>>,
     pending_clipboard_resync: Mutex<HashSet<String>>,
     peer_dials: Mutex<HashMap<String, watch::Sender<Vec<PeerEndpoint>>>>,
     transfer_locks: Mutex<HashSet<(String, String)>>,
@@ -194,7 +187,6 @@ impl NodeProfile {
                 METRICS_NETWORK_CAPABILITY.to_string(),
                 REMOTE_MANAGEMENT_CAPABILITY.to_string(),
                 REMOTE_FILES_CAPABILITY.to_string(),
-                crate::model::TERMINAL_SSH_CAPABILITY.to_string(),
                 TRANSFER_HISTORY_CAPABILITY.to_string(),
             ],
             Self::Android => vec![
@@ -340,6 +332,10 @@ impl NodeRuntime {
         if let Some(snapshot) = clipboard.as_ref() {
             clock.observe(&snapshot.clock);
         }
+        let ssh = Arc::new(crate::terminal::ssh::SshService::new(
+            &data_dir,
+            config.node_id.clone(),
+        )?);
         let node = NodeInfo {
             node_id: config.node_id.clone(),
             node_name: config.node_name.clone(),
@@ -350,19 +346,16 @@ impl NodeRuntime {
             addresses: Vec::new(),
             mobile_addresses: Vec::new(),
             capabilities: profile.capabilities(),
+            terminal: Some(crate::model::TerminalKeys {
+                client_fingerprint: ssh.client_fingerprint(),
+                host_fingerprint: None,
+            }),
         };
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
-            #[cfg(not(target_os = "android"))]
-            ssh: Arc::new(crate::terminal::ssh::SshService::new(
-                data_dir.clone(),
-                node.node_id.clone(),
-            )),
-            #[cfg(not(target_os = "android"))]
+            ssh,
             terminals: Default::default(),
-            #[cfg(not(target_os = "android"))]
             terminal_count: AtomicU64::new(0),
-            #[cfg(not(target_os = "android"))]
             terminals_stopped: Condvar::new(),
             profile,
             clock,
@@ -430,6 +423,9 @@ impl NodeRuntime {
     }
 
     pub fn supports_capability(&self, capability: &str) -> bool {
+        if capability == crate::model::TERMINAL_SSH_CAPABILITY {
+            return !self.is_android_profile() && self.ssh.host_fingerprint().is_some();
+        }
         self.node
             .read()
             .capabilities
@@ -438,7 +434,15 @@ impl NodeRuntime {
     }
 
     pub fn node_info(&self) -> NodeInfo {
-        self.node.read().clone()
+        let mut info = self.node.read().clone();
+        if !self.is_android_profile() {
+            if let (Some(keys), Some(host)) = (&mut info.terminal, self.ssh.host_fingerprint()) {
+                keys.host_fingerprint = Some(host);
+                info.capabilities
+                    .push(crate::model::TERMINAL_SSH_CAPABILITY.to_owned());
+            }
+        }
+        info
     }
 
     pub fn node_id(&self) -> String {
@@ -524,7 +528,6 @@ impl NodeRuntime {
                 .any(|record| is_active_transfer(&record.progress.status))
     }
 
-    #[cfg(not(target_os = "android"))]
     pub(crate) fn reserve_terminal(self: &Arc<Self>) -> anyhow::Result<Arc<TerminalActivity>> {
         let _gate = self.transfer_update_gate.lock();
         anyhow::ensure!(!self.stopping.load(Ordering::SeqCst), "节点正在退出");
@@ -541,7 +544,6 @@ impl NodeRuntime {
         Ok(Arc::new(TerminalActivity(Arc::downgrade(self))))
     }
 
-    #[cfg(not(target_os = "android"))]
     pub(crate) fn wait_for_terminal_shutdown(&self) {
         let mut gate = self.transfer_update_gate.lock();
         let wait = self.terminals_stopped.wait_while_for(
@@ -555,7 +557,6 @@ impl NodeRuntime {
     }
 
     pub(crate) fn update_has_active_work(&self) -> bool {
-        #[cfg(not(target_os = "android"))]
         if self.terminal_count.load(Ordering::SeqCst) != 0 {
             return true;
         }

@@ -31,6 +31,7 @@ fn test_peer(node_id: &str, capabilities: Vec<String>) -> PeerInfo {
         platform: "test".to_string(),
         addresses: Vec::new(),
         mobile_addresses: Vec::new(),
+        terminal: None,
         capabilities,
         online: true,
         last_seen_ms: crate::clock::now_millis(),
@@ -597,7 +598,6 @@ fn update_frequency_parser_rejects_unknown_values() {
     assert_eq!(UpdateFrequency::parse("monthly"), None);
 }
 
-#[cfg(not(target_os = "android"))]
 #[test]
 fn terminal_reservation_and_update_install_exclude_each_other() {
     let path = temp_data_dir();
@@ -612,7 +612,7 @@ fn terminal_reservation_and_update_install_exclude_each_other() {
     assert!(runtime.reserve_terminal().is_err());
     runtime.end_update_install();
     assert!(runtime.reserve_terminal().is_ok());
-    assert!(NodeProfile::Desktop
+    assert!(!NodeProfile::Desktop
         .capabilities()
         .iter()
         .any(|item| item == crate::model::TERMINAL_SSH_CAPABILITY));
@@ -2714,6 +2714,7 @@ fn register_peer_endpoint(runtime: &Arc<NodeRuntime>, node: NodeInfo) {
             addresses: node.addresses.clone(),
             mobile_addresses: node.mobile_addresses.clone(),
             capabilities: node.capabilities.clone(),
+            terminal: node.terminal.clone(),
             online: true,
             last_seen_ms: crate::clock::now_millis(),
             endpoint: Some(format!("ws://127.0.0.1:{}/api/v1/ws", node.port)),
