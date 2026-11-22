@@ -162,6 +162,12 @@ impl SshService {
                             .send(Output::Data(data.to_vec()))
                             .await
                             .map_err(|_| anyhow!("终端界面已关闭"))?,
+                        Some(ChannelMsg::ExtendedData {
+                            ext: OUTPUT_BARRIER,
+                            data,
+                        }) if data.as_ref() == b"\0" => {
+                            writer.extended_data_bytes(OUTPUT_BARRIER, data).await?;
+                        }
                         Some(ChannelMsg::Eof | ChannelMsg::Close) => {
                             return Ok::<_, anyhow::Error>("远程终端已结束")
                         }

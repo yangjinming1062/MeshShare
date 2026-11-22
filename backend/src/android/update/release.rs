@@ -7,7 +7,7 @@ const MAX_APK_SIZE: u64 = 512 * 1024 * 1024;
 #[derive(Debug, Deserialize)]
 pub(super) struct Manifest {
     version: Version,
-    android: Option<Artifact>,
+    android: Artifact,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -25,26 +25,25 @@ pub(super) struct Artifact {
 
 impl Manifest {
     pub fn select(self, current: &Version, installed_code: u64) -> Result<Option<Release>> {
-        let Some(apk) = self.android else {
-            return Ok(None);
-        };
-        Release {
+        let release = Release {
             version: self.version,
-            apk,
-        }
-        .newer_than(current, installed_code)
+            apk: self.android,
+        };
+        Ok(release
+            .is_newer_than(current, installed_code)?
+            .then_some(release))
     }
 }
 
 impl Release {
-    pub fn newer_than(self, current: &Version, installed_code: u64) -> Result<Option<Self>> {
+    pub fn is_newer_than(&self, current: &Version, installed_code: u64) -> Result<bool> {
         let version = &self.version;
         ensure!(
             version.pre.is_empty() && version.build.is_empty(),
             "更新版本不是稳定版"
         );
         if version <= current {
-            return Ok(None);
+            return Ok(false);
         }
         let code = version
             .major
@@ -65,7 +64,7 @@ impl Release {
                 && self.apk.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "更新包的大小或 SHA-256 无效"
         );
-        Ok(Some(self))
+        Ok(true)
     }
 }
 
@@ -84,6 +83,7 @@ mod tests {
             },
             "android": {"version_code": 1002003, "size": 42, "sha256": "ab".repeat(32)},
         });
+        #[cfg(not(target_os = "android"))]
         serde_json::from_value::<tauri_plugin_updater::RemoteRelease>(manifest.clone()).unwrap();
         let release = serde_json::from_value::<Manifest>(manifest)
             .unwrap()
@@ -97,11 +97,13 @@ mod tests {
     #[test]
     fn android_selects_only_supported_newer_releases() {
         let installed = Version::new(1, 2, 3);
-        let old_manifest = serde_json::from_value::<Manifest>(json!({"version": "1.2.2"})).unwrap();
-        assert!(old_manifest
-            .select(&installed, 1_002_003)
-            .unwrap()
-            .is_none());
+        assert!(serde_json::from_value::<Manifest>(json!({"version": "1.2.4"})).is_err());
+        let current = serde_json::from_value::<Manifest>(json!({
+            "version": "1.2.3",
+            "android": {"version_code": 1002003, "size": 42, "sha256": "ab".repeat(32)},
+        }))
+        .unwrap();
+        assert!(current.select(&installed, 1_002_003).unwrap().is_none());
 
         for (version, code, size, hash) in [
             ("1.2.4-rc.1", 1_002_004, 42, "ab".repeat(32)),

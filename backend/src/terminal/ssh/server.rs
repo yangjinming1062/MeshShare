@@ -8,7 +8,7 @@ use axum::{
 };
 use russh::{server as ssh, Channel, ChannelMsg};
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio_util::io::InspectReader;
 
 struct Host {
@@ -262,6 +262,7 @@ async fn relay_channel(
 ) -> Result<()> {
     let id = channel.id();
     let (mut reader, writer) = channel.split();
+    let output_ack = Notify::new();
     let receive = async {
         loop {
             let message = match reader.wait().await {
@@ -275,6 +276,13 @@ async fn relay_channel(
                     Input::Resize { cols, rows }
                 }
                 Some(ChannelMsg::WindowAdjusted { .. }) => continue,
+                Some(ChannelMsg::ExtendedData {
+                    ext: OUTPUT_BARRIER,
+                    data,
+                }) if data.as_ref() == b"\0" => {
+                    output_ack.notify_one();
+                    continue;
+                }
                 Some(ChannelMsg::Close | ChannelMsg::Eof) | None => {
                     return Ok::<_, anyhow::Error>(())
                 }
@@ -292,9 +300,24 @@ async fn relay_channel(
         }
     };
     let transmit = async {
+        // 在 russh 的通道队列填满前停读 PTY，使 SSH 仍能处理心跳和关闭消息。
+        const BATCH_CHUNKS: usize = 16;
+        let mut sent = 0;
         while let Some(msg) = io.output.recv().await {
             match msg {
-                Output::Data(bytes) => writer.data_bytes(bytes).await?,
+                Output::Data(bytes) => {
+                    if sent == BATCH_CHUNKS {
+                        output_ack.notified().await;
+                        sent = 0;
+                    }
+                    writer.data_bytes(bytes).await?;
+                    sent += 1;
+                    if sent == BATCH_CHUNKS {
+                        writer
+                            .extended_data_bytes(OUTPUT_BARRIER, b"\0".as_slice())
+                            .await?;
+                    }
+                }
                 Output::Exit { .. } => break,
             }
         }

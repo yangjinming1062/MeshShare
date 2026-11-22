@@ -38,10 +38,9 @@ pub(crate) fn enable(executable: &Path) -> Result<()> {
     let path = desktop_file()?;
     let wrapper = wrapper_file()?;
     atomic_write(&wrapper, &wrapper_script(executable, &path))?;
-    let shell = desktop_exec_argument(Path::new("/bin/sh"));
     let wrapper = desktop_exec_argument(&wrapper);
     let contents = format!(
-        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={APP_NAME}\nComment={APP_NAME} startup\nExec={shell} {wrapper}\nStartupNotify=false\nTerminal=false\n",
+        "[Desktop Entry]\nType=Application\nVersion=1.0\nName={APP_NAME}\nComment={APP_NAME} startup\nExec=/bin/sh {wrapper}\nStartupNotify=false\nTerminal=false\n",
     );
     atomic_write(&path, &contents)
 }

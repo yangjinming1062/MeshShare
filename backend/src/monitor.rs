@@ -128,22 +128,18 @@ fn log_change(previous: &mut Option<String>, error: Option<String>, context: &st
 fn reconcile(app: &AppHandle, reapply: bool) {
     let (Some(controller), Some(node), Some(window)) = (
         app.try_state::<Controller>(),
-        app.try_state::<crate::ManagedNode>(),
+        app.try_state::<Arc<NodeRuntime>>(),
         app.get_webview_window("monitor"),
     ) else {
         return;
     };
-    if node
-        .runtime
-        .stopping
-        .load(std::sync::atomic::Ordering::SeqCst)
-    {
+    if node.stopping.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
     let mut state = controller.0.lock();
     let desired = state.fullscreen.presentation(
-        node.runtime.monitor_visible(),
-        crate::effective_monitor_locked(app, &node.runtime),
+        node.monitor_visible(),
+        crate::effective_monitor_locked(app, &node),
     );
     if reapply {
         state.applied = None;
@@ -225,11 +221,12 @@ fn capture(app: &AppHandle, restore_position: bool) -> Result<Option<Target>> {
             .try_state::<Controller>()
             .context("悬浮条控制器不存在")?;
         let node = app
-            .try_state::<crate::ManagedNode>()
+            .try_state::<Arc<NodeRuntime>>()
             .context("本机节点不存在")?;
         // 重新定位后，即使仍是同一块屏幕，也要重新检测后再显示。
         controller.0.lock().reset_placement();
-        crate::position_monitor_window(&window, &node.runtime).context("恢复悬浮条位置")?;
+        crate::desktop::monitor_window::position_monitor_window(&window, &node)
+            .context("恢复悬浮条位置")?;
     }
     #[cfg(not(target_os = "windows"))]
     let _ = restore_position;

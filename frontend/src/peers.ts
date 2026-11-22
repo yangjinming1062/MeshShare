@@ -11,11 +11,10 @@ export function normalizePeerEndpoint(endpoint: string | null | undefined): stri
   if (!endpoint) return null;
   try {
     const parsed = new URL(endpoint);
-    if (!['http:', 'https:', 'ws:', 'wss:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) return null;
-    if (!parsed.pathname.endsWith('/api/v1/ws')) return null;
-    parsed.protocol = parsed.protocol === 'ws:' ? 'http:' : parsed.protocol === 'wss:' ? 'https:' : parsed.protocol;
-    parsed.pathname = '';
-    const base = parsed.toString().replace(/\/$/, '');
+    if (!['ws:', 'wss:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) return null;
+    if (parsed.pathname !== '/api/v1/ws') return null;
+    parsed.protocol = parsed.protocol === 'ws:' ? 'http:' : 'https:';
+    const base = parsed.origin;
     return isAllowedPeerBase(base) ? base : null;
   } catch {
     return null;
@@ -27,6 +26,7 @@ export function isAllowedPeerBase(raw: string): boolean {
     const parsed = new URL(raw);
     if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) return false;
     const host = parsed.hostname.toLowerCase();
+    if (parsed.pathname !== '/') return false;
     if (host === 'localhost' || host.endsWith('.local')) return true;
     const octets = host.split('.').map((value) => Number(value));
     if (octets.length !== 4 || octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return false;
@@ -58,16 +58,10 @@ export function peerTargetCandidates(peer: PeerInfo, web: PeerWebContext | null)
     const base = peerTargetBase(peer, web);
     return base ? [base] : [];
   }
-  const bases: string[] = [];
-  const endpointBase = normalizePeerEndpoint(peer.endpoint);
-  if (endpointBase) bases.push(endpointBase);
-  bases.push(...peer.addresses.map((address) => address.url).filter((url): url is string => !!url && isAllowedPeerBase(url)));
-  const unique = new Set<string>();
-  for (const base of bases) {
-    const normalized = base.replace(/\/$/, '');
-    if (normalized) unique.add(normalized);
-  }
-  const candidates = [...unique];
+  const urls = peer.addresses.map((address) => address.url).filter(isAllowedPeerBase);
+  const endpoint = normalizePeerEndpoint(peer.endpoint);
+  if (endpoint) urls.unshift(endpoint);
+  const candidates = [...new Set(urls.map((url) => url.replace(/\/$/, '')))];
   // 链路本地地址只有在没有其他入口时才值得尝试，否则先试常规地址。
   const routable = candidates.filter((base) => !base.includes('//169.254.'));
   return routable.length ? routable : candidates;

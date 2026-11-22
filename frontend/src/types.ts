@@ -13,7 +13,7 @@ export type NodeInfo = {
   platform: string;
   port: number;
   addresses: AddressInfo[];
-  mobile_addresses?: AddressInfo[];
+  mobile_addresses: AddressInfo[];
   capabilities: string[];
 };
 
@@ -49,12 +49,12 @@ export type PeerInfo = {
   node_name: string;
   platform: string;
   addresses: AddressInfo[];
-  mobile_addresses?: AddressInfo[];
+  mobile_addresses: AddressInfo[];
   capabilities: string[];
   online: boolean;
   endpoint?: string;
   metrics?: HardwareMetrics;
-  metrics_stale?: boolean;
+  metrics_stale: boolean;
 };
 
 export type GpuMemoryKind = 'dedicated' | 'unified' | 'unknown';
@@ -101,7 +101,7 @@ export type HardwareMetrics = {
   network_down_bytes_per_sec?: number;
   network_up_bytes_per_sec?: number;
   gpus: GpuMetrics[];
-  disks?: DiskMetrics[];
+  disks: DiskMetrics[];
 };
 
 export type ClipboardSnapshot = {
@@ -216,7 +216,7 @@ export type TransferProgress = {
   retry_count?: number;
   status: TransferStatus;
   /** 出站任务正在等待接收端返回清单对应的状态。 */
-  awaiting_offer_reply?: boolean;
+  awaiting_offer_reply: boolean;
   completed_bytes: number;
   total_bytes: number;
   completed_items: number;
@@ -265,7 +265,7 @@ export type TransferPrepare = {
   item_count: number;
   total_bytes: number;
   hashed_bytes: number;
-  phase?: 'hash' | 'stage';
+  phase: 'hash' | 'stage';
 };
 
 export type OutgoingStagingView = {
@@ -288,14 +288,13 @@ export type OutgoingPrepareView = {
 export type MobileTransferView = {
   session_id: string;
   progress: TransferProgress;
-  downloaded_item_ids?: string[];
+  downloaded_item_ids: string[];
   retryable_download_item_ids?: string[];
 };
 
 export type PhoneTransfer = TransferProgress & {
   peer_name?: string;
-  downloaded_item_ids?: string[];
-  retryable_download_item_ids?: string[];
+  web?: MobileTransferView;
 };
 
 /** 远程管理页在目标机器上的目录浏览结果；路径都由目标节点规范化返回。 */
@@ -332,7 +331,7 @@ export type WireMessage =
   | { type: 'ClipboardUpdate'; payload: { event: unknown } }
   | { type: 'ClipboardSnapshot'; payload: { snapshot: ClipboardSnapshot } }
   | { type: 'TransferOffer'; payload: { offer: TransferOffer } }
-  | { type: 'TransferAction'; payload: { transfer_id: string; action: string; reason?: string; retry_count?: number } }
+  | { type: 'TransferAction'; payload: { transfer_id: string; action: 'accept' | 'reject' | 'cancel' | 'fail'; reason?: string | null; retry_count: number } }
   | { type: 'TransferProgress'; payload: { progress: TransferProgress } }
   | { type: 'MetricsUpdate'; payload: { metrics: HardwareMetrics } }
   | { type: 'TransferHistoryDeleted'; payload: { transfer_ids: string[] } };

@@ -2,7 +2,7 @@ use crate::model::Hlc;
 use parking_lot::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn now_ms() -> i64 {
+pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|value| value.as_millis() as i64)
@@ -30,7 +30,7 @@ impl LogicalClock {
 
     pub fn tick(&self) -> Hlc {
         let mut state = self.state.lock();
-        let wall_clock = now_ms();
+        let wall_clock = now_millis();
         let physical = wall_clock.max(state.last_physical_ms);
         let logical = if physical > state.last_physical_ms {
             0
@@ -48,7 +48,7 @@ impl LogicalClock {
 
     pub fn observe(&self, remote: &Hlc) -> Hlc {
         let mut state = self.state.lock();
-        let wall_clock = now_ms();
+        let wall_clock = now_millis();
         let physical = wall_clock
             .max(state.last_physical_ms)
             .max(remote.physical_ms);
@@ -69,10 +69,6 @@ impl LogicalClock {
             node_id: self.node_id.clone(),
         }
     }
-}
-
-pub fn now_millis() -> i64 {
-    now_ms()
 }
 
 #[cfg(test)]

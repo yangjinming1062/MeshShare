@@ -32,14 +32,9 @@ pub(crate) fn enable(executable: &Path) -> Result<()> {
     let path = launch_agent_file()?;
     let wrapper = wrapper_file()?;
     atomic_write(&wrapper, &wrapper_script(executable, &path))?;
-    let shell = xml_escape(
-        Path::new("/bin/sh")
-            .to_str()
-            .context("当前程序路径不是有效的 UTF-8")?,
-    );
     let wrapper = xml_escape(wrapper.to_str().context("自启动脚本路径不是有效的 UTF-8")?);
     let contents = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{BUNDLE_IDENTIFIER}</string><key>AssociatedBundleIdentifiers</key><array><string>{BUNDLE_IDENTIFIER}</string></array><key>ProgramArguments</key><array><string>{shell}</string><string>{wrapper}</string></array><key>RunAtLoad</key><true/><key>LimitLoadToSessionType</key><string>Aqua</string></dict></plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{BUNDLE_IDENTIFIER}</string><key>AssociatedBundleIdentifiers</key><array><string>{BUNDLE_IDENTIFIER}</string></array><key>ProgramArguments</key><array><string>/bin/sh</string><string>{wrapper}</string></array><key>RunAtLoad</key><true/><key>LimitLoadToSessionType</key><string>Aqua</string></dict></plist>\n",
     );
     atomic_write(&path, &contents)
 }

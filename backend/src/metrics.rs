@@ -4,7 +4,7 @@ use crate::runtime::NodeRuntime;
 #[cfg(target_os = "linux")]
 use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{CpuRefreshKind, Disks, MemoryRefreshKind, Networks, RefreshKind, System};
@@ -36,13 +36,10 @@ pub fn start(runtime: Arc<NodeRuntime>) {
             let mut collector = Collector::new(&runtime.node_id(), network_only);
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 let started = Instant::now();
-                let snapshot = collector.sample(network_only);
+                let snapshot = collector.sample();
                 runtime.set_local_metrics(snapshot.clone());
                 runtime.publish_metrics(snapshot);
-                let elapsed = started.elapsed();
-                if elapsed < SAMPLE_INTERVAL {
-                    thread::sleep(SAMPLE_INTERVAL - elapsed);
-                }
+                thread::sleep(SAMPLE_INTERVAL.saturating_sub(started.elapsed()));
             }
         })
         .expect("metrics collector thread");
@@ -50,144 +47,95 @@ pub fn start(runtime: Arc<NodeRuntime>) {
 
 struct Collector {
     node_id: String,
-    system: System,
     networks: Networks,
-    disks: Disks,
-    disk_samples_since_refresh: u32,
     previous_network: Option<(Instant, u64, u64)>,
-    cpu_ready: bool,
-    gpus: GpuProbe,
+    desktop: Option<DesktopCollector>,
 }
 
 impl Collector {
     fn new(node_id: &str, network_only: bool) -> Self {
-        let system = System::new_with_specifics(
-            RefreshKind::new()
-                .with_cpu(CpuRefreshKind::everything())
-                .with_memory(MemoryRefreshKind::everything()),
-        );
         Self {
-            node_id: node_id.to_string(),
-            system,
+            node_id: node_id.to_owned(),
             networks: Networks::new_with_refreshed_list(),
-            disks: if network_only {
-                Disks::new()
-            } else {
-                Disks::new_with_refreshed_list()
-            },
-            disk_samples_since_refresh: 0,
             previous_network: None,
-            cpu_ready: false,
-            gpus: GpuProbe::new(),
+            desktop: (!network_only).then(DesktopCollector::new),
         }
     }
 
-    fn sample(&mut self, network_only: bool) -> HardwareMetrics {
-        self.system.refresh_cpu_usage();
-        self.system.refresh_memory();
+    fn sample(&mut self) -> HardwareMetrics {
         self.networks.refresh_list();
         self.networks.refresh();
-
         let now = Instant::now();
         let (received, transmitted) = network_totals(&self.networks);
-        let (network_down, network_up) = self
-            .previous_network
-            .map(|(previous_at, previous_received, previous_transmitted)| {
-                let elapsed = now.duration_since(previous_at).as_secs_f64();
-                if elapsed <= 0.0 {
-                    return (None, None);
-                }
-                (
-                    rate(previous_received, received, elapsed),
-                    rate(previous_transmitted, transmitted, elapsed),
-                )
-            })
-            .unwrap_or((None, None));
-        self.previous_network = Some((now, received, transmitted));
-
-        let cpu_usage_percent = if self.cpu_ready {
-            Some(self.system.global_cpu_usage().clamp(0.0, 100.0))
-        } else {
-            self.cpu_ready = true;
-            None
-        };
-        let (cpu_usage_percent, memory_used_bytes, memory_total_bytes, gpus) = if network_only {
-            (None, None, None, Vec::new())
-        } else {
-            (
-                cpu_usage_percent,
-                Some(self.system.used_memory()),
-                Some(self.system.total_memory()),
-                self.gpus.sample(),
-            )
-        };
-        let (
-            cpu_model,
-            cpu_logical_cores,
-            cpu_physical_cores,
-            cpu_frequency_mhz,
-            memory_available_bytes,
-            swap_used_bytes,
-            swap_total_bytes,
-            load_average,
-            uptime_seconds,
-            disks,
-        ) = if network_only {
-            (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                Vec::new(),
-            )
-        } else {
-            self.refresh_disks();
-            (
-                cpu_model(&self.system),
-                u32::try_from(self.system.cpus().len()).ok(),
-                self.system
-                    .physical_core_count()
-                    .and_then(|value| u32::try_from(value).ok()),
-                self.system
-                    .cpus()
-                    .iter()
-                    .map(|cpu| cpu.frequency())
-                    .max()
-                    .filter(|value| *value > 0),
-                Some(self.system.available_memory()),
-                Some(self.system.used_swap()),
-                Some(self.system.total_swap()),
-                system_load_average(),
-                Some(System::uptime()),
-                collect_disks(&self.disks),
-            )
-        };
-
-        HardwareMetrics {
+        let mut snapshot = HardwareMetrics {
             node_id: self.node_id.clone(),
-            sampled_at_ms: now_millis(),
-            cpu_usage_percent,
-            cpu_model,
-            cpu_logical_cores,
-            cpu_physical_cores,
-            cpu_frequency_mhz,
-            memory_used_bytes,
-            memory_total_bytes,
-            memory_available_bytes,
-            swap_used_bytes,
-            swap_total_bytes,
-            load_average,
-            uptime_seconds,
-            network_down_bytes_per_sec: network_down,
-            network_up_bytes_per_sec: network_up,
-            gpus,
-            disks,
+            ..HardwareMetrics::default()
+        };
+        if let Some((at, rx, tx)) = self.previous_network.replace((now, received, transmitted)) {
+            let elapsed = now.duration_since(at).as_secs_f64();
+            snapshot.network_down_bytes_per_sec = rate(rx, received, elapsed);
+            snapshot.network_up_bytes_per_sec = rate(tx, transmitted, elapsed);
         }
+        if let Some(desktop) = &mut self.desktop {
+            desktop.sample(&mut snapshot);
+        }
+        snapshot.sampled_at_ms = now_millis();
+        snapshot
+    }
+}
+
+struct DesktopCollector {
+    system: System,
+    cpu_ready: bool,
+    disks: Disks,
+    disk_samples_since_refresh: u32,
+    static_gpus: OnceLock<Vec<GpuMetrics>>,
+}
+
+impl DesktopCollector {
+    fn new() -> Self {
+        Self {
+            system: System::new_with_specifics(
+                RefreshKind::new()
+                    .with_cpu(CpuRefreshKind::everything())
+                    .with_memory(MemoryRefreshKind::everything()),
+            ),
+            cpu_ready: false,
+            disks: Disks::new(),
+            disk_samples_since_refresh: 0,
+            static_gpus: OnceLock::new(),
+        }
+    }
+
+    fn sample(&mut self, metrics: &mut HardwareMetrics) {
+        self.system.refresh_cpu_usage();
+        self.system.refresh_memory();
+        self.refresh_disks();
+        let system = &self.system;
+        if self.cpu_ready {
+            metrics.cpu_usage_percent = Some(system.global_cpu_usage().clamp(0.0, 100.0));
+        }
+        self.cpu_ready = true;
+        metrics.cpu_model = cpu_model(system);
+        metrics.cpu_logical_cores = u32::try_from(system.cpus().len()).ok();
+        metrics.cpu_physical_cores = system
+            .physical_core_count()
+            .and_then(|n| u32::try_from(n).ok());
+        metrics.cpu_frequency_mhz = system
+            .cpus()
+            .iter()
+            .map(|cpu| cpu.frequency())
+            .max()
+            .filter(|n| *n > 0);
+        metrics.memory_used_bytes = Some(system.used_memory());
+        metrics.memory_total_bytes = Some(system.total_memory());
+        metrics.memory_available_bytes = Some(system.available_memory());
+        metrics.swap_used_bytes = Some(system.used_swap());
+        metrics.swap_total_bytes = Some(system.total_swap());
+        metrics.load_average = system_load_average();
+        metrics.uptime_seconds = Some(System::uptime());
+        metrics.disks = collect_disks(&self.disks);
+        metrics.gpus = collect_gpus(self.static_gpus.get_or_init(probe_static_gpus));
     }
 
     fn refresh_disks(&mut self) {
@@ -283,45 +231,20 @@ fn is_loopback_interface(name: &str) -> bool {
         || normalized.contains("loop-back")
 }
 
-struct GpuProbe {
-    initialized: bool,
-    static_gpus: Vec<GpuMetrics>,
-}
-
-impl GpuProbe {
-    fn new() -> Self {
-        Self {
-            initialized: false,
-            static_gpus: Vec::new(),
-        }
+fn collect_gpus(metadata: &[GpuMetrics]) -> Vec<GpuMetrics> {
+    let mut gpus = probe_nvidia_smi();
+    #[cfg(target_os = "windows")]
+    if gpus.is_empty() {
+        gpus = probe_windows_gpus();
     }
-
-    fn sample(&mut self) -> Vec<GpuMetrics> {
-        if !self.initialized {
-            self.static_gpus = probe_static_gpus();
-            self.initialized = true;
-        }
-        let mut gpus = probe_nvidia_smi();
-        if gpus.is_empty() {
-            #[cfg(target_os = "macos")]
-            {
-                gpus = self.static_gpus.clone();
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                gpus = probe_platform_gpus();
-            }
-        }
-        if gpus.is_empty() {
-            return self.static_gpus.clone();
-        }
-        merge_gpu_metadata(&mut gpus, &self.static_gpus);
-        gpus
+    #[cfg(target_os = "linux")]
+    if gpus.is_empty() {
+        gpus = probe_linux_gpus();
     }
-}
-
-fn merge_gpu_metadata(gpus: &mut [GpuMetrics], metadata: &[GpuMetrics]) {
-    for gpu in gpus {
+    if gpus.is_empty() {
+        return metadata.to_vec();
+    }
+    for gpu in &mut gpus {
         if let Some(reference) = metadata.iter().find(|candidate| candidate.name == gpu.name) {
             if gpu.memory_total_bytes.is_none() {
                 gpu.memory_total_bytes = reference.memory_total_bytes;
@@ -331,6 +254,7 @@ fn merge_gpu_metadata(gpus: &mut [GpuMetrics], metadata: &[GpuMetrics]) {
             }
         }
     }
+    gpus
 }
 
 fn probe_nvidia_smi() -> Vec<GpuMetrics> {
@@ -389,20 +313,10 @@ fn parse_mebibytes(value: &str) -> Option<u64> {
         .map(|value| (value * 1024.0 * 1024.0).round() as u64)
 }
 
+#[cfg(target_os = "linux")]
+use probe_linux_gpus as probe_static_gpus;
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn probe_static_gpus() -> Vec<GpuMetrics> {
-    #[cfg(target_os = "linux")]
-    {
-        return probe_linux_gpus();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return probe_macos_gpus();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return probe_windows_static_gpus();
-    }
-    #[allow(unreachable_code)]
     Vec::new()
 }
 
@@ -480,7 +394,7 @@ fn parse_windows_gpu_line(line: &str) -> Option<(Option<f32>, Option<u64>)> {
 }
 
 #[cfg(target_os = "windows")]
-fn probe_windows_static_gpus() -> Vec<GpuMetrics> {
+fn probe_static_gpus() -> Vec<GpuMetrics> {
     let (name, dedicated_total) = windows_display_adapter();
     vec![GpuMetrics {
         name: name.unwrap_or_else(|| WINDOWS_GPU_FALLBACK_NAME.to_string()),
@@ -524,24 +438,6 @@ fn windows_display_adapter() -> (Option<String>, u64) {
         }
     }
     (name, total)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn probe_platform_gpus() -> Vec<GpuMetrics> {
-    #[cfg(target_os = "linux")]
-    {
-        return probe_linux_gpus();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        return probe_macos_gpus();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        return probe_windows_gpus();
-    }
-    #[allow(unreachable_code)]
-    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
@@ -687,7 +583,7 @@ fn read_text(path: &Path) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn probe_macos_gpus() -> Vec<GpuMetrics> {
+fn probe_static_gpus() -> Vec<GpuMetrics> {
     let output = hidden_command("system_profiler")
         .args(["SPDisplaysDataType", "-json"])
         .output();
@@ -832,7 +728,8 @@ mod tests {
     #[test]
     fn network_only_collection_does_not_publish_system_metrics() {
         let mut collector = super::Collector::new("android", true);
-        let metrics = collector.sample(true);
+        assert!(collector.desktop.is_none());
+        let metrics = collector.sample();
         assert_eq!(metrics.cpu_model, None);
         assert_eq!(metrics.memory_available_bytes, None);
         assert_eq!(metrics.swap_total_bytes, None);

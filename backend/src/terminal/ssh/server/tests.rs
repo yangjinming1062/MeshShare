@@ -112,16 +112,38 @@ async fn late_input_allows_the_last_pty_output_and_channel_close() {
 }
 
 #[tokio::test]
-async fn peer_closing_before_pty_exit_cancels_the_shell() {
+async fn paused_output_allows_pings_and_peer_close_cancels_the_shell() {
     let (input, _receiver) = mpsc::channel(1);
-    let (_keep_pty_alive, output) = mpsc::channel(1);
+    let (pty, output) = mpsc::channel(1);
     let cancel = CancellationToken::new();
     let io = SessionIo {
         input,
         output,
         cancel: cancel.clone(),
     };
-    let (_session, channel, done) = open_relay(io).await;
+    let (session, mut channel, done) = open_relay(io).await;
+    let writing =
+        tokio::spawn(async move { while pty.send(Output::Data(vec![b'x'])).await.is_ok() {} });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { .. }) => continue,
+                Some(ChannelMsg::ExtendedData {
+                    ext: OUTPUT_BARRIER,
+                    data,
+                }) if data.as_ref() == b"\0" => break,
+                other => panic!("unexpected terminal message: {other:?}"),
+            }
+        }
+        session.send_ping().await.unwrap();
+    })
+    .await
+    .expect("SSH must answer while output awaits acknowledgement");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(40), channel.wait())
+            .await
+            .is_err()
+    );
     channel.close().await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), done)
         .await
@@ -129,6 +151,7 @@ async fn peer_closing_before_pty_exit_cancels_the_shell() {
         .unwrap()
         .unwrap();
     assert!(cancel.is_cancelled());
+    writing.await.unwrap();
 }
 
 #[tokio::test]

@@ -5,6 +5,7 @@ import { formatHistoryTime, transferHistoryForSessionView, transferHistoryLocati
 const base = {
   transfer_id: 'id',
   status: 'accepted' as const,
+  awaiting_offer_reply: false,
   completed_bytes: 0,
   total_bytes: 10,
   completed_items: 0,

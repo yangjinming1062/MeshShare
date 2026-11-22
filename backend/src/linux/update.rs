@@ -4,108 +4,69 @@
 //! 更新仍由 tauri updater 自己安装。
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::utils::{config::BundleType, platform::bundle_type};
 
 /// 系统包安装的结果。授权未完成不是失败，调用方需要保留待更新版本。
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
     Installed,
     NeedsAuthorization(&'static str),
     Failed(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SystemPackageKind {
-    Deb,
-    Rpm,
+pub(crate) struct SystemPackage {
+    installer: &'static str,
+    flag: &'static str,
+    extension: &'static str,
 }
 
-impl SystemPackageKind {
+impl SystemPackage {
     fn from_bundle(bundle: Option<BundleType>) -> Option<Self> {
-        match bundle? {
-            BundleType::Deb => Some(Self::Deb),
-            BundleType::Rpm => Some(Self::Rpm),
-            _ => None,
-        }
-    }
-
-    fn installer_candidates(self) -> &'static [&'static str] {
-        match self {
-            Self::Deb => &["/usr/bin/dpkg", "/bin/dpkg"],
-            Self::Rpm => &["/usr/bin/rpm", "/bin/rpm"],
-        }
-    }
-
-    fn mode(self) -> &'static str {
-        match self {
-            Self::Deb => "-i",
-            Self::Rpm => "-U",
-        }
-    }
-
-    fn extension(self) -> &'static str {
-        match self {
-            Self::Deb => "deb",
-            Self::Rpm => "rpm",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Deb => "dpkg",
-            Self::Rpm => "rpm",
-        }
+        let (installer, flag, extension) = match bundle? {
+            BundleType::Deb => ("dpkg", "-i", "deb"),
+            BundleType::Rpm => ("rpm", "-U", "rpm"),
+            _ => return None,
+        };
+        Some(Self {
+            installer,
+            flag,
+            extension,
+        })
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PackageStatus {
-    Installed,
-    Dismissed,
-    NotAuthorized,
-    Failed,
-}
-
-fn classify_exit_code(code: Option<i32>) -> PackageStatus {
-    match code {
-        Some(0) => PackageStatus::Installed,
-        Some(126) => PackageStatus::Dismissed,
-        Some(127) => PackageStatus::NotAuthorized,
-        _ => PackageStatus::Failed,
-    }
-}
-
-pub(crate) fn system_package() -> Option<SystemPackageKind> {
-    SystemPackageKind::from_bundle(bundle_type())
+pub(crate) fn system_package() -> Option<SystemPackage> {
+    SystemPackage::from_bundle(bundle_type())
 }
 
 /// 请求系统授权并安装更新包；授权未完成时返回待授权而不是安装失败。
-pub(crate) async fn install(kind: SystemPackageKind, bytes: Vec<u8>) -> Outcome {
+pub(crate) async fn install(kind: SystemPackage, bytes: Vec<u8>) -> Outcome {
     tokio::task::spawn_blocking(move || install_blocking(kind, bytes))
         .await
         .unwrap_or_else(|error| Outcome::Failed(format!("系统包安装任务失败：{error}")))
 }
 
-fn install_blocking(kind: SystemPackageKind, bytes: Vec<u8>) -> Outcome {
-    let Some(installer) = first_file(kind.installer_candidates()) else {
+fn install_blocking(kind: SystemPackage, bytes: Vec<u8>) -> Outcome {
+    let Some(installer) = system_binary(kind.installer) else {
         return Outcome::Failed(format!(
             "未找到 {}，无法安装系统包更新；请手动安装下载的安装包",
-            kind.label()
+            kind.installer
         ));
     };
-    let Some(pkexec) = first_file(&["/usr/bin/pkexec", "/bin/pkexec"]) else {
+    let Some(pkexec) = system_binary("pkexec") else {
         return Outcome::Failed(
             "未找到 pkexec（polkit），无法请求系统授权安装更新；请手动安装下载的安装包".to_string(),
         );
     };
-    let package_path = match write_package(&bytes, kind.extension()) {
+    let package_path = match write_package(&bytes, kind.extension) {
         Ok(path) => path,
         Err(error) => return Outcome::Failed(format!("写入更新包失败：{error}")),
     };
     let output = Command::new(pkexec)
         .arg(installer)
-        .arg(kind.mode())
+        .arg(kind.flag)
         .arg(&package_path)
         .stdin(Stdio::null())
         .output();
@@ -114,31 +75,28 @@ fn install_blocking(kind: SystemPackageKind, bytes: Vec<u8>) -> Outcome {
         Ok(output) => output,
         Err(error) => return Outcome::Failed(format!("启动系统授权安装失败：{error}")),
     };
-    match classify_exit_code(output.status.code()) {
-        PackageStatus::Installed => Outcome::Installed,
-        PackageStatus::Dismissed => {
-            Outcome::NeedsAuthorization("已取消系统授权；更新保留，稍后自动重试")
-        }
-        PackageStatus::NotAuthorized => {
-            Outcome::NeedsAuthorization("未获得系统授权；请在本机登录桌面后重试")
-        }
-        PackageStatus::Failed => {
-            let code = output
-                .status
-                .code()
-                .map_or_else(|| "被信号终止".to_string(), |code| code.to_string());
+    package_outcome(output.status.code(), &output.stderr, &output.stdout)
+}
+
+fn package_outcome(code: Option<i32>, stderr: &[u8], stdout: &[u8]) -> Outcome {
+    match code {
+        Some(0) => Outcome::Installed,
+        Some(126) => Outcome::NeedsAuthorization("已取消系统授权；更新保留，稍后自动重试"),
+        Some(127) => Outcome::NeedsAuthorization("未获得系统授权；请在本机登录桌面后重试"),
+        _ => {
+            let code = code.map_or_else(|| "被信号终止".to_string(), |code| code.to_string());
             Outcome::Failed(format!(
                 "系统包安装失败（退出码 {code}）：{}",
-                summarize_output(&output.stderr, &output.stdout)
+                summarize_output(stderr, stdout)
             ))
         }
     }
 }
 
-fn first_file(candidates: &[&str]) -> Option<PathBuf> {
-    candidates
-        .iter()
-        .map(PathBuf::from)
+fn system_binary(name: &str) -> Option<PathBuf> {
+    ["/usr/bin", "/bin"]
+        .into_iter()
+        .map(|dir| Path::new(dir).join(name))
         .find(|path| path.is_file())
 }
 
@@ -195,31 +153,36 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_exit_code, summarize_output, PackageStatus, SystemPackageKind};
+    use super::{package_outcome, summarize_output, Outcome, SystemPackage};
     use tauri::utils::config::BundleType;
 
     #[test]
     fn deb_and_rpm_map_to_the_matching_system_installer() {
-        let deb = SystemPackageKind::from_bundle(Some(BundleType::Deb)).expect("deb");
-        assert_eq!(deb.mode(), "-i");
-        assert_eq!(deb.extension(), "deb");
-        assert_eq!(deb.label(), "dpkg");
-        let rpm = SystemPackageKind::from_bundle(Some(BundleType::Rpm)).expect("rpm");
-        assert_eq!(rpm.mode(), "-U");
-        assert_eq!(rpm.extension(), "rpm");
-        assert_eq!(rpm.label(), "rpm");
-        assert!(SystemPackageKind::from_bundle(Some(BundleType::AppImage)).is_none());
-        assert!(SystemPackageKind::from_bundle(Some(BundleType::Msi)).is_none());
-        assert!(SystemPackageKind::from_bundle(None).is_none());
+        let deb = SystemPackage::from_bundle(Some(BundleType::Deb)).expect("deb");
+        assert_eq!(deb.flag, "-i");
+        assert_eq!(deb.extension, "deb");
+        assert_eq!(deb.installer, "dpkg");
+        let rpm = SystemPackage::from_bundle(Some(BundleType::Rpm)).expect("rpm");
+        assert_eq!(rpm.flag, "-U");
+        assert_eq!(rpm.extension, "rpm");
+        assert_eq!(rpm.installer, "rpm");
+        assert!(SystemPackage::from_bundle(Some(BundleType::AppImage)).is_none());
+        assert!(SystemPackage::from_bundle(Some(BundleType::Msi)).is_none());
+        assert!(SystemPackage::from_bundle(None).is_none());
     }
 
     #[test]
     fn authorization_exit_codes_are_not_install_failures() {
-        assert_eq!(classify_exit_code(Some(0)), PackageStatus::Installed);
-        assert_eq!(classify_exit_code(Some(126)), PackageStatus::Dismissed);
-        assert_eq!(classify_exit_code(Some(127)), PackageStatus::NotAuthorized);
-        assert_eq!(classify_exit_code(Some(1)), PackageStatus::Failed);
-        assert_eq!(classify_exit_code(None), PackageStatus::Failed);
+        let outcome = |code| package_outcome(code, b"", b"");
+        assert_eq!(outcome(Some(0)), Outcome::Installed);
+        assert!(
+            matches!(outcome(Some(126)), Outcome::NeedsAuthorization(reason) if reason.contains("已取消"))
+        );
+        assert!(
+            matches!(outcome(Some(127)), Outcome::NeedsAuthorization(reason) if reason.contains("未获得"))
+        );
+        assert!(matches!(outcome(Some(1)), Outcome::Failed(reason) if reason.contains("退出码 1")));
+        assert!(matches!(outcome(None), Outcome::Failed(reason) if reason.contains("被信号终止")));
     }
 
     #[test]

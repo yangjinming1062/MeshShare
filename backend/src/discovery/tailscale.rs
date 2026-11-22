@@ -1,4 +1,4 @@
-use super::queue_peer_connection;
+use super::{fetch_node_info, queue_peer_connection};
 use crate::model::{NodeInfo, PROTOCOL_VERSION};
 use crate::runtime::{
     is_tailscale_ipv4, node_http_client, NodeRuntime, PeerEndpoint, PeerEndpointSource,
@@ -25,7 +25,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 // Leave time for the CLI status lookup before the next scan.
 const PROBE_ROUND_BUDGET: Duration = Duration::from_secs(16);
 const MAX_CONCURRENT_PROBES: usize = 8;
-const MAX_INFO_BYTES: usize = 128 * 1024;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -246,26 +245,9 @@ async fn probe_node(
     own_id: &str,
     address: SocketAddrV4,
 ) -> Option<String> {
-    let mut response = client
-        .get(format!("http://{address}/api/v1/info"))
-        .send()
+    let node = fetch_node_info(client, &format!("http://{address}"))
         .await
         .ok()?;
-    if !response.status().is_success()
-        || response
-            .content_length()
-            .is_some_and(|len| len > MAX_INFO_BYTES as u64)
-    {
-        return None;
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if chunk.len() > MAX_INFO_BYTES - body.len() {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let node: NodeInfo = serde_json::from_slice(&body).ok()?;
     (validate_node_info(&node)
         && node.node_id != own_id
         && node.protocol_version == PROTOCOL_VERSION
@@ -472,6 +454,8 @@ mod tests {
             probe_node(&client, "local", address).await.as_deref(),
             Some("remote")
         );
+        body.write().push_str(&" ".repeat(128 * 1024));
+        assert!(probe_node(&client, "local", address).await.is_none());
         server_task.abort();
         let _ = server_task.await;
     }

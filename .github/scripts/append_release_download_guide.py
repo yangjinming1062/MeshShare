@@ -68,13 +68,7 @@ def render_template(template: str, urls: dict[str, str]) -> str:
             details.append(f"unknown placeholders: {', '.join(unknown)}")
         raise ValueError("Invalid download guide template (" + "; ".join(details) + ")")
 
-    rendered = template
-    for placeholder, url in urls.items():
-        rendered = rendered.replace("{{" + placeholder + "}}", url)
-    unresolved = sorted(set(PLACEHOLDER_RE.findall(rendered)))
-    if unresolved:
-        raise ValueError("Download guide contains unresolved placeholders: " + ", ".join(unresolved))
-    return rendered.strip()
+    return PLACEHOLDER_RE.sub(lambda match: urls[match[1]], template).strip()
 
 
 def append_guide(notes_file: Path, guide: str) -> None:

@@ -68,7 +68,6 @@ impl TerminalSessions {
         channel: Channel<TerminalEvent>,
         activity: impl Send + 'static,
     ) -> Result<()> {
-        uuid::Uuid::parse_str(&id).context("终端会话标识无效")?;
         let (rendered, mut receipt) = watch::channel(0u64);
         let entry = Arc::new(AttachedSession {
             input: io.input.clone(),
@@ -166,11 +165,10 @@ impl TerminalSessions {
         Ok(())
     }
 
-    pub(crate) fn close(&self, id: &str) -> Result<()> {
+    pub(crate) fn close(&self, id: &str) {
         if let Some(entry) = self.attached.lock().remove(id) {
             entry.cancel.cancel();
         }
-        Ok(())
     }
 
     pub(crate) fn close_all(&self) {

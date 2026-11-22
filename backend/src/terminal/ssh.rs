@@ -20,12 +20,14 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 #[cfg(test)]
 const KEEPALIVE: Duration = Duration::from_secs(1);
 const MISSED_HEARTBEATS: u32 = 3;
-const UPGRADE: &str = "meshshare-ssh-v1";
+const UPGRADE: &str = "meshshare-ssh-v2";
 const ROUTE: &str = "/api/v1/terminal/ssh";
+// SSH 私用扩展数据类型。双方以一个零字节请求和确认前一批输出已进入界面队列。
+const OUTPUT_BARRIER: u32 = 0xfe00_0000;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum Direction {
+pub(crate) enum Direction {
     Incoming,
     Outgoing,
 }
@@ -135,14 +137,14 @@ impl SshService {
             .await
     }
 
-    pub(crate) async fn state(&self) -> Result<Settings> {
+    pub(crate) async fn state(&self) -> Settings {
         let key = match self.identity().await {
             Ok(key) => key,
             Err(error) => {
-                return Ok(Settings {
+                return Settings {
                     error: Some(format!("{error:#}")),
                     ..Default::default()
-                })
+                }
             }
         };
         let access = self.access.lock();
@@ -156,7 +158,7 @@ impl SshService {
                 .collect()
         };
         let now = Instant::now();
-        Ok(Settings {
+        Settings {
             enabled: access.policy.enabled,
             fingerprint: Some(key.public_key().fingerprint(HashAlg::Sha256).to_string()),
             error: None,
@@ -172,7 +174,7 @@ impl SshService {
                 .filter(|p| p.expires > now && !p.answer.is_closed())
                 .map(|p| p.request.clone())
                 .collect(),
-        })
+        }
     }
 
     fn save(&self, access: &mut Access, policy: Policy) -> Result<()> {
@@ -258,12 +260,7 @@ impl SshService {
         Ok(())
     }
 
-    pub(crate) fn revoke(&self, direction: &str, node_id: &str) -> Result<()> {
-        let direction = match direction {
-            "incoming" => Direction::Incoming,
-            "outgoing" => Direction::Outgoing,
-            _ => bail!("未知授权方向"),
-        };
+    pub(crate) fn revoke(&self, direction: Direction, node_id: &str) -> Result<()> {
         let mut access = self.access.lock();
         let mut policy = access.policy.clone();
         policy.grants_mut(direction).remove(node_id);

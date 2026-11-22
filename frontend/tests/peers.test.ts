@@ -13,6 +13,8 @@ function peer(overrides: Partial<PeerInfo> = {}): PeerInfo {
     node_name: 'A',
     platform: 'desktop',
     addresses: [],
+    mobile_addresses: [],
+    metrics_stale: false,
     capabilities: [],
     online: true,
     ...overrides,
@@ -24,7 +26,6 @@ const web: PeerWebContext = { selfNodeId: 'node-a', origin: 'https://hub.test', 
 test('normalizePeerEndpoint maps websocket endpoints to http bases', () => {
   assert.equal(normalizePeerEndpoint('ws://192.168.1.5:7880/api/v1/ws'), 'http://192.168.1.5:7880');
   assert.equal(normalizePeerEndpoint('wss://hub.local/api/v1/ws'), 'https://hub.local');
-  assert.equal(normalizePeerEndpoint('http://10.0.0.2:7880/api/v1/ws'), 'http://10.0.0.2:7880');
 });
 
 test('normalizePeerEndpoint rejects endpoints that are not websocket roots', () => {
@@ -32,6 +33,8 @@ test('normalizePeerEndpoint rejects endpoints that are not websocket roots', () 
   assert.equal(normalizePeerEndpoint('ws://user:pass@192.168.1.5:7880/api/v1/ws'), null);
   assert.equal(normalizePeerEndpoint('ws://192.168.1.5:7880/api/v1/ws?x=1'), null);
   assert.equal(normalizePeerEndpoint('ws://8.8.8.8:7880/api/v1/ws'), null);
+  assert.equal(normalizePeerEndpoint('http://10.0.0.2:7880/api/v1/ws'), null);
+  assert.equal(normalizePeerEndpoint('ws://10.0.0.2:7880/nested/api/v1/ws'), null);
   assert.equal(normalizePeerEndpoint('not a url'), null);
   assert.equal(normalizePeerEndpoint(null), null);
 });

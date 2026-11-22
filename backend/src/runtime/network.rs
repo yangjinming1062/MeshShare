@@ -119,20 +119,17 @@ pub(super) fn http_base_from_peer_endpoint(raw: &str) -> Option<String> {
     let scheme = match url.scheme() {
         "ws" => "http",
         "wss" => "https",
-        "http" | "https" => url.scheme(),
         _ => return None,
-    }
-    .to_string();
-    url.set_scheme(&scheme).ok()?;
-    if !url.path().ends_with("/api/v1/ws") {
+    };
+    url.set_scheme(scheme).ok()?;
+    if url.path() != "/api/v1/ws" {
         return None;
     }
     url.set_path("");
-    url.set_query(None);
-    url.set_fragment(None);
     normalize_peer_http_base(url.as_str())
 }
 
+#[cfg(any(test, not(target_os = "android")))]
 pub(super) fn mobile_ca_url(raw: &str) -> Result<reqwest::Url, String> {
     let url = reqwest::Url::parse(raw).map_err(|_| "CA 地址无效".to_string())?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -309,4 +306,25 @@ pub(super) fn bindable_addresses(
             _ => None,
         })
         .collect()
+}
+
+impl NodeRuntime {
+    pub fn set_listening_addresses(
+        &self,
+        http: &BTreeSet<Ipv4Addr>,
+        https: impl Iterator<Item = Ipv4Addr>,
+        https_port: u16,
+    ) {
+        let mut node = self.node.write();
+        node.addresses = network_addresses_for_bound(node.port, http);
+        node.mobile_addresses = https
+            .filter(|ip| http.contains(ip) && is_network_ipv4(*ip))
+            .map(|ip| AddressInfo {
+                address: ip.to_string(),
+                url: format!("https://{ip}:{https_port}"),
+                label: ip.to_string(),
+                kind: "mobile_https".to_string(),
+            })
+            .collect();
+    }
 }

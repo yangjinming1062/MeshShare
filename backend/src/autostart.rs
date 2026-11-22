@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
 use crate::linux::autostart as platform;
@@ -10,45 +9,24 @@ use crate::macos::autostart as platform;
 #[cfg(target_os = "windows")]
 use crate::windows::autostart as platform;
 
+#[cfg(any(not(target_os = "android"), test))]
 pub const AUTOSTART_ARGUMENT: &str = "--meshshare-autostart";
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) const APP_NAME: &str = "MeshShare";
 
-#[derive(Debug, Clone)]
-pub struct Registration {
-    executable: PathBuf,
-}
+pub(crate) use platform::{disable, is_enabled};
 
-impl Registration {
-    pub fn current() -> Result<Self> {
-        Ok(Self {
-            executable: std::env::current_exe().context("无法获取当前程序路径")?,
-        })
-    }
-
-    pub fn enable(&self) -> Result<()> {
-        platform::enable(&self.executable)
-    }
-
-    pub fn disable(&self) -> Result<()> {
-        platform::disable()
-    }
-
-    /// 按目标状态注册或移除登录项，调用方负责失败时回滚配置。
-    pub fn set_enabled(&self, enabled: bool) -> Result<()> {
-        if enabled {
-            self.enable()
-        } else {
-            self.disable()
-        }
-    }
-
-    pub fn is_enabled(&self) -> Result<bool> {
-        platform::is_enabled()
+/// 按目标状态注册或移除登录项，调用方负责失败时回滚配置。
+pub(crate) fn set_enabled(enabled: bool) -> Result<()> {
+    if enabled {
+        platform::enable(&std::env::current_exe().context("无法获取当前程序路径")?)
+    } else {
+        disable()
     }
 }
 
+#[cfg(any(not(target_os = "android"), test))]
 pub fn launched_from_args<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,

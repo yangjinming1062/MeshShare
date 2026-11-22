@@ -11,14 +11,11 @@ const ANDROID_PUBLIC_DOWNLOAD_DIR: &str = "/storage/emulated/0/Download";
 fn public_download_directory() -> Option<PathBuf> {
     let directory = PathBuf::from(ANDROID_PUBLIC_DOWNLOAD_DIR).join("MeshShare");
     std::fs::create_dir_all(&directory).ok()?;
-    let probe = directory.join(".meshshare-write-probe");
-    match std::fs::write(&probe, []) {
-        Ok(()) => {
-            let _ = std::fs::remove_file(&probe);
-            Some(directory)
-        }
-        Err(_) => None,
-    }
+    // 使用独占的新文件，以免覆盖下载目录里已有的同名文件。
+    let probe = directory.join(format!(".meshshare-probe-{}", uuid::Uuid::new_v4()));
+    std::fs::File::create_new(&probe).ok()?;
+    let _ = std::fs::remove_file(probe);
+    Some(directory)
 }
 
 fn private_download_directory(app: &AppHandle) -> Result<PathBuf, String> {
@@ -32,13 +29,6 @@ fn private_download_directory(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
-fn receive_target(app: &AppHandle) -> Result<(PathBuf, bool), String> {
-    if let Some(directory) = public_download_directory() {
-        return Ok((directory, true));
-    }
-    Ok((private_download_directory(app)?, false))
-}
-
 #[derive(Serialize)]
 pub(crate) struct AndroidReceiveStorage {
     directory: String,
@@ -47,7 +37,10 @@ pub(crate) struct AndroidReceiveStorage {
 
 #[tauri::command]
 pub(crate) fn android_receive_storage(app: AppHandle) -> Result<AndroidReceiveStorage, String> {
-    let (directory, public_download) = receive_target(&app)?;
+    let (directory, public_download) = match public_download_directory() {
+        Some(path) => (path, true),
+        None => (private_download_directory(&app)?, false),
+    };
     Ok(AndroidReceiveStorage {
         directory: directory.to_string_lossy().into_owned(),
         public_download,
@@ -60,12 +53,6 @@ pub(crate) fn android_request_receive_storage(app: AppHandle) -> Result<(), Stri
         .0
         .run_mobile_plugin::<()>("requestAllFilesAccess", ())
         .map_err(|error| format!("无法打开存储授权页面：{error}"))
-}
-
-#[tauri::command]
-pub(crate) fn android_receive_directory(app: AppHandle) -> Result<String, String> {
-    let (directory, _) = receive_target(&app)?;
-    Ok(directory.to_string_lossy().into_owned())
 }
 
 /// 在系统文件管理器里打开接收目录；只接受目录，避免把任意路径交给 Intent。

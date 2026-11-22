@@ -63,7 +63,6 @@ pub(crate) struct Status {
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
-#[serde(default)]
 struct Preferences {
     frequency: UpdateFrequency,
     checked_at_ms: Option<i64>,
@@ -412,17 +411,12 @@ impl AndroidUpdater {
     ) -> Result<()> {
         let mut prefs = self.shared.lock().prefs.clone();
         if let Some(release) = &prefs.pending {
-            if release
-                .clone()
-                .newer_than(&self.version, context.version_code)?
-                .is_none()
-            {
+            if !release.is_newer_than(&self.version, context.version_code)? {
                 self.update_preferences(|prefs| {
                     prefs.pending = None;
                     prefs.paused_version_code = None;
                 })?;
-                prefs.pending = None;
-                prefs.paused_version_code = None;
+                prefs = self.shared.lock().prefs.clone();
                 self.remove_cache_file("update.apk").await;
             }
         }

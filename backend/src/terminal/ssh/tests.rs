@@ -18,7 +18,6 @@ async fn next_request(service: &SshService, direction: Direction) -> Request {
             if let Some(req) = service
                 .state()
                 .await
-                .unwrap()
                 .pending
                 .into_iter()
                 .find(|req| req.direction == direction)
@@ -110,7 +109,7 @@ async fn authenticated_loopback_pair_reconnect_and_revoke() {
     abandoned.abort();
     let _ = abandoned.await;
     tokio::time::timeout(Duration::from_secs(4), async {
-        while !host.ssh.state().await.unwrap().pending.is_empty() {
+        while !host.ssh.state().await.pending.is_empty() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -134,7 +133,7 @@ async fn authenticated_loopback_pair_reconnect_and_revoke() {
         !host.begin_update_install(),
         "inbound shell holds update gate"
     );
-    host.ssh.revoke("incoming", &local_id).unwrap();
+    host.ssh.revoke(Direction::Incoming, &local_id).unwrap();
     wait_disconnected(&mut session).await;
     wait_disconnected(&mut second).await;
     assert!(
@@ -157,7 +156,7 @@ async fn authenticated_loopback_pair_reconnect_and_revoke() {
         .await
         .is_err());
     assert!(
-        local.ssh.state().await.unwrap().pending.is_empty(),
+        local.ssh.state().await.pending.is_empty(),
         "rotated key must require explicit forget"
     );
     local.ssh.shutdown();
@@ -224,7 +223,7 @@ async fn native_vault_restores_device_identity_and_signed_grant() {
         fixture.account.clone(),
     ));
     first.set_enabled(true).await.unwrap();
-    let fingerprint = first.state().await.unwrap().fingerprint.unwrap();
+    let fingerprint = first.state().await.fingerprint.unwrap();
     first.begin_pairing().await.unwrap();
     let peer = PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
         .unwrap()
@@ -250,7 +249,7 @@ async fn native_vault_restores_device_identity_and_signed_grant() {
     first.shutdown();
     drop(first);
     let restored = SshService::new(fixture.directory.clone(), fixture.account.clone());
-    let settings = restored.state().await.unwrap();
+    let settings = restored.state().await;
     assert!(settings.enabled);
     assert_eq!(settings.fingerprint.as_ref(), Some(&fingerprint));
     assert_eq!(settings.incoming.len(), 1);

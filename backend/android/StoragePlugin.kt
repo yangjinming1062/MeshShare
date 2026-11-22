@@ -34,24 +34,15 @@ class StoragePlugin(activity: Activity) : Plugin(activity) {
                 invoke.resolve()
                 return@post
             }
-            try {
-                hostActivity.startActivity(
-                    Intent(
-                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
-                        Uri.parse("package:${context.packageName}"),
-                    ),
-                )
-                invoke.resolve()
-            } catch (error: Exception) {
-                try {
-                    hostActivity.startActivity(
-                        Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
-                    )
-                    invoke.resolve()
-                } catch (fallbackError: Exception) {
-                    invoke.reject("无法打开存储授权页面", fallbackError)
-                }
-            }
+            openActivity(
+                invoke,
+                Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:${context.packageName}"),
+                ),
+                Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION),
+                "无法打开存储授权页面",
+            )
         }
     }
 
@@ -89,19 +80,25 @@ class StoragePlugin(activity: Activity) : Plugin(activity) {
             val view = Intent(Intent.ACTION_VIEW)
                 .setDataAndType(uri, "vnd.android.document/directory")
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            openActivity(
+                invoke,
+                view,
+                Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                "无法打开所在目录：$path",
+            )
+        }
+    }
+
+    private fun openActivity(invoke: Invoke, preferred: Intent, fallback: Intent, message: String) {
+        try {
             try {
-                hostActivity.startActivity(view)
-                invoke.resolve()
-            } catch (error: Exception) {
-                try {
-                    hostActivity.startActivity(
-                        Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                    )
-                    invoke.resolve()
-                } catch (fallbackError: Exception) {
-                    invoke.reject("无法打开所在目录：$path", fallbackError)
-                }
+                hostActivity.startActivity(preferred)
+            } catch (_: Exception) {
+                hostActivity.startActivity(fallback)
             }
+            invoke.resolve()
+        } catch (error: Exception) {
+            invoke.reject(message, error)
         }
     }
 }

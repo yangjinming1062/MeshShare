@@ -86,36 +86,18 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
         raise SystemExit(f"tag {args.tag!r} does not match version {args.version!r}")
     notes = args.notes_file.read_text(encoding="utf-8")
 
-    windows_nsis = platform_entry(
-        args.assets_root, "MeshShare-windows-x64", "-setup.exe", args.tag
-    )
-    windows_msi = platform_entry(
-        args.assets_root, "MeshShare-windows-x64", "_en-US.msi", args.tag
-    )
-    mac_x64 = platform_entry(
-        args.assets_root, "MeshShare-macos-x64", ".app.tar.gz", args.tag
-    )
-    mac_arm64 = platform_entry(
-        args.assets_root, "MeshShare-macos-arm64", ".app.tar.gz", args.tag
-    )
-    linux_appimage = platform_entry(
-        args.assets_root, "MeshShare-linux-x64", ".AppImage", args.tag
-    )
-    linux_deb = platform_entry(
-        args.assets_root, "MeshShare-linux-x64", ".deb", args.tag
-    )
-    linux_rpm = platform_entry(
-        args.assets_root, "MeshShare-linux-x64", ".rpm", args.tag
-    )
-
+    assets = {
+        "windows-x86_64-nsis": ("MeshShare-windows-x64", "-setup.exe"),
+        "windows-x86_64-msi": ("MeshShare-windows-x64", "_en-US.msi"),
+        "darwin-x86_64-app": ("MeshShare-macos-x64", ".app.tar.gz"),
+        "darwin-aarch64-app": ("MeshShare-macos-arm64", ".app.tar.gz"),
+        "linux-x86_64-appimage": ("MeshShare-linux-x64", ".AppImage"),
+        "linux-x86_64-deb": ("MeshShare-linux-x64", ".deb"),
+        "linux-x86_64-rpm": ("MeshShare-linux-x64", ".rpm"),
+    }
     platforms = {
-        "windows-x86_64-nsis": windows_nsis,
-        "windows-x86_64-msi": windows_msi,
-        "darwin-x86_64-app": mac_x64,
-        "darwin-aarch64-app": mac_arm64,
-        "linux-x86_64-appimage": linux_appimage,
-        "linux-x86_64-deb": linux_deb,
-        "linux-x86_64-rpm": linux_rpm,
+        target: platform_entry(args.assets_root, directory, suffix, args.tag)
+        for target, (directory, suffix) in assets.items()
     }
     return {
         "version": args.version,

@@ -5,12 +5,13 @@
   import { addPluginListener, invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { buildOffer, putFile, randomId, uploadFileWithRetry } from './upload';
   import { filesFromDataTransfer } from './drop';
   import { peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
-  import { ApiError, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getClipboardStatus, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, requestWithTimeout, createOutgoingPaths, getOutgoingPrepare, createManagedOutgoingPaths, getManagedOutgoingPrepare, cancelManagedOutgoingPrepare, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
+  import { ApiError, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { mergeTransferProgress } from './transferProgress';
-  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, OutgoingPrepareView, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
+  import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
   import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferHistoryLocation, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
   import TerminalWorkspace from './components/TerminalWorkspace.svelte';
   import TerminalAccess from './components/TerminalAccess.svelte';
@@ -45,7 +46,6 @@
   let remoteTarget: PeerInfo | null = null;
   let localBaseUrl = '';
   let localNodeId = '';
-  let contextGeneration = 0;
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
   let clipboardHistory: ClipboardHistoryItem[] = [];
@@ -99,8 +99,8 @@
   let clearTransferHistoryOpen = false;
   let mobileSessions: MobileSession[] = [];
   let mobileTransfers: MobileTransferView[] = [];
-  let phoneFailures: TransferFailure[] = [];
   let mobileSessionId = '';
+  let creatingMobileSession: Promise<string> | null = null;
   let transferActionBusy = '';
   let manualAddress = '';
   let savedNodeUrls: string[] = [];
@@ -140,40 +140,31 @@
     pathPrompt?.resolve(value);
     pathPrompt = null;
   }
-  type TransferRoute = { target: string; nodeId: string; peer?: PeerInfo };
-  type PendingUpload = TransferRoute & { peer: PeerInfo; files: File[]; items: TransferItem[]; offer: TransferOffer };
+  type TransferRoute = { target: string; peer: PeerInfo };
+  type PendingUpload = TransferRoute & { files: File[]; offer: TransferOffer };
   const pendingUploads = new Map<string, PendingUpload>();
   let remoteMode = false;
   const uploading = new Set<string>();
   const watching = new Set<string>();
-  const pendingMobileUploads = new Map<string, { files: File[]; items: TransferItem[]; completedItemIds: Set<string>; sessionId: string; offer: TransferOffer }>();
-  const mobileUploading = new Set<string>();
-  const mobileWatching = new Set<string>();
-  const mobileUploadAttempts = new Map<string, number>();
-  const mobileUploadStopped = new Set<string>();
+  const pendingMobileUploads = new Map<string, { files: File[]; completedItemIds: Set<string>; sessionId: string; offer: TransferOffer; base: string; failure?: TransferFailure }>();
   const uploadAttempts = new Map<string, number>();
   const uploadStopped = new Set<string>();
-  const prepareControllers = new Map<string, AbortController>();
-  // 准备任务可能由本机节点或远程目标节点持有，取消要回到创建它的那台节点。
-  const prepareCancels = new Map<string, (transferId: string) => Promise<unknown>>();
-  const mobileDownloading = new Set<string>();
+  // 用户取消时通知任务所属节点；离开界面只停止页面的准备工作。
+  const prepareTasks = new Map<string, { controller: AbortController; cancel: (id: string) => Promise<unknown> }>();
+  let mobileDownloading = new Set<string>();
   type PendingMobileCompletion = { directory: MobileDirectoryHandle; fileName: string };
   const pendingMobileCompletions = new Map<string, PendingMobileCompletion>();
   let mobileBrowserDownloadStarted = new Set<string>();
-  const MOBILE_UPLOAD_MAX_ATTEMPTS = 6;
-  const DESKTOP_UPLOAD_MAX_ATTEMPTS = 6;
-  const FILE_UPLOAD_ATTEMPTS = 4;
+  const MAX_UPLOAD_ATTEMPTS = 6;
   const REMOTE_MANAGEMENT_CAPABILITY = 'management.remote.v1';
   const REMOTE_FILES_CAPABILITY = 'management.files.v1';
   const WS_RECONNECT_BASE_MS = 1500;
   const WS_RECONNECT_MAX_MS = 30000;
-  const CANDIDATE_PROBE_BUDGET_MS = 12000;
   let mobileReceiveDirectory: MobileDirectoryHandle | null = null;
   let mobileReceiveDirectoryName = '';
   let pageStopped = false;
   let wsReconnectTimer: number | undefined;
   let wsReconnectAttempt = 0;
-  let wsGeneration = 0;
   let wsPingTimer: number | undefined;
   let targetGeneration = 0;
   let refreshRequestId = 0;
@@ -183,15 +174,14 @@
 
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
-  $: secureMobileUrl = node?.mobile_addresses?.find((address) => address.address === mobileAddress?.address)?.url;
+  $: secureMobileUrl = node?.mobile_addresses.find((address) => address.address === mobileAddress?.address)?.url;
   $: phoneTransfers = isWeb
     ? [
         ...transfers.map(asPhoneTransfer),
         ...mobileTransfers.map((transfer): PhoneTransfer => ({
           ...transfer.progress,
           direction: 'receive',
-          downloaded_item_ids: transfer.downloaded_item_ids,
-          retryable_download_item_ids: transfer.retryable_download_item_ids,
+          web: transfer,
         })),
       ]
     : transfers.map(asPhoneTransfer);
@@ -209,7 +199,6 @@
   $: phoneTransferHistory = isWeb
     ? transferHistory.map((entry) => transferHistoryForSessionView(entry, node?.node_id ?? entry.peer_node_id, node?.node_name ?? '接入节点'))
     : transferHistory;
-  $: phoneFailures = failures;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
   $: settingsDisabled = !settingsReady || !node || settingsWrites.has(node.node_id);
@@ -224,6 +213,7 @@
     mobile_addresses: node.mobile_addresses,
     capabilities: node.capabilities,
     online: true,
+    metrics_stale: false,
   } satisfies PeerInfo, ...peers] : peers;
   // 链路轨只表达「这台设备正在收发」；没有 offer 的本地合成行保持静态。
   $: activeLinkPeers = new Set(
@@ -237,6 +227,7 @@
     // 服务端刷新回来的进度可能没有方向，按 offer 的来源节点判断归属即可。
     if (progress.direction === 'receive') return false;
     if (pendingUploads.has(progress.transfer_id) || pendingMobileUploads.has(progress.transfer_id)) return true;
+    if (mobileTransfers.some((view) => view.progress.transfer_id === progress.transfer_id)) return false;
     // 节点驱动的发送由源文件所在节点持有任务，可以按接收端的重试语义续传；
     // 建单失败（节点上没有记录）时不给无效的重试入口。
     return !isWeb
@@ -249,12 +240,13 @@
     pendingMobileUploads.delete(transferId);
     uploadAttempts.delete(transferId);
     uploadStopped.delete(transferId);
-    mobileUploadAttempts.delete(transferId);
-    mobileUploadStopped.delete(transferId);
   }
 
   function pruneFailures() {
     const now = Date.now();
+    for (const [id, pending] of pendingMobileUploads) {
+      if (pending.failure && now - pending.failure.failed_at_ms > FAILURE_RETENTION_MS) forgetPendingTransfer(id);
+    }
     for (const [transferId, dismissedAt] of dismissedFailures) {
       if (now - dismissedAt > FAILURE_RETENTION_MS) dismissedFailures.delete(transferId);
     }
@@ -272,15 +264,11 @@
   function observeFailure(progress: TransferProgress) {
     if (progress.status !== 'failed') return;
     if (dismissedFailures.has(progress.transfer_id)) return;
-    const existing = failures.find((failure) => failure.progress.transfer_id === progress.transfer_id);
-    failures = [
-      {
-        progress,
-        failed_at_ms: existing?.failed_at_ms ?? Date.now(),
-        retryable: failureRetryable(progress),
-      },
-      ...failures.filter((failure) => failure.progress.transfer_id !== progress.transfer_id),
-    ];
+    const pending = pendingMobileUploads.get(progress.transfer_id);
+    const existing = failures.find((failure) => failure.progress.transfer_id === progress.transfer_id) ?? pending?.failure;
+    const failure = { progress, failed_at_ms: existing?.failed_at_ms ?? Date.now(), retryable: failureRetryable(progress) };
+    if (pending) pending.failure = failure;
+    failures = [failure, ...failures.filter((entry) => entry.progress.transfer_id !== progress.transfer_id)];
     pruneFailures();
   }
 
@@ -291,21 +279,14 @@
     const requestId = ++transferHistoryRequestId;
     const current = () => !pageStopped && generation === targetGeneration
       && requestId === transferHistoryRequestId && (!isWeb || session === mobileSessionId);
-    let entries: TransferHistoryEntry[];
     try {
-      entries = await getTransferHistory(session, target);
-    } catch (error) {
+      const entries = await getTransferHistory(session, target);
       if (!current()) return;
-      if (!(error instanceof ApiError && error.status === 404)) {
-        console.error('读取传输历史失败', error);
-        return;
-      }
-      // 旧节点没有历史接口，按空历史处理。
-      entries = [];
+      transferHistory = entries;
+      transferHistoryReady = true;
+    } catch (error) {
+      if (current()) console.error('读取传输历史失败', error);
     }
-    if (!current()) return;
-    transferHistory = entries;
-    transferHistoryReady = true;
   }
 
   function resetTransferHistory(): void {
@@ -361,12 +342,15 @@
 
   async function dismissFailure(failure: TransferFailure) {
     const id = failure.progress.transfer_id;
-    const mobile = mobileTransfers.some((view) => view.progress.transfer_id === id);
+    const generation = targetGeneration;
+    const mobile = pendingMobileUploads.has(id) || mobileTransfers.some((view) => view.progress.transfer_id === id);
     failures = failures.filter((item) => item.progress.transfer_id !== id);
     dismissedFailures.set(id, Date.now());
     if (failure.progress.error && notice === failure.progress.error) clearNotice();
     try {
-      await (mobile ? dismissMobileTransfer(id) : dismissTransfer(id));
+      // 网页发送行只属于本页面；接收端独立管理自己的失败记录。
+      if (mobile) await dismissMobileTransfer(id);
+      else if (!isWeb) await dismissTransfer(id);
       forgetPendingTransfer(id);
     } catch (error) {
       // 记录本来就不在节点上（前端本地合成的失败行）时按移除成功处理。
@@ -374,6 +358,7 @@
         forgetPendingTransfer(id);
         return;
       }
+      if (generation !== targetGeneration) return;
       dismissedFailures.delete(id);
       failures = [failure, ...failures.filter((item) => item.progress.transfer_id !== id)];
       const message = error instanceof Error ? error.message : '无法连接节点';
@@ -433,10 +418,7 @@
     } catch {
       savedNodeUrls = [];
     }
-    folderInput?.setAttribute('webkitdirectory', '');
-    folderInput?.setAttribute('directory', '');
     let timer: number | undefined;
-    let stopped = false;
     let monitorPositionTimer: number | undefined;
     let pendingMonitorPosition: { x: number; y: number } | null = null;
     let monitorPositionWriteInFlight = false;
@@ -447,7 +429,7 @@
       void listen<UpdateStatus>('update-status', ({ payload }) => {
         if (!remoteMode) updateStatus = payload;
       }).then((unlisten) => {
-        if (stopped) unlisten();
+        if (pageStopped) unlisten();
         else updateStatusUnlisten = unlisten;
       }).catch((error) => console.error('监听更新状态失败', error));
     }
@@ -457,7 +439,7 @@
           console.error('通知 Rust 网络绑定变化失败', error);
         });
       }).then((listener) => {
-        if (stopped) void listener.unregister();
+        if (pageStopped) void listener.unregister();
         else androidNetworkUnlisten = () => { void listener.unregister(); };
       }).catch((error) => console.error('监听 Android 网络绑定变化失败', error));
     }
@@ -474,7 +456,7 @@
         console.error('保存悬浮监控条位置失败', error);
       } finally {
         monitorPositionWriteInFlight = false;
-        if (!stopped && pendingMonitorPosition && (pendingMonitorPosition.x !== position.x || pendingMonitorPosition.y !== position.y)) {
+        if (!pageStopped && pendingMonitorPosition && (pendingMonitorPosition.x !== position.x || pendingMonitorPosition.y !== position.y)) {
           void flushMonitorPosition();
         }
       }
@@ -489,7 +471,7 @@
           void flushMonitorPosition();
         }, 200);
       }).then((unlisten) => {
-        if (stopped) unlisten();
+        if (pageStopped) unlisten();
         else monitorPositionUnlisten = unlisten;
       }).catch((error) => console.error('监听悬浮监控条移动失败', error));
     }
@@ -504,11 +486,14 @@
         }
         if (isAndroidApp) void refreshAndroidReceiveStorage();
         await refresh();
+        if (pageStopped) return;
         connectWebSocket();
         timer = window.setInterval(() => {
+          const generation = targetGeneration;
           void refresh().catch(async (error) => {
-            if (pageStopped) return;
-            if (await switchRemoteTargetCandidate()) return;
+            if (pageStopped || generation !== targetGeneration) return;
+            if (remoteTarget && await selectRemoteAddress(remoteTarget, activeBaseUrl)) return;
+            if (generation !== targetGeneration) return;
             status = error instanceof Error ? error.message : '无法刷新节点状态';
             statusKind = 'error';
           });
@@ -520,19 +505,19 @@
         timer = window.setTimeout(start, 3000);
       }
     };
+    if (isWeb) mobileSessionId = window.sessionStorage.getItem('meshshare-mobile-session') ?? '';
     void start();
     return () => {
-      stopped = true;
       pageStopped = true;
       document.removeEventListener('visibilitychange', resumeNotice);
       window.removeEventListener('focus', resumeNotice);
       window.clearTimeout(noticeTimer);
       if (timer) window.clearInterval(timer);
+      for (const { controller } of prepareTasks.values()) controller.abort();
       if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
       wsReconnectTimer = undefined;
       if (wsPingTimer) window.clearInterval(wsPingTimer);
       wsPingTimer = undefined;
-      wsGeneration += 1;
       ws?.close();
       ws = null;
       if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
@@ -540,7 +525,6 @@
       updateStatusUnlisten?.();
       androidNetworkUnlisten?.();
       void flushMonitorPosition();
-      if (stopped) window.clearTimeout(timer);
     };
   });
 
@@ -566,9 +550,10 @@
     const requestId = ++refreshRequestId;
     const generation = targetGeneration;
     const target = activeBaseUrl;
+    const current = () => !pageStopped && requestId === refreshRequestId && generation === targetGeneration;
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(target), getMetrics(target)]);
-      if (requestId !== refreshRequestId || generation !== targetGeneration || target !== activeBaseUrl) return;
+      if (!current()) return;
       node = nextNode;
       metrics = nextMetrics;
       status = '节点在线';
@@ -576,84 +561,33 @@
       await refreshSettings(generation, target);
       return;
     }
-    if (isWeb && !mobileSessionId) await ensureMobileSession();
-    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory, nextClipboardStatus] = await Promise.all([
-      getInfo(),
-      getPeers(),
-      getClipboard(),
-      getMetrics(),
-      getClipboardHistory(),
-      getClipboardStatus().catch(() => clipboardStatus),
+
+    await Promise.all([
+      refreshOverview(current, generation, target),
+      refreshTransfers(current, generation, target),
     ]);
-    const nextTransfers = isWeb ? [] : await getTransfers();
-    if (isWeb) {
-      mobileTransfers = await getMobileTransfersWithRecovery();
-      for (const view of mobileTransfers) {
-        if (mobileReceiveDirectory) {
-          if (view.progress.status === 'ready' && !mobileDownloading.has(view.progress.transfer_id)) {
-            void downloadMobileTransfer(view);
-          }
-          continue;
-        }
-        autoStartMobileDownloads(view);
-        pruneMobileDownloadKeys(view);
-      }
-    } else {
-      mobileSessions = await getMobileSessions();
-      // 出现新的网页会话说明浏览器已通过该地址加入，收起二维码窗口。
-      if (mobileAccessOpen && mobileSessions.some((session) => !mobileAccessKnownSessions.has(session.session_id))) {
-        mobileAccessOpen = false;
-      }
-      mobileTransfers = await getMobileTransfers();
-      nextTransfers.push(...mobileTransfers.map((view) => ({ ...view.progress, direction: 'send' as const })));
-      for (const view of mobileTransfers) {
-        if (!['ready', 'completed', 'rejected', 'failed', 'cancelled'].includes(view.progress.status) && !mobileWatching.has(view.progress.transfer_id)) {
-          void watchMobileTransfer(view.progress.transfer_id);
-        }
-      }
-    }
-    const current = () => requestId === refreshRequestId && generation === targetGeneration && target === activeBaseUrl;
+  }
+
+  async function refreshOverview(current: () => boolean, generation: number, target: string) {
+    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory, sessions] = await Promise.all([
+      getInfo(target), getPeers(target), getClipboard(target), getMetrics(target), getClipboardHistory(target),
+      isWeb ? [] : getMobileSessions(target),
+    ]);
     if (!current()) return;
-    await loadTransferHistory(generation, target);
-    if (!current()) return;
-    pruneFailures();
+    mobileSessions = sessions;
+    if (mobileAccessOpen && sessions.some((session) => !mobileAccessKnownSessions.has(session.session_id))) mobileAccessOpen = false;
     node = nextNode;
     if (!remoteMode) localNodeId = nextNode.node_id;
     peers = nextPeers.filter((peer) => peer.online);
-    if (remoteMode && remoteTarget) {
-      remoteTarget = nextPeers.find((peer) => peer.node_id === remoteTarget?.node_id) ?? remoteTarget;
-    }
     clipboard = nextClipboard;
-    clipboardStatus = nextClipboardStatus;
     clipboardHistory = nextHistory.items;
-    if (isWeb || isMonitor) clipboardHistorySettings = nextHistory.settings;
+    if (isWeb) clipboardHistorySettings = nextHistory.settings;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
       selectedClipboardHistory = null;
       historyDetailToken += 1;
       historyDetailLoading = false;
     }
     metrics = nextMetrics;
-    const refreshedTransfers = nextTransfers.map((next) => {
-      const current = transfers.find((item) => item.transfer_id === next.transfer_id);
-      return mergeTransferProgress(current, next);
-    });
-    transfers = [
-      ...refreshedTransfers,
-      ...transfers.filter((item) => isActiveTransferStatus(item.status) && !nextTransfers.some((next) => next.transfer_id === item.transfer_id)),
-    ];
-    for (const transfer of refreshedTransfers) observeFailure(transfer);
-    if (isWeb) {
-      for (const view of mobileTransfers) {
-        observeFailure({ ...view.progress, direction: 'receive' });
-      }
-    }
-    for (const transfer of nextTransfers) {
-      if (mobileTransfers.some((view) => view.progress.transfer_id === transfer.transfer_id)) continue;
-      if (transfer.direction !== 'send' || !transfer.offer || ['completed', 'rejected', 'failed', 'cancelled'].includes(transfer.status) || watching.has(transfer.transfer_id)) continue;
-      // 页面驱动的上传只对仍持有源文件的发送任务有意义；原生发送由节点暂存并上传。
-      const pending = pendingUploads.get(transfer.transfer_id);
-      if (pending) void watchTransfer(transfer.transfer_id, pending);
-    }
     if (selectedMetricsPeer) {
       selectedMetricsPeer = peers.find((peer) => peer.node_id === selectedMetricsPeer?.node_id) ?? null;
       if (!selectedMetricsPeer) metricsPeerOpen = false;
@@ -668,6 +602,63 @@
     if (!isWeb) await refreshSettings(generation, target);
   }
 
+  /** 文件由持有源内容的一端推进，节点概览的可用性不影响传输。 */
+  async function refreshTransfers(current: () => boolean, generation: number, target: string) {
+    for (const [id, pending] of pendingUploads) {
+      const progress = transfers.find((item) => item.transfer_id === id);
+      if (progress && isActiveTransferStatus(progress.status)) void pollTransfer(id, pending);
+    }
+    const [native, views] = await Promise.all([
+      isWeb ? [] : getTransfers(target),
+      refreshMobileTransfers(current, target),
+    ]);
+    if (!current()) return;
+    const nextTransfers = isWeb ? [] : [
+      ...native, ...views.map(({ progress }) => ({ ...progress, direction: 'send' as const })),
+    ];
+    const refreshedTransfers = nextTransfers.map((next) => {
+      const current = transfers.find((item) => item.transfer_id === next.transfer_id);
+      return mergeTransferProgress(current, next);
+    });
+    transfers = [
+      ...refreshedTransfers,
+      ...transfers.filter((item) => isActiveTransferStatus(item.status) && !nextTransfers.some((next) => next.transfer_id === item.transfer_id)),
+    ];
+    for (const transfer of refreshedTransfers) observeFailure(transfer);
+    pruneFailures();
+    await loadTransferHistory(generation, target);
+  }
+
+  async function refreshMobileTransfers(current: () => boolean, target: string): Promise<MobileTransferView[]> {
+    const views = isWeb ? await getMobileTransfersWithRecovery() : await getMobileTransfers(undefined, target);
+    if (!current()) return views;
+    mobileTransfers = views;
+    if (isWeb) {
+      for (const view of views) {
+        observeFailure({ ...view.progress, direction: 'receive' });
+        if (mobileReceiveDirectory) void downloadMobileTransfer(view);
+        else {
+          autoStartMobileDownloads(view);
+          pruneMobileDownloadKeys(view);
+        }
+      }
+    } else {
+      const owner = remoteTarget?.node_id ?? localNodeId;
+      for (const [id, pending] of pendingMobileUploads) {
+        if (pending.offer.source_node_id !== owner) continue;
+        pending.base = target;
+        if (pending.failure && !failures.some((failure) => failure.progress.transfer_id === id)) failures = [pending.failure, ...failures];
+      }
+      for (const { progress } of views) {
+        if (progress.status === 'accepted' || progress.status === 'uploading') void uploadMobileTransfer(progress.transfer_id);
+        if (progress.status === 'ready' || (!isActiveTransferStatus(progress.status) && progress.status !== 'failed')) {
+          forgetPendingTransfer(progress.transfer_id);
+        }
+      }
+    }
+    return views;
+  }
+
   async function refreshSettings(generation = targetGeneration, target = activeBaseUrl) {
     if (pageStopped || generation !== targetGeneration || target !== activeBaseUrl) return;
     if (!node || settingsRead || settingsWrites.has(node.node_id)) return;
@@ -680,12 +671,8 @@
       settingsReady = true;
     } catch (error) {
       if (pageStopped || settingsRead !== read) return;
-      if (error instanceof ApiError && error.status === 404) {
-        settingsReady = false;
-        status = '节点不支持设置接口，请检查节点版本';
-      } else {
-        status = error instanceof Error ? error.message : '无法读取节点设置';
-      }
+      settingsReady = false;
+      status = error instanceof Error ? error.message : '无法读取节点设置';
       statusKind = 'warn';
     } finally {
       if (settingsRead === read) settingsRead = null;
@@ -737,21 +724,17 @@
     monitorCapabilities = settings.monitor.capabilities;
   }
 
-  async function ensureMobileSession() {
-    if (!isWeb || mobileSessionId) return;
-    const stored = window.sessionStorage.getItem('meshshare-mobile-session');
-    if (stored) {
-      try {
-        await getMobileTransfers(stored);
-        mobileSessionId = stored;
-        return;
-      } catch {
-        window.sessionStorage.removeItem('meshshare-mobile-session');
-      }
-    }
+  async function createSession(): Promise<string> {
     const session = await createMobileSession(webSessionLabel(navigator.userAgent));
     mobileSessionId = session.session_id;
     window.sessionStorage.setItem('meshshare-mobile-session', mobileSessionId);
+    return mobileSessionId;
+  }
+
+  async function ensureMobileSession(): Promise<string> {
+    if (mobileSessionId) return mobileSessionId;
+    creatingMobileSession ??= createSession().finally(() => { creatingMobileSession = null; });
+    return creatingMobileSession;
   }
 
   function connectWebSocket() {
@@ -765,16 +748,15 @@
       wsPingTimer = undefined;
     }
     const socket = new WebSocket(websocketUrl());
-    const generation = ++wsGeneration;
     ws?.close();
     ws = socket;
     socket.onopen = () => {
-      if (generation !== wsGeneration || socket !== ws) return;
+      if (socket !== ws) return;
       wsReconnectAttempt = 0;
       status = '已连接';
       statusKind = 'ok';
       const sendPing = () => {
-        if (generation !== wsGeneration || socket !== ws || socket.readyState !== WebSocket.OPEN) return;
+        if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify({ type: 'Ping', payload: { at_ms: Date.now() } }));
       };
       sendPing();
@@ -782,7 +764,7 @@
       wsPingTimer = window.setInterval(sendPing, 15000);
     };
     socket.onclose = () => {
-      if (generation !== wsGeneration || socket !== ws || pageStopped) return;
+      if (socket !== ws || pageStopped) return;
       ws = null;
       if (wsPingTimer) window.clearInterval(wsPingTimer);
       wsPingTimer = undefined;
@@ -791,14 +773,14 @@
       scheduleWebSocketReconnect();
     };
     socket.onerror = () => {
-      if (generation !== wsGeneration || socket !== ws || pageStopped) return;
+      if (socket !== ws || pageStopped) return;
       // onerror is followed by onclose in browsers. Keep one user-facing
       // recovery state instead of starting another connection here.
       status = '同步连接暂时不可用，正在恢复…';
       statusKind = 'warn';
     };
     socket.onmessage = (event) => {
-      if (generation !== wsGeneration || socket !== ws) return;
+      if (socket !== ws) return;
       try {
         const message = JSON.parse(event.data) as WireMessage;
         handleWireMessage(message);
@@ -828,15 +810,7 @@
       }
       return;
     }
-    if (type === 'Hello') {
-      void refresh();
-      return;
-    }
-    if (type === 'ClipboardUpdate') {
-      void refresh();
-      return;
-    }
-    if (type === 'ClipboardSnapshot') {
+    if (type === 'Hello' || type === 'ClipboardUpdate' || type === 'ClipboardSnapshot') {
       void refresh();
       return;
     }
@@ -861,11 +835,7 @@
     // 进度同时携带清单与接收状态。网页只展示页面发起的发送和会话下载。
     if (type === 'TransferProgress' && !isWeb) {
       const progress = payload.progress;
-      const existing = transfers.find((item) => item.transfer_id === progress.transfer_id);
-      const next = mergeTransferProgress(existing, progress);
-      // 先把记录放进列表，失败行才能在计算可重试性时看到节点上的记录。
-      transfers = [next, ...transfers.filter((item) => item.transfer_id !== progress.transfer_id)];
-      observeFailure(next);
+      const next = recordProgress(progress);
       if (!isActiveTransferStatus(next.status)) void loadTransferHistory();
     }
   }
@@ -887,15 +857,17 @@
   }
 
   async function getMobileTransfersWithRecovery(): Promise<MobileTransferView[]> {
+    const session = await ensureMobileSession();
     try {
-      return await getMobileTransfers(mobileSessionId);
+      return await getMobileTransfers(session);
     } catch (error) {
       if (!(error instanceof ApiError && error.status === 404)) throw error;
-      mobileSessionId = '';
-      resetTransferHistory();
-      window.sessionStorage.removeItem('meshshare-mobile-session');
-      await ensureMobileSession();
-      return await getMobileTransfers(mobileSessionId);
+      if (session === mobileSessionId) {
+        mobileSessionId = '';
+        resetTransferHistory();
+        window.sessionStorage.removeItem('meshshare-mobile-session');
+      }
+      return getMobileTransfers(await ensureMobileSession());
     }
   }
 
@@ -946,7 +918,7 @@
     const generation = targetGeneration;
     if (remoteMode) {
       const path = await askPath('设置默认接收目录', receiveSettings.default_path ?? '');
-      if (path === null) return;
+      if (path === null || generation !== targetGeneration) return;
       await saveReceiveSettings(mode ?? receiveSettings.mode, path || receiveSettings.default_path);
       return;
     }
@@ -1230,17 +1202,16 @@
       showTransientNotice('已复制访问地址');
       return;
     } catch {
-      // 继续尝试旧接口，避免在没有剪贴板权限的 WebView 里给出空承诺。
+      const copied = fallbackCopy(value);
+      showTransientNotice(copied ? '已复制访问地址' : '无法复制地址，请手动选择', copied ? 2400 : 6000);
     }
-    const copied = fallbackCopy(value);
-    showTransientNotice(copied ? '已复制访问地址' : '无法复制地址，请手动选择', copied ? 2400 : 6000);
   }
 
   function startChoose(peer: PeerInfo, folder = false) {
     // 远程管理页的发送由目标机器选文件；本机发送仍由系统对话框给出绝对路径。
     if (remoteMode) {
       if (!managedFilesSupported) {
-        showTransientNotice('目标节点不支持远程文件选择，请先升级目标节点', 6000);
+        showTransientNotice('目标节点不支持远程文件选择，请选择支持此功能的桌面节点', 6000);
         return;
       }
       browsePeer = peer;
@@ -1259,6 +1230,7 @@
   }
 
   async function pickAndSendPaths(peer: PeerInfo, folder: boolean) {
+    const generation = targetGeneration;
     let picked: string | string[] | null = null;
     try {
       picked = folder
@@ -1269,34 +1241,28 @@
       return;
     }
     const paths = typeof picked === 'string' ? [picked] : picked ?? [];
-    if (!paths.length) return;
-    await sendPathsThroughNode(peer, paths);
+    if (!paths.length || generation !== targetGeneration) return;
+    await sendPaths(peer, paths, false);
   }
 
   /**
    * 节点侧按路径准备并发送：本机节点与远程管理目标共用准备行、轮询、取消和失败语义。
    * 状态权威留在持有源文件的那台节点上，页面只展示。
    */
-  async function runPathsPrepare(
-    targetName: string,
-    api: {
-      create: () => Promise<OutgoingPrepareView>;
-      status: (transferId: string) => Promise<OutgoingPrepareView>;
-      cancel: (transferId: string) => Promise<unknown>;
-    },
-    doneNotice: string,
-  ) {
+  async function sendPaths(peer: PeerInfo, paths: string[], managed: boolean) {
+    const generation = targetGeneration;
+    const api = outgoingPathsApi(activeBaseUrl, managed);
     let prepareId = '';
     const controller = new AbortController();
     try {
-      const view = await api.create();
+      const view = await api.create(peer.node_id, paths);
+      if (generation !== targetGeneration || pageStopped) return;
       prepareId = view.transfer_id;
-      prepareControllers.set(prepareId, controller);
-      prepareCancels.set(prepareId, api.cancel);
+      prepareTasks.set(prepareId, { controller, cancel: api.cancel });
       prepares = [
         {
           prepare_id: prepareId,
-          target_name: targetName,
+          target_name: peer.node_name,
           item_count: view.total_items,
           total_bytes: view.total_bytes,
           hashed_bytes: 0,
@@ -1306,49 +1272,28 @@
       ];
       while (!controller.signal.aborted) {
         await new Promise((resolve) => window.setTimeout(resolve, 600));
-        const status = await api.status(prepareId).catch(() => null);
+        const status = await api.status(prepareId).catch((error) => {
+          if (error instanceof ApiError && error.status === 404) return null;
+          throw error;
+        });
         // 准备条目消失表示清单已发给接收端（或任务被取消）。
         if (!status) break;
-        if (status.state === 'failed') throw new Error(status.error || '准备发送失败');
+        if (status.state === 'failed') {
+          await api.cancel(prepareId).catch(() => undefined);
+          throw new Error(status.error || '准备发送失败');
+        }
         updatePrepare(prepareId, status.hashed_bytes);
       }
       if (controller.signal.aborted) return;
-      showTransientNotice(doneNotice, 3600);
+      showTransientNotice(managed ? '已交给目标机器' : '已交给本机节点', 3600);
       await refresh();
     } catch (error) {
-      if (prepareId) await api.cancel(prepareId).catch(() => undefined);
-      if (!isPrepareCancelled(error)) {
+      if (!controller.signal.aborted && generation === targetGeneration) {
         showTransientNotice(error instanceof Error ? error.message : '无法发送文件', 6000);
       }
     } finally {
       if (prepareId) finishPrepare(prepareId);
     }
-  }
-
-  /** 桌面端发送主路径：本机节点按原路径读取、计算摘要并上传。 */
-  async function sendPathsThroughNode(peer: PeerInfo, paths: string[]) {
-    await runPathsPrepare(
-      peer.node_name,
-      {
-        create: () => createOutgoingPaths(peer.node_id, paths),
-        status: (transferId) => getOutgoingPrepare(transferId),
-        cancel: (transferId) => cancelOutgoingStaging(transferId),
-      },
-      '已交给本机节点',
-    );
-  }
-
-  /** 远程管理页发送：目标机器读取自己磁盘上的文件并直接发给对端。 */
-  async function sendPathsThroughTarget(peer: PeerInfo, paths: string[]) {
-    await runPathsPrepare(
-      peer.node_name,
-      {
-        create: () => createManagedOutgoingPaths(peer.node_id, paths),
-        status: (transferId) => getManagedOutgoingPrepare(transferId),
-        cancel: (transferId) => cancelManagedOutgoingPrepare(transferId),
-      },
-      '已交给目标机器',
-    );
   }
 
   async function confirmBrowse(paths: string[]) {
@@ -1361,7 +1306,7 @@
       if (transfer) await acceptTransferAt(transfer, paths[0]);
       return;
     }
-    if (peer) await sendPathsThroughTarget(peer, paths);
+    if (peer) await sendPaths(peer, paths, true);
   }
 
   function closeBrowse() {
@@ -1446,58 +1391,19 @@
     return peerTargetCandidates(peer, webContext());
   }
 
-  function isRetryableHttpStatus(status: number): boolean {
-    return status >= 500 || [408, 425, 429].includes(status);
-  }
-
-  function isTransportFailure(error: unknown): boolean {
-    if (error instanceof ApiError) return error.status === 421 || isRetryableHttpStatus(error.status);
-    return error instanceof TypeError || (error instanceof DOMException && error.name === 'AbortError');
-  }
-
-  function describeUnreachable(peerName: string, targets: string): string {
-    return `无法连接 ${peerName}${targets ? '（' + targets + '）' : ''}：请确认设备在同一网络且保持打开`;
-  }
-
   function describeTransferFailure(error: unknown, peerName: string, targets: string): string {
     if (error instanceof ApiError) return error.message;
-    if (isTransportFailure(error)) return describeUnreachable(peerName, targets);
+    if (isTransportFailure(error)) return `无法连接 ${peerName}（${targets}）：请确认设备在同一网络且保持打开`;
     return error instanceof Error ? error.message : '文件传输失败';
   }
 
-  function transferCandidates(route: TransferRoute): string[] {
-    const peer = peers.find((candidate) => candidate.node_id === route.nodeId) ?? route.peer;
-    return [...new Set([route.target, ...(peer ? targetCandidates(peer) : [])])];
-  }
-
   async function onTransferRoute<T>(route: TransferRoute, perform: (base: string) => Promise<T>): Promise<T> {
-    let lastError: unknown;
-    const deadline = Date.now() + CANDIDATE_PROBE_BUDGET_MS;
-    for (const base of transferCandidates(route)) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      try {
-        const info = await requestWithTimeout<NodeInfo>(
-          '/api/v1/info',
-          {},
-          base,
-          Math.min(6000, remaining),
-        );
-        if (info?.node_id !== route.nodeId) throw new ApiError('地址上的设备与传输目标不匹配', 421);
-      } catch (error) {
-        lastError = error;
-        continue;
-      }
-      try {
-        const result = await perform(base);
-        route.target = base;
-        return result;
-      } catch (error) {
-        if (!isTransportFailure(error)) throw error;
-        lastError = error;
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error('无法连接传输目标');
+    const peer = peers.find((candidate) => candidate.node_id === route.peer.node_id) ?? route.peer;
+    return withPeerAddress(peer.node_id, [route.target, ...targetCandidates(peer)], async (base) => {
+      const result = await perform(base);
+      route.target = base;
+      return result;
+    });
   }
 
   async function createTransferOnCandidates(offer: TransferOffer, route: TransferRoute): Promise<TransferProgress> {
@@ -1521,6 +1427,7 @@
     settingsReady = false;
     settingsRead = null;
     closeBrowse();
+    resolvePathPrompt(null);
     node = null;
     peers = [];
     clipboard = null;
@@ -1540,10 +1447,8 @@
     selectedMobileSession = null;
     clipboardHistory = [];
     transfers = [];
-    for (const controller of prepareControllers.values()) controller.abort();
-    prepareControllers.clear();
+    for (const { controller } of prepareTasks.values()) controller.abort();
     prepares = [];
-    for (const failure of failures) forgetPendingTransfer(failure.progress.transfer_id);
     failures = [];
     dismissedFailures.clear();
     mobileSessions = [];
@@ -1559,8 +1464,6 @@
    * 目标设备列表包含本机节点，按 node_id 识别后等同于返回。
    */
   async function applyTargetContext(baseUrl: string, target: PeerInfo | null) {
-    const context = ++contextGeneration;
-    wsGeneration += 1;
     ws?.close();
     ws = null;
     if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
@@ -1571,17 +1474,18 @@
     activeBaseUrl = baseUrl;
     setApiTarget(baseUrl);
     resetTargetUi();
+    const context = targetGeneration;
     status = target ? '正在连接目标节点…' : '正在返回本机…';
     statusKind = 'warn';
     wsReconnectAttempt = 0;
     await tick();
-    if (context !== contextGeneration) return;
+    if (context !== targetGeneration) return;
     await refresh().catch((error) => {
-      if (context !== contextGeneration) return;
+      if (context !== targetGeneration) return;
       status = error instanceof Error ? error.message : target ? '无法连接目标节点' : '无法连接本机节点';
       statusKind = 'error';
     });
-    if (context !== contextGeneration) return;
+    if (context !== targetGeneration) return;
     connectWebSocket();
   }
 
@@ -1593,64 +1497,23 @@
     }
     if (!peer.online) return;
     if (!peer.capabilities.includes(REMOTE_MANAGEMENT_CAPABILITY)) {
-      showTransientNotice('目标节点不支持远程管理，请先升级目标节点', 6000);
+      showTransientNotice('目标节点不支持远程管理，请选择支持此功能的桌面节点', 6000);
       return;
     }
-    const candidates = targetCandidates(peer);
-    let target: string | null = null;
-    const deadline = Date.now() + CANDIDATE_PROBE_BUDGET_MS;
-    for (const candidate of candidates) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      try {
-        const info = await requestWithTimeout<NodeInfo>(
-          '/api/v1/info',
-          {},
-          candidate,
-          Math.min(6000, remaining),
-        );
-        if (info.node_id === peer.node_id) {
-          target = candidate;
-          break;
-        }
-      } catch {
-        // A peer can advertise interfaces that are not reachable from this
-        // network. Continue with the next private/Tailscale candidate.
-      }
-    }
-    if (!target) {
-      showTransientNotice('目标设备没有可访问地址', 6000);
-      return;
-    }
-    localBaseUrl ||= activeBaseUrl;
-    await applyTargetContext(target, peer);
+    await selectRemoteAddress(peer);
   }
 
-  async function switchRemoteTargetCandidate(): Promise<boolean> {
-    if (!remoteMode || !remoteTarget) return false;
-    const deadline = Date.now() + CANDIDATE_PROBE_BUDGET_MS;
-    for (const candidate of targetCandidates(remoteTarget)) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) break;
-      if (candidate === activeBaseUrl) continue;
-      try {
-        const info = await requestWithTimeout<NodeInfo>(
-          '/api/v1/info',
-          {},
-          candidate,
-          Math.min(6000, remaining),
-        );
-        if (info.node_id !== remoteTarget.node_id) continue;
-        for (const pending of pendingUploads.values()) {
-          if (pending.nodeId === remoteTarget.node_id) pending.target = candidate;
-        }
-        await applyTargetContext(candidate, remoteTarget);
-        return true;
-      } catch {
-        // Keep probing the remaining private/Tailscale interfaces.
-      }
+  async function selectRemoteAddress(peer: PeerInfo, skipBase?: string): Promise<boolean> {
+    const generation = targetGeneration;
+    const candidates = targetCandidates(peer).filter((url) => url !== skipBase);
+    try {
+      const target = await withPeerAddress(peer.node_id, candidates, async (base) => base);
+      if (generation === targetGeneration) await applyTargetContext(target, peer);
+      return true;
+    } catch {
+      if (!skipBase && generation === targetGeneration) showTransientNotice('目标设备没有可访问地址', 6000);
+      return false;
     }
-    return false;
   }
 
   async function returnToLocal() {
@@ -1663,66 +1526,16 @@
   }
 
   function finishPrepare(prepareId: string) {
-    prepareControllers.delete(prepareId);
-    prepareCancels.delete(prepareId);
+    prepareTasks.delete(prepareId);
     prepares = prepares.filter((item) => item.prepare_id !== prepareId);
   }
 
   function cancelPrepare(prepareId: string) {
-    prepareControllers.get(prepareId)?.abort();
-    // 取消同时通知创建者：准备中的路径任务或已写入的暂存都要清理。
-    const cancel = prepareCancels.get(prepareId) ?? cancelOutgoingStaging;
-    void cancel(prepareId).catch(() => undefined);
+    const task = prepareTasks.get(prepareId);
+    if (!task) return;
+    task.controller.abort();
+    void task.cancel(prepareId).catch(() => undefined);
     finishPrepare(prepareId);
-  }
-
-  function isPrepareCancelled(error: unknown): boolean {
-    return typeof error === 'object' && error !== null && (error as { name?: string }).name === 'AbortError';
-  }
-
-  /** 清单摘要留空，由节点在写入文件体时计算回填。 */
-  function buildItems(files: File[]): TransferItem[] {
-    return files.map((file, index) => ({
-      item_id: `${index}-${randomId()}`,
-      name: file.name,
-      relative_path: (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name,
-      size: file.size,
-      sha256: '',
-      media_type: file.type || 'application/octet-stream',
-      directory: false,
-    }));
-  }
-
-  function randomId() {
-    if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  }
-
-  async function uploadFileWithRetry(url: string, file: File, mediaType: string): Promise<Response> {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < FILE_UPLOAD_ATTEMPTS; attempt += 1) {
-      try {
-        const response = await fetch(url, {
-          method: 'PUT',
-          redirect: 'error',
-          headers: { 'Content-Type': mediaType },
-          body: file,
-        });
-        if (response.ok) return response;
-        const payload = await response.json().catch(() => ({}));
-        const message = typeof payload === 'object' && payload !== null && 'error' in payload && typeof payload.error === 'string'
-          ? payload.error
-          : `上传失败 (${response.status})`;
-        lastError = new ApiError(message, response.status);
-        if (!isRetryableHttpStatus(response.status)) break;
-      } catch (error) {
-        lastError = error;
-      }
-      if (attempt + 1 < FILE_UPLOAD_ATTEMPTS) {
-        await new Promise((resolve) => window.setTimeout(resolve, Math.min(8000, 800 * 2 ** attempt)));
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error('上传失败');
   }
 
   async function sendFiles(peer: PeerInfo, files: File[]) {
@@ -1733,26 +1546,6 @@
     }
     if (isNativeSender) await sendFilesThroughNode(peer, files);
     else await sendFilesFromPage(peer, files);
-  }
-
-  function outgoingItemUrl(transferId: string, itemId: string): string {
-    return apiUrl(`/api/v1/outgoing/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}`);
-  }
-
-  async function putOutgoingFile(url: string, file: File, mediaType: string, signal: AbortSignal): Promise<void> {
-    const response = await fetch(url, {
-      method: 'PUT',
-      redirect: 'error',
-      headers: { 'Content-Type': mediaType },
-      body: file,
-      signal,
-    });
-    if (response.ok) return;
-    const payload = await response.json().catch(() => ({}));
-    const message = typeof payload === 'object' && payload !== null && 'error' in payload && typeof payload.error === 'string'
-      ? payload.error
-      : `源文件暂存失败 (${response.status})`;
-    throw new ApiError(message, response.status);
   }
 
   /**
@@ -1767,77 +1560,60 @@
       return;
     }
     selectedPeer = null;
+    const owner = activeBaseUrl;
     const controller = new AbortController();
-    let offer: TransferOffer | undefined;
+    const offer = buildOffer(source, peer.node_id, files);
+    const id = offer.transfer_id;
+    const cancel = () => cancelOutgoingStaging(id, owner);
+    let handedOff = false;
     try {
-      const items = buildItems(files);
-      const totalBytes = items.reduce((sum, item) => sum + item.size, 0);
-      offer = {
-        transfer_id: randomId(),
-        source_node_id: source.node_id,
-        source_name: source.node_name,
-        target_node_id: peer.node_id,
-        items,
-        total_bytes: totalBytes,
-        created_at_ms: Date.now(),
-      };
-      await createOutgoingStaging(offer);
-      const prepare: TransferPrepare = {
-        prepare_id: offer.transfer_id,
-        target_name: peer.node_name,
-        item_count: items.length,
-        total_bytes: totalBytes,
-        hashed_bytes: 0,
-        phase: 'stage',
-      };
-      prepareControllers.set(prepare.prepare_id, controller);
-      prepares = [prepare, ...prepares];
+      await createOutgoingStaging(offer, owner);
+      if (generation !== targetGeneration || pageStopped) return;
+      prepareTasks.set(id, { controller, cancel });
+      prepares = [{
+        prepare_id: id, target_name: peer.node_name, item_count: offer.items.length,
+        total_bytes: offer.total_bytes, hashed_bytes: 0, phase: 'stage',
+      }, ...prepares];
       let stagedBytes = 0;
-      try {
-        for (const [index, item] of items.entries()) {
-          if (controller.signal.aborted) throw new DOMException('已取消发送', 'AbortError');
-          const file = files[index];
-          if (!file) throw new Error(`找不到待发送文件：${item.relative_path}`);
-          await putOutgoingFile(outgoingItemUrl(offer.transfer_id, item.item_id), file, item.media_type, controller.signal);
-          stagedBytes += item.size;
-          updatePrepare(prepare.prepare_id, stagedBytes);
-        }
-      } finally {
-        finishPrepare(prepare.prepare_id);
+      for (const [index, item] of offer.items.entries()) {
+        const url = apiUrl(`/api/v1/outgoing/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`, owner);
+        await putFile(url, files[index], item.media_type, controller.signal);
+        stagedBytes += item.size;
+        updatePrepare(id, stagedBytes);
       }
+      if (controller.signal.aborted || generation !== targetGeneration) return;
+      // 从 start 起节点负责暂存的回收，响应丢失时接收方可能已经接受任务。
+      finishPrepare(id);
+      handedOff = true;
+      const progress = await startOutgoingStaging(id, owner);
       if (generation !== targetGeneration) return;
-      const progress = await startOutgoingStaging(offer.transfer_id);
-      if (generation !== targetGeneration) return;
-      const existing = transfers.find((item) => item.transfer_id === progress.transfer_id);
-      const next = mergeTransferProgress(existing, { ...progress, offer: progress.offer ?? offer, direction: 'send' });
-      transfers = [
-        next,
-        ...transfers.filter((item) => item.transfer_id !== next.transfer_id),
-      ];
+      recordProgress({ ...progress, offer: progress.offer ?? offer, direction: 'send' });
       showTransientNotice('已交给本机节点', 3600);
-      await refresh();
     } catch (error) {
-      if (isPrepareCancelled(error)) {
-        if (offer) await cancelOutgoingStaging(offer.transfer_id).catch(() => undefined);
-        return;
+      if (!controller.signal.aborted && generation === targetGeneration) {
+        recordSendFailure(offer, error instanceof Error ? error.message : '无法发送文件');
       }
-      const message = error instanceof Error ? error.message : '无法发送文件';
-      if (offer) {
-        await cancelOutgoingStaging(offer.transfer_id).catch(() => undefined);
-        observeFailure({
-          transfer_id: offer.transfer_id,
-          status: 'failed',
-          completed_bytes: 0,
-          total_bytes: offer.total_bytes,
-          completed_items: 0,
-          total_items: offer.items.length,
-          error: message,
-          offer,
-          direction: 'send',
-        });
-      }
-      showTransientNotice(message, 6000);
+    } finally {
+      finishPrepare(id);
+      if (!handedOff) await cancel().catch(() => undefined);
     }
+  }
+
+  function recordSendFailure(offer: TransferOffer, error: string) {
+    observeFailure({
+      transfer_id: offer.transfer_id, offer, status: 'failed', direction: 'send', error,
+      awaiting_offer_reply: false, completed_items: 0, total_items: offer.items.length,
+      completed_bytes: 0, total_bytes: offer.total_bytes,
+    });
+    showTransientNotice(error, 6000);
+  }
+
+  function recordProgress(progress: TransferProgress): TransferProgress {
+    const id = progress.transfer_id;
+    const next = mergeTransferProgress(transfers.find((item) => item.transfer_id === id), progress);
+    transfers = [next, ...transfers.filter((item) => item.transfer_id !== id)];
+    observeFailure(next);
+    return next;
   }
 
   async function sendFilesFromPage(peer: PeerInfo, files: File[]) {
@@ -1848,166 +1624,76 @@
       return;
     }
     selectedPeer = null;
-    const items = buildItems(files);
-    const offer: TransferOffer = {
-      transfer_id: randomId(),
-      source_node_id: source.node_id,
-      source_name: source.node_name,
-      target_node_id: peer.node_id,
-      items,
-      total_bytes: items.reduce((sum, item) => sum + item.size, 0),
-      created_at_ms: Date.now(),
-    };
+    const offer = buildOffer(source, peer.node_id, files);
     try {
-      const pending: PendingUpload = { target: candidates[0], nodeId: peer.node_id, peer, files, items, offer };
+      const pending: PendingUpload = { target: candidates[0], peer, files, offer };
       const created = await createTransferOnCandidates(offer, pending);
       if (created.status === 'failed') {
         throw new Error(created.error ?? '无法创建传输');
       }
       pendingUploads.set(offer.transfer_id, pending);
       transfers = [{ ...created, offer: created.offer ?? offer, direction: 'send' }, ...transfers];
-      void watchTransfer(offer.transfer_id, pending);
+      void pollTransfer(offer.transfer_id, pending);
       showTransientNotice('已发送传输请求', 3600);
     } catch (error) {
       const message = describeTransferFailure(error, peer.node_name, candidates.join('、'));
-      observeFailure({
-        transfer_id: offer.transfer_id,
-        status: 'failed',
-        completed_bytes: 0,
-        total_bytes: offer.total_bytes,
-        completed_items: 0,
-        total_items: offer.items.length,
-        error: message,
-        offer,
-        direction: 'send',
-      });
-      showTransientNotice(message, 6000);
+      recordSendFailure(offer, message);
     }
   }
 
   async function sendFilesToMobile(session: MobileSession, files: File[]) {
     if (!node) return;
+    const offer = buildOffer(node, node.node_id, files);
+    const base = activeBaseUrl;
+    const generation = targetGeneration;
     selectedMobileSession = null;
-    let offerForFailure: TransferOffer | undefined;
+    pendingMobileUploads.set(offer.transfer_id, { files, completedItemIds: new Set(), sessionId: session.session_id, offer, base });
     try {
-      const items = buildItems(files);
-      const offer: TransferOffer = {
-        transfer_id: randomId(),
-        source_node_id: node.node_id,
-        source_name: node.node_name,
-        target_node_id: node.node_id,
-        items,
-        total_bytes: items.reduce((sum, item) => sum + item.size, 0),
-        created_at_ms: Date.now(),
-      };
-      offerForFailure = offer;
-      pendingMobileUploads.set(offer.transfer_id, { files, items, completedItemIds: new Set(), sessionId: session.session_id, offer });
-      await request<MobileTransferView>('/api/v1/mobile/transfers', {
-        method: 'POST',
-        body: JSON.stringify({ session_id: session.session_id, offer }),
-      });
-      transfers = [{ transfer_id: offer.transfer_id, status: 'waiting', completed_bytes: 0, total_bytes: offer.total_bytes, completed_items: 0, total_items: items.length, offer, direction: 'send' }, ...transfers];
-      void watchMobileTransfer(offer.transfer_id);
+      const view = await createMobileTransfer(session.session_id, offer, base);
+      if (generation !== targetGeneration) return;
+      recordProgress({ ...view.progress, direction: 'send' });
       showTransientNotice('已发送，等待网页端确认', 3600);
     } catch (error) {
-      const message = error instanceof Error ? error.message : '无法发送到网页端';
-      if (offerForFailure) {
-        observeFailure({
-          transfer_id: offerForFailure.transfer_id,
-          status: 'failed',
-          completed_bytes: 0,
-          total_bytes: offerForFailure.total_bytes,
-          completed_items: 0,
-          total_items: offerForFailure.items.length,
-          error: message,
-          offer: offerForFailure,
-          direction: 'send',
-        });
-      }
-      showTransientNotice(message, 6000);
+      if (generation === targetGeneration) recordSendFailure(offer, error instanceof Error ? error.message : '无法发送到网页端');
+      else forgetPendingTransfer(offer.transfer_id);
     }
-  }
-
-  async function watchMobileTransfer(id: string) {
-    if (mobileWatching.has(id)) return;
-    const generation = targetGeneration;
-    mobileWatching.add(id);
-    for (let attempt = 0; attempt < 360; attempt += 1) {
-      if (generation !== targetGeneration) {
-        mobileWatching.delete(id);
-        return;
-      }
-      try {
-        const view = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
-        if (generation !== targetGeneration) {
-          mobileWatching.delete(id);
-          return;
-        }
-        if (!view) throw new Error('网页端传输任务不存在');
-        const progress = { ...view.progress, direction: 'send' as const };
-        const existing = transfers.find((item) => item.transfer_id === id);
-        const nextProgress = mergeTransferProgress(existing, progress);
-        observeFailure(nextProgress);
-        transfers = [nextProgress, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (['accepted', 'uploading'].includes(nextProgress.status) && !mobileUploading.has(id) && !mobileUploadStopped.has(id)) {
-          await uploadMobileTransfer(id);
-        }
-        if (['ready', 'completed', 'rejected', 'failed', 'cancelled'].includes(nextProgress.status)) {
-          if (nextProgress.status !== 'failed') forgetPendingTransfer(id);
-          if (nextProgress.status === 'failed') {
-            mobileUploadAttempts.delete(id);
-          } else {
-            mobileUploadAttempts.delete(id);
-            mobileUploadStopped.delete(id);
-          }
-          mobileWatching.delete(id);
-          return;
-        }
-      } catch (error) {
-        if (attempt === 359 && error instanceof Error) showTransientNotice(error.message, 6000);
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 1000));
-    }
-    mobileWatching.delete(id);
   }
 
   async function uploadMobileTransfer(id: string) {
     const pending = pendingMobileUploads.get(id);
-    if (!pending || mobileUploadStopped.has(id)) return;
-    mobileUploading.add(id);
+    if (!pending || pending.base !== activeBaseUrl || uploading.has(id) || uploadStopped.has(id)) return;
+    uploading.add(id);
     try {
-      const latest = (await getMobileTransfers()).find((candidate) => candidate.progress.transfer_id === id);
-      if (!latest || ['ready', 'rejected', 'failed', 'cancelled'].includes(latest.progress.status)) return;
-      for (const [index, item] of pending.items.entries()) {
+      for (const [index, item] of pending.offer.items.entries()) {
         // 已确认的项目跳过；节点对重复写入按幂等处理，丢失响应后可安全重试。
         if (pending.completedItemIds.has(item.item_id)) continue;
         const file = pending.files[index];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
         await uploadFileWithRetry(
-          apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`),
+          apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`, pending.base),
           file,
           item.media_type,
         );
         pending.completedItemIds.add(item.item_id);
       }
-      mobileUploadAttempts.delete(id);
+      uploadAttempts.delete(id);
       showTransientNotice('文件已准备好，网页端可以下载');
     } catch (error) {
-      const attempts = (mobileUploadAttempts.get(id) ?? 0) + 1;
-      mobileUploadAttempts.set(id, attempts);
+      const attempts = (uploadAttempts.get(id) ?? 0) + 1;
+      uploadAttempts.set(id, attempts);
       const message = error instanceof Error ? error.message : '网页端文件上传失败';
-      if (attempts >= MOBILE_UPLOAD_MAX_ATTEMPTS) {
-        mobileUploadStopped.add(id);
+      if (attempts >= MAX_UPLOAD_ATTEMPTS) {
+        uploadStopped.add(id);
         await request(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/fail`, {
           method: 'POST',
           body: JSON.stringify({ error: message }),
-        }).catch(() => undefined);
+        }, pending.base).catch(() => undefined);
         showTransientNotice(`${message}，已停止重试`);
       } else {
-        showTransientNotice(`${message}，正在重试（${attempts}/${MOBILE_UPLOAD_MAX_ATTEMPTS}）`, 6000);
+        showTransientNotice(`${message}，正在重试（${attempts}/${MAX_UPLOAD_ATTEMPTS}）`, 6000);
       }
     } finally {
-      mobileUploading.delete(id);
+      uploading.delete(id);
     }
   }
 
@@ -2024,46 +1710,20 @@
       showTransientNotice(error instanceof Error ? error.message : '无法接收文件', 6000);
       return;
     }
+    if (!mobileDirectoryPickerAvailable()) showTransientNotice('已接受，正在等待发送方上传', 3000);
     await refresh();
-    if (mobileDirectoryPickerAvailable()) return;
-    showTransientNotice('已接受，正在等待发送方上传', 3000);
-    void waitForMobileDownload(view.progress.transfer_id, sessionId);
-  }
-
-  /**
-   * HTTP 页面无法指定保存目录，接收后立刻等文件就绪并触发浏览器下载，
-   * 用户不必再翻到传输记录里手动点下载。
-   */
-  async function waitForMobileDownload(transferId: string, sessionId: string) {
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      if (sessionId !== mobileSessionId) return;
-      try {
-        const views = await getMobileTransfers(sessionId);
-        if (sessionId !== mobileSessionId) return;
-        const view = views.find((candidate) => candidate.progress.transfer_id === transferId);
-        if (!view) return;
-        if (view.progress.status === 'ready') {
-          autoStartMobileDownloads(view);
-          return;
-        }
-        if (['completed', 'rejected', 'failed', 'cancelled'].includes(view.progress.status)) return;
-      } catch {
-        // 常规刷新会兜底；这里只负责让自动下载尽快发生。
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 400));
-    }
   }
 
   function autoStartMobileDownloads(view: MobileTransferView) {
     if (view.progress.status !== 'ready' || mobileReceiveDirectory) return;
     for (const item of view.progress.offer?.items ?? []) {
-      if (view.downloaded_item_ids?.includes(item.item_id)) continue;
+      if (view.downloaded_item_ids.includes(item.item_id)) continue;
       startMobileBrowserDownload(view, item, true);
     }
   }
 
   function pruneMobileDownloadKeys(view: MobileTransferView) {
-    const downloaded = view.downloaded_item_ids ?? [];
+    const downloaded = view.downloaded_item_ids;
     if (!downloaded.length) return;
     const started = new Set(mobileBrowserDownloadStarted);
     let changed = false;
@@ -2091,48 +1751,31 @@
     await refresh();
   }
 
-  async function watchTransfer(id: string, route: TransferRoute) {
+  /** 页面直发的状态由接收节点持有；一次只轮询同一任务一次，下次刷新继续。 */
+  async function pollTransfer(id: string, route: TransferRoute) {
     if (watching.has(id)) return;
-    const generation = targetGeneration;
     watching.add(id);
-    for (let attempt = 0; attempt < 360; attempt += 1) {
-      if (generation !== targetGeneration) {
-        watching.delete(id);
-        return;
-      }
-      try {
-        const progress = await onTransferRoute(route, (base) => requestWithTimeout<TransferProgress>(
-          `/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, base,
-        ));
-        if (generation !== targetGeneration) {
-          watching.delete(id);
-          return;
-        }
-        const existing = transfers.find((item) => item.transfer_id === id);
-        const nextProgress = mergeTransferProgress(existing, { ...progress, direction: 'send' });
-        observeFailure(nextProgress);
-        transfers = [nextProgress, ...transfers.filter((item) => item.transfer_id !== id)];
-        if (['accepted', 'uploading'].includes(nextProgress.status) && !uploading.has(id) && !uploadStopped.has(id)) await uploadTransfer(id);
-        if (['completed', 'rejected', 'failed', 'cancelled'].includes(nextProgress.status)) {
-          if (nextProgress.status !== 'failed') forgetPendingTransfer(id);
-          else uploadAttempts.delete(id);
-          watching.delete(id);
-          return;
-        }
-      } catch {
-        // The target may be briefly offline; the next poll will recover it.
-      }
-      await new Promise((resolve) => window.setTimeout(resolve, 800));
+    try {
+      const progress = await onTransferRoute(route, (base) => requestWithTimeout<TransferProgress>(
+        `/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, base,
+      ));
+      if (pageStopped || !pendingUploads.has(id)) return;
+      const next = recordProgress({ ...progress, direction: 'send' });
+      if (next.status === 'accepted' || next.status === 'uploading') await uploadTransfer(id);
+      if (!isActiveTransferStatus(next.status) && next.status !== 'failed') forgetPendingTransfer(id);
+    } catch {
+      // 接收节点暂时不可达时保留页面持有的源文件。
+    } finally {
+      watching.delete(id);
     }
-    watching.delete(id);
   }
 
   async function uploadTransfer(id: string) {
     const pending = pendingUploads.get(id);
-    if (!pending || uploadStopped.has(id)) return;
+    if (!pending || uploading.has(id) || uploadStopped.has(id)) return;
     uploading.add(id);
     try {
-      for (const [index, item] of pending.items.entries()) {
+      for (const [index, item] of pending.offer.items.entries()) {
         const file = pending.files[index];
         if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
         await onTransferRoute(pending, (base) => uploadFileWithRetry(
@@ -2147,7 +1790,7 @@
       const message = describeTransferFailure(error, pending.peer.node_name, pending.target);
       const attempts = (uploadAttempts.get(id) ?? 0) + 1;
       uploadAttempts.set(id, attempts);
-      if (attempts >= DESKTOP_UPLOAD_MAX_ATTEMPTS) {
+      if (attempts >= MAX_UPLOAD_ATTEMPTS) {
         uploadStopped.add(id);
         const failed = `${message}，已停止重试`;
         const failPath = `/api/v1/transfers/${encodeURIComponent(id)}/fail`;
@@ -2156,10 +1799,7 @@
         )).catch(() => undefined);
         showTransientNotice(failed, 8000);
       } else {
-        // Keep the accepted task alive. watchTransfer will retry the current
-        // item after the peer becomes reachable again; PUT is idempotent for
-        // an already committed item.
-        showTransientNotice(`${message}，连接恢复后将继续（${attempts}/${DESKTOP_UPLOAD_MAX_ATTEMPTS}）`, 6000);
+        showTransientNotice(`${message}，连接恢复后将继续（${attempts}/${MAX_UPLOAD_ATTEMPTS}）`, 6000);
       }
     } finally {
       uploading.delete(id);
@@ -2168,80 +1808,42 @@
 
   async function retryFailure(failure: TransferFailure) {
     if (transferActionBusy) return;
+    const generation = targetGeneration;
     const id = failure.progress.transfer_id;
     dismissedFailures.delete(id);
-    const pending = pendingUploads.get(id);
-    if (pending) {
-      transferActionBusy = id;
-      try {
-        const path = `/api/v1/transfers/${encodeURIComponent(id)}/retry`;
-        const retried = await onTransferRoute(pending, (base) => requestWithTimeout<TransferProgress>(path, { method: 'POST' }, base));
-        uploadAttempts.delete(id);
-        uploadStopped.delete(id);
-        failures = failures.filter((item) => item.progress.transfer_id !== id);
-        transfers = [{ ...retried, direction: 'send', offer: retried.offer ?? pending.offer }, ...transfers.filter((item) => item.transfer_id !== id)];
-        void watchTransfer(id, pending);
-      } catch (error) {
-        showTransientNotice(error instanceof Error ? error.message : '无法重试传输', 6000);
-      } finally {
-        transferActionBusy = '';
-      }
-      return;
-    }
-    const failureOffer = failure.progress.offer;
-    if (!isWeb && failureOffer && failureOffer.source_node_id === node?.node_id) {
-      const offer = failureOffer;
-      const peer = peers.find((item) => item.node_id === offer.target_node_id);
-      const target = peer ? targetBase(peer) : null;
-      if (!peer || !target) {
-        showTransientNotice('目标设备当前不可用，无法重试', 6000);
-        return;
-      }
-      transferActionBusy = id;
-      try {
-        // 源文件仍由持有任务的节点保留，按接收端的重试语义重新打开任务后由该节点续传。
-        await onTransferRoute({ target, nodeId: peer.node_id, peer }, (base) =>
-          requestWithTimeout<TransferProgress>(`/api/v1/transfers/${encodeURIComponent(id)}/retry`, { method: 'POST' }, base),
-        );
-        failures = failures.filter((item) => item.progress.transfer_id !== id);
-        await refresh();
-      } catch (error) {
-        showTransientNotice(error instanceof Error ? error.message : '无法重试传输', 6000);
-      } finally {
-        transferActionBusy = '';
-      }
-      return;
-    }
-    const mobilePending = pendingMobileUploads.get(id);
-    if (!mobilePending) return;
     transferActionBusy = id;
     try {
-      const offer: TransferOffer = {
-        ...mobilePending.offer,
-        transfer_id: randomId(),
-        created_at_ms: Date.now(),
-      };
-      await request<MobileTransferView>('/api/v1/mobile/transfers', {
-        method: 'POST',
-        body: JSON.stringify({ session_id: mobilePending.sessionId, offer }),
-      });
-      pendingMobileUploads.delete(id);
-      pendingMobileUploads.set(offer.transfer_id, { ...mobilePending, offer, completedItemIds: new Set() });
+      const mobile = pendingMobileUploads.get(id);
+      if (mobile) {
+        const offer = { ...mobile.offer, transfer_id: randomId(), created_at_ms: Date.now() };
+        const view = await createMobileTransfer(mobile.sessionId, offer, mobile.base);
+        forgetPendingTransfer(id);
+        pendingMobileUploads.set(offer.transfer_id, { ...mobile, offer, failure: undefined, completedItemIds: new Set() });
+        if (generation !== targetGeneration) return;
+        transfers = transfers.filter((item) => item.transfer_id !== id);
+        recordProgress({ ...view.progress, direction: 'send' });
+        if (mobileTransfers.some((view) => view.progress.transfer_id === id)) {
+          await dismissMobileTransfer(id, mobile.base);
+        }
+      } else {
+        const pending = pendingUploads.get(id);
+        const peer = pending?.peer ?? peers.find((item) => item.node_id === failure.progress.offer?.target_node_id);
+        const target = pending?.target ?? (peer && targetBase(peer));
+        if (!peer || !target) throw new Error('目标设备当前不可用，无法重试');
+        const progress = await onTransferRoute(pending ?? { target, peer }, (base) => requestWithTimeout<TransferProgress>(
+          `/api/v1/transfers/${encodeURIComponent(id)}/retry`, { method: 'POST' }, base,
+        ));
+        if (generation !== targetGeneration) return;
+        if (pending) {
+          uploadAttempts.delete(id);
+          uploadStopped.delete(id);
+          recordProgress({ ...progress, offer: pending.offer, direction: 'send' });
+          void pollTransfer(id, pending);
+        } else await refresh();
+      }
       failures = failures.filter((item) => item.progress.transfer_id !== id);
-      const progress: TransferProgress = {
-        transfer_id: offer.transfer_id,
-        status: 'waiting',
-        completed_bytes: 0,
-        total_bytes: offer.total_bytes,
-        completed_items: 0,
-        total_items: offer.items.length,
-        offer,
-        direction: 'send',
-      };
-      transfers = [progress, ...transfers.filter((item) => item.transfer_id !== id)];
-      void watchMobileTransfer(offer.transfer_id);
     } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法重试网页传输', 6000);
+      showTransientNotice(error instanceof Error ? error.message : '无法重试传输', 6000);
     } finally {
       transferActionBusy = '';
     }
@@ -2258,7 +1860,7 @@
   };
 
   function mobileDirectoryPickerAvailable() {
-    return isWeb && window.isSecureContext && typeof (window as MobilePickerWindow).showDirectoryPicker === 'function';
+    return isWeb && window.isSecureContext && !!navigator.locks && typeof (window as MobilePickerWindow).showDirectoryPicker === 'function';
   }
 
   async function chooseMobileReceiveDirectory() {
@@ -2269,7 +1871,7 @@
     try {
       const picker = (window as MobilePickerWindow).showDirectoryPicker;
       if (!picker) return false;
-      const directory = await picker({ mode: 'readwrite' });
+      const directory = await picker.call(window, { mode: 'readwrite' });
       mobileReceiveDirectory = directory;
       mobileReceiveDirectoryName = directory.name;
       showTransientNotice(`已选择存储目录：${mobileReceiveDirectoryName}`);
@@ -2281,46 +1883,18 @@
     }
   }
 
-  function mobilePathParts(relativePath: string) {
-    if (!relativePath || relativePath.includes('\\')) throw new Error('传输路径无效');
-    const parts = relativePath.split('/');
-    if (parts.some((part) => !part || part === '.' || part === '..')) throw new Error('传输路径无效');
-    return parts;
-  }
-
-  async function mobileTargetHandle(relativePath: string) {
-    if (!mobileReceiveDirectory) throw new Error('请先选择接收目录');
-    const parts = mobilePathParts(relativePath);
-    const fileName = parts.pop();
-    if (!fileName) throw new Error('传输文件名无效');
-    let directory = mobileReceiveDirectory;
-    for (const part of parts) directory = await directory.getDirectoryHandle(part, { create: true });
-    try {
-      await directory.getFileHandle(fileName);
-      throw new Error(`目标文件已存在：${relativePath}`);
-    } catch (error) {
-      if (error instanceof Error && error.message.startsWith('目标文件已存在：')) throw error;
-      if (error instanceof DOMException && error.name !== 'NotFoundError') throw error;
-    }
-    return { directory, fileName };
-  }
-
   async function downloadMobileItem(view: MobileTransferView, item: TransferItem) {
     if (!mobileSessionId) throw new Error('网页会话已过期');
     const completionKey = transferItemKey(view.progress.transfer_id, item.item_id);
     let saved = pendingMobileCompletions.get(completionKey);
     if (!saved) {
-      const target = await mobileTargetHandle(item.relative_path);
+      const directory = mobileReceiveDirectory;
+      if (!directory) throw new Error('请先选择接收目录');
       const response = await fetch(mobileDownloadUrl(view.progress.transfer_id, item.item_id, mobileSessionId));
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        throw new Error(payload.error ?? `下载失败 (${response.status})`);
-      }
-      await saveMobileResponse(target.directory, target.fileName, response, item.size, item.sha256);
-      saved = target;
+      if (!response.ok) throw await responseError(response);
+      saved = await saveMobileResponse(directory, item.relative_path, response, item.size, item.sha256);
     } else {
-      // The previous completion request may have failed after the file was
-      // closed. Keep that file and retry only the state notification.
+      // 文件已落盘，只需补发完成通知。
       try {
         await saved.directory.getFileHandle(saved.fileName);
       } catch {
@@ -2342,9 +1916,9 @@
   async function downloadMobileTransfer(view: MobileTransferView) {
     if (mobileDownloading.has(view.progress.transfer_id) || !mobileReceiveDirectory) return;
     if (view.progress.status !== 'ready') return;
-    mobileDownloading.add(view.progress.transfer_id);
+    mobileDownloading = new Set(mobileDownloading).add(view.progress.transfer_id);
     try {
-      const downloaded = new Set(view.downloaded_item_ids ?? []);
+      const downloaded = new Set(view.downloaded_item_ids);
       for (const item of view.progress.offer?.items ?? []) {
         if (downloaded.has(item.item_id)) continue;
         await downloadMobileItem(view, item);
@@ -2364,6 +1938,7 @@
       }).catch(() => undefined);
     } finally {
       mobileDownloading.delete(view.progress.transfer_id);
+      mobileDownloading = mobileDownloading;
     }
   }
 
@@ -2375,7 +1950,7 @@
 
   function startMobileBrowserDownload(view: MobileTransferView, item: TransferItem, auto = false) {
     if (!mobileSessionId || !['ready', 'completed'].includes(view.progress.status)) return;
-    if (view.downloaded_item_ids?.includes(item.item_id) && (auto || !view.retryable_download_item_ids?.includes(item.item_id))) return;
+    if (view.downloaded_item_ids.includes(item.item_id) && (auto || !view.retryable_download_item_ids?.includes(item.item_id))) return;
     const key = transferItemKey(view.progress.transfer_id, item.item_id);
     if (auto && mobileBrowserDownloadStarted.has(key)) return;
     const anchor = document.createElement('a');
@@ -2388,38 +1963,6 @@
     anchor.remove();
     mobileBrowserDownloadStarted = new Set(mobileBrowserDownloadStarted).add(key);
     showTransientNotice(`正在下载 ${item.name}`, 3000);
-  }
-
-  function phoneTransferView(transfer: PhoneTransfer): MobileTransferView {
-    return {
-      session_id: mobileSessionId,
-      progress: transfer,
-      downloaded_item_ids: transfer.downloaded_item_ids,
-      retryable_download_item_ids: transfer.retryable_download_item_ids,
-    };
-  }
-
-  function acceptPhoneTransfer(transfer: PhoneTransfer) {
-    if (isWeb) void acceptMobileTransfer(phoneTransferView(transfer));
-    else void acceptTransfer(transfer);
-  }
-
-  function rejectPhoneTransfer(transfer: PhoneTransfer) {
-    if (isWeb) void rejectMobileTransfer(phoneTransferView(transfer));
-    else void rejectTransfer(transfer);
-  }
-
-  function cancelPhoneTransfer(transfer: PhoneTransfer) {
-    if (isWeb && transfer.direction !== 'send') void cancelMobileTransfer(phoneTransferView(transfer));
-    else void cancelTransfer(transfer);
-  }
-
-  function savePhoneTransfer(transfer: PhoneTransfer) {
-    if (isWeb) void chooseAndDownloadMobileTransfer(phoneTransferView(transfer));
-  }
-
-  function downloadPhoneItem(transfer: PhoneTransfer, item: TransferItem) {
-    if (isWeb) startMobileBrowserDownload(phoneTransferView(transfer), item);
   }
 
   async function acceptTransfer(transfer: TransferProgress) {
@@ -2447,7 +1990,7 @@
     let path: string | undefined;
     if (isAndroidApp) {
       try {
-        path = await invoke<string>('android_receive_directory');
+        path = (await invoke<AndroidReceiveStorage>('android_receive_storage')).directory;
       } catch (error) {
         showTransientNotice(error instanceof Error ? error.message : '无法准备 Android 接收目录', 6000);
         return;
@@ -2547,7 +2090,7 @@
       peers={isWeb ? mobileTargets : peers}
       transfers={phoneTransfers}
       prepares={prepares}
-      failures={phoneFailures}
+      {failures}
       transferHistory={phoneTransferHistory}
       {transferHistoryReady}
       {transferHistoryBusy}
@@ -2564,13 +2107,13 @@
       onSendFile={(peer) => startChoose(peer)}
       onSendFolder={(peer) => startChoose(peer, true)}
       receiveStorage={androidReceiveStorage}
-    onRequestReceiveStorage={requestAndroidReceiveStorage}
-    onAcceptTransfer={acceptPhoneTransfer}
-      onRejectTransfer={rejectPhoneTransfer}
-      onCancelTransfer={cancelPhoneTransfer}
+      onRequestReceiveStorage={requestAndroidReceiveStorage}
+      onAcceptTransfer={(transfer) => transfer.web ? acceptMobileTransfer(transfer.web) : acceptTransfer(transfer)}
+      onRejectTransfer={(transfer) => transfer.web ? rejectMobileTransfer(transfer.web) : rejectTransfer(transfer)}
+      onCancelTransfer={(transfer) => transfer.web ? cancelMobileTransfer(transfer.web) : cancelTransfer(transfer)}
       onCancelPrepare={cancelPrepare}
-      onSaveToDirectory={savePhoneTransfer}
-      onStartDownload={downloadPhoneItem}
+      onSaveToDirectory={(transfer) => transfer.web && chooseAndDownloadMobileTransfer(transfer.web)}
+      onStartDownload={(transfer, item) => transfer.web && startMobileBrowserDownload(transfer.web, item)}
       onRetryFailure={retryFailure}
       onDismissFailure={dismissFailure}
       onPublish={publishClipboard}
@@ -2746,4 +2289,4 @@
 </div>
 
 <input bind:this={fileInput} class="hidden-input" type="file" multiple on:change={onFileInput} />
-<input bind:this={folderInput} class="hidden-input" type="file" multiple on:change={onFileInput} />
+<input bind:this={folderInput} class="hidden-input" type="file" webkitdirectory multiple on:change={onFileInput} />

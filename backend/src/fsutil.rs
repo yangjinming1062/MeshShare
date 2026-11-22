@@ -91,3 +91,11 @@ fn commit(temporary: &Path, path: &Path) -> Result<()> {
         }
     }
 }
+
+pub(crate) fn file_modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|value| value.as_millis() as i64)
+}

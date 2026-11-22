@@ -95,17 +95,14 @@
       .filter((id): id is string => !!id),
   );
   $: recentDownloads = mode === 'web' ? transfers.filter((transfer) =>
-    transfer.status === 'completed' && transfer.retryable_download_item_ids?.length,
+    transfer.status === 'completed' && transfer.web?.retryable_download_item_ids?.length,
   ) : [];
   $: acceptLabel = mode === 'android'
     ? '接收'
     : canChooseDirectory
       ? (receiveDirectoryName ? '开始接收' : '选择目录并接收')
       : '接收并下载';
-  $: if (!transfersAutoOpened) autoOpenTransfers();
-
-  function autoOpenTransfers() {
-    if (!activeTransfers.some((transfer) => transfer.status === 'accepted' || transfer.status === 'uploading' || transfer.status === 'ready')) return;
+  $: if (!transfersAutoOpened && activeTransfers.some((transfer) => transfer.status !== 'waiting')) {
     transfersOpen = true;
     transfersAutoOpened = true;
   }
@@ -154,11 +151,11 @@
   }
 
   function downloaded(transfer: PhoneTransfer, item: TransferItem): boolean {
-    return transfer.downloaded_item_ids?.includes(item.item_id) ?? false;
+    return transfer.web?.downloaded_item_ids.includes(item.item_id) ?? false;
   }
 
   function canRetryDownload(transfer: PhoneTransfer, item: TransferItem): boolean {
-    return transfer.retryable_download_item_ids?.includes(item.item_id) ?? false;
+    return transfer.web?.retryable_download_item_ids?.includes(item.item_id) ?? false;
   }
 
   function downloadStarted(transfer: PhoneTransfer, item: TransferItem): boolean {
@@ -527,7 +524,7 @@
       <p class="phone-copy">
         {canChooseDirectory
           ? '接收文件前可以选择存储目录，文件会流式写入且不会覆盖同名文件。'
-          : '浏览器会逐项下载到默认位置，下载完成后需要手动确认。HTTP 不提供链路加密和完整性保护，仅适用于受信任网络。'}
+          : '浏览器会逐项下载到默认位置，可在最近下载中重试。使用 HTTP 时请连接受信任网络。'}
       </p>
       {#if canChooseDirectory}
         <div class="phone-actions">

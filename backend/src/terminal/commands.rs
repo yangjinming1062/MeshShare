@@ -1,6 +1,9 @@
 //! 只有本地主窗口拥有交互终端。网络入站会话由 SSH 服务独立持有。
-use super::{ssh::Settings, TerminalEvent, TerminalSessions};
-use crate::{runtime::NodeRuntime, ManagedNode};
+use super::{
+    ssh::{Direction, Settings},
+    TerminalEvent, TerminalSessions,
+};
+use crate::runtime::NodeRuntime;
 use anyhow::{ensure, Context};
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -19,8 +22,10 @@ impl<'de, R: Runtime> CommandArg<'de, R> for MainTerminal {
         if webview.label() != "main" || webview.window().label() != "main" {
             return Err("终端仅在本机主窗口可用".into());
         }
-        let state = webview.try_state::<ManagedNode>().ok_or("节点尚未就绪")?;
-        Ok(Self(state.runtime.clone()))
+        let state = webview
+            .try_state::<Arc<NodeRuntime>>()
+            .ok_or("节点尚未就绪")?;
+        Ok(Self(state.inner().clone()))
     }
 }
 
@@ -60,7 +65,7 @@ impl WindowTerminals {
         })
     }
 
-    fn close(&self, id: &str) -> anyhow::Result<()> {
+    fn close(&self, id: &str) {
         let mut pending = self.opening.lock();
         if let Some(cancel) = pending.remove(id) {
             cancel.cancel();
@@ -172,8 +177,8 @@ pub(crate) async fn terminal_resize(
 }
 
 #[tauri::command]
-pub(crate) fn terminal_close(main: MainTerminal, id: String) -> Result<(), String> {
-    main.0.terminals.close(&id).map_err(describe)
+pub(crate) fn terminal_close(main: MainTerminal, id: String) {
+    main.0.terminals.close(&id)
 }
 
 #[tauri::command]
@@ -186,8 +191,8 @@ pub(crate) fn terminal_ack(main: MainTerminal, id: String, sequence: u64) -> Res
 }
 
 #[tauri::command]
-pub(crate) async fn terminal_settings(main: MainTerminal) -> Result<Settings, String> {
-    main.0.ssh.state().await.map_err(describe)
+pub(crate) async fn terminal_settings(main: MainTerminal) -> Settings {
+    main.0.ssh.state().await
 }
 
 #[tauri::command]
@@ -208,10 +213,10 @@ pub(crate) fn terminal_decide(main: MainTerminal, id: String, allow: bool) -> Re
 #[tauri::command]
 pub(crate) async fn terminal_revoke(
     main: MainTerminal,
-    direction: String,
+    direction: Direction,
     node_id: String,
 ) -> Result<(), String> {
-    main.0.ssh.revoke(&direction, &node_id).map_err(describe)
+    main.0.ssh.revoke(direction, &node_id).map_err(describe)
 }
 
 #[cfg(test)]
@@ -224,7 +229,7 @@ mod tests {
         let id = Uuid::new_v4().to_string();
         let first = window.begin(&id).unwrap();
         assert!(window.begin(&id).is_err());
-        window.close(&id).unwrap();
+        window.close(&id);
         assert!(first.cancel.is_cancelled());
 
         let next = window.begin(&id).unwrap();

@@ -1,4 +1,4 @@
-export const TERMINAL_CAPABILITY = 'terminal.ssh.v1';
+export const TERMINAL_CAPABILITY = 'terminal.ssh.v2';
 
 export function terminalSessionId(): string {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();

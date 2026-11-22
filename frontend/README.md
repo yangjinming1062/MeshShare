@@ -13,7 +13,8 @@
 
 | 任务 | 代码入口 |
 | --- | --- |
-| 筛选设备地址、选择同源代理 | `src/peers.ts` |
+| 设备地址与同源代理 | `src/peers.ts` 选择候选，`src/api.ts` 在操作前核对节点身份。 |
+| 文件发送 | `src/upload.ts` 构造清单并上传文件。`src/App.svelte` 随节点快照刷新网页任务，页面直发任务单独向接收节点查询。 |
 | 递归收集拖放目录、保留相对路径 | `src/drop.ts` |
 | 流式下载、摘要与本地目录保存 | `src/mobileSave.ts`、`src/sha256.ts` |
 | 传输进度与显示格式 | `src/transferProgress.ts`、`src/format.ts` |

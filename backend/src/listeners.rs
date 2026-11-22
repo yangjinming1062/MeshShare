@@ -195,20 +195,11 @@ impl Listeners {
     async fn restart_network_listeners(&mut self) {
         let local = Ipv4Addr::LOCALHOST;
         let mut stopping = Vec::new();
-        let http = std::mem::take(&mut self.http);
-        for (ip, listener) in http {
-            if ip == local {
-                self.http.insert(ip, listener);
-            } else {
-                stopping.push(listener);
-            }
-        }
-        let https = std::mem::take(&mut self.https);
-        for (ip, listener) in https {
-            if ip == local {
-                self.https.insert(ip, listener);
-            } else {
-                stopping.push(listener);
+        for listeners in [&mut self.http, &mut self.https] {
+            let loopback = listeners.remove(&local);
+            stopping.extend(std::mem::take(listeners).into_values());
+            if let Some(listener) = loopback {
+                listeners.insert(local, listener);
             }
         }
         self.failed_binds.retain(|(ip, _)| *ip == local);

@@ -79,23 +79,15 @@ pub(super) fn load_or_create_config_with_hostname(
     let path = data_dir.join("node.json");
     match std::fs::read_to_string(&path) {
         Ok(contents) => {
-            let value: serde_json::Value = serde_json::from_str(&contents)
+            let mut config: PersistedConfig = serde_json::from_str(&contents)
                 .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
-            let mut config: PersistedConfig = serde_json::from_value(value.clone())
-                .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
-            if value.get("monitor_visible").is_none() {
-                config.monitor_visible = !matches!(
-                    value.get("monitor_display").and_then(|item| item.as_str()),
-                    Some("tray" | "disabled")
-                );
-            }
             config.clipboard_history_count = config
                 .clipboard_history_count
                 .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
             config.clipboard_history_days = config
                 .clipboard_history_days
                 .clamp(1, MAX_CLIPBOARD_HISTORY_DAYS);
-            if sync_node_name(&mut config.node_name, profile, hostname.clone()) {
+            if sync_node_name(&mut config.node_name, profile, hostname) {
                 if let Err(error) = persist_config(data_dir, &config) {
                     eprintln!("保存节点名称失败：{error}");
                 }
@@ -111,14 +103,14 @@ pub(super) fn load_or_create_config_with_hostname(
         monitor_visible: true,
         monitor_position: None,
         monitor_locked: false,
-        autostart_enabled: default_autostart_enabled(),
+        autostart_enabled: true,
         update_frequency: UpdateFrequency::default(),
         update_last_checked_at_ms: None,
         pending_update_version: None,
         clipboard_history_mode: ClipboardHistoryMode::default(),
-        clipboard_history_count: default_clipboard_history_count(),
-        clipboard_history_days: default_clipboard_history_days(),
-        receive_mode: default_receive_mode(),
+        clipboard_history_count: DEFAULT_CLIPBOARD_HISTORY_COUNT,
+        clipboard_history_days: DEFAULT_CLIPBOARD_HISTORY_DAYS,
+        receive_mode: ReceiveMode::default(),
         remote_file_access: false,
         receive_directory: None,
         receive_directory_bookmark: None,
@@ -137,14 +129,6 @@ pub(super) fn activate_receive_directory_access(config: &PersistedConfig) -> Opt
             None
         }
     }
-}
-
-pub(crate) fn file_modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|value| value.as_millis() as i64)
 }
 
 pub(super) fn desktop_temp_registry_path(data_dir: &Path) -> PathBuf {
@@ -228,4 +212,284 @@ pub(super) fn persist_config(data_dir: &Path, config: &PersistedConfig) -> anyho
         &data_dir.join("node.json"),
         &serde_json::to_vec_pretty(config)?,
     )
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateFrequency {
+    Daily,
+    #[default]
+    Weekly,
+    Disabled,
+}
+
+impl UpdateFrequency {
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value))
+            .ok()
+    }
+
+    pub fn period_ms(self) -> Option<i64> {
+        match self {
+            Self::Daily => Some(24 * 60 * 60 * 1000),
+            Self::Weekly => Some(7 * 24 * 60 * 60 * 1000),
+            Self::Disabled => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PersistedConfig {
+    pub(super) node_id: String,
+    pub(super) node_name: String,
+    pub(super) monitor_visible: bool,
+    pub(super) monitor_position: Option<MonitorPosition>,
+    pub(super) monitor_locked: bool,
+    pub(super) autostart_enabled: bool,
+    pub(super) update_frequency: UpdateFrequency,
+    pub(super) update_last_checked_at_ms: Option<i64>,
+    pub(super) pending_update_version: Option<String>,
+    pub(super) clipboard_history_mode: ClipboardHistoryMode,
+    pub(super) clipboard_history_count: usize,
+    pub(super) clipboard_history_days: u32,
+    pub(super) receive_mode: ReceiveMode,
+    pub(super) receive_directory: Option<String>,
+    /// 所选接收目录的 macOS 安全作用域书签。
+    /// 其他平台保持未设置，继续使用 path 字段。
+    pub(super) receive_directory_bookmark: Option<Vec<u8>>,
+    /// 是否允许其他设备在远程管理中浏览本机目录并选择发送；默认关闭。
+    remote_file_access: bool,
+}
+
+/// 界面使用的接收设置：配置保留规范化路径，展示时去掉 Windows 扩展长度前缀。
+fn receive_settings_view(config: &PersistedConfig) -> ReceiveSettings {
+    ReceiveSettings {
+        mode: config.receive_mode,
+        default_path: config
+            .receive_directory
+            .as_deref()
+            .map(|path| crate::fsutil::display_absolute_path(Path::new(path))),
+    }
+}
+
+pub(super) fn history_settings(config: &PersistedConfig) -> ClipboardHistorySettings {
+    ClipboardHistorySettings {
+        mode: config.clipboard_history_mode,
+        count: config.clipboard_history_count,
+        days: config.clipboard_history_days,
+    }
+}
+
+impl NodeRuntime {
+    pub fn monitor_visible(&self) -> bool {
+        self.config.lock().monitor_visible
+    }
+
+    /// 配置修改统一顺序：锁内改副本，写盘成功后回写内存；写盘失败保持原值。
+    fn update_config(
+        &self,
+        change: impl FnOnce(&mut PersistedConfig) -> anyhow::Result<()>,
+    ) -> anyhow::Result<PersistedConfig> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        change(&mut next)?;
+        persist_config(&self.data_dir, &next)?;
+        *config = next.clone();
+        Ok(next)
+    }
+
+    pub fn set_monitor_visible(&self, visible: bool) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.monitor_visible = visible;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    pub fn monitor_locked(&self) -> bool {
+        self.config.lock().monitor_locked
+    }
+
+    pub fn set_monitor_locked(&self, locked: bool) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.monitor_locked = locked;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    #[cfg(any(test, not(target_os = "android")))]
+    pub fn monitor_position(&self) -> Option<MonitorPosition> {
+        self.config.lock().monitor_position.clone()
+    }
+
+    #[cfg(any(test, not(target_os = "android")))]
+    pub fn set_monitor_position(&self, position: MonitorPosition) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.monitor_position = Some(position);
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    /// 切换剪贴板同步开关并返回新状态；托盘与控制面共用。
+    #[cfg(any(test, not(target_os = "android")))]
+    pub fn toggle_sync_enabled(&self) -> bool {
+        !self.sync_enabled.fetch_xor(true, Ordering::SeqCst)
+    }
+
+    pub fn autostart_enabled(&self) -> bool {
+        self.config.lock().autostart_enabled
+    }
+
+    pub fn set_autostart_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.autostart_enabled = enabled;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    pub fn remote_file_access(&self) -> bool {
+        self.config.lock().remote_file_access
+    }
+
+    pub fn set_remote_file_access(&self, enabled: bool) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.remote_file_access = enabled;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    pub fn receive_settings(&self) -> ReceiveSettings {
+        receive_settings_view(&self.config.lock())
+    }
+
+    pub fn set_receive_settings(
+        &self,
+        mode: ReceiveMode,
+        directory: Option<PathBuf>,
+    ) -> anyhow::Result<ReceiveSettings> {
+        let canonical_directory = directory
+            .as_deref()
+            .map(validate_receive_directory)
+            .transpose()?;
+        if mode == ReceiveMode::Auto && canonical_directory.is_none() {
+            anyhow::bail!("自动接收必须设置默认目录");
+        }
+        let config = self.update_config(|config| {
+            config.receive_mode = mode;
+            config.receive_directory = canonical_directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
+            #[cfg(target_os = "macos")]
+            {
+                config.receive_directory_bookmark = canonical_directory
+                    .as_deref()
+                    .and_then(|path| crate::macos::security_scope::create_bookmark(path).ok());
+                if let Some(bookmark) = config.receive_directory_bookmark.as_deref() {
+                    if let Err(error) = crate::macos::security_scope::activate_bookmark(bookmark) {
+                        eprintln!("激活接收目录授权失败：{error}");
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(receive_settings_view(&config))
+    }
+
+    pub(super) fn default_receive_directory(&self) -> Option<PathBuf> {
+        let directory = {
+            let config = self.config.lock();
+            if config.receive_mode != ReceiveMode::Auto {
+                return None;
+            }
+            config.receive_directory.clone()?
+        };
+        validate_receive_directory(Path::new(&directory)).ok()
+    }
+
+    pub fn update_settings(&self) -> (UpdateFrequency, Option<i64>, Option<String>) {
+        let config = self.config.lock();
+        (
+            config.update_frequency,
+            config.update_last_checked_at_ms,
+            config.pending_update_version.clone(),
+        )
+    }
+
+    pub fn set_update_frequency(&self, frequency: UpdateFrequency) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.update_frequency = frequency;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    #[cfg(any(test, not(target_os = "android")))]
+    pub fn set_update_check_state(
+        &self,
+        checked_at_ms: Option<i64>,
+        pending_version: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.update_config(|config| {
+            config.update_last_checked_at_ms = checked_at_ms;
+            config.pending_update_version = pending_version;
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
+    pub fn clipboard_history_settings(&self) -> ClipboardHistorySettings {
+        history_settings(&self.config.lock())
+    }
+
+    pub fn set_clipboard_history_settings(
+        &self,
+        mode: ClipboardHistoryMode,
+        value: u64,
+    ) -> anyhow::Result<ClipboardHistorySettings> {
+        let config = self.update_config(|config| {
+            match mode {
+                ClipboardHistoryMode::Count => {
+                    let count = usize::try_from(value)
+                        .ok()
+                        .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_COUNT).contains(value))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "剪贴板历史条数必须在 1 到 {MAX_CLIPBOARD_HISTORY_COUNT} 之间"
+                            )
+                        })?;
+                    config.clipboard_history_count = count;
+                }
+                ClipboardHistoryMode::Days => {
+                    let days = u32::try_from(value)
+                        .ok()
+                        .filter(|value| (1..=MAX_CLIPBOARD_HISTORY_DAYS).contains(value))
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "剪贴板历史天数必须在 1 到 {MAX_CLIPBOARD_HISTORY_DAYS} 之间"
+                            )
+                        })?;
+                    config.clipboard_history_days = days;
+                }
+            }
+            config.clipboard_history_mode = mode;
+            Ok(())
+        })?;
+        self.prune_clipboard_history();
+        Ok(history_settings(&config))
+    }
+}
+
+pub fn validate_receive_directory(path: &Path) -> anyhow::Result<PathBuf> {
+    if !path.is_absolute() {
+        anyhow::bail!("接收目录必须是绝对路径");
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("接收目录必须是实际目录，不能是符号链接");
+    }
+    Ok(std::fs::canonicalize(path)?)
 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+pub const MAX_WIRE_ERROR_LENGTH: usize = 4_096;
 pub const CLIPBOARD_TEXT_LIMIT: usize = 16 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_LIMIT: usize = 16 * 1024 * 1024;
 pub const CLIPBOARD_VIEW_CAPABILITY: &str = "clipboard.view";
@@ -20,7 +21,7 @@ pub const METRICS_NETWORK_CAPABILITY: &str = "metrics.network";
 pub const METRICS_SYSTEM_VIEW_CAPABILITY: &str = "metrics.view.system";
 pub const METRICS_GPU_VIEW_CAPABILITY: &str = "metrics.view.gpu";
 pub const REMOTE_MANAGEMENT_CAPABILITY: &str = "management.remote.v1";
-pub const TERMINAL_SSH_CAPABILITY: &str = "terminal.ssh.v1";
+pub const TERMINAL_SSH_CAPABILITY: &str = "terminal.ssh.v2";
 pub const REMOTE_FILES_CAPABILITY: &str = "management.files.v1";
 pub const METRICS_STALE_AFTER_MS: i64 = 5_000;
 
@@ -49,7 +50,6 @@ pub struct NodeInfo {
     pub platform: String,
     pub port: u16,
     pub addresses: Vec<AddressInfo>,
-    #[serde(default)]
     pub mobile_addresses: Vec<AddressInfo>,
     pub capabilities: Vec<String>,
 }
@@ -70,18 +70,14 @@ pub struct PeerInfo {
     pub node_name: String,
     pub platform: String,
     pub addresses: Vec<AddressInfo>,
-    #[serde(default)]
     pub mobile_addresses: Vec<AddressInfo>,
     pub capabilities: Vec<String>,
     pub online: bool,
     pub last_seen_ms: i64,
     pub endpoint: Option<String>,
     pub source: String,
-    #[serde(default)]
     pub metrics: Option<HardwareMetrics>,
-    #[serde(default)]
     pub metrics_received_at_ms: Option<i64>,
-    #[serde(default)]
     pub metrics_stale: bool,
 }
 
@@ -125,30 +121,20 @@ pub struct HardwareMetrics {
     pub node_id: String,
     pub sampled_at_ms: i64,
     pub cpu_usage_percent: Option<f32>,
-    #[serde(default)]
     pub cpu_model: Option<String>,
-    #[serde(default)]
     pub cpu_logical_cores: Option<u32>,
-    #[serde(default)]
     pub cpu_physical_cores: Option<u32>,
-    #[serde(default)]
     pub cpu_frequency_mhz: Option<u64>,
     pub memory_used_bytes: Option<u64>,
     pub memory_total_bytes: Option<u64>,
-    #[serde(default)]
     pub memory_available_bytes: Option<u64>,
-    #[serde(default)]
     pub swap_used_bytes: Option<u64>,
-    #[serde(default)]
     pub swap_total_bytes: Option<u64>,
-    #[serde(default)]
     pub load_average: Option<LoadAverage>,
-    #[serde(default)]
     pub uptime_seconds: Option<u64>,
     pub network_down_bytes_per_sec: Option<u64>,
     pub network_up_bytes_per_sec: Option<u64>,
     pub gpus: Vec<GpuMetrics>,
-    #[serde(default)]
     pub disks: Vec<DiskMetrics>,
 }
 
@@ -320,7 +306,6 @@ pub struct TransferProgress {
     pub retry_count: u32,
     pub status: TransferStatus,
     /// 出站任务还在等待接收端返回清单对应的状态。
-    #[serde(default)]
     pub awaiting_offer_reply: bool,
     pub completed_bytes: u64,
     pub total_bytes: u64,
@@ -342,7 +327,6 @@ fn is_zero_u32(value: &u32) -> bool {
 pub struct MobileTransferView {
     pub session_id: String,
     pub progress: TransferProgress,
-    #[serde(default)]
     pub downloaded_item_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retryable_download_item_ids: Vec<String>,
@@ -362,18 +346,38 @@ pub struct TransferHistoryEntry {
     pub total_items: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_paths: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
     /// 接收方向记录首个已提交条目的顶层名称，供界面定位落地项目。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub item_root: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub retry_count: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     pub finished_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransferAction {
+    Accept,
+    Reject,
+    Cancel,
+    Fail,
+}
+
+impl TransferAction {
+    pub fn status(self) -> TransferStatus {
+        match self {
+            Self::Accept => TransferStatus::Accepted,
+            Self::Reject => TransferStatus::Rejected,
+            Self::Cancel => TransferStatus::Cancelled,
+            Self::Fail => TransferStatus::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,10 +403,9 @@ pub enum WireMessage {
     },
     TransferAction {
         transfer_id: String,
-        action: String,
+        action: TransferAction,
         reason: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        retry_count: Option<u32>,
+        retry_count: u32,
     },
     TransferProgress {
         progress: TransferProgress,
@@ -419,8 +422,8 @@ pub enum WireMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiskMetrics, GpuMemoryKind, GpuMetrics, HardwareMetrics, LoadAverage, TransferItem,
-        TransferOffer, TransferProgress, TransferStatus, WireMessage,
+        DiskMetrics, GpuMemoryKind, GpuMetrics, HardwareMetrics, LoadAverage, TransferAction,
+        TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
     };
     use serde_json::Value;
 
@@ -481,31 +484,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_metrics_payload_defaults_new_fields() {
-        let value = serde_json::json!({
-            "type": "MetricsUpdate",
-            "payload": {
-                "metrics": {
-                    "node_id": "old-node",
-                    "sampled_at_ms": 1,
-                    "cpu_usage_percent": 10.0,
-                    "memory_used_bytes": 1,
-                    "memory_total_bytes": 2,
-                    "network_down_bytes_per_sec": 3,
-                    "network_up_bytes_per_sec": 4,
-                    "gpus": []
-                }
-            }
-        });
-        let decoded: WireMessage = serde_json::from_value(value).expect("decode legacy metrics");
-        match decoded {
-            WireMessage::MetricsUpdate { metrics } => {
-                assert_eq!(metrics.cpu_model, None);
-                assert_eq!(metrics.swap_total_bytes, None);
-                assert!(metrics.disks.is_empty());
-            }
-            _ => panic!("unexpected wire message"),
-        }
+    fn transfer_action_requires_a_known_action_and_generation() {
+        let message = WireMessage::TransferAction {
+            transfer_id: "transfer".into(),
+            action: TransferAction::Accept,
+            reason: None,
+            retry_count: 0,
+        };
+        let mut json = serde_json::to_value(message).unwrap();
+        assert_eq!(json["payload"]["action"], "accept");
+        assert_eq!(json["payload"]["retry_count"], 0);
+        assert!(serde_json::from_value::<WireMessage>(json.clone()).is_ok());
+        json["payload"]["action"] = serde_json::json!("retry");
+        assert!(serde_json::from_value::<WireMessage>(json.clone()).is_err());
+        json["payload"]["action"] = serde_json::json!("accept");
+        json["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("retry_count");
+        assert!(serde_json::from_value::<WireMessage>(json).is_err());
     }
 
     #[test]

@@ -66,15 +66,11 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                         registered_address = register_service(&daemon, &current_node);
                     }
                     if let Ok(ServiceEvent::ServiceResolved(info)) = event {
-                        let properties = info.get_properties();
-                        let Some(node_id) = properties.iter().find_map(|item| {
-                            (item.key() == "node_id").then(|| item.val_str().to_string())
-                        }) else {
+                        let Some(node_id) = info.get_property_val_str("node_id") else {
                             continue;
                         };
-                        let protocol = properties
-                            .iter()
-                            .find_map(|item| (item.key() == "protocol").then(|| item.val_str()))
+                        let protocol = info
+                            .get_property_val_str("protocol")
                             .and_then(|value| value.parse::<u32>().ok());
                         if protocol != Some(PROTOCOL_VERSION) {
                             continue;
@@ -100,7 +96,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                         queue_peer_connection(
                             &handle,
                             &runtime,
-                            node_id,
+                            node_id.to_owned(),
                             PeerEndpoint {
                                 source: PeerEndpointSource::Mdns,
                                 url: endpoint,
@@ -157,16 +153,7 @@ pub async fn connect_manual(
     base_url: String,
 ) -> Result<PeerInfo, String> {
     let base_url = normalize_http_base_url(&base_url)?;
-    let info_url = format!("{base_url}/api/v1/info");
-    let node: crate::model::NodeInfo = runtime
-        .http
-        .get(info_url)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json()
+    let node = fetch_node_info(&runtime.http, &base_url)
         .await
         .map_err(|error| error.to_string())?;
     if node.node_id == runtime.node_id() {
@@ -193,20 +180,37 @@ pub async fn connect_manual(
     );
     Ok(runtime.peer(&peer.node_id).unwrap_or(peer))
 }
+
+async fn fetch_node_info(client: &reqwest::Client, base: &str) -> anyhow::Result<NodeInfo> {
+    const MAX_INFO_BYTES: usize = 128 * 1024;
+    let mut response = client.get(format!("{base}/api/v1/info")).send().await?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "读取节点信息失败（HTTP {}）",
+        response.status()
+    );
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|len| len <= MAX_INFO_BYTES as u64),
+        "节点信息过大"
+    );
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        anyhow::ensure!(chunk.len() <= MAX_INFO_BYTES - body.len(), "节点信息过大");
+        body.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&body)?)
+}
+
 fn normalize_http_base_url(value: &str) -> Result<String, String> {
-    let candidate = value
-        .trim()
-        .trim_end_matches('/')
-        .trim_end_matches("/mobile");
-    let path = reqwest::Url::parse(candidate)
-        .map_err(|_| "节点地址必须使用有效的 http:// 或 https:// 地址".to_string())?
-        .path()
-        .trim_end_matches('/')
-        .to_string();
+    let candidate = reqwest::Url::parse(value.trim())
+        .map_err(|_| "节点地址必须使用有效的 http:// 或 https:// 地址".to_string())?;
+    let path = candidate.path().trim_end_matches('/');
     if !path.is_empty() && path != "/mobile" {
         return Err("节点地址只能包含根路径或 /mobile".to_string());
     }
-    crate::runtime::normalize_peer_http_base(candidate).ok_or_else(|| {
+    crate::runtime::normalize_peer_http_base(candidate.as_str()).ok_or_else(|| {
         "节点地址必须是不含凭据与查询参数的本机、局域网、链路本地或 Tailscale 地址".to_string()
     })
 }
@@ -354,16 +358,10 @@ async fn run_peer_session(
     let hello = WireMessage::Hello {
         node: runtime.node_info(),
     };
-    if !matches!(
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            writer.send(Message::Text(
-                serde_json::to_string(&hello).unwrap_or_default()
-            )),
-        )
-        .await,
-        Ok(Ok(()))
-    ) {
+    let Ok(body) = serde_json::to_string(&hello) else {
+        return false;
+    };
+    if !send_frame(&mut writer, Message::Text(body)).await {
         return false;
     }
     server::sync_peer_state(runtime, node_id).await;
@@ -372,56 +370,57 @@ async fn run_peer_session(
     let mut clipboard_resync = tokio::time::interval(Duration::from_secs(1));
     let mut last_pong = tokio::time::Instant::now();
     while !runtime.stopping.load(Ordering::SeqCst) {
-        tokio::select! {
+        let frame = tokio::select! {
             _ = heartbeat.tick() => {
-                if last_pong.elapsed() > Duration::from_secs(30) {
-                    break;
-                }
-                let body = serde_json::to_string(&WireMessage::Ping { at_ms: crate::clock::now_millis() }).unwrap_or_default();
-                if !matches!(
-                    tokio::time::timeout(Duration::from_secs(10), writer.send(Message::Text(body))).await,
-                    Ok(Ok(()))
-                ) { break; }
+                if last_pong.elapsed() > Duration::from_secs(30) { break; }
+                let ping = WireMessage::Ping { at_ms: crate::clock::now_millis() };
+                let Ok(body) = serde_json::to_string(&ping) else { break; };
+                Message::Text(body)
             }
             _ = clipboard_resync.tick() => {
                 let _ = runtime.flush_clipboard_resync(node_id);
                 let _ = runtime.flush_history_deletions(node_id);
+                continue;
             }
             outbound = rx.recv() => {
                 let Some(message) = outbound else { break };
                 let Ok(body) = serde_json::to_string(&message) else { break };
-                if !matches!(
-                    tokio::time::timeout(Duration::from_secs(10), writer.send(Message::Text(body))).await,
-                    Ok(Ok(()))
-                ) { break; }
+                Message::Text(body)
             }
-            inbound = reader.next() => {
-                match inbound {
-                    Some(Ok(Message::Text(body))) => {
-                        if let Ok(message) = serde_json::from_str::<WireMessage>(&body) {
-                            if matches!(message, WireMessage::Pong { .. }) {
-                                last_pong = tokio::time::Instant::now();
-                            }
-                            let is_hello = matches!(&message, WireMessage::Hello { .. });
-                            if server::handle_wire_message(message, runtime, Some(node_id)).await.is_none() && is_hello {
-                                break;
-                            }
-                        }
+            inbound = reader.next() => match inbound {
+                Some(Ok(Message::Text(body))) => {
+                    let Ok(message) = serde_json::from_str::<WireMessage>(&body) else { continue };
+                    if matches!(message, WireMessage::Pong { .. }) {
+                        last_pong = tokio::time::Instant::now();
                     }
-                    Some(Ok(Message::Ping(payload))) => {
-                        if !matches!(
-                            tokio::time::timeout(Duration::from_secs(10), writer.send(Message::Pong(payload))).await,
-                            Ok(Ok(()))
-                        ) { break; }
+                    let is_hello = matches!(&message, WireMessage::Hello { .. });
+                    if server::handle_wire_message(message, runtime, Some(node_id)).await.is_none() && is_hello {
+                        break;
                     }
-                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
-                    Some(Ok(_)) => {}
+                    continue;
                 }
+                Some(Ok(Message::Ping(payload))) => Message::Pong(payload),
+                Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                Some(Ok(_)) => continue,
             }
+        };
+        if !send_frame(&mut writer, frame).await {
+            break;
         }
     }
     true
 }
+
+async fn send_frame(
+    writer: &mut futures_util::stream::SplitSink<PeerSocket, Message>,
+    frame: Message,
+) -> bool {
+    matches!(
+        tokio::time::timeout(Duration::from_secs(10), writer.send(frame)).await,
+        Ok(Ok(()))
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{dial_peer, normalize_http_base_url, websocket_endpoint};
@@ -474,6 +473,7 @@ mod tests {
         assert!(normalize_http_base_url("http://8.8.8.8").is_err());
         assert!(normalize_http_base_url("http://[::1]").is_err());
         assert!(normalize_http_base_url("http://meshshare.example.test").is_err());
+        assert!(normalize_http_base_url("http://meshshare.local/mobile/mobile").is_err());
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ mod discovery;
 mod fsutil;
 #[cfg(not(target_os = "android"))]
 mod links;
+#[cfg(target_os = "linux")]
 mod linux;
 mod listeners;
 #[cfg(target_os = "macos")]
@@ -27,61 +28,20 @@ mod updater;
 mod windows;
 
 #[cfg(not(target_os = "android"))]
-use anyhow::Context;
+mod desktop;
 #[cfg(not(target_os = "android"))]
-use model::MonitorPosition;
+pub use desktop::run;
+#[cfg(not(target_os = "android"))]
+use desktop::tray::sync_tray_labels;
+
 use runtime::NodeRuntime;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-#[cfg(not(target_os = "android"))]
-use tauri::menu::{Menu, MenuItem};
-#[cfg(not(target_os = "android"))]
-use tauri::tray::{MouseButton, TrayIconEvent};
-#[cfg(not(target_os = "android"))]
-use tauri::RunEvent;
 use tauri::{AppHandle, Manager, State};
-#[cfg(not(target_os = "android"))]
-use tauri::{LogicalSize, PhysicalRect, PhysicalSize, WindowEvent};
-#[cfg(not(target_os = "android"))]
-use tauri_plugin_dialog::DialogExt;
-#[cfg(not(target_os = "android"))]
-use updater::UpdateCoordinator;
 
 const DEFAULT_NODE_PORT: u16 = 37880;
-
-#[derive(Clone)]
-struct ManagedNode {
-    runtime: Arc<NodeRuntime>,
-}
-
-#[cfg(not(target_os = "android"))]
-struct TrayHandles {
-    window_toggle: MenuItem<tauri::Wry>,
-    monitor_toggle: MenuItem<tauri::Wry>,
-    lock_toggle: MenuItem<tauri::Wry>,
-    sync_toggle: MenuItem<tauri::Wry>,
-}
-
-// Linux 下 show/hide 由 GTK 主循环异步执行，is_visible() 会读到变更前的状态，因此托盘文字以命令意图为准。
-#[cfg(not(target_os = "android"))]
-struct MainWindowVisibility(std::sync::atomic::AtomicBool);
-
-#[cfg(not(target_os = "android"))]
-impl MainWindowVisibility {
-    fn new(visible: bool) -> Self {
-        Self(std::sync::atomic::AtomicBool::new(visible))
-    }
-
-    fn get(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    fn set(&self, visible: bool) {
-        self.0.store(visible, std::sync::atomic::Ordering::SeqCst);
-    }
-}
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,40 +64,18 @@ pub(crate) struct MonitorCapabilities {
 }
 
 impl MonitorCapabilities {
-    /// 无法判定桌面后端时按“不支持全局控制”处理。
+    const fn for_backend(backend: MonitorBackend) -> Self {
+        let global = !matches!(backend, MonitorBackend::Unknown | MonitorBackend::Wayland);
+        Self {
+            backend,
+            can_persist_position: global,
+            can_click_through: global,
+            can_keep_above: global,
+        }
+    }
+
     pub(crate) const fn unknown() -> Self {
-        Self::without_controls(MonitorBackend::Unknown)
-    }
-
-    const fn without_controls(backend: MonitorBackend) -> Self {
-        Self {
-            backend,
-            can_persist_position: false,
-            can_click_through: false,
-            can_keep_above: false,
-        }
-    }
-
-    /// 支持窗口定位、点击穿透与置顶的原生桌面。
-    #[cfg(not(target_os = "android"))]
-    const fn global_controls(backend: MonitorBackend) -> Self {
-        Self {
-            backend,
-            can_persist_position: true,
-            can_click_through: true,
-            can_keep_above: true,
-        }
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn monitor_capabilities_for_backend(backend: MonitorBackend) -> MonitorCapabilities {
-    match backend {
-        MonitorBackend::Wayland => MonitorCapabilities::without_controls(backend),
-        MonitorBackend::X11 => MonitorCapabilities::global_controls(backend),
-        #[cfg(not(target_os = "linux"))]
-        MonitorBackend::Other => MonitorCapabilities::global_controls(backend),
-        MonitorBackend::Unknown => MonitorCapabilities::unknown(),
+        Self::for_backend(MonitorBackend::Unknown)
     }
 }
 
@@ -151,7 +89,7 @@ pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabiliti
     #[cfg(not(target_os = "linux"))]
     {
         let _ = app;
-        monitor_capabilities_for_backend(MonitorBackend::Other)
+        MonitorCapabilities::for_backend(MonitorBackend::Other)
     }
 }
 
@@ -171,20 +109,22 @@ pub(crate) fn effective_monitor_locked(_app: &AppHandle, runtime: &NodeRuntime) 
 }
 
 #[tauri::command]
-fn node_base_url(state: State<'_, ManagedNode>) -> String {
-    format!("http://127.0.0.1:{}", state.runtime.node_info().port)
+fn node_base_url(state: State<'_, Arc<NodeRuntime>>) -> String {
+    format!("http://127.0.0.1:{}", state.node_info().port)
 }
 
 /// 远程管理页只能在本机界面开关这项能力；远程设置接口不暴露它。
 #[tauri::command]
-fn remote_file_access(state: State<'_, ManagedNode>) -> bool {
-    state.runtime.remote_file_access()
+fn remote_file_access(state: State<'_, Arc<NodeRuntime>>) -> bool {
+    state.remote_file_access()
 }
 
 #[tauri::command]
-fn set_remote_file_access(state: State<'_, ManagedNode>, enabled: bool) -> Result<bool, String> {
+fn set_remote_file_access(
+    state: State<'_, Arc<NodeRuntime>>,
+    enabled: bool,
+) -> Result<bool, String> {
     state
-        .runtime
         .set_remote_file_access(enabled)
         .map(|_| enabled)
         .map_err(|error| error.to_string())
@@ -192,416 +132,65 @@ fn set_remote_file_access(state: State<'_, ManagedNode>, enabled: bool) -> Resul
 
 #[cfg(target_os = "android")]
 #[tauri::command]
-fn android_network_changed(state: State<'_, ManagedNode>) {
-    state.runtime.request_network_rebind();
-}
-
-/// 把节点 CA 写到用户选择的位置，返回实际路径；用户取消时返回 `None`。
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-async fn save_ca_certificate(
-    app: AppHandle,
-    window: tauri::WebviewWindow,
-    state: State<'_, ManagedNode>,
-    url: String,
-) -> Result<Option<String>, String> {
-    let bytes = state.runtime.fetch_mobile_ca(&url).await?;
-    tauri::async_runtime::spawn_blocking(move || -> Result<Option<String>, String> {
-        let mut dialog = app
-            .dialog()
-            .file()
-            .set_title("保存节点 CA 证书")
-            .set_file_name("meshshare-ca.crt")
-            .add_filter("证书文件", &["crt"])
-            .set_parent(&window);
-        if let Ok(directory) = app.path().download_dir() {
-            dialog = dialog.set_directory(directory);
-        }
-        let Some(target) = dialog.blocking_save_file() else {
-            return Ok(None);
-        };
-        let path = target
-            .into_path()
-            .map_err(|error| format!("保存 CA 证书失败：{error}"))?;
-        std::fs::write(&path, bytes).map_err(|error| format!("保存 CA 证书失败：{error}"))?;
-        Ok(Some(path.display().to_string()))
-    })
-    .await
-    .map_err(|_| "无法打开保存对话框".to_string())?
-}
-
-#[cfg(not(target_os = "android"))]
-pub(crate) fn apply_monitor_locked(
-    app: &AppHandle,
-    runtime: &NodeRuntime,
-    locked: bool,
-) -> Result<bool, String> {
-    let capabilities = current_monitor_capabilities(app);
-    if locked && !capabilities.can_click_through {
-        return Err("当前桌面环境不支持悬浮条点击穿透，请从托盘隐藏悬浮条".to_string());
-    }
-    runtime
-        .set_monitor_locked(locked)
-        .map_err(|error| error.to_string())?;
-    monitor::refresh(app)?;
-    Ok(locked)
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-fn popup_monitor_menu(app: AppHandle) -> Result<(), String> {
-    let Some(window) = app.get_webview_window("monitor") else {
-        return Err("悬浮监控条尚未创建".to_string());
-    };
-    let lock = MenuItem::with_id(
-        &app,
-        "monitor-lock-now",
-        "锁定悬浮条（忽略鼠标）",
-        true,
-        None::<&str>,
-    )
-    .map_err(|error| error.to_string())?;
-    let hide = MenuItem::with_id(&app, "monitor-hide-now", "隐藏悬浮条", true, None::<&str>)
-        .map_err(|error| error.to_string())?;
-    let menu = Menu::with_items(&app, &[&lock, &hide]).map_err(|error| error.to_string())?;
-    window
-        .popup_menu(&menu)
-        .map_err(|error| format!("无法打开悬浮条菜单：{error}"))
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-fn set_monitor_position(
-    app: AppHandle,
-    state: State<'_, ManagedNode>,
-    x: i32,
-    y: i32,
-) -> Result<(), String> {
-    if !current_monitor_capabilities(&app).can_persist_position {
-        return Err("当前桌面环境不支持保存悬浮条全局坐标".to_string());
-    }
-    let position = MonitorPosition { x, y };
-    #[cfg(target_os = "windows")]
-    {
-        let window = app
-            .get_webview_window("monitor")
-            .ok_or_else(|| "悬浮条窗口不存在".to_string())?;
-        let current =
-            windows::fullscreen::on_screen_position(&window).map_err(|error| error.to_string())?;
-        // WebView 会延迟提交移动事件。只保存当前仍在屏幕上的实际位置。
-        if current.as_ref() != Some(&position)
-            || state.runtime.monitor_position().as_ref() == Some(&position)
-        {
-            return Ok(());
-        }
-    }
-    state
-        .runtime
-        .set_monitor_position(position)
-        .map_err(|error| error.to_string())
-}
-
-#[cfg(not(target_os = "android"))]
-fn window_toggle_label(visible: bool) -> &'static str {
-    if visible {
-        "隐藏窗口"
-    } else {
-        "显示窗口"
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn monitor_toggle_label(visible: bool) -> &'static str {
-    if visible {
-        "隐藏悬浮监控条"
-    } else {
-        "显示悬浮监控条"
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn monitor_lock_toggle_label(locked: bool) -> &'static str {
-    if locked {
-        "解锁悬浮条"
-    } else {
-        "锁定悬浮条"
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn tray_monitor_locked(app: &AppHandle) -> bool {
-    app.try_state::<ManagedNode>()
-        .is_some_and(|state| effective_monitor_locked(app, state.runtime.as_ref()))
-}
-
-#[cfg(not(target_os = "android"))]
-fn clipboard_sync_toggle_label(enabled: bool) -> &'static str {
-    if enabled {
-        "暂停剪贴板同步"
-    } else {
-        "恢复剪贴板同步"
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn tray_sync_enabled(app: &AppHandle) -> bool {
-    app.try_state::<ManagedNode>().is_some_and(|state| {
-        state
-            .runtime
-            .sync_enabled
-            .load(std::sync::atomic::Ordering::SeqCst)
-    })
-}
-
-#[cfg(not(target_os = "android"))]
-fn main_window_visible(app: &AppHandle) -> bool {
-    app.try_state::<MainWindowVisibility>()
-        .is_some_and(|state| state.get())
-}
-
-#[cfg(not(target_os = "android"))]
-fn monitor_window_visible(app: &AppHandle) -> bool {
-    app.try_state::<ManagedNode>()
-        .is_some_and(|state| state.runtime.monitor_visible())
-}
-
-#[cfg(not(target_os = "android"))]
-pub(crate) fn sync_tray_labels(app: &AppHandle) {
-    let Some(tray) = app.try_state::<TrayHandles>() else {
-        return;
-    };
-    let _ = tray
-        .window_toggle
-        .set_text(window_toggle_label(main_window_visible(app)));
-    let _ = tray
-        .monitor_toggle
-        .set_text(monitor_toggle_label(monitor_window_visible(app)));
-    let _ = tray
-        .lock_toggle
-        .set_text(monitor_lock_toggle_label(tray_monitor_locked(app)));
-    let _ = tray
-        .sync_toggle
-        .set_text(clipboard_sync_toggle_label(tray_sync_enabled(app)));
-}
-
-#[cfg(not(target_os = "android"))]
-fn set_main_window_visible(app: &AppHandle, visible: bool) {
-    if let Some(state) = app.try_state::<MainWindowVisibility>() {
-        state.set(visible);
-    }
-    if let Some(window) = app.get_webview_window("main") {
-        if visible {
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_focus();
-        } else {
-            let _ = window.hide();
-        }
-    }
-    sync_tray_labels(app);
-}
-
-#[cfg(not(target_os = "android"))]
-fn handle_tray_icon_event(app: &AppHandle, event: TrayIconEvent) {
-    if event.id().as_ref() != "meshshare"
-        || !matches!(
-            event,
-            TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
-            }
-        )
-    {
-        return;
-    }
-
-    set_main_window_visible(app, !main_window_visible(app));
-}
-
-#[cfg(not(target_os = "android"))]
-pub(crate) fn apply_monitor_visible(
-    app: &AppHandle,
-    runtime: &NodeRuntime,
-    visible: bool,
-) -> Result<(), String> {
-    runtime
-        .set_monitor_visible(visible)
-        .map_err(|error| error.to_string())?;
-    monitor::refresh(app)
-}
-
-#[cfg(not(target_os = "android"))]
-fn hide_monitor_persisted(app: &AppHandle) {
-    if let Some(state) = app.try_state::<ManagedNode>() {
-        if let Err(error) = apply_monitor_visible(app, state.runtime.as_ref(), false) {
-            eprintln!("保存悬浮监控条可见性失败：{error}");
-        }
-    }
+fn android_network_changed(state: State<'_, Arc<NodeRuntime>>) {
+    state.request_network_rebind();
 }
 
 #[cfg(target_os = "android")]
 pub(crate) fn sync_tray_labels(_app: &AppHandle) {}
 
-#[cfg(target_os = "android")]
+pub(crate) fn apply_monitor_locked(
+    app: &AppHandle,
+    runtime: &NodeRuntime,
+    locked: bool,
+) -> Result<(), String> {
+    if !cfg!(target_os = "android")
+        && locked
+        && !current_monitor_capabilities(app).can_click_through
+    {
+        return Err("当前桌面环境不支持悬浮条点击穿透，请从托盘隐藏悬浮条".to_string());
+    }
+    runtime
+        .set_monitor_locked(locked)
+        .map_err(|error| error.to_string())?;
+    refresh_monitor(app)
+}
+
 pub(crate) fn apply_monitor_visible(
-    _app: &AppHandle,
+    app: &AppHandle,
     runtime: &NodeRuntime,
     visible: bool,
 ) -> Result<(), String> {
     runtime
         .set_monitor_visible(visible)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    refresh_monitor(app)
 }
 
 #[cfg(target_os = "android")]
-pub(crate) fn apply_monitor_locked(
-    _app: &AppHandle,
-    runtime: &NodeRuntime,
-    locked: bool,
-) -> Result<bool, String> {
-    runtime
-        .set_monitor_locked(locked)
-        .map_err(|error| error.to_string())?;
-    Ok(locked)
-}
-
-#[cfg(not(target_os = "android"))]
-fn sync_autostart_registration(runtime: &NodeRuntime) {
-    if cfg!(debug_assertions) {
-        return;
-    }
-    let registration = match autostart::Registration::current() {
-        Ok(registration) => registration,
-        Err(error) => {
-            eprintln!("准备开机自启动失败：{error}");
-            return;
-        }
-    };
-    if let Err(error) = registration.set_enabled(runtime.autostart_enabled()) {
-        eprintln!("同步开机自启动失败：{error}");
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn is_autostart_launch() -> bool {
-    autostart::launched_from_args(std::env::args())
-}
-
-#[cfg(not(target_os = "android"))]
-fn show_main_window(app: &AppHandle) {
-    set_main_window_visible(app, true);
-}
-
-#[cfg(not(target_os = "android"))]
-const MONITOR_MARGIN_PX: i32 = 16;
-
-#[cfg(not(target_os = "android"))]
-const MONITOR_WIDTH: f64 = 220.0;
-
-#[cfg(not(target_os = "android"))]
-const MONITOR_HEIGHT: f64 = 50.0;
-
-#[cfg(not(any(target_os = "android", target_os = "windows")))]
-fn normalize_monitor_size<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>) {
-    if let Err(error) = window.set_size(LogicalSize::new(MONITOR_WIDTH, MONITOR_HEIGHT)) {
-        eprintln!("设置监控条尺寸失败：{error}");
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn point_is_in_work_area(position: &MonitorPosition, area: &PhysicalRect<i32, u32>) -> bool {
-    let left = i64::from(area.position.x);
-    let top = i64::from(area.position.y);
-    let right = left + i64::from(area.size.width);
-    let bottom = top + i64::from(area.size.height);
-    let x = i64::from(position.x);
-    let y = i64::from(position.y);
-    x >= left && x < right && y >= top && y < bottom
-}
-
-#[cfg(not(target_os = "android"))]
-fn clamp_position_to_work_area(
-    position: Option<MonitorPosition>,
-    area: &PhysicalRect<i32, u32>,
-    size: PhysicalSize<u32>,
-) -> MonitorPosition {
-    let margin = i64::from(MONITOR_MARGIN_PX);
-    let (x, y) = (i64::from(area.position.x), i64::from(area.position.y));
-    let left = x + margin;
-    let top = y + margin;
-    let right = (x + i64::from(area.size.width) - i64::from(size.width) - margin).max(left);
-    let bottom = (y + i64::from(area.size.height) - i64::from(size.height) - margin).max(top);
-    let (x, y) = position
-        .map(|position| (i64::from(position.x), i64::from(position.y)))
-        .unwrap_or((right, bottom));
-    MonitorPosition {
-        x: x.clamp(left, right) as i32,
-        y: y.clamp(top, bottom) as i32,
-    }
-}
-
-#[cfg(not(target_os = "android"))]
-fn position_monitor_window(
-    window: &tauri::WebviewWindow,
-    runtime: &NodeRuntime,
-) -> anyhow::Result<()> {
-    if !current_monitor_capabilities(window.app_handle()).can_persist_position {
-        return Ok(());
-    }
-    let monitors = window.available_monitors()?;
-    let first = monitors.first().context("未找到活动显示器")?;
-    let saved = runtime.monitor_position().and_then(|position| {
-        monitors
-            .iter()
-            .find(|item| point_is_in_work_area(&position, item.work_area()))
-            .map(|item| (Some(position), item.clone()))
-    });
-    let (position, monitor) = saved.unwrap_or_else(|| {
-        let monitor = window
-            .primary_monitor()
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| first.clone());
-        (None, monitor)
-    });
-    let area = monitor.work_area();
-    anyhow::ensure!(
-        area.size.width > 0 && area.size.height > 0,
-        "显示器工作区尚未就绪"
-    );
-    #[cfg(target_os = "windows")]
-    let size = LogicalSize::new(MONITOR_WIDTH, MONITOR_HEIGHT).to_physical(monitor.scale_factor());
-    #[cfg(not(target_os = "windows"))]
-    let size = window.outer_size()?;
-    let position = clamp_position_to_work_area(position, area, size);
-    #[cfg(target_os = "windows")]
-    let position = windows::fullscreen::place_hidden(window, position, size)?;
-    #[cfg(not(target_os = "windows"))]
-    let physical = tauri::PhysicalPosition::new(position.x, position.y);
-    #[cfg(target_os = "linux")]
-    linux::fullscreen::set_initial_position(window, physical)?;
-    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
-    window.set_position(physical)?;
-    if runtime.monitor_position().as_ref() != Some(&position) {
-        if let Err(error) = runtime.set_monitor_position(position) {
-            eprintln!("保存悬浮条位置失败：{error}");
-        }
-    }
+fn refresh_monitor(_app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
+use monitor::refresh as refresh_monitor;
+
 async fn start_node(
+    app: &AppHandle,
     data_dir: PathBuf,
-    static_root: PathBuf,
-    version: String,
-    app: AppHandle,
 ) -> anyhow::Result<(Arc<NodeRuntime>, Arc<control::ControlPlane>)> {
     let preferred_port = std::env::var("MESHSHARE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_NODE_PORT);
-    let (runtime, control) =
-        listeners::start_with_app(data_dir, static_root, version, preferred_port, app).await?;
+    let (runtime, control) = listeners::start_with_app(
+        data_dir,
+        static_root(app),
+        app.package_info().version.to_string(),
+        preferred_port,
+        app.clone(),
+    )
+    .await?;
     let cleanup_runtime = runtime.clone();
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -628,269 +217,23 @@ async fn start_node(
     clipboard::start_monitor(runtime.clone());
     metrics::start(runtime.clone());
     discovery::start(runtime.clone());
+    app.manage(runtime.clone());
     Ok((runtime, control))
 }
 
 fn static_root(app: &AppHandle) -> PathBuf {
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        for candidate in [
-            resource_dir.join("web"),
-            resource_dir.join("web/dist"),
-            resource_dir.join("dist"),
-        ] {
-            if candidate.join("index.html").exists() {
-                return candidate;
-            }
-        }
-    }
-    let bundled = std::env::current_exe()
+    app.path()
+        .resource_dir()
         .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join("web")))
-        .filter(|path| path.exists());
-    bundled.unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/dist"))
+        .map(|resource_dir| resource_dir.join("web"))
+        .filter(|web| web.join("index.html").is_file())
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/dist"))
 }
 
-#[cfg(not(target_os = "android"))]
-fn setup_tray_menu(app: &AppHandle) -> anyhow::Result<()> {
-    let tray = app
-        .tray_by_id("meshshare")
-        .context("MeshShare tray icon is missing")?;
-    let window_toggle = MenuItem::with_id(
-        app,
-        "toggle-window",
-        window_toggle_label(main_window_visible(app)),
-        true,
-        None::<&str>,
-    )?;
-    let monitor_toggle = MenuItem::with_id(
-        app,
-        "toggle-monitor",
-        monitor_toggle_label(monitor_window_visible(app)),
-        true,
-        None::<&str>,
-    )?;
-    let lock_toggle = MenuItem::with_id(
-        app,
-        "monitor-lock-toggle",
-        monitor_lock_toggle_label(tray_monitor_locked(app)),
-        true,
-        None::<&str>,
-    )?;
-    let sync_toggle = MenuItem::with_id(
-        app,
-        "toggle-sync",
-        clipboard_sync_toggle_label(tray_sync_enabled(app)),
-        true,
-        None::<&str>,
-    )?;
-    let exit = MenuItem::with_id(app, "exit", "退出程序", true, None::<&str>)?;
-    let menu = Menu::with_items(
-        app,
-        &[
-            &monitor_toggle,
-            &lock_toggle,
-            &window_toggle,
-            &sync_toggle,
-            &exit,
-        ],
-    )?;
-    tray.set_menu(Some(menu))?;
-    app.manage(TrayHandles {
-        window_toggle,
-        monitor_toggle,
-        lock_toggle,
-        sync_toggle,
-    });
-    sync_tray_labels(app);
-    app.on_tray_icon_event(handle_tray_icon_event);
-    tray.on_menu_event(|app, event| match event.id().as_ref() {
-        "toggle-window" => {
-            set_main_window_visible(app, !main_window_visible(app));
-        }
-        "toggle-monitor" => {
-            if let Some(state) = app.try_state::<ManagedNode>() {
-                let visible = !monitor_window_visible(app);
-                if let Err(error) = apply_monitor_visible(app, state.runtime.as_ref(), visible) {
-                    eprintln!("保存悬浮监控条可见性失败：{error}");
-                }
-            }
-        }
-        "monitor-lock-toggle" => {
-            if let Some(state) = app.try_state::<ManagedNode>() {
-                let locked = !effective_monitor_locked(app, state.runtime.as_ref());
-                if let Err(error) = apply_monitor_locked(app, state.runtime.as_ref(), locked) {
-                    eprintln!("{error}");
-                }
-            }
-        }
-        "toggle-sync" => {
-            if let Some(state) = app.try_state::<ManagedNode>() {
-                state.runtime.toggle_sync_enabled();
-            }
-            sync_tray_labels(app);
-        }
-        "exit" => {
-            if let Some(state) = app.try_state::<ManagedNode>() {
-                state
-                    .runtime
-                    .stopping
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            app.exit(0);
-        }
-        _ => {}
-    });
-    Ok(())
-}
-
-#[cfg(not(target_os = "android"))]
-fn run_desktop() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            show_main_window(app);
-        }))
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .on_page_load(|webview, payload| {
-            if webview.label() == "main"
-                && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
-            {
-                if let Some(state) = webview.try_state::<ManagedNode>() {
-                    state.runtime.terminals.close_all();
-                }
-            }
-        })
-        .setup(|app| {
-            let autostart_launch = is_autostart_launch();
-            app.manage(monitor::Controller::default());
-            app.manage(MainWindowVisibility::new(
-                app.get_webview_window("main")
-                    .and_then(|window| window.is_visible().ok())
-                    .unwrap_or(false),
-            ));
-            let monitor_window = app.get_webview_window("monitor");
-            #[cfg(target_os = "linux")]
-            {
-                let backend = monitor_window
-                    .as_ref()
-                    .map_or(MonitorBackend::Unknown, |window| {
-                        linux::fullscreen::prepare(window).unwrap_or_else(|error| {
-                            eprintln!("准备悬浮条原生窗口失败：{error:#}");
-                            MonitorBackend::Unknown
-                        })
-                    });
-                app.manage(monitor_capabilities_for_backend(backend));
-            }
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| PathBuf::from(".meshshare"));
-            let (runtime, control) = tauri::async_runtime::block_on(start_node(
-                data_dir,
-                static_root(app.handle()),
-                app.package_info().version.to_string(),
-                app.handle().clone(),
-            ))?;
-            app.manage(ManagedNode {
-                runtime: runtime.clone(),
-            });
-            let updater = UpdateCoordinator::new(app.handle().clone(), runtime.clone());
-            control.install_updater(updater.clone())?;
-            updater.start();
-            sync_autostart_registration(runtime.as_ref());
-            setup_tray_menu(app.handle())?;
-            if let Some(window) = monitor_window.as_ref() {
-                #[cfg(not(target_os = "windows"))]
-                normalize_monitor_size(window);
-                if let Err(error) = position_monitor_window(window, runtime.as_ref()) {
-                    eprintln!("设置悬浮条初始位置失败：{error:#}");
-                }
-            }
-            monitor::start(app.handle().clone(), runtime.clone())?;
-            if let Some(window) = app.get_webview_window("monitor") {
-                let app_for_menu = app.handle().clone();
-                window.on_menu_event(move |_window, event| match event.id().as_ref() {
-                    "monitor-lock-now" => {
-                        if let Some(state) = app_for_menu.try_state::<ManagedNode>() {
-                            if let Err(error) =
-                                apply_monitor_locked(&app_for_menu, state.runtime.as_ref(), true)
-                            {
-                                eprintln!("{error}");
-                            }
-                        }
-                    }
-                    "monitor-hide-now" => hide_monitor_persisted(&app_for_menu),
-                    _ => {}
-                });
-            }
-            if let Some(window) = app.get_webview_window("main") {
-                if !autostart_launch {
-                    show_main_window(app.handle());
-                }
-                let app_for_close = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        set_main_window_visible(&app_for_close, false);
-                    }
-                });
-            }
-            if let Some(window) = app.get_webview_window("monitor") {
-                let app_for_close = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        hide_monitor_persisted(&app_for_close);
-                    }
-                });
-            }
-            Ok(())
-        })
-        .invoke_handler(tauri::generate_handler![
-            node_base_url,
-            save_ca_certificate,
-            remote_file_access,
-            set_remote_file_access,
-            popup_monitor_menu,
-            set_monitor_position,
-            links::open_project_page,
-            links::open_transfer_location,
-            terminal::commands::terminal_open,
-            terminal::commands::terminal_close,
-            terminal::commands::terminal_resize,
-            terminal::commands::terminal_write,
-            terminal::commands::terminal_ack,
-            terminal::commands::terminal_settings,
-            terminal::commands::terminal_set_enabled,
-            terminal::commands::terminal_pair,
-            terminal::commands::terminal_decide,
-            terminal::commands::terminal_revoke
-        ])
-        .build(tauri::generate_context!())
-        .expect("error while building MeshShare")
-        .run(|app, event| match event {
-            RunEvent::ExitRequested { .. } | RunEvent::Exit => {
-                if let Some(state) = app.try_state::<ManagedNode>() {
-                    state
-                        .runtime
-                        .stopping
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                    state.runtime.terminals.close_all();
-                    state.runtime.ssh.shutdown();
-                    if matches!(event, RunEvent::Exit) {
-                        state.runtime.wait_for_terminal_shutdown();
-                    }
-                }
-            }
-            #[cfg(target_os = "macos")]
-            RunEvent::Reopen { .. } => show_main_window(app),
-            _ => {}
-        });
-}
-
-#[cfg(not(target_os = "android"))]
-pub fn run() {
-    run_desktop();
+fn node_data_dir(app: &AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| PathBuf::from(".meshshare"))
 }
 
 #[cfg(target_os = "android")]
@@ -902,22 +245,12 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(android::update::app::plugin())
         .setup(|app| {
-            let data_dir = app
-                .path()
-                .app_data_dir()
-                .unwrap_or_else(|_| PathBuf::from(".meshshare"));
-            let (runtime, _control) = tauri::async_runtime::block_on(start_node(
-                data_dir.clone(),
-                static_root(app.handle()),
-                app.package_info().version.to_string(),
-                app.handle().clone(),
-            ))?;
-            if let Err(error) =
-                android::update::app::start(app.handle(), runtime.clone(), &data_dir)
-            {
+            let data_dir = node_data_dir(app.handle());
+            let (runtime, _) =
+                tauri::async_runtime::block_on(start_node(app.handle(), data_dir.clone()))?;
+            if let Err(error) = android::update::app::start(app.handle(), runtime, &data_dir) {
                 eprintln!("启动 Android 更新服务失败：{error:#}");
             }
-            app.manage(ManagedNode { runtime });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -925,7 +258,6 @@ pub fn run() {
             android_network_changed,
             remote_file_access,
             set_remote_file_access,
-            android::commands::android_receive_directory,
             android::commands::android_receive_storage,
             android::commands::android_request_receive_storage,
             android::commands::android_reveal_path,
@@ -934,92 +266,22 @@ pub fn run() {
             android::update::app::android_check_for_updates,
             android::update::app::android_continue_update
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building MeshShare")
-        .run(|_app, _event| {});
+        .run(tauri::generate_context!())
+        .expect("error while running MeshShare");
 }
 
 pub fn cleanup_autostart() {
-    if let Err(error) =
-        autostart::Registration::current().and_then(|registration| registration.disable())
-    {
+    if let Err(error) = autostart::disable() {
         eprintln!("清理开机自启动失败：{error}");
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        clamp_position_to_work_area, clipboard_sync_toggle_label, monitor_capabilities_for_backend,
-        monitor_lock_toggle_label, monitor_toggle_label, point_is_in_work_area,
-        window_toggle_label, MainWindowVisibility, MonitorBackend, MONITOR_HEIGHT, MONITOR_WIDTH,
-    };
-    use crate::autostart::launched_from_args;
-    use crate::model::MonitorPosition;
-    use tauri::{LogicalSize, PhysicalPosition, PhysicalRect, PhysicalSize};
-
-    #[test]
-    fn monitor_position_is_clamped_inside_work_area() {
-        let work_area = PhysicalRect {
-            position: PhysicalPosition::new(0, 0),
-            size: PhysicalSize::new(1920, 1080),
-        };
-        let size = PhysicalSize::new(440, 42);
-        assert_eq!(
-            clamp_position_to_work_area(
-                Some(MonitorPosition { x: -500, y: -500 }),
-                &work_area,
-                size,
-            ),
-            MonitorPosition { x: 16, y: 16 }
-        );
-        assert_eq!(
-            clamp_position_to_work_area(
-                Some(MonitorPosition { x: 4000, y: 4000 }),
-                &work_area,
-                size,
-            ),
-            MonitorPosition { x: 1464, y: 1022 }
-        );
-    }
-
-    #[test]
-    fn monitor_position_preserves_a_negative_display_and_falls_back_at_destination_scale() {
-        let secondary = PhysicalRect {
-            position: PhysicalPosition::new(-1920, -160),
-            size: PhysicalSize::new(1920, 1040),
-        };
-        let primary = PhysicalRect {
-            position: PhysicalPosition::new(0, 0),
-            size: PhysicalSize::new(5120, 2100),
-        };
-        let saved = MonitorPosition { x: -800, y: -50 };
-        let parked = MonitorPosition {
-            x: -32000,
-            y: -32000,
-        };
-        let logical_size = LogicalSize::new(MONITOR_WIDTH, MONITOR_HEIGHT);
-        assert!(point_is_in_work_area(&saved, &secondary));
-        assert!(!point_is_in_work_area(&saved, &primary));
-        assert!(!point_is_in_work_area(&parked, &secondary));
-        assert!(!point_is_in_work_area(&parked, &primary));
-        assert_eq!(
-            clamp_position_to_work_area(
-                Some(saved.clone()),
-                &secondary,
-                logical_size.to_physical(1.5),
-            ),
-            saved,
-        );
-        assert_eq!(
-            clamp_position_to_work_area(None, &primary, logical_size.to_physical(1.25)),
-            MonitorPosition { x: 4829, y: 2021 },
-        );
-    }
-
+    use super::*;
     #[test]
     fn wayland_monitor_capabilities_do_not_claim_global_controls() {
-        let capabilities = monitor_capabilities_for_backend(MonitorBackend::Wayland);
+        let capabilities = MonitorCapabilities::for_backend(MonitorBackend::Wayland);
         assert!(!capabilities.can_persist_position);
         assert!(!capabilities.can_click_through);
         assert!(!capabilities.can_keep_above);
@@ -1032,38 +294,11 @@ mod tests {
         #[cfg(target_os = "linux")]
         let supported = [MonitorBackend::X11];
         for backend in supported {
-            let capabilities = monitor_capabilities_for_backend(backend);
+            let capabilities = MonitorCapabilities::for_backend(backend);
             assert!(capabilities.can_persist_position);
             assert!(capabilities.can_click_through);
             assert!(capabilities.can_keep_above);
         }
-        assert!(!monitor_capabilities_for_backend(MonitorBackend::Unknown).can_click_through);
-    }
-
-    #[test]
-    fn autostart_argument_is_detected_without_matching_similar_flags() {
-        assert!(launched_from_args(["meshshare", "--meshshare-autostart"]));
-        assert!(!launched_from_args(["meshshare", "--autostart"]));
-    }
-    #[test]
-    fn tray_toggle_labels_follow_state() {
-        assert_eq!(window_toggle_label(true), "隐藏窗口");
-        assert_eq!(window_toggle_label(false), "显示窗口");
-        assert_eq!(monitor_toggle_label(true), "隐藏悬浮监控条");
-        assert_eq!(monitor_toggle_label(false), "显示悬浮监控条");
-        assert_eq!(clipboard_sync_toggle_label(true), "暂停剪贴板同步");
-        assert_eq!(clipboard_sync_toggle_label(false), "恢复剪贴板同步");
-        assert_eq!(monitor_lock_toggle_label(true), "解锁悬浮条");
-        assert_eq!(monitor_lock_toggle_label(false), "锁定悬浮条");
-    }
-
-    #[test]
-    fn main_window_visibility_keeps_last_command() {
-        let state = MainWindowVisibility::new(false);
-        assert!(!state.get());
-        state.set(true);
-        assert!(state.get());
-        state.set(false);
-        assert!(!state.get());
+        assert!(!MonitorCapabilities::for_backend(MonitorBackend::Unknown).can_click_through);
     }
 }

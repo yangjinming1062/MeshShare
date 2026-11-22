@@ -1,4 +1,4 @@
-# MeshShare v1 协议
+# MeshShare 节点协议
 
 ## HTTP 接口
 
@@ -76,13 +76,15 @@
 | `GET` | `/api/v1/management/outgoing/{id}` | 查询远程准备进度；结束或取消后 404 |
 | `POST` | `/api/v1/management/outgoing/{id}/cancel` | 取消远程准备任务 |
 
-远程管理目标应声明 `management.remote.v1`，远程文件选择还需 `management.files.v1`；缺少能力标记或接口不存在时，界面保留本机上下文并提示升级。管理接口只返回目录元数据，路径发送的 `target_node_id` 必须是目标已连接的 peer，发送源固定为目标节点自身。这组接口只在目标机器本机开启 `remote_file_access` 时可用，关闭时统一返回 403；该设置不出现在 `GET/PATCH /api/v1/settings` 中。相对路径返回 400，不可访问路径返回 404。
+远程管理需要目标声明 `management.remote.v1`。从目标磁盘选择文件还需要 `management.files.v1`。管理接口只返回目录元数据，路径发送的 `target_node_id` 必须是目标已连接的 peer，发送源固定为目标节点自身。这组接口只在目标机器本机开启 `remote_file_access` 时可用，关闭时统一返回 403；该设置不出现在 `GET/PATCH /api/v1/settings` 中。相对路径返回 400，不可访问路径返回 404。
 
 ### 桌面终端
 
-桌面节点通过 `terminal.ssh.v1` 声明协议支持。发起端按本机已连接的目标节点 ID 选择候选地址，对目标节点端口的 `GET /api/v1/terminal/ssh` 请求发送 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v1` 和 `X-MeshShare-Terminal-Target`（目标节点 ID）。收到 101 并校验升级协议后，同一连接承载 SSH 握手、公钥认证和交互 shell 的字节流。连接只接受原生客户端，带浏览器 `Origin` 的请求返回 403。目标 ID 不符返回 421，缺少升级头返回 426，关闭接入返回 403。只有 SSH 公钥认证及本机授权通过后才创建伪终端。
+桌面节点通过 `terminal.ssh.v2` 声明协议支持。发起端按本机已连接的目标节点 ID 选择候选地址，对目标节点端口的 `GET /api/v1/terminal/ssh` 请求发送 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v2` 和 `X-MeshShare-Terminal-Target`（目标节点 ID）。收到 101 并校验升级协议后，同一连接承载 SSH 握手、公钥认证和交互 shell 的字节流。连接只接受原生客户端，带浏览器 `Origin` 的请求返回 403。目标 ID 不符返回 421，缺少升级头返回 426，关闭接入返回 403。只有 SSH 公钥认证及本机授权通过后才创建伪终端。
 
-终端的输入、输出与尺寸变更各自属于对应的 SSH 会话。配对期间按配对窗口的期限等待确认。交互终端建立后，发起端通过 SSH 心跳确认连接，目标端根据入站流量检测断线。shell 正常退出时，目标端先送完剩余输出，再发送 EOF 并关闭通道。文件与剪贴板协议独立运行。节点的常规设置接口只处理共享设置；终端开关、固定的主机指纹与授权记录通过本机主窗口管理。旧节点和 Android 不声明终端能力。
+终端的输入、输出与尺寸变更各自属于对应的 SSH 会话。配对期间按配对窗口的期限等待确认。交互终端建立后，发起端通过 SSH 心跳确认连接，目标端根据入站流量检测断线。shell 正常退出时，目标端先送完剩余输出，再发送 EOF 并关闭通道。文件与剪贴板协议独立运行。节点的常规设置接口只处理共享设置；终端开关、固定的主机指纹与授权记录通过本机主窗口管理。
+
+目标端分批发送终端输出。每批结束时，目标端通过 SSH 通道的私用扩展数据类型 `0xFE000000` 发送单个 `0x00` 字节。发起端将此前的输出排入有界界面队列后原样回复，目标端随后可以发送下一批。界面暂停消费时，目标端暂停读取后续输出，SSH 仍处理心跳和关闭请求。
 
 ### 网页会话
 
@@ -111,17 +113,17 @@
 
 消息使用 `{ "type": "VariantName", "payload": ... }`，结构以 `backend/src/model.rs` 中的 `WireMessage` 为准。
 
-- `Hello` 携带节点身份、能力和 `protocol_version`。会话注册要求双方协议版本一致。注册后节点出现在设备列表。
+- `Hello` 携带节点身份、能力和 `protocol_version`。当前节点握手版本为 `2`，双方版本一致才会注册并出现在设备列表。HTTP 和 WebSocket 路径使用 `/api/v1`。
 - `Ping` / `Pong` 用于保活。
 - `ClipboardUpdate` 的 `payload.event` 包含事件 ID、原始来源节点、HLC 和内容。接收端用当前 Peer Channel 确认发送方；多跳转发时来源可以与当前发送方不同。
 - `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新快照，保留原始 `source_node_id`；接收端按 HLC 比较新旧并按事件 ID 去重。
 - `TransferOffer` 的 `payload.offer` 包含清单、总大小和发送节点。
-- `TransferAction` 表示接受、拒绝、取消、失败或重试，可携带失败原因和重试代次；接收目录只由接收节点本地选择，不通过消息传输。节点把长时间无进展的传输判为失败时也会发送 `fail`。
+- `TransferAction` 支持 `accept`、`reject`、`cancel` 和 `fail`，每条消息携带 `retry_count`。接收端只应用当前代次的操作。重试由目标节点的 HTTP `retry` 接口发起，通过 `TransferProgress` 同步新代次。接收目录仅由接收节点本地选择。
 - `TransferProgress` 的 `payload.progress` 包含状态、已完成字节、错误和可选的 `retry_count`。只有代次递增才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。传输进行中，节点本地进度与状态接口返回的 `completed_bytes` 还包含当前条目已接收但尚未提交的字节，`completed_items` 仍只统计已提交条目；两者都不回退且不超过总量。
 - `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
 - `TransferHistoryDeleted` 的 `payload.transfer_ids` 请求对端删除配对记录；接收端只接受有限数量，只删除当前 Peer 自己的记录，不反向转发。
 
-发送端的本地出站进度在收到清单回复前为 `waiting`，同时标记 `awaiting_offer_reply: true`。接收节点通过 HTTP 建单响应或 WebSocket 进度返回任务状态，`accepted` 表示已确定接收目录，`waiting` 表示仍需确认。该标记只用于发送端本地的建立阶段，收到任务状态后清除。字段缺失时按 `false` 处理。
+发送端的本地出站进度在收到清单回复前为 `waiting`，同时标记 `awaiting_offer_reply: true`。接收节点通过 HTTP 建单响应或 WebSocket 进度返回任务状态，`accepted` 表示已确定接收目录，`waiting` 表示仍需确认。收到接收端状态后，发送端将该标记设为 `false`。
 
 能力声明决定消息是否发送：`clipboard.text` 表示接收剪贴板事件并允许写入本机系统剪贴板，`clipboard.view` 表示只展示快照；发送端跳过未声明两者的对端。Android 声明 `clipboard.view`，但通过本地 HTTP 主动发布的文字仍会发给声明 `clipboard.text` 的桌面节点。`transfer.history.v1` 表示可处理 `TransferHistoryDeleted`；只向声明该能力的对端发送此消息。对端离线时待删除标识写入节点数据目录，重连后补发；已知不支持时丢弃队列。
 
@@ -131,7 +133,7 @@
 
 ## 硬件指标
 
-`HardwareMetrics` 只包含当前快照：`node_id`、`sampled_at_ms`、CPU 使用率与型号、逻辑/物理核心数、频率、内存已用/可用/总量、交换分区、系统负载、运行时间、网络上下行速率、磁盘分区容量与可用空间，以及逐 GPU 的利用率、显存用量和类型。磁盘条目包含名称、挂载点、文件系统和可移动标记。可选字段缺失按空值或空列表处理。
+`HardwareMetrics` 包含本机采样时间、系统资源、网络速率及各磁盘与 GPU 的指标。没有磁盘或 GPU 数据时，相应列表为空。字段定义见 [HardwareMetrics](../backend/src/model.rs)。
 
 显存只统计独立显存，共享内存与统一内存不折算，没有独立显存的核显字段为空；平台无法读取时附 `unavailable_reason`。Windows 不提供系统负载均值时该字段为空；Android 只填充网络上下行速率。`PeerInfo.metrics_received_at_ms` 是本地收到快照的时间，`metrics_stale` 由服务端按 5 秒阈值计算。
 
@@ -144,4 +146,4 @@
 - **路径。** `relative_path` 必须是目标目录下的相对路径，禁止盘符、分隔符穿越、`.` 和 `..`，同一清单不能出现归一化后的重复路径。清单和内容没有固定业务上限，但受控制面解析预算、网页清单内存预算、`u64` 溢出检查、磁盘安全余量和运行时清理约束。运行时最多保留有限条桌面传输记录，优先淘汰终态；失败记录最长保留 24 小时且数量受限。
 - **写入。** 接收端逐级检查目录并拒绝符号链接，同一项目加锁避免并发写入。先在同目录创建随机 `.part` 文件并登记，校验清单大小；清单携带 SHA-256 时核对内容摘要，留空时以写入内容的摘要回填清单（页面创建的清单留空，节点直传的清单必须携带），随后提交为最终文件名，不覆盖已有文件。节点启动时清理仍登记的遗留 `.part`；读取、写入、校验或提交报错，以及请求被取消时都会尝试清理，提交成功后才移除登记。
 - **网页。** 接入节点持有短期会话，桌面先把文件上传到暂存区。HTTP 页面逐项流式下载，`Content-Disposition` 同时提供 ASCII `filename` 和 UTF-8 `filename*` 并过滤路径分隔符与控制字符；`auto_complete=true` 在节点提供完整响应时确认项目，空文件在响应准备好时确认。`retryable_download_item_ids` 标记仍可重新下载的项目，暂存文件随会话到期、终态任务回收或显式确认清理。HTTPS 页面校验并流式写入本地目录后调用 `complete`，网页选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径；HTTPS 网页经接入节点同源代理向其他桌面节点流式上传。会话空闲 90 秒后后台清理任务和临时目录，活动传输五分钟无进展也会失败并清理。
-- **原生态发送。** 桌面上传前比对源文件大小与修改时间，变化时直接失败。单个项目遇到网络中断、请求超时或服务端暂时不可用时，在保持 `accepted`/`uploading` 的前提下按项目退避重试，达到上限后通过 `fail` 标记失败。失败任务可通过递增重试代次恢复，保留已提交项目并依靠重复 PUT 幂等续传；接收目录失效时回到等待确认。已接受但迟迟未开始上传的传输约 90 秒后失败并通知对端，上传中仍按五分钟无进展判定停滞。
+- **原生态发送。** 桌面上传前比对源文件大小与修改时间，变化时直接失败。发送端只接受与清单总量和当前代次一致的 PUT 确认。网络中断、响应丢失或服务端暂时不可用时按项目退避重试，耗尽后通过 `fail` 标记失败。手动重试递增代次并保留已提交项目。重复 PUT 会重新校验已落盘的文件，返回当前代次的 `uploading` 或 `completed` 确认，已提交项目只计数一次。接收目录失效时回到等待确认。已接受但迟迟未开始上传的传输约 90 秒后失败并通知对端，上传中仍按五分钟无进展判定停滞。

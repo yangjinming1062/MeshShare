@@ -4,10 +4,14 @@ use crate::model::{
     TransferProgress, WireMessage,
 };
 use crate::runtime::{validate_receive_directory, NodeRuntime, UpdateFrequency};
-use crate::updater::{UpdateCoordinator, UpdateStatus};
+#[cfg(not(target_os = "android"))]
+use crate::updater::UpdateCoordinator;
+use crate::updater::UpdateStatus;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+#[cfg(not(target_os = "android"))]
+use std::sync::OnceLock;
 
 use tauri::AppHandle;
 
@@ -22,7 +26,7 @@ pub struct MonitorSettingsSnapshot {
 pub struct SettingsSnapshot {
     pub clipboard_sync_enabled: bool,
     pub autostart_enabled: bool,
-    pub update_frequency: String,
+    pub update_frequency: UpdateFrequency,
     pub update_status: Option<UpdateStatus>,
     pub receive_settings: ReceiveSettings,
     pub clipboard_history_settings: ClipboardHistorySettings,
@@ -56,6 +60,7 @@ pub struct SettingsPatch {
 pub struct ControlPlane {
     runtime: Arc<NodeRuntime>,
     app: Option<AppHandle>,
+    #[cfg(not(target_os = "android"))]
     updater: OnceLock<Arc<UpdateCoordinator>>,
 }
 
@@ -64,6 +69,7 @@ impl ControlPlane {
         Arc::new(Self {
             runtime,
             app: None,
+            #[cfg(not(target_os = "android"))]
             updater: OnceLock::new(),
         })
     }
@@ -72,55 +78,16 @@ impl ControlPlane {
         Arc::new(Self {
             runtime,
             app: Some(app),
+            #[cfg(not(target_os = "android"))]
             updater: OnceLock::new(),
         })
     }
 
+    #[cfg(not(target_os = "android"))]
     pub fn install_updater(&self, updater: Arc<UpdateCoordinator>) -> Result<(), String> {
         self.updater
             .set(updater)
             .map_err(|_| "更新服务已经初始化".to_string())
-    }
-
-    fn updater(&self) -> Option<&Arc<UpdateCoordinator>> {
-        self.updater.get()
-    }
-
-    fn set_clipboard_history_settings(
-        &self,
-        mode: ClipboardHistoryMode,
-        value: u64,
-    ) -> Result<ClipboardHistorySettings, String> {
-        self.runtime
-            .set_clipboard_history_settings(mode, value)
-            .map_err(|error| error.to_string())
-    }
-
-    fn set_update_frequency(&self, frequency: UpdateFrequency) -> Result<String, String> {
-        if let Some(updater) = self.updater() {
-            updater.set_frequency(frequency)
-        } else {
-            self.runtime
-                .set_update_frequency(frequency)
-                .map_err(|error| format!("保存自动更新设置失败：{error}"))?;
-            Ok(frequency.as_str().to_string())
-        }
-    }
-
-    fn set_receive_settings(
-        &self,
-        mode: crate::model::ReceiveMode,
-        directory: Option<PathBuf>,
-    ) -> Result<ReceiveSettings, String> {
-        self.runtime
-            .set_receive_settings(mode, directory)
-            .map_err(|error| error.to_string())
-    }
-
-    fn current_update_frequency(&self) -> String {
-        self.updater()
-            .map(|updater| updater.frequency().as_str().to_string())
-            .unwrap_or_else(|| self.runtime.update_settings().0.as_str().to_string())
     }
 
     fn monitor_capabilities(&self) -> crate::MonitorCapabilities {
@@ -142,8 +109,11 @@ impl ControlPlane {
                 .sync_enabled
                 .load(std::sync::atomic::Ordering::SeqCst),
             autostart_enabled: self.runtime.autostart_enabled(),
-            update_frequency: self.current_update_frequency(),
-            update_status: self.updater().map(|updater| updater.status()),
+            update_frequency: self.runtime.update_settings().0,
+            #[cfg(not(target_os = "android"))]
+            update_status: self.updater.get().map(|updater| updater.status()),
+            #[cfg(target_os = "android")]
+            update_status: None,
             receive_settings: self.runtime.receive_settings(),
             clipboard_history_settings: self.runtime.clipboard_history_settings(),
             clipboard_status: self.runtime.clipboard_status(),
@@ -177,11 +147,15 @@ impl ControlPlane {
 
         if let Some(settings) = patch.receive_settings {
             let directory = settings.default_path.map(PathBuf::from);
-            self.set_receive_settings(settings.mode, directory)?;
+            self.runtime
+                .set_receive_settings(settings.mode, directory)
+                .map_err(|error| error.to_string())?;
         }
 
         if let Some(settings) = patch.clipboard_history_settings {
-            self.set_clipboard_history_settings(settings.mode, settings.value)?;
+            self.runtime
+                .set_clipboard_history_settings(settings.mode, settings.value)
+                .map_err(|error| error.to_string())?;
         }
 
         if let Some(monitor) = patch.monitor {
@@ -197,11 +171,22 @@ impl ControlPlane {
     }
 
     pub fn request_update_check(&self) -> Result<SettingsSnapshot, String> {
-        let Some(updater) = self.updater() else {
-            return Err("更新服务尚未初始化".to_string());
-        };
-        updater.request_manual_check()?;
-        Ok(self.snapshot())
+        #[cfg(not(target_os = "android"))]
+        if let Some(updater) = self.updater.get() {
+            updater.request_manual_check()?;
+            return Ok(self.snapshot());
+        }
+        Err("更新服务尚未初始化".to_string())
+    }
+
+    fn set_update_frequency(&self, frequency: UpdateFrequency) -> Result<(), String> {
+        #[cfg(not(target_os = "android"))]
+        if let Some(updater) = self.updater.get() {
+            return updater.set_frequency(frequency);
+        }
+        self.runtime
+            .set_update_frequency(frequency)
+            .map_err(|error| format!("保存自动更新设置失败：{error}"))
     }
 
     fn set_autostart(&self, enabled: bool) -> Result<(), String> {
@@ -214,10 +199,7 @@ impl ControlPlane {
         if cfg!(debug_assertions) {
             return Err("开发构建不注册开机自启动".to_string());
         }
-        let registration = autostart::Registration::current()
-            .map_err(|error| format!("无法准备开机自启动设置：{error}"))?;
-        let previous_registration = registration
-            .is_enabled()
+        let previous_registration = autostart::is_enabled()
             .map_err(|error| format!("无法读取当前开机自启动状态：{error}"))?;
         let previous_preference = self.runtime.autostart_enabled();
         self.runtime
@@ -226,7 +208,7 @@ impl ControlPlane {
         // 任一失败都同时恢复系统注册与配置，避免界面与真实状态分叉。
         let failure = |error: anyhow::Error| {
             let mut message = format!("更新开机自启动失败：{error}");
-            if let Err(restore) = registration.set_enabled(previous_registration) {
+            if let Err(restore) = autostart::set_enabled(previous_registration) {
                 message.push_str(&format!("；恢复系统注册状态失败：{restore}"));
             }
             if let Err(restore) = self.runtime.set_autostart_enabled(previous_preference) {
@@ -234,10 +216,10 @@ impl ControlPlane {
             }
             message
         };
-        if let Err(error) = registration.set_enabled(enabled) {
+        if let Err(error) = autostart::set_enabled(enabled) {
             return Err(failure(error));
         }
-        match registration.is_enabled() {
+        match autostart::is_enabled() {
             Ok(actual) if actual == enabled => Ok(()),
             Ok(actual) => Err(failure(anyhow::anyhow!(
                 "系统报告的开机自启动状态为 {actual}，期望状态为 {enabled}"
@@ -290,9 +272,9 @@ pub fn accept_transfer_at(
     if let Some(source_node_id) = runtime.transfer_source_id(&transfer_id) {
         let message = WireMessage::TransferAction {
             transfer_id,
-            action: "accept".to_string(),
+            action: crate::model::TransferAction::Accept,
             reason: None,
-            retry_count: None,
+            retry_count: progress.retry_count,
         };
         if !runtime.send_to_peer(&source_node_id, message.clone()) {
             let runtime = runtime.clone();

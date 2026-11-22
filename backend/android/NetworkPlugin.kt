@@ -10,9 +10,7 @@ import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
-import app.tauri.annotation.Command
 import app.tauri.annotation.TauriPlugin
-import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.net.InetAddress
@@ -41,19 +39,10 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
         .build()
 
-    private val defaultNetworkCallback = object : ConnectivityManager.NetworkCallback() {
-        override fun onAvailable(network: Network) = scheduleRebind()
+    private val defaultNetworkCallback = networkCallback()
+    private val lanNetworkCallback = networkCallback()
 
-        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
-            scheduleRebind()
-
-        override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
-            scheduleRebind()
-
-        override fun onLost(network: Network) = scheduleRebind()
-    }
-
-    private val lanNetworkCallback = object : ConnectivityManager.NetworkCallback() {
+    private fun networkCallback() = object : ConnectivityManager.NetworkCallback() {
         override fun onAvailable(network: Network) = scheduleRebind()
 
         override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) =
@@ -75,17 +64,6 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         }
         // 这里同步执行，Rust 监听器和 mDNS 守护进程会在绑定生效后才创建。
         rebindProcessNetwork()
-    }
-
-    @Command
-    fun rebind(invoke: Invoke) {
-        main.post {
-            try {
-                invoke.resolve(rebindProcessNetwork())
-            } catch (error: Exception) {
-                invoke.reject("无法绑定 MeshShare 局域网网络", error)
-            }
-        }
     }
 
     override fun onDestroy(activity: androidx.appcompat.app.AppCompatActivity) {
@@ -118,7 +96,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         main.post { if (!destroyed) rebindProcessNetwork() }
     }
 
-    private fun rebindProcessNetwork(): JSObject {
+    private fun rebindProcessNetwork() {
         val lan = selectLanNetwork()
         val target = lan?.takeIf { vpnCapturesLan(it) }
         val targetHandle = target?.networkHandle
@@ -150,10 +128,6 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
                     },
                 )
             }
-        }
-        return JSObject().apply {
-            put("mode", if (boundNetworkHandle == null) "default" else "lan")
-            put("network_handle", boundNetworkHandle ?: 0L)
         }
     }
 
