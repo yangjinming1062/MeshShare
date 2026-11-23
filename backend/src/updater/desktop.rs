@@ -1,4 +1,4 @@
-use super::{UpdateInstallGuard, UpdateState, UpdateStatus};
+use super::{is_due, UpdateInstallGuard, UpdateState, UpdateStatus};
 use crate::clock::now_millis;
 use crate::runtime::{NodeRuntime, UpdateFrequency};
 use parking_lot::Mutex;
@@ -430,28 +430,6 @@ enum CheckResult {
 // 保留手动检查得到的已是最新、待授权和失败结果。
 fn should_apply_disabled_placeholder(state: &UpdateState) -> bool {
     matches!(state, UpdateState::Idle)
-}
-
-fn is_due(
-    frequency: UpdateFrequency,
-    last_checked_at_ms: Option<i64>,
-    pending: bool,
-    retry_at_ms: Option<i64>,
-    now_ms: i64,
-    manual: bool,
-) -> bool {
-    if manual || frequency == UpdateFrequency::Disabled {
-        return manual;
-    }
-    if let Some(retry_at_ms) = retry_at_ms {
-        return now_ms >= retry_at_ms;
-    }
-    pending
-        || last_checked_at_ms.is_none_or(|at| {
-            frequency
-                .period_ms()
-                .is_some_and(|period| now_ms.saturating_sub(at) >= period)
-        })
 }
 
 #[cfg(test)]

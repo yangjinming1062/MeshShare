@@ -1,0 +1,9 @@
+[Unit]
+Description=MeshShare local service control operation
+
+[Service]
+ExecStart=/usr/bin/meshshare-headless helper
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+UMask=0077

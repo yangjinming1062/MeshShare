@@ -191,6 +191,36 @@ jobs:
           path: ${{ matrix.bundles }}
           if-no-files-found: error
 
+  headless:
+    name: Build (headless amd64)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci && npm --prefix frontend run build
+      - name: Build headless service and Debian package
+        run: |
+          export MESHSHARE_VERSION="${GITHUB_REF_NAME#v}"
+          cargo build --manifest-path backend/Cargo.toml --release --locked --no-default-features --features headless --bin meshshare-headless
+          backend/packaging/headless/build-deb.sh "$MESHSHARE_VERSION" backend/target/release/meshshare-headless dist/headless
+      - name: Bind updater signature to the release version
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          python3 .github/scripts/validate_updater_key.py
+          npx --yes --package="@tauri-apps/cli@$TAURI_CLI_VERSION" tauri signer sign --app-version "${GITHUB_REF_NAME#v}" dist/headless/*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeshShare-headless-amd64
+          path: dist/headless/*
+          if-no-files-found: error
+
   android:
     name: Build (android-arm64)
     runs-on: ubuntu-24.04
@@ -297,7 +327,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [notes, build, android]
+    needs: [notes, build, headless, android]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -333,6 +363,8 @@ jobs:
             "MeshShare_${version}_amd64.deb"
             "MeshShare-${version}-1.x86_64.rpm"
             "MeshShare_${version}_android_arm64.apk"
+            "meshshare-headless_${version}_amd64.deb"
+            "meshshare-headless_${version}_amd64.deb.sha256"
           )
           mapfile -t mac_updater_assets < <(find release-assets -type f -name '*.app.tar.gz' -printf '%f\n' | sort -u)
           if (( ${#mac_updater_assets[@]} != 2 )); then

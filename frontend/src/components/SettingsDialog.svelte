@@ -17,6 +17,11 @@
   export let updateFrequency: UpdateFrequency = 'weekly';
   export let updateStatus: UpdateStatus | null = null;
   export let settingsDisabled = false;
+  export let headless = false;
+  export let serviceControlError = '';
+  export let restartBusy = false;
+  export let restartError = '';
+  export let onRestart: () => void = () => {};
   export let localMode = true;
   export let receiveSettings: ReceiveSettings = { mode: 'confirm' };
   export let historySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
@@ -58,7 +63,7 @@
     <div class="setting">
       <div class="setting-copy">
         <strong>自动更新</strong>
-        <span>只获取 GitHub 稳定版 Release；安装会等待文件传输与终端会话结束，系统包需要本机授权。</span>
+        <span>{headless ? '服务会在传输和终端空闲后自动安装签名的稳定版。' : '只获取 GitHub 稳定版 Release；安装会等待文件传输与终端会话结束，系统包需要本机授权。'}</span>
       </div>
       <div class="setting-actions">
         <div class="segmented" role="radiogroup" aria-label="自动更新检查频率">
@@ -158,7 +163,15 @@
         <span>版本 v{node?.version ?? '—'} · 协议 v{node?.protocol_version ?? '—'} · 端口 {node?.port ?? '—'}</span>
       </div>
     </div>
-    <span class="hint">关闭窗口后节点服务仍在系统托盘运行。</span>
+    {#if headless}
+      <div class="setting-foot">
+        <span class="hint">{serviceControlError || '由目标机器的 systemd 管理。'}</span>
+        <button type="button" class="btn btn-sm" disabled={settingsDisabled || restartBusy || !!serviceControlError} on:click={onRestart}>{restartBusy ? '正在请求…' : '重启节点服务'}</button>
+      </div>
+      {#if restartError}<span role="alert">{restartError}</span>{/if}
+    {:else}
+      <span class="hint">关闭窗口后节点服务仍在系统托盘运行。</span>
+    {/if}
   </div>
 
   <svelte:fragment slot="footer">

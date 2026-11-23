@@ -166,7 +166,7 @@ async fn handle_socket(
     }
 }
 
-/// 接受远端剪贴板内容。能写系统剪贴板的节点同时向其他对端转发，只读节点仅更新本地快照。
+/// 接受远端剪贴板内容。桌面与无界面节点向其他对端转发，移动节点仅更新本地快照。
 fn accept_remote_clipboard(
     runtime: &Arc<NodeRuntime>,
     peer_id: &str,
@@ -183,7 +183,7 @@ fn accept_remote_clipboard(
     runtime.publish_event(WireMessage::ClipboardUpdate {
         event: event.clone(),
     });
-    if can_write_system_clipboard {
+    if can_write_system_clipboard || runtime.is_headless() {
         runtime.send_to_peers_except(Some(peer_id), WireMessage::ClipboardUpdate { event });
     }
 }

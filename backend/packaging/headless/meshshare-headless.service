@@ -1,0 +1,23 @@
+[Unit]
+Description=MeshShare headless LAN node
+After=network.target meshshare-headless-control.socket
+Requires=meshshare-headless-control.socket
+
+[Service]
+User=meshshare-headless
+Group=meshshare-headless
+ExecStart=/usr/bin/meshshare-headless serve
+StateDirectory=meshshare-headless
+StateDirectoryMode=0700
+RuntimeDirectory=meshshare-headless
+RuntimeDirectoryMode=0755
+WorkingDirectory=/var/lib/meshshare-headless
+Environment=HOME=/var/lib/meshshare-headless
+Environment=SHELL=/bin/sh
+NoNewPrivileges=yes
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,29 +1,32 @@
+#[cfg(feature = "gui")]
 use crate::model::ClipboardSession;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use crate::model::ClipboardSnapshot;
+#[cfg(feature = "gui")]
 use crate::runtime::NodeRuntime;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use arboard::{Clipboard, Error as ClipboardError, ImageData};
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use image::Limits;
 use image::{DynamicImage, ImageFormat, ImageReader};
 use sha2::{Digest, Sha256};
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use std::borrow::Cow;
 use std::io::Cursor;
+#[cfg(feature = "gui")]
 use std::sync::Arc;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use std::thread;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use std::time::Duration;
 
 const MAX_CLIPBOARD_IMAGE_DIMENSION: u32 = 8_192;
 const MAX_CLIPBOARD_IMAGE_ALLOCATION: u64 = 128 * 1024 * 1024;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 type ClipboardPayload = (Option<String>, Option<ImageData<'static>>);
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 pub fn start_monitor(runtime: Arc<NodeRuntime>) {
     thread::Builder::new()
         .name("meshshare-clipboard".to_string())
@@ -31,7 +34,7 @@ pub fn start_monitor(runtime: Arc<NodeRuntime>) {
         .expect("clipboard monitor thread");
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 pub fn start_monitor(runtime: Arc<NodeRuntime>) {
     runtime.set_clipboard_unavailable(
         ClipboardSession::Other,
@@ -40,7 +43,7 @@ pub fn start_monitor(runtime: Arc<NodeRuntime>) {
     );
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 fn monitor_loop(runtime: Arc<NodeRuntime>) {
     let mut last_hash = String::new();
     'monitor: loop {
@@ -125,7 +128,7 @@ fn monitor_loop(runtime: Arc<NodeRuntime>) {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 fn current_session() -> ClipboardSession {
     #[cfg(target_os = "linux")]
     {
@@ -143,7 +146,7 @@ fn current_session() -> ClipboardSession {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 fn read_payload(clipboard: &mut Clipboard) -> Result<Option<ClipboardPayload>, String> {
     let text = match clipboard.get_text() {
         Ok(value) if !value.is_empty() => Some(value),
@@ -169,7 +172,7 @@ fn read_payload(clipboard: &mut Clipboard) -> Result<Option<ClipboardPayload>, S
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 fn encode_image(image: &ImageData<'_>) -> Option<Vec<u8>> {
     let rgba = image::RgbaImage::from_raw(
         image.width as u32,
@@ -184,7 +187,7 @@ fn encode_image(image: &ImageData<'_>) -> Option<Vec<u8>> {
 }
 
 /// 系统返回的是像素，PNG 的编码方式可能与写入前不同。
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 fn system_payload_hash(text: Option<&str>, image: Option<&ImageData<'_>>) -> String {
     let mut hasher = Sha256::new();
     if let Some(image) = image {
@@ -227,7 +230,7 @@ pub fn payload_hash(text: Option<&str>, image_png: Option<&[u8]>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 fn write_snapshot(
     clipboard: &mut Clipboard,
     snapshot: ClipboardSnapshot,

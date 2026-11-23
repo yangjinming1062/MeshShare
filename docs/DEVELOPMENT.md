@@ -60,6 +60,20 @@ npx --yes @tauri-apps/cli@2 android build --aab --target aarch64
 npx --yes @tauri-apps/cli@2 build --debug --no-bundle -- --locked
 ```
 
+## Linux headless 包
+
+以 Ubuntu 22.04 amd64、glibc 2.35、systemd 249 为构建和安装基线。使用独立的 `headless` feature，从仓库根目录执行以下命令；将 `version` 设为要构建的版本。
+
+```bash
+version=0.0.0
+npm --prefix frontend ci
+npm --prefix frontend run build
+MESHSHARE_VERSION="$version" cargo build --manifest-path backend/Cargo.toml --locked --release --no-default-features --features headless --bin meshshare-headless
+backend/packaging/headless/build-deb.sh "$version" backend/target/release/meshshare-headless dist/headless
+```
+
+安装验收使用一次性 systemd 环境。CI 在首次安装前为服务配置只有回环接口的网络命名空间，隔离生产更新源。管理员用 apt 安装，在该命名空间内以普通用户执行 `meshshare-headless status`，核对首次安装和重装后的运行版本。运行 `node --test backend/tests/headless-smoke.mjs` 会创建剪贴板历史和样例文件。检查 ELF 的最高 glibc 版本，确认未链接 WebKitGTK、GTK 或显示服务。升级验收使用自有测试签名的两个递增版本，覆盖工作中推迟安装、空闲后恢复、关闭自启后升级，以及拒绝包名、架构、版本或签名不匹配的包。
+
 ## 检查
 
 需要 `rustfmt` 和 `clippy`，可通过 `rustup component add rustfmt clippy` 安装。
@@ -82,6 +96,7 @@ cargo test --manifest-path backend/Cargo.toml --locked
 | 产物 | 说明 |
 | --- | --- |
 | 桌面安装包 | Windows x64、macOS Intel/Apple Silicon、Linux x64，共七个 |
+| Linux headless | 独立的 amd64 deb，签名绑定版本和文件名，更新使用独立平台键 `linux-x86_64-headless-deb`。 |
 | Android | 签名的 arm64 APK；AAB 由本地构建，用于商店或 `bundletool` |
 | 更新清单 | `latest.json`，含桌面平台条目和 `android` 字段；不单独上传 `.sig` |
 

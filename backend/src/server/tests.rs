@@ -357,9 +357,24 @@ async fn settings_and_remote_accept_endpoints_update_runtime_state() {
         .expect("send denied origin request");
     assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
 
+    let wrong_node = runtime
+        .http
+        .post(format!("http://{address}/api/v1/clipboard"))
+        .header("X-MeshShare-Target", "previous-occupant")
+        .json(&serde_json::json!({ "text": "private draft" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong_node.status(),
+        reqwest::StatusCode::MISDIRECTED_REQUEST
+    );
+    assert!(runtime.clipboard_snapshot().is_none());
+
     let allowed = runtime
         .http
         .patch(format!("http://{address}/api/v1/settings"))
+        .header("X-MeshShare-Target", runtime.node_id())
         .header("Origin", "http://192.168.1.10:37880")
         .json(&serde_json::json!({ "clipboard_sync_enabled": true }))
         .send()
@@ -1411,6 +1426,7 @@ async fn mobile_download_requires_explicit_completion_after_stream_finishes() {
     runtime
         .stage_mobile_item(
             "mobile-download",
+            0,
             "item",
             bytes.len() as u64,
             format!("{:x}", Sha256::digest(bytes)),
@@ -1589,6 +1605,7 @@ async fn browser_download_completes_and_keeps_staged_items_retryable() {
         runtime
             .stage_mobile_item(
                 id,
+                0,
                 "item",
                 bytes.len() as u64,
                 format!("{:x}", Sha256::digest(&bytes)),
@@ -2869,4 +2886,132 @@ async fn failed_mobile_transfer_removal_cleans_staged_directory() {
     server_task.abort();
     let _ = server_task.await;
     let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[cfg(all(feature = "headless", target_os = "linux"))]
+#[tokio::test]
+async fn restart_refuses_wrong_target_and_an_active_terminal_before_contacting_systemd() {
+    let dir = tempfile::tempdir().unwrap();
+    let node =
+        NodeRuntime::new_with_profile(dir.path().into(), 0, "1.0.0".into(), NodeProfile::Headless)
+            .unwrap();
+    node.set_update_frequency(crate::runtime::UpdateFrequency::Disabled)
+        .unwrap();
+    let control = super::ControlPlane::runtime_only(node.clone());
+    control.start_headless();
+    let state = super::AppState {
+        runtime: node.clone(),
+        control,
+    };
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-meshshare-target", HeaderValue::from_static("different"));
+    assert_eq!(
+        super::restart_headless(super::State(state.clone()), headers.clone())
+            .await
+            .unwrap_err()
+            .status,
+        super::StatusCode::MISDIRECTED_REQUEST
+    );
+    headers.insert("x-meshshare-target", node.node_id().parse().unwrap());
+    let _session = node.reserve_terminal().unwrap();
+    assert_eq!(
+        super::restart_headless(super::State(state), headers)
+            .await
+            .unwrap_err()
+            .status,
+        super::StatusCode::CONFLICT
+    );
+    node.stopping
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[tokio::test]
+async fn managed_phone_transfer_uses_node_files_only_after_acceptance() {
+    let dir = std::env::temp_dir().join(format!("meshshare-managed-phone-{}", Uuid::new_v4()));
+    let runtime =
+        NodeRuntime::new_with_profile(dir.clone(), 0, "test".into(), NodeProfile::Headless)
+            .unwrap();
+    let phone = runtime.create_mobile_session("browser".into()).unwrap();
+    let state = super::AppState {
+        runtime: runtime.clone(),
+        control: super::ControlPlane::runtime_only(runtime.clone()),
+    };
+    let source = dir.join("file.txt");
+    std::fs::write(&source, b"on the NAS").unwrap();
+    let offer = || {
+        super::create_managed_mobile_offer(
+            super::State(state.clone()),
+            super::Json(super::ManagedMobileRequest {
+                session_id: phone.session_id.clone(),
+                paths: vec![source.display().to_string()],
+            }),
+        )
+    };
+    let accept = |id: String| {
+        super::accept_mobile_transfer(
+            super::AxumPath(id),
+            super::State(state.clone()),
+            super::Json(super::MobileSessionRequest {
+                session_id: phone.session_id.clone(),
+            }),
+        )
+    };
+    let wait_for = |id: String, expected: TransferStatus| {
+        let runtime = runtime.clone();
+        async move {
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let record = runtime.mobile_transfer(&id).unwrap();
+                    if record.progress.status == expected {
+                        return record;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+
+    runtime.set_remote_file_access(false).unwrap();
+    assert_eq!(
+        offer().await.unwrap_err().status,
+        super::StatusCode::FORBIDDEN
+    );
+    runtime.set_remote_file_access(true).unwrap();
+    let first = offer().await.unwrap().0.progress;
+    let id = first.transfer_id;
+    let item = first.offer.unwrap().items[0].item_id.clone();
+    assert_eq!(first.status, TransferStatus::Waiting);
+    assert!(!runtime
+        .mobile_transfer(&id)
+        .unwrap()
+        .staged_directory
+        .exists());
+    let err = super::upload_mobile_item(
+        super::AxumPath((id.clone(), item.clone())),
+        super::State(state.clone()),
+        axum::body::Body::from("fake bytes"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.status, super::StatusCode::FORBIDDEN);
+    let _ = accept(id.clone()).await.unwrap();
+    let ready = wait_for(id.clone(), TransferStatus::Ready).await;
+    assert_eq!(
+        ready.offer().items[0].sha256,
+        format!("{:x}", Sha256::digest(b"on the NAS"))
+    );
+    assert_eq!(
+        std::fs::read(runtime.mobile_item_path(&id, &item).unwrap()).unwrap(),
+        b"on the NAS"
+    );
+
+    let changed = offer().await.unwrap().0.progress.transfer_id;
+    std::fs::write(&source, b"changed after selection").unwrap();
+    let _ = accept(changed.clone()).await.unwrap();
+    let failed = wait_for(changed, TransferStatus::Failed).await;
+    assert!(failed.progress.error.unwrap().contains("变化"));
+    assert!(!failed.staged_directory.exists());
+    std::fs::remove_dir_all(dir).unwrap();
 }

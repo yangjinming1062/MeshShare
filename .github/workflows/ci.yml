@@ -65,6 +65,62 @@ jobs:
       - name: Run Rust regression tests
         run: cargo test --manifest-path backend/Cargo.toml --all-features --locked
 
+  headless:
+    name: Headless package and systemd (Jammy amd64)
+    runs-on: ubuntu-22.04
+    env:
+      MESHSHARE_VERSION: 0.0.0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci && npm --prefix frontend run build
+      - name: Check GUI-independent build and tests
+        run: |
+          cargo clippy --manifest-path backend/Cargo.toml --all-targets --no-default-features --features headless --locked -- -D warnings
+          cargo test --manifest-path backend/Cargo.toml --no-default-features --features headless --locked
+          cargo build --manifest-path backend/Cargo.toml --release --no-default-features --features headless --locked --bin meshshare-headless
+      - name: Install, manage and reinstall on systemd
+        shell: bash
+        run: |
+          backend/packaging/headless/build-deb.sh "$MESHSHARE_VERSION" backend/target/release/meshshare-headless dist/headless
+          # The unmodified package starts its updater on first boot. Give the test node only loopback.
+          sudo install -d /run/systemd/system/meshshare-headless.service.d
+          printf '[Service]\nPrivateNetwork=yes\n' | sudo tee /run/systemd/system/meshshare-headless.service.d/ci.conf >/dev/null
+          in_node_network() {
+            local pid
+            pid=$(systemctl show --property=MainPID --value meshshare-headless.service)
+            sudo nsenter --target "$pid" --net --setgid "$(id -g)" --setuid "$(id -u)" -- "$@"
+          }
+          check_running_version() {
+            timeout 30 sh -c 'until test -r /run/meshshare-headless/port; do sleep 0.2; done'
+            in_node_network meshshare-headless status | jq -e --arg version "$MESHSHARE_VERSION" '.version == $version'
+          }
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y ./dist/headless/*.deb
+          systemctl is-enabled meshshare-headless.service
+          systemctl is-active meshshare-headless.service
+          check_running_version
+          in_node_network "$(command -v node)" --test backend/tests/headless-smoke.mjs
+          sudo systemctl disable meshshare-headless.service
+          sudo dpkg -i dist/headless/*.deb
+          test "$(systemctl is-enabled meshshare-headless.service)" = disabled
+          systemctl is-active meshshare-headless.service
+          check_running_version
+          sudo dpkg --remove meshshare-headless
+          sudo test -s /var/lib/meshshare-headless/node.json
+          sudo dpkg -i dist/headless/*.deb
+          test "$(systemctl is-enabled meshshare-headless.service)" = disabled
+          test "$(systemctl is-active meshshare-headless.service)" = inactive
+      - name: Show service errors
+        if: failure()
+        run: sudo journalctl -b -u 'meshshare-headless*' --no-pager -n 100
+
   android:
     name: Android APK build
     runs-on: ubuntu-24.04

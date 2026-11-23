@@ -259,6 +259,7 @@ impl NodeRuntime {
         Some(channels.get(node_id)?.terminal_client.token().clone())
     }
 
+    #[cfg(feature = "gui")]
     pub(crate) fn terminal_peer_keys(&self, node_id: &str) -> Option<crate::model::TerminalKeys> {
         let peers = self.peers.read();
         let peer = peers.get(node_id)?;

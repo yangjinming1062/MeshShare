@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::AppHandle;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
@@ -42,13 +41,14 @@ struct Listeners {
     app: Router,
 }
 
-pub async fn start_with_app(
+pub async fn start(
     data_dir: PathBuf,
     static_root: PathBuf,
     version: String,
     preferred_port: u16,
-    app: AppHandle,
-) -> anyhow::Result<(Arc<runtime::NodeRuntime>, Arc<ControlPlane>)> {
+    profile: runtime::NodeProfile,
+    make_control: impl FnOnce(Arc<runtime::NodeRuntime>) -> Arc<ControlPlane>,
+) -> anyhow::Result<(Arc<runtime::NodeRuntime>, Arc<ControlPlane>, JoinHandle<()>)> {
     let addresses = runtime::bind_addresses();
     let (mut listeners, runtime, control) = Listeners::start(
         data_dir,
@@ -56,13 +56,14 @@ pub async fn start_with_app(
         version,
         preferred_port,
         &addresses,
-        Some(app),
+        profile,
+        make_control,
     )
     .await?;
     listeners.reconcile(&runtime, &addresses).await;
     runtime.spawn_outgoing_upload_supervisor();
     let owner = runtime.clone();
-    tokio::spawn(async move {
+    let listener_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(RESCAN_INTERVAL).await;
             if owner.stopping.load(Ordering::SeqCst) {
@@ -72,8 +73,9 @@ pub async fn start_with_app(
                 .reconcile(&owner, &runtime::bind_addresses())
                 .await;
         }
+        listeners.shutdown().await;
     });
-    Ok((runtime, control))
+    Ok((runtime, control, listener_task))
 }
 
 impl Listeners {
@@ -83,7 +85,8 @@ impl Listeners {
         version: String,
         preferred_port: u16,
         addresses: &BTreeSet<Ipv4Addr>,
-        control_app: Option<AppHandle>,
+        profile: runtime::NodeProfile,
+        make_control: impl FnOnce(Arc<runtime::NodeRuntime>) -> Arc<ControlPlane>,
     ) -> anyhow::Result<(Self, Arc<runtime::NodeRuntime>, Arc<ControlPlane>)> {
         let local = Ipv4Addr::LOCALHOST;
         let http = match TcpListener::bind((local, preferred_port)).await {
@@ -101,11 +104,10 @@ impl Listeners {
         let tls = mobile_tls::ensure(&data_dir, &certificate_addresses)?;
         let config =
             RustlsConfig::from_pem_file(&tls.server_certificate_path, &tls.server_key_path).await?;
-        let runtime = runtime::NodeRuntime::new(data_dir.clone(), http_port, version)?;
+        let runtime =
+            runtime::NodeRuntime::new_with_profile(data_dir.clone(), http_port, version, profile)?;
         runtime.set_mobile_ca(tls.ca_certificate_path, tls.fingerprint);
-        let control = control_app
-            .map(|app| ControlPlane::with_app(runtime.clone(), app))
-            .unwrap_or_else(|| ControlPlane::runtime_only(runtime.clone()));
+        let control = make_control(runtime.clone());
         let app = server::router_with_control(runtime.clone(), static_root, control.clone());
         let listeners = Self {
             http: BTreeMap::from([(local, serve_listener(http, app.clone(), None)?)]),
@@ -203,11 +205,23 @@ impl Listeners {
             }
         }
         self.failed_binds.retain(|(ip, _)| *ip == local);
+        Self::stop_listeners(stopping).await;
+    }
+
+    async fn shutdown(self) {
+        Self::stop_listeners(self.http.into_values().chain(self.https.into_values())).await;
+    }
+
+    async fn stop_listeners(stopping: impl IntoIterator<Item = Listener>) {
+        let mut tasks = Vec::new();
         for mut listener in stopping {
             listener.handle.graceful_shutdown(Some(SHUTDOWN_TIMEOUT));
             if let Some(task) = listener.task.take() {
-                let _ = task.await;
+                tasks.push(task);
             }
+        }
+        for task in tasks {
+            let _ = task.await;
         }
     }
 
@@ -321,7 +335,8 @@ mod tests {
             "test".into(),
             0,
             &local_only,
-            None,
+            NodeProfile::current(),
+            ControlPlane::runtime_only,
         )
         .await
         .expect("start listeners");

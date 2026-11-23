@@ -22,6 +22,7 @@ ASSET_NAMES = {
     "LINUX_APPIMAGE_URL": "MeshShare_{version}_amd64.AppImage",
     "LINUX_DEB_URL": "MeshShare_{version}_amd64.deb",
     "LINUX_RPM_URL": "MeshShare-{version}-1.x86_64.rpm",
+    "HEADLESS_DEB_URL": "meshshare-headless_{version}_amd64.deb",
     "ANDROID_ARM64_APK_URL": "MeshShare_{version}_android_arm64.apk",
 }
 

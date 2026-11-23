@@ -25,7 +25,7 @@ impl NodeRuntime {
         if self.update_installing.load(Ordering::SeqCst) {
             return false;
         }
-        let mut progress = transfer_progress(&offer, "receive");
+        let mut progress = transfer_progress(offer.clone(), "receive");
         let accepted_destination = self.default_receive_directory();
         if let Some(destination) = accepted_destination.as_ref() {
             progress.destination = Some(crate::fsutil::display_absolute_path(destination));

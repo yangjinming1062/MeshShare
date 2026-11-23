@@ -1,5 +1,5 @@
 use super::*;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use crate::terminal::ssh::migration::LegacyPolicy;
 use std::path::{Path, PathBuf};
 
@@ -83,6 +83,10 @@ pub(super) fn load_or_create_config_with_hostname(
         Ok(contents) => {
             let mut config: PersistedConfig = serde_json::from_str(&contents)
                 .map_err(|error| anyhow::anyhow!("节点配置文件损坏：{error}"))?;
+            anyhow::ensure!(
+                config.headless == (profile == NodeProfile::Headless),
+                "无界面服务与桌面节点需要分别使用独立的数据目录"
+            );
             config.clipboard_history_count = config
                 .clipboard_history_count
                 .clamp(1, MAX_CLIPBOARD_HISTORY_COUNT);
@@ -100,9 +104,10 @@ pub(super) fn load_or_create_config_with_hostname(
         Err(error) => return Err(error.into()),
     }
     let config = PersistedConfig {
+        headless: profile == NodeProfile::Headless,
         node_id: Uuid::new_v4().to_string(),
         node_name: default_node_name(profile, hostname),
-        monitor_visible: true,
+        monitor_visible: profile != NodeProfile::Headless,
         monitor_position: None,
         monitor_locked: false,
         autostart_enabled: true,
@@ -113,8 +118,8 @@ pub(super) fn load_or_create_config_with_hostname(
         clipboard_history_count: DEFAULT_CLIPBOARD_HISTORY_COUNT,
         clipboard_history_days: DEFAULT_CLIPBOARD_HISTORY_DAYS,
         receive_mode: ReceiveMode::default(),
-        remote_file_access: false,
-        #[cfg(not(target_os = "android"))]
+        remote_file_access: profile == NodeProfile::Headless,
+        #[cfg(all(feature = "gui", not(target_os = "android")))]
         terminal_access_migration: TerminalAccessMigration::NoLegacyPolicy,
         receive_directory: None,
         receive_directory_bookmark: None,
@@ -244,6 +249,8 @@ impl UpdateFrequency {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PersistedConfig {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    headless: bool,
     pub(super) node_id: String,
     pub(super) node_name: String,
     pub(super) monitor_visible: bool,
@@ -261,14 +268,14 @@ pub(super) struct PersistedConfig {
     /// 所选接收目录的 macOS 安全作用域书签。
     /// 其他平台保持未设置，继续使用 path 字段。
     pub(super) receive_directory_bookmark: Option<Vec<u8>>,
-    /// 是否允许其他设备在远程管理中浏览本机目录并选择发送；默认关闭。
+    /// 是否允许其他设备在远程管理中浏览本机目录并选择发送。
     remote_file_access: bool,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     #[serde(default)]
     terminal_access_migration: TerminalAccessMigration,
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TerminalAccessMigration {
@@ -279,7 +286,7 @@ enum TerminalAccessMigration {
     AcceptedPolicy(String),
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 impl TerminalAccessMigration {
     fn from_policy(policy: Option<LegacyPolicy>) -> Self {
         match policy {
@@ -289,7 +296,7 @@ impl TerminalAccessMigration {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 impl PersistedConfig {
     pub(super) fn terminal_host_ready(&self, dir: &Path) -> bool {
         match LegacyPolicy::read(dir) {
@@ -324,7 +331,7 @@ pub(super) fn history_settings(config: &PersistedConfig) -> ClipboardHistorySett
 }
 
 impl NodeRuntime {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub(crate) fn restore_legacy_terminal_grant(&self) -> anyhow::Result<()> {
         if let Some(policy) = LegacyPolicy::read(&self.data_dir)? {
             if policy.was_enabled(&self.node_id())? {
@@ -334,7 +341,7 @@ impl NodeRuntime {
         Ok(())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub(crate) fn accept_terminal_migration(
         &self,
         verified_digest: Option<&str>,
@@ -382,6 +389,7 @@ impl NodeRuntime {
         .map(|_| ())
     }
 
+    #[cfg(any(test, feature = "gui"))]
     pub fn monitor_locked(&self) -> bool {
         self.config.lock().monitor_locked
     }
@@ -394,12 +402,12 @@ impl NodeRuntime {
         .map(|_| ())
     }
 
-    #[cfg(any(test, not(target_os = "android")))]
+    #[cfg(any(test, all(feature = "gui", not(target_os = "android"))))]
     pub fn monitor_position(&self) -> Option<MonitorPosition> {
         self.config.lock().monitor_position.clone()
     }
 
-    #[cfg(any(test, not(target_os = "android")))]
+    #[cfg(any(test, all(feature = "gui", not(target_os = "android"))))]
     pub fn set_monitor_position(&self, position: MonitorPosition) -> anyhow::Result<()> {
         self.update_config(|config| {
             config.monitor_position = Some(position);
@@ -409,7 +417,7 @@ impl NodeRuntime {
     }
 
     /// 切换剪贴板同步开关并返回新状态；托盘与控制面共用。
-    #[cfg(any(test, not(target_os = "android")))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub fn toggle_sync_enabled(&self) -> bool {
         !self.sync_enabled.fetch_xor(true, Ordering::SeqCst)
     }
@@ -430,6 +438,7 @@ impl NodeRuntime {
         self.config.lock().remote_file_access
     }
 
+    #[cfg(any(test, feature = "gui"))]
     pub fn set_remote_file_access(&self, enabled: bool) -> anyhow::Result<()> {
         self.update_config(|config| {
             config.remote_file_access = enabled;

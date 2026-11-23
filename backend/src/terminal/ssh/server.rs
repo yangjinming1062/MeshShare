@@ -349,5 +349,5 @@ async fn relay_channel(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gui"))]
 mod tests;

@@ -1,6 +1,12 @@
+#[cfg(feature = "gui")]
 use std::env;
+#[cfg(feature = "gui")]
 use std::path::Path;
 
+#[cfg(not(feature = "gui"))]
+fn main() {}
+
+#[cfg(feature = "gui")]
 fn main() {
     if is_windows_msvc() {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("windows-app-manifest.xml");
@@ -22,6 +28,7 @@ fn main() {
     }
 }
 
+#[cfg(feature = "gui")]
 fn is_windows_msvc() -> bool {
     env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
         && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")

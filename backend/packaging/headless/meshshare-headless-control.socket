@@ -1,0 +1,13 @@
+[Unit]
+Description=MeshShare local service control socket
+
+[Socket]
+ListenStream=/run/meshshare-headless-control.sock
+SocketUser=root
+SocketGroup=meshshare-headless
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+
+[Install]
+WantedBy=sockets.target

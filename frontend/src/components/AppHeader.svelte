@@ -12,6 +12,8 @@
   export let settingsReady = false;
   export let settingsDisabled = false;
   export let remote = false;
+  export let headless = false;
+  export let serviceControlError = '';
   export let terminalCount = 0;
   export let terminalVisible = false;
   export let onTerminal: () => void = () => {};
@@ -43,7 +45,7 @@
   <span class="status-text" class:sr-only={statusKind === 'ok'} role="status" aria-live="polite">{status}</span>
   {#if node}
     <div class="header-chips">
-      <span class="chip">{platformLabel(node.platform)}</span>
+      <span class="chip">{headless ? 'Linux 无界面服务' : platformLabel(node.platform)}</span>
       {#if node.addresses[0]}
         <button type="button" class="chip chip-button address-chip mono" title={'点击复制 ' + addressText} aria-label={'复制访问地址 ' + addressText} on:click={onCopyAddress}>
           <span class="address-text">{addressText}</span>
@@ -54,12 +56,16 @@
     </div>
   {/if}
   <div class="header-actions">
-    <button type="button" class="btn btn-sm" on:click={onTerminal} aria-pressed={terminalVisible}>
+    <button type="button" class="btn btn-sm" disabled={remote && !node && !terminalVisible} on:click={onTerminal} aria-pressed={terminalVisible}>
       <Icon name={terminalVisible ? 'monitor' : 'terminal'} size={16} />
-      {terminalVisible ? '设备概览' : terminalCount ? '终端 · ' + terminalCount : '本机终端'}
+      {terminalVisible ? '设备概览' : headless ? '目标终端' : terminalCount ? '终端 · ' + terminalCount : '本机终端'}
     </button>
-    <TogglePill active={syncEnabled} label="自动同步" pressedLabel="同步已暂停" disabled={settingsDisabled} onToggle={onSync} />
-    <TogglePill active={autostartEnabled} label="开机自启" pressedLabel="自启已关闭" disabled={settingsDisabled} onToggle={onAutostart} />
+    <TogglePill active={syncEnabled} label={headless ? '允许发布' : '自动同步'} pressedLabel={headless ? '发布已暂停' : '同步已暂停'} disabled={settingsDisabled} onToggle={onSync} />
+    {#if serviceControlError}
+      <span class="chip" title={serviceControlError}>自启状态未知</span>
+    {:else}
+      <TogglePill active={autostartEnabled} label="开机自启" pressedLabel="自启已关闭" disabled={settingsDisabled} onToggle={onAutostart} />
+    {/if}
     <button type="button" class="btn-icon" aria-label="设置" title="设置" disabled={!settingsReady} on:click={onSettings}>
       <Icon name="settings" size={17} />
     </button>

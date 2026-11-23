@@ -131,7 +131,7 @@ pub(super) fn http_base_from_peer_endpoint(raw: &str) -> Option<String> {
     normalize_peer_http_base(url.as_str())
 }
 
-#[cfg(any(test, not(target_os = "android")))]
+#[cfg(any(test, all(feature = "gui", not(target_os = "android"))))]
 pub(super) fn mobile_ca_url(raw: &str) -> Result<reqwest::Url, String> {
     let url = reqwest::Url::parse(raw).map_err(|_| "CA 地址无效".to_string())?;
     if !matches!(url.scheme(), "http" | "https") {

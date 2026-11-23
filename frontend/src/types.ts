@@ -147,6 +147,7 @@ export type NodeSettings = {
   autostart_enabled: boolean;
   update_frequency: UpdateFrequency;
   update_status: UpdateStatus | null;
+  service_control_error?: string | null;
   receive_settings: ReceiveSettings;
   clipboard_history_settings: ClipboardHistorySettings;
   clipboard_status: ClipboardStatus;

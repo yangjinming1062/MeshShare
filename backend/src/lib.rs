@@ -1,5 +1,6 @@
-#[cfg(any(target_os = "android", test))]
+#[cfg(all(feature = "gui", any(target_os = "android", test)))]
 mod android;
+#[cfg(feature = "gui")]
 mod autostart;
 mod browse;
 mod clipboard;
@@ -7,17 +8,23 @@ mod clock;
 mod control;
 mod discovery;
 mod fsutil;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "headless", target_os = "linux"))]
+mod headless;
+#[cfg(all(feature = "headless", target_os = "linux"))]
+mod headless_service;
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 mod links;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "gui", target_os = "linux"))]
 mod linux;
+#[cfg(all(feature = "headless", target_os = "linux"))]
+pub use headless::run_headless;
 mod listeners;
 #[cfg(target_os = "macos")]
 mod macos;
 mod metrics;
 mod mobile_tls;
 mod model;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 mod monitor;
 mod runtime;
 mod server;
@@ -26,25 +33,27 @@ mod updater;
 #[cfg(target_os = "windows")]
 mod windows;
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 mod desktop;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 pub use desktop::run;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use desktop::tray::sync_tray_labels;
 
 use runtime::NodeRuntime;
 use serde::Serialize;
+#[cfg(feature = "gui")]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(feature = "gui")]
 use tauri::{AppHandle, Manager, State};
 
 const DEFAULT_NODE_PORT: u16 = 37880;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(all(feature = "gui", target_os = "linux")), allow(dead_code))]
 enum MonitorBackend {
     Wayland,
     X11,
@@ -78,7 +87,7 @@ impl MonitorCapabilities {
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabilities {
     #[cfg(target_os = "linux")]
     {
@@ -92,32 +101,35 @@ pub(crate) fn current_monitor_capabilities(app: &AppHandle) -> MonitorCapabiliti
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 pub(crate) fn effective_monitor_locked(app: &AppHandle, runtime: &NodeRuntime) -> bool {
     current_monitor_capabilities(app).can_click_through && runtime.monitor_locked()
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 pub(crate) fn current_monitor_capabilities(_app: &AppHandle) -> MonitorCapabilities {
     MonitorCapabilities::unknown()
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 pub(crate) fn effective_monitor_locked(_app: &AppHandle, runtime: &NodeRuntime) -> bool {
     runtime.monitor_locked()
 }
 
+#[cfg(feature = "gui")]
 #[tauri::command]
 fn node_base_url(state: State<'_, Arc<NodeRuntime>>) -> String {
     format!("http://127.0.0.1:{}", state.node_info().port)
 }
 
 /// 远程管理页只能在本机界面开关这项能力；远程设置接口不暴露它。
+#[cfg(feature = "gui")]
 #[tauri::command]
 fn remote_file_access(state: State<'_, Arc<NodeRuntime>>) -> bool {
     state.remote_file_access()
 }
 
+#[cfg(feature = "gui")]
 #[tauri::command]
 fn set_remote_file_access(
     state: State<'_, Arc<NodeRuntime>>,
@@ -129,15 +141,16 @@ fn set_remote_file_access(
         .map_err(|error| error.to_string())
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 #[tauri::command]
 fn android_network_changed(state: State<'_, Arc<NodeRuntime>>) {
     state.request_network_rebind();
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 pub(crate) fn sync_tray_labels(_app: &AppHandle) {}
 
+#[cfg(feature = "gui")]
 pub(crate) fn apply_monitor_locked(
     app: &AppHandle,
     runtime: &NodeRuntime,
@@ -155,6 +168,7 @@ pub(crate) fn apply_monitor_locked(
     refresh_monitor(app)
 }
 
+#[cfg(feature = "gui")]
 pub(crate) fn apply_monitor_visible(
     app: &AppHandle,
     runtime: &NodeRuntime,
@@ -166,14 +180,15 @@ pub(crate) fn apply_monitor_visible(
     refresh_monitor(app)
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 fn refresh_monitor(_app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use monitor::refresh as refresh_monitor;
 
+#[cfg(feature = "gui")]
 fn terminal_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLoadPayload<'_>) {
     if webview.label() == "main"
         && matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
@@ -184,6 +199,7 @@ fn terminal_page_load(webview: &tauri::Webview, payload: &tauri::webview::PageLo
     }
 }
 
+#[cfg(feature = "gui")]
 fn stop_node(app: &AppHandle, wait: bool) {
     if let Some(runtime) = app.try_state::<Arc<NodeRuntime>>() {
         runtime
@@ -197,6 +213,7 @@ fn stop_node(app: &AppHandle, wait: bool) {
     }
 }
 
+#[cfg(feature = "gui")]
 async fn start_node(
     app: &AppHandle,
     data_dir: PathBuf,
@@ -205,12 +222,13 @@ async fn start_node(
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_NODE_PORT);
-    let (runtime, control) = listeners::start_with_app(
+    let (runtime, control, _listener_task) = listeners::start(
         data_dir,
         static_root(app),
         app.package_info().version.to_string(),
         preferred_port,
-        app.clone(),
+        runtime::NodeProfile::current(),
+        |runtime| control::ControlPlane::with_app(runtime, app.clone()),
     )
     .await?;
     #[cfg(not(target_os = "android"))]
@@ -222,8 +240,15 @@ async fn start_node(
             }
         });
     }
+    start_workers(&runtime);
+    clipboard::start_monitor(runtime.clone());
+    app.manage(runtime.clone());
+    Ok((runtime, control))
+}
+
+fn start_workers(runtime: &Arc<NodeRuntime>) {
     let cleanup_runtime = runtime.clone();
-    tauri::async_runtime::spawn(async move {
+    tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
         loop {
             interval.tick().await;
@@ -245,13 +270,12 @@ async fn start_node(
             cleanup_runtime.prune_clipboard_history();
         }
     });
-    clipboard::start_monitor(runtime.clone());
+
     metrics::start(runtime.clone());
     discovery::start(runtime.clone());
-    app.manage(runtime.clone());
-    Ok((runtime, control))
 }
 
+#[cfg(feature = "gui")]
 fn static_root(app: &AppHandle) -> PathBuf {
     app.path()
         .resource_dir()
@@ -261,13 +285,14 @@ fn static_root(app: &AppHandle) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../frontend/dist"))
 }
 
+#[cfg(feature = "gui")]
 fn node_data_dir(app: &AppHandle) -> PathBuf {
     app.path()
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from(".meshshare"))
 }
 
-#[cfg(target_os = "android")]
+#[cfg(all(feature = "gui", target_os = "android"))]
 #[tauri::mobile_entry_point]
 pub fn run() {
     tauri::Builder::default()
@@ -315,6 +340,7 @@ pub fn run() {
         });
 }
 
+#[cfg(feature = "gui")]
 pub fn cleanup_autostart() {
     if let Err(error) = autostart::disable() {
         eprintln!("清理开机自启动失败：{error}");

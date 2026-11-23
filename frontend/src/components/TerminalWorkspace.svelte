@@ -62,6 +62,12 @@
     selectTab(id);
   }
 
+  export function showPeer(target: TerminalTarget) {
+    const existing = tabs.find(tab => tab.target.peerId === target.peerId && tab.state !== 'ended');
+    if (existing) selectTab(existing.id);
+    else openSession(target);
+  }
+
   export function showWorkspace() {
     if (!tabs.length) openSession();
     else selectTab(active);

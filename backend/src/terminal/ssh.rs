@@ -1,11 +1,14 @@
+#[cfg(feature = "gui")]
 mod client;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 pub(crate) mod migration;
 #[cfg(not(target_os = "android"))]
 mod server;
 
 use crate::runtime::NodeProfile;
-use anyhow::{anyhow, bail, ensure, Result};
+#[cfg(feature = "gui")]
+use anyhow::bail;
+use anyhow::{anyhow, ensure, Result};
 use russh::keys::{Algorithm, HashAlg, PrivateKey};
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +24,7 @@ const KEEPALIVE: Duration = Duration::from_secs(1);
 const MISSED_HEARTBEATS: u32 = 3;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const UPGRADE: &str = "meshshare-ssh-v3";
+#[cfg(feature = "gui")]
 const ROUTE: &str = "/api/v1/terminal/ssh";
 // SSH 私用扩展数据类型。双方以一个零字节请求和确认前一批输出已进入界面队列。
 const OUTPUT_BARRIER: u32 = 0xfe00_0000;
@@ -73,7 +77,7 @@ impl SshService {
         self.host_ready.subscribe()
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub(crate) fn activate_host(&self) {
         self.host_ready.send_if_modified(|ready| {
             let changed = !*ready;
@@ -106,5 +110,5 @@ where
     local
 }
 
-#[cfg(all(test, not(target_os = "android")))]
+#[cfg(all(test, feature = "gui", not(target_os = "android")))]
 mod tests;

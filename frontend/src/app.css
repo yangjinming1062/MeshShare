@@ -113,6 +113,7 @@ select.field { cursor: pointer; }
 .area-hardware { grid-area: hardware; }
 .area-clipboard { grid-area: clipboard; }
 .area-transfers { grid-area: transfers; max-height: min(32vh, 300px); }
+.area-transfers .surface-body > .transfer-list { flex-shrink: 0; }
 .area-transfers .surface-body { overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
 
 .surface { min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--surface); box-shadow: var(--shadow-1); }

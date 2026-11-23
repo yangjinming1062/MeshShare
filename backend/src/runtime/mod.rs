@@ -47,6 +47,7 @@ use transfer::*;
 use transfer_history::*;
 
 pub use config::UpdateFrequency;
+pub(crate) use outgoing::ManagedMobilePath;
 pub use outgoing::OutgoingPrepareView;
 
 pub use config::validate_receive_directory;
@@ -95,6 +96,7 @@ impl Drop for TerminalActivity {
 
 pub struct NodeRuntime {
     pub(crate) ssh: Arc<crate::terminal::ssh::SshService>,
+    #[cfg(feature = "gui")]
     pub(crate) terminals: crate::terminal::commands::WindowTerminals,
     terminal_count: AtomicU64,
     terminals_stopped: Condvar,
@@ -123,6 +125,7 @@ pub struct NodeRuntime {
     peer_dials: Mutex<HashMap<String, watch::Sender<Vec<PeerEndpoint>>>>,
     transfer_locks: Mutex<HashSet<(String, String)>>,
     desktop_temp_files: Mutex<HashSet<PathBuf>>,
+    source_scans: AtomicU64,
     staged_outgoing: Mutex<HashMap<String, StagedOutgoing>>,
     outgoing_prepares: Mutex<HashMap<String, OutgoingPrepare>>,
     outgoing_uploads: Mutex<HashSet<String>>,
@@ -160,6 +163,7 @@ impl Drop for PeerSession<'_> {
 pub enum NodeProfile {
     Desktop,
     Android,
+    Headless,
 }
 
 impl NodeProfile {
@@ -177,19 +181,32 @@ impl NodeProfile {
 
     pub fn capabilities(self) -> Vec<String> {
         match self {
-            Self::Desktop => vec![
-                "clipboard.text".to_string(),
-                "clipboard.image/png".to_string(),
-                "transfer.file".to_string(),
-                "transfer.folder".to_string(),
-                "web.mobile".to_string(),
-                METRICS_SYSTEM_CAPABILITY.to_string(),
-                METRICS_GPU_CAPABILITY.to_string(),
-                METRICS_NETWORK_CAPABILITY.to_string(),
-                REMOTE_MANAGEMENT_CAPABILITY.to_string(),
-                REMOTE_FILES_CAPABILITY.to_string(),
-                TRANSFER_HISTORY_CAPABILITY.to_string(),
-            ],
+            Self::Desktop | Self::Headless => {
+                let mut caps = vec![
+                    "transfer.file".to_string(),
+                    "transfer.folder".to_string(),
+                    "web.mobile".to_string(),
+                    METRICS_SYSTEM_CAPABILITY.to_string(),
+                    METRICS_GPU_CAPABILITY.to_string(),
+                    METRICS_NETWORK_CAPABILITY.to_string(),
+                    REMOTE_MANAGEMENT_CAPABILITY.to_string(),
+                    REMOTE_FILES_CAPABILITY.to_string(),
+                    crate::model::MANAGED_MOBILE_PATHS_CAPABILITY.to_string(),
+                    TRANSFER_HISTORY_CAPABILITY.to_string(),
+                ];
+                if self == Self::Headless {
+                    caps.extend([
+                        CLIPBOARD_VIEW_CAPABILITY.to_owned(),
+                        "node.headless.v1".to_owned(),
+                    ]);
+                } else {
+                    caps.extend([
+                        "clipboard.text".to_owned(),
+                        "clipboard.image/png".to_owned(),
+                    ]);
+                }
+                caps
+            }
             Self::Android => vec![
                 "transfer.file".to_string(),
                 "transfer.folder".to_string(),
@@ -203,7 +220,7 @@ impl NodeProfile {
     }
 }
 
-fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress {
+fn transfer_progress(offer: TransferOffer, direction: &str) -> TransferProgress {
     TransferProgress {
         transfer_id: offer.transfer_id.clone(),
         retry_count: 0,
@@ -215,7 +232,7 @@ fn transfer_progress(offer: &TransferOffer, direction: &str) -> TransferProgress
         total_items: offer.items.len(),
         destination: None,
         error: None,
-        offer: Some(offer.clone()),
+        offer: Some(offer),
         direction: Some(direction.to_string()),
     }
 }
@@ -234,7 +251,7 @@ const MAX_MOBILE_FAILED_TRANSFERS_PER_SESSION: usize = 20;
 const MAX_MOBILE_FAILED_TRANSFERS: usize = 64;
 const MAX_MOBILE_TRANSFER_RECORDS: usize = 512;
 const MAX_MOBILE_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
-#[cfg(any(test, not(target_os = "android")))]
+#[cfg(any(test, all(feature = "gui", not(target_os = "android"))))]
 const MAX_MOBILE_CA_BYTES: usize = 64 * 1024;
 const MAX_SEEN_CLIPBOARD_EVENTS: usize = 4_096;
 const OUTGOING_STAGING_DIR: &str = "outgoing";
@@ -290,6 +307,7 @@ fn is_clipboard_message(message: &WireMessage) -> bool {
 }
 
 impl NodeRuntime {
+    #[cfg(test)]
     pub fn new(data_dir: PathBuf, port: u16, version: String) -> anyhow::Result<Arc<Self>> {
         Self::new_with_profile(data_dir, port, version, NodeProfile::current())
     }
@@ -333,10 +351,14 @@ impl NodeRuntime {
         if let Some(snapshot) = clipboard.as_ref() {
             clock.observe(&snapshot.clock);
         }
-        #[cfg(not(target_os = "android"))]
-        let host_ready = !profile.is_android() && config.terminal_host_ready(&data_dir);
-        #[cfg(target_os = "android")]
-        let host_ready = false;
+        let host_ready = match profile {
+            NodeProfile::Headless => true,
+            #[cfg(all(feature = "gui", not(target_os = "android")))]
+            NodeProfile::Desktop => config.terminal_host_ready(&data_dir),
+            #[cfg(not(all(feature = "gui", not(target_os = "android"))))]
+            NodeProfile::Desktop => false,
+            NodeProfile::Android => false,
+        };
         let ssh = Arc::new(crate::terminal::ssh::SshService::new(
             config.node_id.clone(),
             profile,
@@ -360,6 +382,7 @@ impl NodeRuntime {
         let (events, _) = broadcast::channel(256);
         Ok(Arc::new(Self {
             ssh,
+            #[cfg(feature = "gui")]
             terminals: Default::default(),
             terminal_count: AtomicU64::new(0),
             terminals_stopped: Condvar::new(),
@@ -373,7 +396,16 @@ impl NodeRuntime {
             }),
             #[cfg(not(target_os = "android"))]
             system_clipboard_ready: Condvar::new(),
-            clipboard_status: RwLock::new(ClipboardStatus::default()),
+            clipboard_status: RwLock::new(if profile == NodeProfile::Headless {
+                ClipboardStatus {
+                    session: ClipboardSession::Other,
+                    available: false,
+                    retrying: false,
+                    message: Some("无界面节点保存并转发共享剪贴板".to_owned()),
+                }
+            } else {
+                ClipboardStatus::default()
+            }),
             clipboard_history: Mutex::new(clipboard_history),
             transfer_history: Mutex::new(load_transfer_history(&data_dir)),
             peers: RwLock::new(HashMap::new()),
@@ -393,6 +425,7 @@ impl NodeRuntime {
             peer_dials: Mutex::new(HashMap::new()),
             transfer_locks: Mutex::new(HashSet::new()),
             desktop_temp_files: Mutex::new(desktop_temp_files),
+            source_scans: AtomicU64::new(0),
             staged_outgoing: Mutex::new(HashMap::new()),
             outgoing_prepares: Mutex::new(HashMap::new()),
             outgoing_uploads: Mutex::new(HashSet::new()),
@@ -412,6 +445,10 @@ impl NodeRuntime {
                 .build()?,
             transfer_update_gate: Mutex::new(()),
         }))
+    }
+
+    pub fn is_headless(&self) -> bool {
+        self.profile == NodeProfile::Headless
     }
 
     pub fn is_android_profile(&self) -> bool {
@@ -476,7 +513,7 @@ impl NodeRuntime {
     }
 
     /// 只从节点私网地址取 CA；命令层收到的 URL 来自渲染进程，不能让它指向公网或任意资源。
-    #[cfg(any(test, not(target_os = "android")))]
+    #[cfg(any(test, all(feature = "gui", not(target_os = "android"))))]
     pub async fn fetch_mobile_ca(&self, raw_url: &str) -> Result<Vec<u8>, String> {
         let url = mobile_ca_url(raw_url)?;
         let mut response = self
@@ -563,7 +600,7 @@ impl NodeRuntime {
         if self.terminal_count.load(Ordering::SeqCst) != 0 {
             return true;
         }
-        self.has_active_transfers()
+        self.has_active_transfers() || self.has_preparing_outgoing()
     }
 
     pub fn begin_update_install(&self) -> bool {

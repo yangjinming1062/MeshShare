@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import { HEADLESS_CAPABILITY } from '../peers';
   import Meter from './Meter.svelte';
   import { formatConnectedSince, formatPercent, formatRateCompact, gpuUtilization, memoryPercent, peerSummary } from '../format';
   import { platformLabel } from '../format';
@@ -24,7 +25,7 @@
   $: name = kind === 'mobile' ? (session?.label ?? '网页设备') : (peer?.node_name ?? '设备');
   $: meta = kind === 'mobile'
     ? (session ? session.node_name + ' · 浏览器' : '浏览器')
-    : (peer ? (isHome ? '本机 · ' : '') + platformLabel(peer.platform) + ' · ' + (peer.addresses[0]?.address ?? '在线') : '');
+    : (peer ? (isHome ? '本机 · ' : '') + (peer.capabilities.includes(HEADLESS_CAPABILITY) ? 'Linux 无界面服务' : platformLabel(peer.platform)) + ' · ' + (peer.addresses[0]?.address ?? '在线') : '');
   $: metrics = kind === 'mobile' ? null : (peer?.metrics ?? null);
   $: stale = kind === 'peer' && !!peer?.metrics_stale;
   $: hasMetrics = !!metrics;

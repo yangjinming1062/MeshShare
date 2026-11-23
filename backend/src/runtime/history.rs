@@ -403,11 +403,12 @@ impl NodeRuntime {
         self.clipboard_status.read().clone()
     }
 
+    #[cfg(feature = "gui")]
     pub fn set_clipboard_status(&self, status: ClipboardStatus) {
         *self.clipboard_status.write() = status;
     }
 
-    #[cfg(any(test, not(target_os = "android")))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub fn set_clipboard_available(&self, session: ClipboardSession) {
         self.set_clipboard_status(ClipboardStatus {
             session,
@@ -417,6 +418,7 @@ impl NodeRuntime {
         });
     }
 
+    #[cfg(feature = "gui")]
     pub fn set_clipboard_unavailable(
         &self,
         session: ClipboardSession,
@@ -614,7 +616,8 @@ impl NodeRuntime {
         clipboard.snapshot = Some(snapshot);
         #[cfg(not(target_os = "android"))]
         {
-            clipboard.pending_system_write = write_to_system && !self.profile.is_android();
+            clipboard.pending_system_write =
+                write_to_system && self.profile == NodeProfile::Desktop;
             if clipboard.pending_system_write {
                 self.system_clipboard_ready.notify_one();
             }
@@ -664,7 +667,7 @@ impl NodeRuntime {
     }
 
     /// 系统读操作可能等待其他应用。若共享状态期间已更新，保留较新的事件。
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(any(feature = "gui", test), not(target_os = "android")))]
     pub fn create_local_clipboard(
         &self,
         text: Option<String>,
@@ -739,7 +742,7 @@ impl NodeRuntime {
         self.clipboard.lock().snapshot.clone()
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(any(feature = "gui", test), not(target_os = "android")))]
     pub(crate) fn clipboard_event_id(&self) -> Option<String> {
         self.clipboard
             .lock()
@@ -748,7 +751,7 @@ impl NodeRuntime {
             .map(|snapshot| snapshot.event_id.clone())
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(any(feature = "gui", test), not(target_os = "android")))]
     pub(crate) fn take_system_clipboard_write(&self) -> Option<ClipboardSnapshot> {
         let mut clipboard = self.clipboard.lock();
         if std::mem::take(&mut clipboard.pending_system_write) {
@@ -758,7 +761,7 @@ impl NodeRuntime {
         }
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub(crate) fn wait_for_system_clipboard_write(&self, timeout: Duration) {
         let mut clipboard = self.clipboard.lock();
         if !clipboard.pending_system_write {

@@ -93,6 +93,7 @@ def build_manifest(args: argparse.Namespace) -> dict[str, object]:
         "darwin-aarch64-app": ("MeshShare-macos-arm64", ".app.tar.gz"),
         "linux-x86_64-appimage": ("MeshShare-linux-x64", ".AppImage"),
         "linux-x86_64-deb": ("MeshShare-linux-x64", ".deb"),
+        "linux-x86_64-headless-deb": ("MeshShare-headless-amd64", f"meshshare-headless_{args.version}_amd64.deb"),
         "linux-x86_64-rpm": ("MeshShare-linux-x64", ".rpm"),
     }
     platforms = {

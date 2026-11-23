@@ -2,6 +2,8 @@
   import { formatMemory, formatPercent, formatRate, gpuUtilization, isMetricsStale, memoryPercent } from '../format';
   import type { HardwareMetrics } from '../types';
 
+  export let remote = false;
+  export let showMonitorControls = true;
   export let metrics: HardwareMetrics | null = null;
   export let monitorLocked = false;
   export let monitorVisible = true;
@@ -44,8 +46,9 @@
 <section class="surface area-hardware">
   <div class="surface-head">
     <div class="surface-title">
-      <h2>本机硬件</h2>
+      <h2>{remote ? '目标硬件' : '本机硬件'}</h2>
     </div>
+    {#if showMonitorControls}
     <div class="surface-actions">
       <button
         type="button"
@@ -64,6 +67,7 @@
         on:click={onToggleLock}
       >{monitorLocked ? '取消点击穿透' : '开启点击穿透'}</button>
     </div>
+    {/if}
   </div>
   <div class="surface-body">
     {#if stale}

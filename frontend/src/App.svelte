@@ -7,8 +7,8 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { buildOffer, putFile, randomId, uploadFileWithRetry } from './upload';
   import { filesFromDataTransfer } from './drop';
-  import { peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
-  import { ApiError, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
+  import { HEADLESS_CAPABILITY, peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
+  import { ApiError, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, sendManagedPathsToMobile, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restartService, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { mergeTransferProgress } from './transferProgress';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
@@ -76,8 +76,10 @@
   let browseOpen = false;
   let browseMode: 'send' | 'directory' | 'view' = 'send';
   let browseStartPath = '';
-  let browsePeer: PeerInfo | null = null;
+  type BrowseRecipient = { peer: PeerInfo } | { mobile: MobileSession };
+  let browseRecipient: BrowseRecipient | null = null;
   let browseTransfer: TransferProgress | null = null;
+  let browseReceiveMode: ReceiveMode | null = null;
   let ws: WebSocket | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
@@ -105,6 +107,9 @@
   let monitorLocked = false;
   let monitorVisible = true;
   let settingsOpen = false;
+  let serviceControlError = '';
+  let restartBusy = false;
+  let restartError = '';
   let terminalWorkspace: TerminalWorkspace;
   let terminalVisible = false;
   let terminalCount = 0;
@@ -142,7 +147,7 @@
   let remoteMode = false;
   const uploading = new Set<string>();
   const watching = new Set<string>();
-  const pendingMobileUploads = new Map<string, { files: File[]; completedItemIds: Set<string>; sessionId: string; offer: TransferOffer; base: string; failure?: TransferFailure }>();
+  const pendingMobileUploads = new Map<string, { files: File[]; completedItemIds: Set<string>; sessionId: string; offer: TransferOffer; base: string; controller?: AbortController; failure?: TransferFailure }>();
   const uploadAttempts = new Map<string, number>();
   const uploadStopped = new Set<string>();
   // 用户取消时通知任务所属节点；离开界面只停止页面的准备工作。
@@ -163,6 +168,7 @@
   let wsReconnectAttempt = 0;
   let wsPingTimer: number | undefined;
   let targetGeneration = 0;
+  let rediscoveringGeneration: number | undefined;
   let refreshRequestId = 0;
   const FAILURE_RETENTION_MS = 24 * 60 * 60 * 1000;
   const MAX_FAILURES = 20;
@@ -197,6 +203,7 @@
     : transferHistory;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
+  $: headless = remoteMode && !!node?.capabilities.includes(HEADLESS_CAPABILITY);
   $: settingsDisabled = !settingsReady || !node || settingsWrites.has(node.node_id);
   // 远程管理页的发送由目标机器选文件，需要目标节点声明对应的管理能力。
   $: managedFilesSupported = remoteMode && !!node?.capabilities.includes(REMOTE_FILES_CAPABILITY);
@@ -329,7 +336,7 @@
       showTransientNotice('该记录没有可用的路径', 3600);
       return;
     }
-    browsePeer = null;
+    browseRecipient = null;
     browseTransfer = null;
     browseMode = 'view';
     browseStartPath = location.directory;
@@ -488,7 +495,10 @@
           const generation = targetGeneration;
           void refresh().catch(async (error) => {
             if (pageStopped || generation !== targetGeneration) return;
-            if (remoteTarget && await selectRemoteAddress(remoteTarget, activeBaseUrl)) return;
+            if (remoteTarget) {
+              settingsReady = false;
+              if (await rediscoverRemote(generation, activeBaseUrl)) return;
+            }
             if (generation !== targetGeneration) return;
             status = error instanceof Error ? error.message : '无法刷新节点状态';
             statusKind = 'error';
@@ -546,6 +556,10 @@
     const requestId = ++refreshRequestId;
     const generation = targetGeneration;
     const target = activeBaseUrl;
+    if (remoteTarget && !target) {
+      await rediscoverRemote(generation, '');
+      return;
+    }
     const current = () => !pageStopped && requestId === refreshRequestId && generation === targetGeneration;
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(target), getMetrics(target)]);
@@ -558,15 +572,21 @@
       return;
     }
 
+    const nextNode = await requestWithTimeout<NodeInfo>('/api/v1/info', {}, target);
+    if (!current()) return;
+    if (remoteTarget && nextNode.node_id !== remoteTarget.node_id) {
+      suspendRemoteTarget();
+      return;
+    }
     await Promise.all([
-      refreshOverview(current, generation, target),
+      refreshOverview(current, generation, target, nextNode),
       refreshTransfers(current, generation, target),
     ]);
   }
 
-  async function refreshOverview(current: () => boolean, generation: number, target: string) {
-    const [nextNode, nextPeers, nextClipboard, nextMetrics, nextHistory, sessions] = await Promise.all([
-      getInfo(target), getPeers(target), getClipboard(target), getMetrics(target), getClipboardHistory(target),
+  async function refreshOverview(current: () => boolean, generation: number, target: string, nextNode: NodeInfo) {
+    const [nextPeers, nextClipboard, nextMetrics, nextHistory, sessions] = await Promise.all([
+      getPeers(target), getClipboard(target), getMetrics(target), getClipboardHistory(target),
       isWeb ? [] : getMobileSessions(target),
     ]);
     if (!current()) return;
@@ -712,6 +732,7 @@
     autostartEnabled = settings.autostart_enabled;
     updateFrequency = settings.update_frequency;
     updateStatus = settings.update_status;
+    serviceControlError = settings.service_control_error ?? '';
     receiveSettings = settings.receive_settings;
     clipboardHistorySettings = settings.clipboard_history_settings;
     clipboardStatus = settings.clipboard_status;
@@ -734,7 +755,7 @@
   }
 
   function connectWebSocket() {
-    if (pageStopped) return;
+    if (pageStopped || !activeBaseUrl) return;
     if (wsReconnectTimer) {
       window.clearTimeout(wsReconnectTimer);
       wsReconnectTimer = undefined;
@@ -743,14 +764,18 @@
       window.clearInterval(wsPingTimer);
       wsPingTimer = undefined;
     }
+    const expectedId = remoteTarget?.node_id;
+    let identified = !expectedId;
     const socket = new WebSocket(websocketUrl());
     ws?.close();
     ws = socket;
     socket.onopen = () => {
       if (socket !== ws) return;
       wsReconnectAttempt = 0;
-      status = '已连接';
-      statusKind = 'ok';
+      if (identified) {
+        status = '已连接';
+        statusKind = 'ok';
+      }
       const sendPing = () => {
         if (socket !== ws || socket.readyState !== WebSocket.OPEN) return;
         socket.send(JSON.stringify({ type: 'Ping', payload: { at_ms: Date.now() } }));
@@ -779,7 +804,11 @@
       if (socket !== ws) return;
       try {
         const message = JSON.parse(event.data) as WireMessage;
-        handleWireMessage(message);
+        if (expectedId && message.type === 'Hello') {
+          identified = message.payload.node.node_id === expectedId;
+          if (!identified) { suspendRemoteTarget(); return; }
+        }
+        if (identified) handleWireMessage(message);
       } catch {
         // A malformed event must not break the live UI.
       }
@@ -807,7 +836,7 @@
       return;
     }
     if (type === 'Hello' || type === 'ClipboardUpdate' || type === 'ClipboardSnapshot') {
-      void refresh();
+      void refresh().catch(() => { /* 定期刷新负责重新发现并报告离线。 */ });
       return;
     }
     if (type === 'MetricsUpdate') {
@@ -868,10 +897,10 @@
   }
 
   async function toggleSync() {
-    const scope = remoteMode ? '目标节点的' : '';
+    const feature = headless ? '目标节点的剪贴板发布' : remoteMode ? '目标节点的剪贴板自动同步' : '剪贴板自动同步';
     await saveSettings(
       (target) => patchSettings({ clipboard_sync_enabled: !syncEnabled }, target),
-      (settings) => settings.clipboard_sync_enabled ? `${scope}剪贴板自动同步已恢复` : `${scope}剪贴板自动同步已暂停`,
+      (settings) => settings.clipboard_sync_enabled ? `${feature}已恢复` : `${feature}已暂停`,
       '无法更新剪贴板同步设置',
     );
   }
@@ -912,6 +941,13 @@
   async function chooseReceiveDirectory(mode?: ReceiveMode) {
     if (settingsDisabled) return;
     const generation = targetGeneration;
+    if (managedFilesSupported) {
+      browseMode = 'directory';
+      browseStartPath = receiveSettings.default_path ?? '';
+      browseReceiveMode = mode ?? receiveSettings.mode;
+      browseOpen = true;
+      return;
+    }
     if (remoteMode) {
       const path = await askPath('设置默认接收目录', receiveSettings.default_path ?? '');
       if (path === null || generation !== targetGeneration) return;
@@ -1055,15 +1091,18 @@
   }
 
   async function publishClipboard() {
-    if (!clipboardDraft.trim()) return;
+    if (!node || !clipboardDraft.trim()) return;
+    const generation = targetGeneration;
     try {
-      clipboard = await request<ClipboardSnapshot>('/api/v1/clipboard', {
+      const published = await request<ClipboardSnapshot>('/api/v1/clipboard', {
         method: 'POST',
-        body: JSON.stringify({ text: clipboardDraft, source_name: node?.node_name }),
+        body: JSON.stringify({ text: clipboardDraft, source_name: node.node_name }),
       });
+      if (generation !== targetGeneration) return;
+      clipboard = published;
       showTransientNotice('已同步到在线设备');
     } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '剪贴板同步失败', 6000);
+      if (generation === targetGeneration) showTransientNotice(error instanceof Error ? error.message : '剪贴板同步失败', 6000);
     }
   }
 
@@ -1097,23 +1136,28 @@
     const eventId = selectedClipboardHistory?.item.event_id;
     if (!eventId || clipboardHistoryBusy) return;
     clipboardHistoryBusy = true;
+    const generation = targetGeneration;
     try {
-      clipboard = await restoreClipboardHistory(eventId);
+      const restored = await restoreClipboardHistory(eventId);
+      if (generation !== targetGeneration) return;
+      clipboard = restored;
       clipboardDraft = clipboard.text ?? '';
       await refreshClipboardHistory();
       showTransientNotice('已恢复并同步剪贴板内容');
     } catch (error) {
       showTransientNotice(error instanceof Error ? error.message : '无法恢复剪贴板历史', 6000);
     } finally {
-      clipboardHistoryBusy = false;
+      if (generation === targetGeneration) clipboardHistoryBusy = false;
     }
   }
 
   async function clearClipboardHistoryItems() {
     if (clipboardHistoryBusy || !clipboardHistory.length) return;
     clipboardHistoryBusy = true;
+    const generation = targetGeneration;
     try {
       await clearClipboardHistory();
+      if (generation !== targetGeneration) return;
       clipboardHistory = [];
       historyDetailToken += 1;
       historyDetailLoading = false;
@@ -1123,7 +1167,7 @@
     } catch (error) {
       showTransientNotice(error instanceof Error ? error.message : '无法清空剪贴板历史', 6000);
     } finally {
-      clipboardHistoryBusy = false;
+      if (generation === targetGeneration) clipboardHistoryBusy = false;
     }
   }
 
@@ -1203,18 +1247,21 @@
     }
   }
 
+  function browseForSend(recipient: BrowseRecipient) {
+    if (!managedFilesSupported) {
+      showTransientNotice('目标节点不支持远程文件选择', 6000);
+      return;
+    }
+    browseRecipient = recipient;
+    browseTransfer = null;
+    browseMode = 'send';
+    browseStartPath = '';
+    browseOpen = true;
+  }
+
   function startChoose(peer: PeerInfo, folder = false) {
-    // 远程管理页的发送由目标机器选文件；本机发送仍由系统对话框给出绝对路径。
     if (remoteMode) {
-      if (!managedFilesSupported) {
-        showTransientNotice('目标节点不支持远程文件选择，请选择支持此功能的桌面节点', 6000);
-        return;
-      }
-      browsePeer = peer;
-      browseTransfer = null;
-      browseMode = 'send';
-      browseStartPath = '';
-      browseOpen = true;
+      browseForSend({ peer });
       return;
     }
     selectedPeer = peer;
@@ -1268,12 +1315,13 @@
       ];
       while (!controller.signal.aborted) {
         await new Promise((resolve) => window.setTimeout(resolve, 600));
+        if (controller.signal.aborted) return;
         const status = await api.status(prepareId).catch((error) => {
           if (error instanceof ApiError && error.status === 404) return null;
           throw error;
         });
         // 准备条目消失表示清单已发给接收端（或任务被取消）。
-        if (!status) break;
+        if (!status || controller.signal.aborted) break;
         if (status.state === 'failed') {
           await api.cancel(prepareId).catch(() => undefined);
           throw new Error(status.error || '准备发送失败');
@@ -1293,36 +1341,56 @@
   }
 
   async function confirmBrowse(paths: string[]) {
-    const peer = browsePeer;
+    const recipient = browseRecipient;
     const transfer = browseTransfer;
     const directory = browseMode === 'directory';
+    const receiveMode = browseReceiveMode;
     closeBrowse();
     if (!paths.length) return;
     if (directory) {
-      if (transfer) await acceptTransferAt(transfer, paths[0]);
+      if (receiveMode) await saveReceiveSettings(receiveMode, paths[0]);
+      else if (transfer) await acceptTransferAt(transfer, paths[0]);
       return;
     }
-    if (peer) await sendPaths(peer, paths, true);
+    if (!recipient) return;
+    if ('peer' in recipient) {
+      await sendPaths(recipient.peer, paths, true);
+      return;
+    }
+    const generation = targetGeneration;
+    try {
+      const view = await sendManagedPathsToMobile(recipient.mobile.session_id, paths, activeBaseUrl);
+      if (generation !== targetGeneration) return;
+      recordProgress({ ...view.progress, direction: 'send' });
+      showTransientNotice('已发送，等待网页端确认');
+    } catch (error) {
+      if (generation === targetGeneration) showTransientNotice(error instanceof Error ? error.message : '无法发送到网页端', 6000);
+    }
   }
 
   function closeBrowse() {
     browseOpen = false;
     browseStartPath = '';
-    browsePeer = null;
+    browseRecipient = null;
     browseTransfer = null;
+    browseReceiveMode = null;
   }
 
   /** 目标机器未开启远程文件访问时，接收目录仍可手输。 */
   async function requestManualAcceptPath() {
     const transfer = browseTransfer;
+    const mode = browseReceiveMode;
+    const generation = targetGeneration;
     closeBrowse();
-    if (!transfer) return;
+    if (!transfer && !mode) return;
     const path = await askPath('输入接收目录', settingsReady ? receiveSettings.default_path ?? '' : '');
     if (!path) {
       showTransientNotice('需要输入目标节点上的接收目录', 6000);
       return;
     }
-    void acceptTransferAt(transfer, path);
+    if (generation !== targetGeneration) return;
+    if (mode) await saveReceiveSettings(mode, path);
+    else if (transfer) await acceptTransferAt(transfer, path);
   }
 
   async function setRemoteFileAccess(enabled: boolean) {
@@ -1345,6 +1413,10 @@
   }
 
   function startChooseMobile(session: MobileSession, folder = false) {
+    if (remoteMode && node?.capabilities.includes('management.mobile-paths.v1')) {
+      browseForSend({ mobile: session });
+      return;
+    }
     selectedMobileSession = session;
     selectedPeer = null;
     if (folder) folderInput?.click();
@@ -1433,9 +1505,14 @@
     node = null;
     peers = [];
     clipboard = null;
+    clipboardDraft = '';
+    clipboardHistoryBusy = false;
     metrics = null;
     clipboardStatus = { session: 'unknown', available: false, retrying: true, message: '正在连接系统剪贴板…' };
     settingsOpen = false;
+    restartBusy = false;
+    restartError = '';
+    serviceControlError = '';
     mobileAccessOpen = false;
     addDeviceOpen = false;
     clearHistoryOpen = false;
@@ -1461,20 +1538,34 @@
     mobileQr = null;
   }
 
-  /**
-   * 远程目标只有一层：进入其他设备直接替换当前目标，返回始终回到本机。
-   * 目标设备列表包含本机节点，按 node_id 识别后等同于返回。
-   */
-  async function applyTargetContext(baseUrl: string, target: PeerInfo | null) {
+  function disconnectTargetSocket() {
     ws?.close();
     ws = null;
     if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
     wsReconnectTimer = undefined;
     if (wsPingTimer) window.clearInterval(wsPingTimer);
     wsPingTimer = undefined;
+  }
+
+  function suspendRemoteTarget() {
+    if (!remoteTarget || !activeBaseUrl) return;
+    for (const pending of pendingMobileUploads.values()) {
+      if (pending.base === activeBaseUrl) {
+        pending.controller?.abort();
+        pending.base = '';
+      }
+    }
+    activeBaseUrl = setApiTarget('');
+    disconnectTargetSocket();
+    resetTargetUi();
+    statusKind = 'warn';
+    status = '节点地址已变更，正在重新发现目标节点';
+  }
+
+  async function applyTargetContext(baseUrl: string, target: PeerInfo | null) {
+    disconnectTargetSocket();
     remoteTarget = target;
-    activeBaseUrl = baseUrl;
-    setApiTarget(baseUrl);
+    activeBaseUrl = setApiTarget(baseUrl, target ? { nodeId: target.node_id, onMismatch: suspendRemoteTarget } : undefined);
     resetTargetUi();
     const context = targetGeneration;
     status = target ? '正在连接目标节点…' : '正在返回本机…';
@@ -1489,6 +1580,25 @@
     });
     if (context !== targetGeneration) return;
     connectWebSocket();
+  }
+
+  async function restartManagedNode() {
+    if (!headless || !remoteTarget || !settingsReady || restartBusy) return;
+    const generation = targetGeneration;
+    restartBusy = true;
+    restartError = '';
+    try {
+      await restartService(activeBaseUrl, remoteTarget.node_id);
+      if (generation !== targetGeneration) return;
+      settingsOpen = false;
+      showTransientNotice('重启请求已接受，正在等待目标节点重新连接');
+    } catch (error) {
+      if (generation !== targetGeneration) return;
+      if (error instanceof ApiError && error.status === 421) suspendRemoteTarget();
+      else restartError = error instanceof Error ? error.message : '重启请求失败';
+    } finally {
+      if (generation === targetGeneration) restartBusy = false;
+    }
   }
 
   async function openRemotePeer(peer: PeerInfo) {
@@ -1513,8 +1623,22 @@
       if (generation === targetGeneration) await applyTargetContext(target, peer);
       return true;
     } catch {
-      if (!skipBase && generation === targetGeneration) showTransientNotice('目标设备没有可访问地址', 6000);
+      if (skipBase === undefined && generation === targetGeneration) showTransientNotice('目标设备没有可访问地址', 6000);
       return false;
+    }
+  }
+
+  async function rediscoverRemote(generation: number, skipBase: string): Promise<boolean> {
+    if (!remoteTarget || rediscoveringGeneration === generation) return false;
+    const expected = remoteTarget;
+    rediscoveringGeneration = generation;
+    try {
+      const online = await getPeers(localBaseUrl).catch(() => []);
+      if (pageStopped || generation !== targetGeneration) return false;
+      const peer = online.find(p => p.node_id === expected.node_id) ?? expected;
+      return await selectRemoteAddress(peer, skipBase);
+    } finally {
+      if (rediscoveringGeneration === generation) rediscoveringGeneration = undefined;
     }
   }
 
@@ -1663,7 +1787,9 @@
 
   async function uploadMobileTransfer(id: string) {
     const pending = pendingMobileUploads.get(id);
-    if (!pending || pending.base !== activeBaseUrl || uploading.has(id) || uploadStopped.has(id)) return;
+    if (!pending?.base || pending.base !== activeBaseUrl || uploading.has(id) || uploadStopped.has(id)) return;
+    const controller = new AbortController();
+    pending.controller = controller;
     uploading.add(id);
     try {
       for (const [index, item] of pending.offer.items.entries()) {
@@ -1675,12 +1801,14 @@
           apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`, pending.base),
           file,
           item.media_type,
+          controller.signal,
         );
         pending.completedItemIds.add(item.item_id);
       }
       uploadAttempts.delete(id);
       showTransientNotice('文件已准备好，网页端可以下载');
     } catch (error) {
+      if (controller.signal.aborted) return;
       const attempts = (uploadAttempts.get(id) ?? 0) + 1;
       uploadAttempts.set(id, attempts);
       const message = error instanceof Error ? error.message : '网页端文件上传失败';
@@ -1695,6 +1823,7 @@
         showTransientNotice(`${message}，正在重试（${attempts}/${MAX_UPLOAD_ATTEMPTS}）`, 6000);
       }
     } finally {
+      pending.controller = undefined;
       uploading.delete(id);
     }
   }
@@ -1982,7 +2111,7 @@
         return;
       }
       browseTransfer = transfer;
-      browsePeer = null;
+      browseRecipient = null;
       browseMode = 'directory';
       browseStartPath = defaultPath;
       browseOpen = true;
@@ -2129,6 +2258,8 @@
     <AppHeader
       {node}
       remote={remoteMode}
+      {headless}
+      {serviceControlError}
       {status}
       {statusKind}
       {syncEnabled}
@@ -2140,16 +2271,20 @@
       onSettings={() => (settingsOpen = true)}
       {terminalCount}
       {terminalVisible}
-      onTerminal={() => { if (terminalVisible) terminalVisible = false; else terminalWorkspace.showWorkspace(); }}
+      onTerminal={() => {
+        if (terminalVisible) terminalVisible = false;
+        else if (headless && remoteTarget) terminalWorkspace.showPeer({ peerId: remoteTarget.node_id, name: remoteTarget.node_name });
+        else terminalWorkspace.showWorkspace();
+      }}
       onOpenProject={openProjectPage}
       onBack={returnToLocal}
       onCopyAddress={copyAccessAddress}
     />
-    {#if isDesktopWindow && node && !clipboardStatus.available}
+    {#if isDesktopWindow && node && !headless && !clipboardStatus.available}
       <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
     {/if}
     <TerminalWorkspace bind:this={terminalWorkspace} bind:visible={terminalVisible} bind:count={terminalCount} peers={remoteMode ? null : peers} />
-    <main class="app-main" hidden={terminalVisible}>
+    <main class="app-main" hidden={terminalVisible || (remoteMode && !node)}>
       <DevicePanel
         peers={peers}
         homeNodeId={remoteMode ? localNodeId : ''}
@@ -2177,6 +2312,8 @@
         allowFolderSend={!remoteMode}
       />
       <HardwarePanel
+        remote={remoteMode}
+        showMonitorControls={!headless}
         metrics={metrics}
         {monitorLocked}
         {monitorVisible}
@@ -2186,6 +2323,7 @@
         onToggleVisible={toggleMonitorVisibility}
       />
       <ClipboardPanel
+        {headless}
         {clipboard}
         bind:draft={clipboardDraft}
         historyCount={clipboardHistory.length}
@@ -2201,6 +2339,11 @@
       {updateStatus}
       {settingsDisabled}
       localMode={!remoteMode}
+      {headless}
+      {serviceControlError}
+      {restartBusy}
+      {restartError}
+      onRestart={restartManagedNode}
       {receiveSettings}
       historySettings={clipboardHistorySettings}
       {remoteFileAccess}

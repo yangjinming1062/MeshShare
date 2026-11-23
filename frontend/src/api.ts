@@ -2,6 +2,9 @@ import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferHistoryCleared, TransferHistoryEntry, TransferOffer, TransferProgress } from './types';
 
 let baseUrl = '';
+let suspendedBase = '';
+type ManagedTarget = { nodeId: string; onMismatch: () => void };
+let managedTarget: ManagedTarget | undefined;
 const SETTINGS_WRITE_TIMEOUT_MS = 30_000;
 
 /** HTTP 状态码保留在错误上，调用方才能区分对端拒绝与网络不可达。 */
@@ -19,13 +22,18 @@ export async function initApi(): Promise<string> {
   return setApiTarget(isTauri() ? await invoke<string>('node_base_url') : window.location.origin);
 }
 
-export function setApiTarget(target: string): string {
+export function setApiTarget(target: string, managed?: ManagedTarget): string {
+  // 后台任务可能持有原地址；重连期间该地址只允许探测身份。
+  suspendedBase = target ? '' : baseUrl;
   baseUrl = target.replace(/\/$/, '');
+  managedTarget = managed;
   return baseUrl;
 }
 
 export function apiUrl(path: string, target = baseUrl): string {
-  return `${target.replace(/\/$/, '')}${path}`;
+  const base = target.replace(/\/$/, '');
+  if (!base || (base === suspendedBase && path !== '/api/v1/info')) throw new ApiError('尚未连接到目标节点', 421);
+  return `${base}${path}`;
 }
 
 export function websocketUrl(target = baseUrl): string {
@@ -33,16 +41,32 @@ export function websocketUrl(target = baseUrl): string {
 }
 
 export async function request<T>(path: string, options: RequestInit = {}, target = baseUrl): Promise<T> {
-  const response = await fetch(apiUrl(path, target), {
+  const url = apiUrl(path, target);
+  const managed = target === baseUrl && path !== '/api/v1/info' ? managedTarget : undefined;
+  if (managed && options.method && options.method !== 'GET') {
+    // 旧节点也能通过 info 核实身份。写操作只向验证过的地址提交一次。
+    try {
+      await verifyPeerAddress(managed.nodeId, target);
+    } catch (error) {
+      if (managed === managedTarget && error instanceof ApiError && error.status === 421) managed.onMismatch();
+      throw error;
+    }
+    if (managed !== managedTarget) throw new ApiError('管理目标已变更', 421);
+  }
+  const response = await fetch(url, {
     ...options,
     cache: 'no-store',
     redirect: 'error',
     headers: {
       ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}),
       ...(options.headers ?? {}),
+      ...(managed ? { 'X-MeshShare-Target': managed.nodeId } : {}),
     },
   });
-  if (!response.ok) throw await responseError(response);
+  if (!response.ok) {
+    if (response.status === 421 && managed && managed === managedTarget) managed.onMismatch();
+    throw await responseError(response);
+  }
   return response.json().catch((cause: unknown) => {
     const message = response.headers.get('content-type')?.startsWith('text/html')
       ? '未连接到 MeshShare 节点，请启动桌面应用'
@@ -68,6 +92,11 @@ export function isTransportFailure(error: unknown): boolean {
   return error instanceof TypeError || (error instanceof DOMException && error.name === 'AbortError');
 }
 
+async function verifyPeerAddress(nodeId: string, base: string, timeoutMs = 6000): Promise<void> {
+  const info = await requestWithTimeout<NodeInfo>('/api/v1/info', {}, base, timeoutMs);
+  if (info.node_id !== nodeId) throw new ApiError('地址上的设备与目标不匹配', 421);
+}
+
 /** 操作前核对候选地址上的节点身份，非暂时性的业务错误交还调用方。 */
 export async function withPeerAddress<T>(nodeId: string, candidates: string[], perform: (base: string) => Promise<T>): Promise<T> {
   const deadline = Date.now() + 12000;
@@ -76,8 +105,7 @@ export async function withPeerAddress<T>(nodeId: string, candidates: string[], p
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     try {
-      const info = await requestWithTimeout<NodeInfo>('/api/v1/info', {}, base, Math.min(6000, remaining));
-      if (info.node_id !== nodeId) throw new ApiError('地址上的设备与目标不匹配', 421);
+      await verifyPeerAddress(nodeId, base, Math.min(6000, remaining));
     } catch (error) {
       lastError = error;
       continue;
@@ -102,19 +130,37 @@ export async function requestWithTimeout<T>(path: string, options: RequestInit, 
   }
 }
 
-async function requestList<T>(path: string, target = baseUrl): Promise<T[]> {
-  const payload = await request<unknown>(path, {}, target);
+async function requestList<T>(path: string, target = baseUrl, timeoutMs?: number): Promise<T[]> {
+  const payload = timeoutMs === undefined
+    ? await request<unknown>(path, {}, target)
+    : await requestWithTimeout<unknown>(path, {}, target, timeoutMs);
   if (!Array.isArray(payload)) throw new Error(`节点返回的列表格式无效 (${path})`);
   return payload;
 }
 
 export const getInfo = (target = baseUrl) => request<NodeInfo>('/api/v1/info', {}, target);
-export const getPeers = (target = baseUrl) => requestList<PeerInfo>('/api/v1/peers', target);
+export const getPeers = (target = baseUrl) => requestList<PeerInfo>('/api/v1/peers', target, 6000);
 export const getMetrics = (target = baseUrl) => request<HardwareMetrics | null>('/api/v1/metrics', {}, target);
 export const getClipboard = (target = baseUrl) => request<ClipboardSnapshot | null>('/api/v1/clipboard', {}, target);
 export const getSettings = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', {}, target);
 export const patchSettings = (patch: NodeSettingsPatch, target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', { method: 'PATCH', body: JSON.stringify(patch) }, target, SETTINGS_WRITE_TIMEOUT_MS);
 export const requestUpdateCheck = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target, SETTINGS_WRITE_TIMEOUT_MS);
+// 节点可能在响应到达前重启；自动重试会对同一节点重复执行操作。
+export async function restartService(target: string, nodeId: string): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SETTINGS_WRITE_TIMEOUT_MS);
+  try {
+    const response = await fetch(apiUrl('/api/v1/management/service/restart', target), {
+      method: 'POST', cache: 'no-store', redirect: 'error', signal: controller.signal,
+      headers: { 'X-MeshShare-Target': nodeId },
+    });
+    if (!response.ok) throw await responseError(response);
+    if (response.status !== 202) throw new Error('节点未确认重启请求');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export const getClipboardHistory = (target = baseUrl) => request<ClipboardHistoryResponse>('/api/v1/clipboard/history', {}, target);
 export const getClipboardHistoryDetail = (eventId: string, target = baseUrl) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`, {}, target);
 export const clipboardHistoryThumbnailUrl = (eventId: string, target = baseUrl) => apiUrl(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/thumbnail`, target);
@@ -128,6 +174,9 @@ export const dismissMobileTransfer = (transferId: string, target = baseUrl) => r
 export const createMobileSession = (label?: string, target = baseUrl) => request<MobileSession>('/api/v1/mobile/sessions', { method: 'POST', body: JSON.stringify({ label }) }, target);
 export const getMobileSessions = (target = baseUrl) => requestList<MobileSession>('/api/v1/mobile/sessions', target);
 export const createMobileTransfer = (sessionId: string, offer: TransferOffer, target: string) => request<MobileTransferView>('/api/v1/mobile/transfers', { method: 'POST', body: JSON.stringify({ session_id: sessionId, offer }) }, target);
+export const sendManagedPathsToMobile = (sessionId: string, paths: string[], target: string) => request<MobileTransferView>(
+  '/api/v1/management/mobile/outgoing/paths', { method: 'POST', body: JSON.stringify({ session_id: sessionId, paths }) }, target,
+);
 export const getMobileTransfers = (sessionId?: string, target = baseUrl) => requestList<MobileTransferView>(`/api/v1/mobile/transfers${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`, target);
 export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId: string, autoComplete = false) => apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(transferId)}/items/${encodeURIComponent(itemId)}/download?session_id=${encodeURIComponent(sessionId)}${autoComplete ? '&auto_complete=true' : ''}`);
 /** 原生发送：先把清单和源文件交给本机节点，之后的上传由节点负责。 */

@@ -35,12 +35,12 @@ export async function putFile(url: string, file: File, mediaType: string, signal
 }
 
 /** 接收节点对同一项目的 PUT 幂等，暂时断网或服务忙时可以重发。 */
-export async function uploadFileWithRetry(url: string, file: File, mediaType: string): Promise<void> {
+export async function uploadFileWithRetry(url: string, file: File, mediaType: string, signal?: AbortSignal): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      return await putFile(url, file, mediaType);
+      return await putFile(url, file, mediaType, signal);
     } catch (error) {
-      if (attempt >= 3 || (error instanceof ApiError && !isRetryableHttpStatus(error.status))) throw error;
+      if (signal?.aborted || attempt >= 3 || (error instanceof ApiError && !isRetryableHttpStatus(error.status))) throw error;
       await new Promise((resolve) => window.setTimeout(resolve, 800 * 2 ** attempt));
     }
   }

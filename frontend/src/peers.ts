@@ -1,5 +1,7 @@
 import type { PeerInfo } from './types';
 
+export const HEADLESS_CAPABILITY = 'node.headless.v1';
+
 /** 网页模式下其他节点只能经接入节点的同源代理访问；非网页环境传 null。 */
 export type PeerWebContext = {
   selfNodeId: string | null;

@@ -20,6 +20,7 @@ pub const METRICS_GPU_CAPABILITY: &str = "metrics.gpu";
 pub const METRICS_NETWORK_CAPABILITY: &str = "metrics.network";
 pub const METRICS_SYSTEM_VIEW_CAPABILITY: &str = "metrics.view.system";
 pub const METRICS_GPU_VIEW_CAPABILITY: &str = "metrics.view.gpu";
+pub const MANAGED_MOBILE_PATHS_CAPABILITY: &str = "management.mobile-paths.v1";
 pub const REMOTE_MANAGEMENT_CAPABILITY: &str = "management.remote.v1";
 pub const TERMINAL_SSH_CAPABILITY: &str = "terminal.ssh.v3";
 pub const REMOTE_FILES_CAPABILITY: &str = "management.files.v1";

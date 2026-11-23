@@ -3,15 +3,21 @@ use super::*;
 #[derive(Debug, Clone)]
 pub struct MobileTransferRecord {
     pub session_id: String,
-    pub offer: TransferOffer,
     pub progress: TransferProgress,
     pub staged_directory: PathBuf,
+    pub(crate) managed_sources: Option<Arc<[ManagedMobilePath]>>,
     pub staged_items: HashSet<String>,
     pub downloaded_items: HashSet<String>,
     pub retryable_downloads: HashSet<String>,
     /// 创建时算好的清单序列化字节数，用于全局清单内存预算。
     pub manifest_bytes: u64,
     pub updated_at_ms: i64,
+}
+
+impl MobileTransferRecord {
+    pub(crate) fn offer(&self) -> &TransferOffer {
+        self.progress.offer.as_ref().expect("手机传输始终保留清单")
+    }
 }
 
 fn mobile_view(record: &MobileTransferRecord) -> MobileTransferView {
@@ -107,6 +113,15 @@ impl NodeRuntime {
         session_id: &str,
         offer: TransferOffer,
     ) -> Result<MobileTransferView, String> {
+        self.register_mobile_offer(session_id, offer, None)
+    }
+
+    pub(super) fn register_mobile_offer(
+        &self,
+        session_id: &str,
+        offer: TransferOffer,
+        managed_sources: Option<Arc<[ManagedMobilePath]>>,
+    ) -> Result<MobileTransferView, String> {
         if self.touch_mobile_session(session_id).is_none() {
             return Err("手机会话已过期".to_string());
         }
@@ -114,7 +129,16 @@ impl NodeRuntime {
         if self.update_installing.load(Ordering::SeqCst) {
             return Err(UPDATE_INSTALLING_MESSAGE.to_string());
         }
-        let manifest_bytes = mobile_manifest_size(&offer);
+        let source_bytes = managed_sources
+            .iter()
+            .flat_map(|v| v.iter())
+            .map(|s| {
+                (s.path.as_os_str().len()
+                    + s.item_id.len()
+                    + std::mem::size_of::<ManagedMobilePath>()) as u64
+            })
+            .sum::<u64>();
+        let manifest_bytes = mobile_manifest_size(&offer).saturating_add(source_bytes);
         if self
             .mobile_manifest_bytes
             .load(Ordering::SeqCst)
@@ -124,16 +148,13 @@ impl NodeRuntime {
             return Err("手机传输清单资源暂时不足，请稍后重试".to_string());
         }
         let mut transfers = self.mobile_transfers.write();
-        if transfers
-            .values()
-            .any(|record| record.offer.transfer_id == offer.transfer_id)
-        {
+        if transfers.contains_key(&offer.transfer_id) {
             return Err("手机传输任务已存在".to_string());
         }
         if transfers.len() >= MAX_MOBILE_TRANSFER_RECORDS {
             return Err("手机传输记录资源暂时不足，请稍后重试".to_string());
         }
-        let progress = transfer_progress(&offer, "receive");
+        let progress = transfer_progress(offer, "receive");
         // `transfer_id` 由对端提供，也会出现在 HTTP API 中。
         // 它只作为协议键使用，绝不作为路径组件：
         // 新生成的 UUID 给每个传输一个不透明的暂存目录，
@@ -141,9 +162,9 @@ impl NodeRuntime {
         let staged_directory = self.mobile_staging_root().join(Uuid::new_v4().to_string());
         let record = MobileTransferRecord {
             session_id: session_id.to_string(),
-            offer,
             progress,
             staged_directory,
+            managed_sources,
             staged_items: HashSet::new(),
             downloaded_items: HashSet::new(),
             retryable_downloads: HashSet::new(),
@@ -151,7 +172,7 @@ impl NodeRuntime {
             updated_at_ms: now_millis(),
         };
         let view = mobile_view(&record);
-        transfers.insert(record.offer.transfer_id.clone(), record);
+        transfers.insert(record.progress.transfer_id.clone(), record);
         self.mobile_manifest_bytes
             .fetch_add(manifest_bytes, Ordering::SeqCst);
         Ok(view)
@@ -329,8 +350,26 @@ impl NodeRuntime {
             .collect()
     }
 
+    /// 只有第一次接受时交给暂存任务；空切片继续标记这单不接受客户端上传。
+    pub(crate) fn take_managed_mobile_sources(&self, id: &str) -> Option<Arc<[ManagedMobilePath]>> {
+        let mut records = self.mobile_transfers.write();
+        let record = records.get_mut(id)?;
+        if record.progress.status != TransferStatus::Accepted {
+            return None;
+        }
+        let sources = record.managed_sources.as_mut()?;
+        (!sources.is_empty()).then(|| std::mem::take(sources))
+    }
+
     pub fn mobile_transfer(&self, transfer_id: &str) -> Option<MobileTransferRecord> {
         self.mobile_transfers.read().get(transfer_id).cloned()
+    }
+
+    pub(crate) fn mobile_transfer_view(&self, transfer_id: &str) -> Option<MobileTransferView> {
+        self.mobile_transfers
+            .read()
+            .get(transfer_id)
+            .map(mobile_view)
     }
 
     /// 删除失败的移动端传输记录，并释放其清单预算。
@@ -385,10 +424,11 @@ impl NodeRuntime {
     pub fn stage_mobile_item(
         &self,
         transfer_id: &str,
+        index: usize,
         item_id: &str,
         bytes: u64,
         digest: String,
-    ) -> Option<MobileTransferView> {
+    ) -> Option<()> {
         let mut transfers = self.mobile_transfers.write();
         let record = transfers.get_mut(transfer_id)?;
         if !matches!(
@@ -397,12 +437,8 @@ impl NodeRuntime {
         ) {
             return None;
         }
-        let item = record
-            .offer
-            .items
-            .iter_mut()
-            .find(|item| item.item_id == item_id)?;
-        if item.size != bytes {
+        let item = record.progress.offer.as_mut()?.items.get_mut(index)?;
+        if item.item_id != item_id || item.size != bytes {
             return None;
         }
         item.sha256 = digest;
@@ -416,11 +452,10 @@ impl NodeRuntime {
         } else {
             TransferStatus::Uploading
         };
-        record.progress.offer = Some(record.offer.clone());
-        Some(mobile_view(record))
+        Some(())
     }
 
-    pub fn begin_mobile_upload(&self, transfer_id: &str) -> Option<MobileTransferView> {
+    pub fn begin_mobile_upload(&self, transfer_id: &str) -> Option<()> {
         let mut transfers = self.mobile_transfers.write();
         let record = transfers.get_mut(transfer_id)?;
         if !matches!(
@@ -431,7 +466,7 @@ impl NodeRuntime {
         }
         record.progress.status = TransferStatus::Uploading;
         record.updated_at_ms = now_millis();
-        Some(mobile_view(record))
+        Some(())
     }
 
     pub fn mark_mobile_item_downloaded(
@@ -499,27 +534,16 @@ impl NodeRuntime {
     }
 
     pub fn mobile_item_path(&self, transfer_id: &str, item_id: &str) -> Option<PathBuf> {
-        let record = self.mobile_transfers.read().get(transfer_id)?.clone();
+        let transfers = self.mobile_transfers.read();
+        let record = transfers.get(transfer_id)?;
         if !record.staged_items.contains(item_id) {
             return None;
         }
         let item = record
-            .offer
+            .offer()
             .items
             .iter()
             .find(|item| item.item_id == item_id)?;
         Some(record.staged_directory.join(&item.relative_path))
-    }
-
-    pub fn mobile_item_already_staged(
-        &self,
-        transfer_id: &str,
-        item_id: &str,
-    ) -> Option<MobileTransferView> {
-        let record = self.mobile_transfers.read().get(transfer_id)?.clone();
-        record
-            .staged_items
-            .contains(item_id)
-            .then(|| mobile_view(&record))
     }
 }

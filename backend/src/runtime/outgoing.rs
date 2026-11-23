@@ -76,6 +76,9 @@ fn push_outgoing_source(
 
 /// 把用户选中的文件与文件夹展开成待发送清单，文件夹按选中目录名保留层级。
 fn expand_outgoing_paths(paths: &[String]) -> Result<(Vec<PreparedSource>, Vec<String>), String> {
+    if paths.is_empty() || paths.len() > OUTGOING_PREPARE_MAX_SELECTION {
+        return Err("需要选择 1 到 512 个文件或文件夹".into());
+    }
     let mut sources = Vec::new();
     let mut roots = Vec::new();
     let mut seen = HashSet::new();
@@ -121,6 +124,9 @@ fn expand_outgoing_paths(paths: &[String]) -> Result<(Vec<PreparedSource>, Vec<S
             return Err(format!("{raw} 不是普通文件或文件夹"));
         }
     }
+    if sources.is_empty() {
+        return Err("选择的内容里没有可发送的文件".into());
+    }
     sources.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok((sources, roots))
 }
@@ -154,6 +160,42 @@ struct PreparedSource {
     modified_ms: Option<i64>,
 }
 
+impl PreparedSource {
+    fn item(&self, index: usize, sha256: String) -> TransferItem {
+        TransferItem {
+            item_id: format!("{index}-{}", Uuid::new_v4()),
+            name: self.file_name.clone(),
+            relative_path: self.relative_path.clone(),
+            size: self.size,
+            sha256,
+            media_type: outgoing_media_type(&self.relative_path),
+            directory: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ManagedMobilePath {
+    pub(crate) item_index: usize,
+    pub(crate) item_id: String,
+    pub(crate) path: PathBuf,
+    size: u64,
+    modified_ms: Option<i64>,
+}
+
+impl ManagedMobilePath {
+    pub(crate) async fn verify_file(&self, file: &tokio::fs::File) -> Result<(), String> {
+        let metadata = file.metadata().await.map_err(|e| e.to_string())?;
+        if !metadata.is_file()
+            || metadata.len() != self.size
+            || file_modified_ms(&metadata) != self.modified_ms
+        {
+            return Err("源文件已变化，请重新发送".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OutgoingPrepareState {
     Preparing,
@@ -184,12 +226,91 @@ pub struct OutgoingPrepareView {
     pub total_items: usize,
 }
 
+const MAX_CONCURRENT_SOURCE_SCANS: u64 = 8;
+
+struct SourceScan<'a>(&'a AtomicU64);
+
+impl Drop for SourceScan<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl NodeRuntime {
+    fn reserve_source_scan(&self) -> Result<SourceScan<'_>, String> {
+        let _gate = self.transfer_update_gate.lock();
+        if self.update_installing.load(Ordering::SeqCst) {
+            return Err(UPDATE_INSTALLING_MESSAGE.to_owned());
+        }
+        if self.source_scans.load(Ordering::SeqCst) >= MAX_CONCURRENT_SOURCE_SCANS {
+            return Err("正在扫描的发送目录过多".to_owned());
+        }
+        self.source_scans.fetch_add(1, Ordering::SeqCst);
+        Ok(SourceScan(&self.source_scans))
+    }
+
+    pub(crate) fn offer_mobile_paths(
+        &self,
+        session_id: &str,
+        paths: &[String],
+    ) -> Result<MobileTransferView, String> {
+        let _scan = self.reserve_source_scan()?;
+        let (sources, _) = expand_outgoing_paths(paths)?;
+        let mut items = Vec::with_capacity(sources.len());
+        let mut originals = Vec::with_capacity(sources.len());
+        let mut total_bytes = 0u64;
+        for (index, source) in sources.into_iter().enumerate() {
+            let item = source.item(index, String::new());
+            total_bytes = total_bytes.checked_add(item.size).ok_or("文件总大小溢出")?;
+            originals.push(ManagedMobilePath {
+                item_index: index,
+                item_id: item.item_id.clone(),
+                path: source.path,
+                size: source.size,
+                modified_ms: source.modified_ms,
+            });
+            items.push(item);
+        }
+        let node = self.node_info();
+        let offer = TransferOffer {
+            transfer_id: Uuid::new_v4().to_string(),
+            source_node_id: node.node_id.clone(),
+            target_node_id: node.node_id,
+            source_name: node.node_name,
+            total_bytes,
+            items,
+            created_at_ms: now_millis(),
+        };
+        crate::server::validate_mobile_offer(&offer)?;
+        self.register_mobile_offer(session_id, offer, Some(originals.into()))
+    }
+
+    pub(super) fn has_preparing_outgoing(&self) -> bool {
+        if self.source_scans.load(Ordering::SeqCst) != 0
+            || self
+                .outgoing_prepares
+                .lock()
+                .values()
+                .any(|p| p.state == OutgoingPrepareState::Preparing)
+        {
+            return true;
+        }
+        // 已经建立的任务由传输状态判定，失败时保留的重试素材不阻止升级。
+        let staged = self
+            .staged_outgoing
+            .lock()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let transfers = self.transfers.read();
+        staged.iter().any(|id| !transfers.contains_key(id))
+    }
+
     pub fn add_outgoing_transfer(&self, offer: TransferOffer) -> TransferProgress {
         let peer_name = self.peer_name(&offer.target_node_id);
         let _update_gate = self.transfer_update_gate.lock();
         if self.update_installing.load(Ordering::SeqCst) {
-            let mut failed = transfer_progress(&offer, "send");
+            let mut failed = transfer_progress(offer, "send");
             failed.status = TransferStatus::Failed;
             failed.error = Some(UPDATE_INSTALLING_MESSAGE.to_string());
             return failed;
@@ -198,7 +319,7 @@ impl NodeRuntime {
         if let Some(record) = transfers.get(&offer.transfer_id) {
             return record.progress.clone();
         }
-        let mut progress = transfer_progress(&offer, "send");
+        let mut progress = transfer_progress(offer.clone(), "send");
         if !evict_terminal_transfer_if_needed(&mut transfers) {
             let mut failed = progress;
             failed.status = TransferStatus::Failed;
@@ -254,6 +375,10 @@ impl NodeRuntime {
         {
             return Err("传输项目标识无效".to_string());
         }
+        let _gate = self.transfer_update_gate.lock();
+        if self.update_installing.load(Ordering::SeqCst) {
+            return Err(UPDATE_INSTALLING_MESSAGE.to_owned());
+        }
         let directory = self.outgoing_staging_directory(&offer.transfer_id);
         let mut staged = self.staged_outgoing.lock();
         if staged.contains_key(&offer.transfer_id) {
@@ -282,13 +407,8 @@ impl NodeRuntime {
         target_node_id: String,
         paths: Vec<String>,
     ) -> Result<OutgoingPrepareView, String> {
-        if paths.is_empty() || paths.len() > OUTGOING_PREPARE_MAX_SELECTION {
-            return Err("需要选择 1 到 512 个文件或文件夹".to_string());
-        }
+        let _scan = self.reserve_source_scan()?;
         let (sources, source_roots) = expand_outgoing_paths(&paths)?;
-        if sources.is_empty() {
-            return Err("选择的内容里没有可发送的文件".to_string());
-        }
         let total_bytes = sources.iter().map(|source| source.size).sum::<u64>();
         let total_items = sources.len();
         let transfer_id = Uuid::new_v4().to_string();
@@ -415,15 +535,7 @@ impl NodeRuntime {
                     return;
                 }
             };
-            items.push(TransferItem {
-                item_id: format!("{index}-{}", Uuid::new_v4()),
-                name: source.file_name.clone(),
-                relative_path: source.relative_path.clone(),
-                size: source.size,
-                sha256: digest,
-                media_type: outgoing_media_type(&source.relative_path),
-                directory: false,
-            });
+            items.push(source.item(index, digest));
             self.add_outgoing_prepare_item(transfer_id);
         }
         let offer = TransferOffer {

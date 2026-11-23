@@ -1,18 +1,23 @@
+#[cfg(feature = "gui")]
 use crate::autostart;
 use crate::model::{
     ClipboardHistoryMode, ClipboardHistorySettings, ClipboardStatus, ReceiveSettings,
     TransferProgress, WireMessage,
 };
 use crate::runtime::{validate_receive_directory, NodeRuntime, UpdateFrequency};
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 use crate::updater::UpdateCoordinator;
 use crate::updater::UpdateStatus;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(not(target_os = "android"))]
+#[cfg(any(
+    all(feature = "gui", not(target_os = "android")),
+    all(feature = "headless", target_os = "linux")
+))]
 use std::sync::OnceLock;
 
+#[cfg(feature = "gui")]
 use tauri::AppHandle;
 
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +31,8 @@ pub struct MonitorSettingsSnapshot {
 pub struct SettingsSnapshot {
     pub clipboard_sync_enabled: bool,
     pub autostart_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_control_error: Option<String>,
     pub update_frequency: UpdateFrequency,
     pub update_status: Option<UpdateStatus>,
     pub receive_settings: ReceiveSettings,
@@ -59,8 +66,11 @@ pub struct SettingsPatch {
 /// Tauri 命令与远程 HTTP API 共用的控制面。
 pub struct ControlPlane {
     runtime: Arc<NodeRuntime>,
+    #[cfg(feature = "gui")]
     app: Option<AppHandle>,
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "headless", target_os = "linux"))]
+    headless: OnceLock<Arc<crate::headless_service::Coordinator>>,
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     updater: OnceLock<Arc<UpdateCoordinator>>,
 }
 
@@ -68,22 +78,39 @@ impl ControlPlane {
     pub fn runtime_only(runtime: Arc<NodeRuntime>) -> Arc<Self> {
         Arc::new(Self {
             runtime,
+            #[cfg(feature = "gui")]
             app: None,
-            #[cfg(not(target_os = "android"))]
+            #[cfg(all(feature = "headless", target_os = "linux"))]
+            headless: OnceLock::new(),
+            #[cfg(all(feature = "gui", not(target_os = "android")))]
             updater: OnceLock::new(),
         })
     }
 
+    #[cfg(all(feature = "headless", target_os = "linux"))]
+    pub fn start_headless(&self) {
+        self.headless
+            .get_or_init(|| crate::headless_service::Coordinator::start(self.runtime.clone()));
+    }
+
+    #[cfg(all(feature = "headless", target_os = "linux"))]
+    pub fn headless(&self) -> Option<&Arc<crate::headless_service::Coordinator>> {
+        self.headless.get()
+    }
+
+    #[cfg(feature = "gui")]
     pub fn with_app(runtime: Arc<NodeRuntime>, app: AppHandle) -> Arc<Self> {
         Arc::new(Self {
             runtime,
             app: Some(app),
-            #[cfg(not(target_os = "android"))]
+            #[cfg(all(feature = "headless", target_os = "linux"))]
+            headless: OnceLock::new(),
+            #[cfg(all(feature = "gui", not(target_os = "android")))]
             updater: OnceLock::new(),
         })
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub fn install_updater(&self, updater: Arc<UpdateCoordinator>) -> Result<(), String> {
         self.updater
             .set(updater)
@@ -91,52 +118,77 @@ impl ControlPlane {
     }
 
     fn monitor_capabilities(&self) -> crate::MonitorCapabilities {
+        #[cfg(not(feature = "gui"))]
+        return crate::MonitorCapabilities::unknown();
+        #[cfg(feature = "gui")]
         self.app.as_ref().map_or_else(
             crate::MonitorCapabilities::unknown,
             crate::current_monitor_capabilities,
         )
     }
 
-    pub fn snapshot(&self) -> SettingsSnapshot {
+    pub async fn snapshot(&self) -> SettingsSnapshot {
         let monitor_capabilities = self.monitor_capabilities();
+        #[cfg(not(feature = "gui"))]
+        let locked = false;
+        #[cfg(feature = "gui")]
         let locked = self.app.as_ref().map_or_else(
             || self.runtime.monitor_locked(),
             |app| crate::effective_monitor_locked(app, self.runtime.as_ref()),
         );
+        let autostart = Ok::<_, String>(self.runtime.autostart_enabled());
+        #[cfg(all(feature = "headless", target_os = "linux"))]
+        let autostart = match self.headless() {
+            Some(service) => service.autostart().await,
+            None => autostart,
+        };
+        #[cfg(all(feature = "gui", not(target_os = "android")))]
+        let update_status = self.updater.get().map(|updater| updater.status());
+        #[cfg(not(all(feature = "gui", not(target_os = "android"))))]
+        let update_status = None;
+        #[cfg(all(feature = "headless", target_os = "linux"))]
+        let update_status = self
+            .headless()
+            .map(|service| service.status())
+            .or(update_status);
         SettingsSnapshot {
             clipboard_sync_enabled: self
                 .runtime
                 .sync_enabled
                 .load(std::sync::atomic::Ordering::SeqCst),
-            autostart_enabled: self.runtime.autostart_enabled(),
+            autostart_enabled: autostart.as_ref().copied().unwrap_or(false),
+            service_control_error: autostart.err(),
             update_frequency: self.runtime.update_settings().0,
-            #[cfg(not(target_os = "android"))]
-            update_status: self.updater.get().map(|updater| updater.status()),
-            #[cfg(target_os = "android")]
-            update_status: None,
+            update_status,
             receive_settings: self.runtime.receive_settings(),
             clipboard_history_settings: self.runtime.clipboard_history_settings(),
             clipboard_status: self.runtime.clipboard_status(),
             monitor: MonitorSettingsSnapshot {
-                visible: self.runtime.monitor_visible(),
+                visible: !self.runtime.supports_capability("node.headless.v1")
+                    && self.runtime.monitor_visible(),
                 locked,
                 capabilities: monitor_capabilities,
             },
         }
     }
 
-    pub fn apply_patch(&self, patch: SettingsPatch) -> Result<SettingsSnapshot, String> {
+    pub async fn apply_patch(&self, patch: SettingsPatch) -> Result<SettingsSnapshot, String> {
+        #[cfg(all(feature = "headless", target_os = "linux"))]
+        if self.headless().is_some() && patch.monitor.is_some() {
+            return Err("无界面服务没有监控窗口".into());
+        }
         if let Some(value) = patch.clipboard_sync_enabled {
             self.runtime
                 .sync_enabled
                 .store(value, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(feature = "gui")]
             if let Some(app) = self.app.as_ref() {
                 crate::sync_tray_labels(app);
             }
         }
 
         if let Some(value) = patch.autostart_enabled {
-            self.set_autostart(value)?;
+            self.set_autostart(value).await?;
         }
 
         if let Some(value) = patch.update_frequency {
@@ -167,29 +219,53 @@ impl ControlPlane {
             }
         }
 
-        Ok(self.snapshot())
+        Ok(self.snapshot().await)
     }
 
-    pub fn request_update_check(&self) -> Result<SettingsSnapshot, String> {
-        #[cfg(not(target_os = "android"))]
+    pub async fn request_update_check(&self) -> Result<SettingsSnapshot, String> {
+        #[cfg(all(feature = "gui", not(target_os = "android")))]
         if let Some(updater) = self.updater.get() {
             updater.request_manual_check()?;
-            return Ok(self.snapshot());
+            return Ok(self.snapshot().await);
+        }
+        #[cfg(all(feature = "headless", target_os = "linux"))]
+        if let Some(service) = self.headless() {
+            service.request()?;
+            return Ok(self.snapshot().await);
         }
         Err("更新服务尚未初始化".to_string())
     }
 
     fn set_update_frequency(&self, frequency: UpdateFrequency) -> Result<(), String> {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(feature = "gui", not(target_os = "android")))]
         if let Some(updater) = self.updater.get() {
             return updater.set_frequency(frequency);
+        }
+        #[cfg(all(feature = "headless", target_os = "linux"))]
+        if let Some(service) = self.headless() {
+            return service.set_frequency(frequency);
         }
         self.runtime
             .set_update_frequency(frequency)
             .map_err(|error| format!("保存自动更新设置失败：{error}"))
     }
 
-    fn set_autostart(&self, enabled: bool) -> Result<(), String> {
+    async fn set_autostart(&self, enabled: bool) -> Result<(), String> {
+        #[cfg(all(feature = "headless", target_os = "linux"))]
+        if let Some(service) = self.headless() {
+            return service.set_autostart(enabled).await;
+        }
+        #[cfg(not(feature = "gui"))]
+        return self
+            .runtime
+            .set_autostart_enabled(enabled)
+            .map_err(|e| e.to_string());
+        #[cfg(feature = "gui")]
+        self.set_gui_autostart(enabled)
+    }
+
+    #[cfg(feature = "gui")]
+    fn set_gui_autostart(&self, enabled: bool) -> Result<(), String> {
         let Some(_app) = self.app.as_ref() else {
             self.runtime
                 .set_autostart_enabled(enabled)
@@ -229,24 +305,23 @@ impl ControlPlane {
     }
 
     fn set_monitor_visible(&self, visible: bool) -> Result<(), String> {
-        match self.app.as_ref() {
-            Some(app) => crate::apply_monitor_visible(app, self.runtime.as_ref(), visible),
-            None => self
-                .runtime
-                .set_monitor_visible(visible)
-                .map_err(|error| error.to_string()),
+        #[cfg(feature = "gui")]
+        if let Some(app) = self.app.as_ref() {
+            return crate::apply_monitor_visible(app, self.runtime.as_ref(), visible);
         }
+        self.runtime
+            .set_monitor_visible(visible)
+            .map_err(|e| e.to_string())
     }
 
     fn set_monitor_locked(&self, locked: bool) -> Result<(), String> {
+        #[cfg(feature = "gui")]
         if let Some(app) = self.app.as_ref() {
-            crate::apply_monitor_locked(app, self.runtime.as_ref(), locked)?;
-        } else {
-            self.runtime
-                .set_monitor_locked(locked)
-                .map_err(|error| error.to_string())?;
+            return crate::apply_monitor_locked(app, self.runtime.as_ref(), locked);
         }
-        Ok(())
+        self.runtime
+            .set_monitor_locked(locked)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -278,7 +353,7 @@ pub fn accept_transfer_at(
         };
         if !runtime.send_to_peer(&source_node_id, message.clone()) {
             let runtime = runtime.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 let _ = runtime
                     .send_to_peer_with_retry(&source_node_id, message)
                     .await;

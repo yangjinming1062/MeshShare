@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+[ "$1" = configure ] || exit 0
+
+account=meshshare-headless
+if ! getent passwd "$account" >/dev/null; then
+    adduser --system --group --no-create-home --home /var/lib/meshshare-headless \
+        --shell /bin/sh "$account"
+fi
+# An unrelated login with this name must not become a remote shell.
+if [ "$(id -u "$account")" = 0 ] || [ "$(id -gn "$account")" != "$account" ] ||
+   [ "$(getent passwd "$account" | cut -d: -f6)" != /var/lib/meshshare-headless ]; then
+    echo "Conflicting meshshare-headless system account" >&2
+    exit 1
+fi
+
+socket=meshshare-headless-control.socket
+unit=meshshare-headless.service
+# dpkg passes the old version even on reinstallation after remove. The package's
+# temporary mask distinguishes that case while preserving the administrator's boot choice.
+fresh=false
+if [ -z "${2:-}" ] || [ "$(readlink "/etc/systemd/system/$socket" || :)" = /dev/null ]; then
+    fresh=true
+fi
+for item in "$socket" "$unit"; do
+    deb-systemd-helper unmask "$item" >/dev/null
+    if deb-systemd-helper --quiet was-enabled "$item"; then
+        deb-systemd-helper enable "$item" >/dev/null
+    else
+        deb-systemd-helper update-state "$item"
+    fi
+done
+if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+    deb-systemd-invoke start "$socket"
+    if "$fresh"; then
+        deb-systemd-invoke start "$unit"
+    elif systemctl is-active --quiet "$unit"; then
+        # Restart running nodes even when their next-boot preference is disabled.
+        deb-systemd-invoke restart "$unit"
+    fi
+fi

@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+case "$1" in
+    remove)
+        deb-systemd-helper mask meshshare-headless.service meshshare-headless-control.socket
+        ;;
+    purge)
+        deb-systemd-helper purge meshshare-headless.service meshshare-headless-control.socket
+        deb-systemd-helper unmask meshshare-headless.service meshshare-headless-control.socket
+        ;;
+esac
+if [ "$1" = remove ] && [ -d /run/systemd/system ]; then
+    systemctl daemon-reload
+fi

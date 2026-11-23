@@ -2,7 +2,7 @@
 
 ## HTTP 接口
 
-业务错误使用 `{ "error": "..." }`。适用网络与授权条件见[信任边界](ARCHITECTURE.md#信任边界)。
+业务错误使用 `{ "error": "..." }`。远程管理请求可以通过 `X-MeshShare-Target` 指定预期节点 ID；节点在处理请求前校验该值，不匹配时返回 421。桌面端在写入前还会用 `GET /api/v1/info` 核对地址，以兼容忽略该请求头的旧节点。适用网络与授权条件见[信任边界](ARCHITECTURE.md#信任边界)。
 
 ### 节点与设置
 
@@ -18,6 +18,10 @@
 | `GET` | `/api/v1/mobile/access` | 网页 HTTP/HTTPS 地址和 CA 指纹 |
 | `GET` | `/api/v1/mobile/ca` | 下载接入节点的本地 CA |
 | `POST` | `/api/v1/peers/connect` | 通过手动地址发起连接 |
+
+支持 `node.headless.v1` 的 Linux 服务沿用握手版本 2。它报告 `clipboard.view`，在保存最新快照后按事件 ID 去重并转发，且不请求写入系统剪贴板。普通只读节点仍按原语义处理。
+
+Headless 的 `autostart_enabled` 读写 systemd 自启状态。如果无法读取，设置快照用可选的 `service_control_error` 返回原因，客户端停用服务控制。远程管理通过 `POST /api/v1/management/service/restart` 请求重启，必须使用 `X-MeshShare-Target` 发送预期的节点 ID，无请求体。目标不匹配返回 421，工作进行中返回 409，无法提交给控制助手返回 503，接受后返回无正文的 202。连接可能在重启时中断，客户端按节点 ID 重连，避免重新提交同一重启请求。
 
 设置中的 `monitor.visible` 表示保存的用户显示偏好，不表示窗口当前一定可见。全屏自动隐藏仅在桌面壳内临时生效，不修改该字段；全屏期间设置为 `true` 后仍需等全屏条件解除才显示，设置为 `false` 则解除后也不会自动显示。
 
@@ -73,10 +77,11 @@
 | `GET` | `/api/v1/management/files/roots` | 可浏览的起始位置 |
 | `GET` | `/api/v1/management/files?path=...` | 列出目标目录一层内容，只返回名称、类型、大小和时间 |
 | `POST` | `/api/v1/management/outgoing/paths` | 用目标机器绝对路径建立发送任务 |
+| `POST` | `/api/v1/management/mobile/outgoing/paths` | 从目标机器的路径发送到其网页会话（要求能力 `management.mobile-paths.v1` 和远程文件访问授权），传入 `session_id` 和 `paths`，返回待确认的网页传输 |
 | `GET` | `/api/v1/management/outgoing/{id}` | 查询远程准备进度；结束或取消后 404 |
 | `POST` | `/api/v1/management/outgoing/{id}/cancel` | 取消远程准备任务 |
 
-远程管理需要目标声明 `management.remote.v1`。从目标磁盘选择文件还需要 `management.files.v1`。管理接口只返回目录元数据，路径发送的 `target_node_id` 必须是目标已连接的 peer，发送源固定为目标节点自身。这组接口只在目标机器本机开启 `remote_file_access` 时可用，关闭时统一返回 403；该设置不出现在 `GET/PATCH /api/v1/settings` 中。相对路径返回 400，不可访问路径返回 404。
+远程管理需要目标声明 `management.remote.v1`。从目标磁盘选择文件还需要 `management.files.v1`。管理接口只返回目录元数据，路径发送的 `target_node_id` 必须是目标已连接的 peer，发送源固定为目标节点自身。这组接口要求目标机器开启 `remote_file_access`（桌面默认关闭，新安装的 Headless 服务默认开启），关闭时统一返回 403；该设置不出现在 `GET/PATCH /api/v1/settings` 中。相对路径返回 400，不可访问路径返回 404。
 
 ### 桌面终端
 

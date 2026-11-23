@@ -601,7 +601,12 @@ fn update_frequency_parser_rejects_unknown_values() {
 #[test]
 fn terminal_reservation_and_update_install_exclude_each_other() {
     let path = temp_data_dir();
-    let runtime = NodeRuntime::new(path.clone(), 0, "test".into()).unwrap();
+    let profile = if cfg!(all(feature = "headless", not(feature = "gui"))) {
+        NodeProfile::Headless
+    } else {
+        NodeProfile::current()
+    };
+    let runtime = NodeRuntime::new_with_profile(path.clone(), 0, "test".into(), profile).unwrap();
     let local = runtime.reserve_terminal().unwrap();
     let remote = runtime.reserve_terminal().unwrap();
     assert!(!runtime.begin_update_install());
@@ -663,7 +668,20 @@ fn active_transfers_block_update_installation() {
         )
         .expect("mark transfer failed");
     assert!(!runtime.has_active_transfers());
+    let pending = mobile_offer(&runtime, "staging-before-update", 1);
+    runtime.begin_outgoing_staging(pending.clone()).unwrap();
+    assert!(!runtime.begin_update_install());
+    runtime.remove_outgoing_staging(&pending.transfer_id);
     assert!(runtime.begin_update_install());
+    assert!(runtime.begin_outgoing_staging(pending).is_err());
+    let source = path.join("source.txt");
+    std::fs::write(&source, "payload").unwrap();
+    assert_eq!(
+        runtime
+            .begin_outgoing_paths("peer".into(), vec![source.display().to_string()])
+            .unwrap_err(),
+        super::UPDATE_INSTALLING_MESSAGE
+    );
     let blocked = runtime.add_outgoing_transfer(mobile_offer(&runtime, "blocked", 1));
     assert_eq!(blocked.status, TransferStatus::Failed);
     assert!(runtime
@@ -1472,6 +1490,7 @@ fn mobile_transfer_history_is_scoped_to_session() {
         runtime
             .stage_mobile_item(
                 transfer_id,
+                0,
                 &format!("{transfer_id}-item"),
                 4,
                 "hash".to_string(),
@@ -1573,7 +1592,7 @@ fn history_deletion_from_peer_only_removes_paired_entries() {
         .set_mobile_transfer_status("mobile-one", &session.session_id, TransferStatus::Accepted)
         .expect("accept mobile transfer");
     runtime
-        .stage_mobile_item("mobile-one", "mobile-one-item", 4, "hash".to_string())
+        .stage_mobile_item("mobile-one", 0, "mobile-one-item", 4, "hash".to_string())
         .expect("stage mobile item");
     runtime
         .mark_mobile_item_downloaded("mobile-one", "mobile-one-item", false)
@@ -1759,9 +1778,10 @@ fn mobile_transfer_requires_acceptance_and_becomes_ready_after_staging() {
             TransferStatus::Accepted,
         )
         .expect("accept mobile transfer");
-    let ready = runtime
-        .stage_mobile_item("mobile-transfer", "item", 3, "hash".to_string())
+    runtime
+        .stage_mobile_item("mobile-transfer", 0, "item", 3, "hash".to_string())
         .expect("stage item");
+    let ready = runtime.mobile_transfer_view("mobile-transfer").unwrap();
     assert_eq!(ready.progress.status, TransferStatus::Ready);
     let (unchanged, cleanup) = runtime
         .set_mobile_transfer_status(
@@ -1785,6 +1805,49 @@ fn mobile_transfer_requires_acceptance_and_becomes_ready_after_staging() {
         .mobile_item_path("mobile-transfer", "item")
         .is_some());
     let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
+fn mobile_staging_updates_each_manifest_slot_in_place() {
+    let path = temp_data_dir();
+    let runtime = NodeRuntime::new(path.clone(), 0, "test".into()).unwrap();
+    let session = runtime.create_mobile_session("phone".into()).unwrap();
+    let mut offer = mobile_offer(&runtime, "many-small-files", 1);
+    let template = offer.items.pop().unwrap();
+    let count = super::OUTGOING_PREPARE_MAX_ITEMS;
+    offer.items = (0..count)
+        .map(|i| TransferItem {
+            item_id: i.to_string(),
+            relative_path: format!("{i}.bin"),
+            ..template.clone()
+        })
+        .collect();
+    offer.total_bytes = count as u64;
+    let id = offer.transfer_id.clone();
+    runtime
+        .create_mobile_transfer(&session.session_id, offer)
+        .unwrap();
+    runtime
+        .set_mobile_transfer_status(&id, &session.session_id, TransferStatus::Accepted)
+        .unwrap();
+    assert!(runtime
+        .stage_mobile_item(&id, 1, "0", 1, "bad".into())
+        .is_none());
+    for i in (0..count).rev() {
+        let item_id = i.to_string();
+        runtime.begin_mobile_upload(&id).unwrap();
+        runtime
+            .stage_mobile_item(&id, i, &item_id, 1, format!("digest-{i}"))
+            .unwrap();
+    }
+    let progress = runtime.mobile_transfer_view(&id).unwrap().progress;
+    assert_eq!(progress.status, TransferStatus::Ready);
+    assert_eq!(progress.completed_items, count);
+    assert_eq!(progress.completed_bytes, count as u64);
+    for (i, item) in progress.offer.unwrap().items.iter().enumerate() {
+        assert_eq!(item.sha256, format!("digest-{i}"));
+    }
+    std::fs::remove_dir_all(path).unwrap();
 }
 
 #[test]
@@ -1983,7 +2046,13 @@ fn recently_completed_mobile_transfer_uses_completion_time_for_retention() {
         )
         .expect("accept mobile transfer");
     runtime
-        .stage_mobile_item("recent-mobile", "recent-mobile-item", 1, "hash".to_string())
+        .stage_mobile_item(
+            "recent-mobile",
+            0,
+            "recent-mobile-item",
+            1,
+            "hash".to_string(),
+        )
         .expect("stage mobile item");
     runtime
         .mark_mobile_item_downloaded("recent-mobile", "recent-mobile-item", false)
@@ -3258,4 +3327,59 @@ async fn outgoing_paths_fail_when_source_changes() {
     server.abort();
     let _ = server.await;
     let _ = std::fs::remove_dir_all(&sender_dir);
+}
+
+#[tokio::test]
+async fn headless_stores_and_relays_a_remote_event_once_without_writing_a_system_clipboard() {
+    let path = temp_data_dir();
+    let start = || {
+        NodeRuntime::new_with_profile(path.clone(), 0, "1.0.0".into(), NodeProfile::Headless)
+            .unwrap()
+    };
+    let nas = start();
+    let id = nas.node_id();
+    assert!(nas.remote_file_access());
+    assert!(nas.supports_capability(crate::model::TERMINAL_SSH_CAPABILITY));
+    assert!(!nas.clipboard_status().retrying);
+    let wire = WireMessage::ClipboardUpdate {
+        event: ClipboardEvent {
+            event_id: "relay-test".into(),
+            origin_node_id: "a".into(),
+            clock: Hlc {
+                physical_ms: 1,
+                logical: 0,
+                node_id: "a".into(),
+            },
+            text: Some("relay through NAS".into()),
+            image_png: None,
+            updated_at_ms: 1,
+        },
+    };
+    let (sender, mut second) = mpsc::channel(4);
+    nas.set_peer(test_peer("b", vec!["clipboard.text".into()]));
+    assert!(nas.add_peer_channel("b".into(), sender));
+    for source in ["a", "a", "b"] {
+        crate::server::handle_wire_message(wire.clone(), &nas, Some(source)).await;
+    }
+    assert!(matches!(
+        second.try_recv(),
+        Ok(WireMessage::ClipboardUpdate { .. })
+    ));
+    assert!(second.try_recv().is_err());
+    assert_eq!(nas.clipboard_history_list().items.len(), 1);
+    #[cfg(not(target_os = "android"))]
+    assert!(nas.take_system_clipboard_write().is_none());
+    drop(nas);
+    assert!(
+        NodeRuntime::new_with_profile(path.clone(), 0, "1.0.0".into(), NodeProfile::Desktop)
+            .is_err()
+    );
+    let restarted = start();
+    assert_eq!(restarted.node_id(), id);
+    assert_eq!(
+        restarted.clipboard_snapshot().unwrap().text.as_deref(),
+        Some("relay through NAS")
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(path).unwrap();
 }

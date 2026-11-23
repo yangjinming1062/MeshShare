@@ -15,7 +15,7 @@ use crate::runtime::{
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
-use axum::middleware::{from_fn, Next};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::Response as AxumResponse;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -245,6 +245,12 @@ pub fn router_with_control(
     } else {
         app.route("/api/v1/terminal/ssh", get(terminal_upgrade))
     };
+    #[cfg(all(feature = "headless", target_os = "linux"))]
+    let app = if state.runtime.supports_capability("node.headless.v1") {
+        app.route("/api/v1/management/service/restart", post(restart_headless))
+    } else {
+        app
+    };
     app.route("/api/v1/info", get(info))
         .route("/api/v1/peers", get(peers))
         .route("/api/v1/metrics", get(metrics))
@@ -372,6 +378,10 @@ pub fn router_with_control(
         .route("/api/v1/outgoing/:id/start", post(start_outgoing_staging))
         .route("/api/v1/outgoing/:id/cancel", post(cancel_outgoing_staging))
         .route("/api/v1/outgoing/:id", get(outgoing_prepare_status))
+        .route(
+            "/api/v1/management/mobile/outgoing/paths",
+            post(create_managed_mobile_offer),
+        )
         .route("/api/v1/management/files/roots", get(management_file_roots))
         .route("/api/v1/management/files", get(management_files))
         .route(
@@ -395,6 +405,7 @@ pub fn router_with_control(
         )
         .fallback_service(ServeDir::new(static_root).fallback(ServeFile::new(index)))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(from_fn_with_state(state.runtime.clone(), target_guard))
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin, _| {
@@ -405,6 +416,22 @@ pub fn router_with_control(
         )
         .layer(from_fn(origin_guard))
         .with_state(state)
+}
+
+async fn target_guard(
+    State(runtime): State<Arc<NodeRuntime>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> AxumResponse {
+    if request
+        .headers()
+        .get("x-meshshare-target")
+        .is_some_and(|id| id.as_bytes() != runtime.node_id().as_bytes())
+    {
+        return ApiError::new(StatusCode::MISDIRECTED_REQUEST, "地址上的设备与目标不匹配")
+            .into_response();
+    }
+    next.run(request).await
 }
 
 #[cfg(not(target_os = "android"))]
@@ -480,7 +507,37 @@ async fn metrics(State(state): State<AppState>) -> Json<Option<HardwareMetrics>>
 }
 
 async fn settings(State(state): State<AppState>) -> Json<SettingsSnapshot> {
-    Json(state.control.snapshot())
+    Json(state.control.snapshot().await)
+}
+
+#[cfg(all(feature = "headless", target_os = "linux"))]
+async fn restart_headless(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    if headers
+        .get("x-meshshare-target")
+        .and_then(|id| id.to_str().ok())
+        != Some(&state.runtime.node_id())
+    {
+        return Err(ApiError::new(
+            StatusCode::MISDIRECTED_REQUEST,
+            "重启请求的目标节点不匹配",
+        ));
+    }
+    let service = state
+        .control
+        .headless()
+        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "服务控制尚未就绪"))?;
+    service.restart().await.map_err(|error| match error {
+        crate::headless_service::RestartError::Busy => {
+            ApiError::conflict("文件准备、传输、终端或维护正在进行，暂时无法重启")
+        }
+        crate::headless_service::RestartError::Unavailable(reason) => {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, reason)
+        }
+    })?;
+    Ok(StatusCode::ACCEPTED)
 }
 
 async fn patch_settings(
@@ -490,6 +547,7 @@ async fn patch_settings(
     state
         .control
         .apply_patch(patch)
+        .await
         .map(Json)
         .map_err(ApiError::bad_request)
 }
@@ -500,6 +558,7 @@ async fn request_update_check(
     state
         .control
         .request_update_check()
+        .await
         .map(Json)
         .map_err(ApiError::conflict)
 }
@@ -1174,6 +1233,50 @@ impl Drop for DesktopTempFileGuard {
     }
 }
 
+pub(crate) fn validate_mobile_offer(offer: &TransferOffer) -> Result<(), String> {
+    validate_offer(offer, false).map_err(|error| error.message)
+}
+
+#[derive(Deserialize)]
+struct ManagedMobileRequest {
+    session_id: String,
+    paths: Vec<String>,
+}
+
+async fn create_managed_mobile_offer(
+    State(state): State<AppState>,
+    Json(request): Json<ManagedMobileRequest>,
+) -> Result<Json<MobileTransferView>, ApiError> {
+    if !state
+        .runtime
+        .supports_capability(crate::model::MANAGED_MOBILE_PATHS_CAPABILITY)
+    {
+        return Err(ApiError::not_found(
+            "当前节点不支持从本机路径发送到网页会话",
+        ));
+    }
+    ensure_remote_file_access(&state)?;
+    state
+        .runtime
+        .touch_mobile_session(&request.session_id)
+        .ok_or_else(|| ApiError::not_found("手机会话已过期"))?;
+    tokio::task::spawn_blocking(move || {
+        state
+            .runtime
+            .offer_mobile_paths(&request.session_id, &request.paths)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map(Json)
+    .map_err(|e| {
+        if e == UPDATE_INSTALLING_MESSAGE {
+            ApiError::new(StatusCode::TOO_EARLY, e)
+        } else {
+            ApiError::bad_request(e)
+        }
+    })
+}
+
 async fn create_mobile_transfer(
     State(state): State<AppState>,
     Json(mut payload): Json<MobileTransferCreateRequest>,
@@ -1232,6 +1335,27 @@ async fn mobile_session_action(
     if let Some(directory) = cleanup {
         cleanup_mobile_staging_directory(&directory).await;
     }
+    if let Some(sources) = state.runtime.take_managed_mobile_sources(transfer_id) {
+        let state = state.clone();
+        let transfer_id = transfer_id.to_string();
+        tokio::spawn(async move {
+            for source in sources.iter() {
+                let result = stage_managed_mobile_path(&state, &transfer_id, source).await;
+                if let Err(error) = result {
+                    if let Some(record) = state.runtime.mobile_transfer(&transfer_id) {
+                        fail_mobile_upload(
+                            &state.runtime,
+                            &transfer_id,
+                            &record.staged_directory,
+                            error.message,
+                        )
+                        .await;
+                    }
+                    break;
+                }
+            }
+        });
+    }
     Ok(Json(view))
 }
 
@@ -1244,7 +1368,7 @@ async fn fail_mobile_transfer(
         .runtime
         .mobile_transfer(&id)
         .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
-    if record.offer.source_node_id != state.runtime.node_id() {
+    if record.offer().source_node_id != state.runtime.node_id() {
         return Err(ApiError::forbidden("手机传输来源不匹配"));
     }
     let message = payload
@@ -1278,47 +1402,106 @@ async fn upload_mobile_item(
     State(state): State<AppState>,
     body: Body,
 ) -> Result<Json<MobileTransferView>, ApiError> {
-    let record = state
+    stage_mobile_body(&state, &transfer_id, &item_id, body, None).await?;
+    state
         .runtime
-        .mobile_transfer(&transfer_id)
-        .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
-    if record.offer.source_node_id != state.runtime.node_id()
-        || !matches!(
-            record.progress.status,
-            TransferStatus::Accepted | TransferStatus::Uploading
+        .mobile_transfer_view(&transfer_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("手机传输不存在"))
+}
+
+async fn stage_managed_mobile_path(
+    state: &AppState,
+    id: &str,
+    source: &crate::runtime::ManagedMobilePath,
+) -> Result<(), ApiError> {
+    ensure_remote_file_access(state)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = options
+        .open(&source.path)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("打开源文件失败：{e}")))?;
+    source
+        .verify_file(&file)
+        .await
+        .map_err(ApiError::bad_request)?;
+    let reader = tokio_util::io::ReaderStream::new(
+        file.try_clone()
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?,
+    );
+    stage_mobile_body(
+        state,
+        id,
+        &source.item_id,
+        Body::from_stream(reader),
+        Some((source, &file)),
+    )
+    .await
+}
+
+async fn stage_mobile_body(
+    state: &AppState,
+    transfer_id: &str,
+    item_id: &str,
+    body: Body,
+    origin: Option<(&crate::runtime::ManagedMobilePath, &fs::File)>,
+) -> Result<(), ApiError> {
+    let _item_lock;
+    let (session_id, staged_directory, index, item, staged) = {
+        let transfers = state.runtime.mobile_transfers.read();
+        let record = transfers
+            .get(transfer_id)
+            .ok_or_else(|| ApiError::not_found("手机传输不存在"))?;
+        if record.managed_sources.is_some() != origin.is_some() {
+            return Err(ApiError::forbidden("这项传输由目标节点读取源文件"));
+        }
+        let offer = record.offer();
+        if offer.source_node_id != state.runtime.node_id()
+            || !matches!(
+                record.progress.status,
+                TransferStatus::Accepted | TransferStatus::Uploading
+            )
+        {
+            return Err(ApiError::conflict("手机传输尚未被接受"));
+        }
+        let index = match origin {
+            Some((source, _)) => Some(source.item_index),
+            None => offer.items.iter().position(|item| item.item_id == item_id),
+        }
+        .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
+        let item = offer
+            .items
+            .get(index)
+            .filter(|item| item.item_id == item_id)
+            .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
+        _item_lock = TransferItemLock::new(&state.runtime, transfer_id, item_id)?;
+        (
+            record.session_id.clone(),
+            record.staged_directory.clone(),
+            index,
+            item.clone(),
+            record.staged_items.contains(item_id),
         )
-    {
-        return Err(ApiError::conflict("手机传输尚未被接受"));
-    }
-    if state
-        .runtime
-        .touch_mobile_session(&record.session_id)
-        .is_none()
-    {
+    };
+    if state.runtime.touch_mobile_session(&session_id).is_none() {
         return Err(ApiError::not_found("手机会话已过期"));
     }
-    let item = record
-        .offer
-        .items
-        .iter()
-        .find(|item| item.item_id == item_id)
-        .ok_or_else(|| ApiError::not_found("传输项目不存在"))?;
     if item.directory || has_parent_component(&item.relative_path) || item.relative_path.is_empty()
     {
         return Err(ApiError::bad_request("传输路径无效"));
     }
-    let _item_lock = TransferItemLock::new(&state.runtime, &transfer_id, &item_id)?;
-    if let Some(progress) = state
-        .runtime
-        .mobile_item_already_staged(&transfer_id, &item_id)
-    {
-        return Ok(Json(progress));
+    if staged {
+        return Ok(());
     }
-    ensure_directory_without_symlink(&record.staged_directory).await?;
-    let target = prepare_target(&record.staged_directory, &item.relative_path).await?;
+    ensure_directory_without_symlink(&staged_directory).await?;
+    let target = prepare_target(&staged_directory, &item.relative_path).await?;
     state
         .runtime
-        .begin_mobile_upload(&transfer_id)
+        .begin_mobile_upload(transfer_id)
         .ok_or_else(|| ApiError::conflict("手机传输已结束"))?;
     let temp = target.with_extension(format!("meshshare-{}.part", uuid::Uuid::new_v4()));
     let file = match fs::OpenOptions::new()
@@ -1332,32 +1515,27 @@ async fn upload_mobile_item(
             let message = format!("无法创建手机临时文件：{error}");
             fail_mobile_upload(
                 &state.runtime,
-                &transfer_id,
-                &record.staged_directory,
+                transfer_id,
+                &staged_directory,
                 message.clone(),
             )
             .await;
             return Err(ApiError::internal(message));
         }
     };
-    let stream_result = stream_body_to_file(
-        body,
-        file,
-        item.size,
-        &record.staged_directory,
-        |_chunk_bytes| {
-            if state
-                .runtime
-                .touch_mobile_session(&record.session_id)
-                .is_none()
-            {
+    let stream_result =
+        stream_body_to_file(body, file, item.size, &staged_directory, |_chunk_bytes| {
+            if state.runtime.touch_mobile_session(&session_id).is_none() {
                 return Err(ApiError::not_found("手机会话已过期"));
             }
-            state.runtime.touch_mobile_transfer_activity(&transfer_id);
+            if !state.runtime.touch_mobile_transfer_activity(transfer_id)
+                || (origin.is_some() && !state.runtime.remote_file_access())
+            {
+                return Err(ApiError::conflict("手机上传已取消或授权已关闭"));
+            }
             Ok(())
-        },
-    )
-    .await;
+        })
+        .await;
     let (total, digest) = match stream_result {
         Ok(value) => value,
         Err(error) => {
@@ -1365,18 +1543,24 @@ async fn upload_mobile_item(
             return Err(error);
         }
     };
+    if let Some((source, file)) = origin {
+        if let Err(error) = source.verify_file(file).await {
+            remove_file_with_diagnostics(&temp).await;
+            return Err(ApiError::bad_request(error));
+        }
+    }
     if total != item.size || !digest_matches(&item.sha256, &digest) {
         remove_file_with_diagnostics(&temp).await;
         fail_mobile_upload(
             &state.runtime,
-            &transfer_id,
-            &record.staged_directory,
+            transfer_id,
+            &staged_directory,
             "文件校验失败".to_string(),
         )
         .await;
         return Err(ApiError::bad_request("文件校验失败"));
     }
-    let target = match prepare_target(&record.staged_directory, &item.relative_path).await {
+    let target = match prepare_target(&staged_directory, &item.relative_path).await {
         Ok(target) => target,
         Err(error) => {
             remove_file_with_diagnostics(&temp).await;
@@ -1394,14 +1578,15 @@ async fn upload_mobile_item(
         return Err(ApiError::internal(error.to_string()));
     }
     remove_file_with_diagnostics(&temp).await;
-    let Some(progress) = state
+    if state
         .runtime
-        .stage_mobile_item(&transfer_id, &item_id, total, digest)
-    else {
+        .stage_mobile_item(transfer_id, index, item_id, total, digest)
+        .is_none()
+    {
         remove_file_with_diagnostics(&target).await;
         return Err(ApiError::conflict("手机传输已取消或完成"));
-    };
-    Ok(Json(progress))
+    }
+    Ok(())
 }
 
 /// Windows 上，显式完成请求可能先于下载响应关闭文件句柄。
@@ -1470,7 +1655,7 @@ async fn download_mobile_item(
         return Err(ApiError::conflict("文件尚未准备好下载"));
     }
     let item = record
-        .offer
+        .offer()
         .items
         .iter()
         .find(|item| item.item_id == item_id)
@@ -1565,7 +1750,7 @@ async fn complete_mobile_item(
         return Err(ApiError::forbidden("手机会话不匹配"));
     }
     if !record
-        .offer
+        .offer()
         .items
         .iter()
         .any(|item| item.item_id == item_id)

@@ -1,9 +1,9 @@
 use crate::runtime::NodeRuntime;
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 mod desktop;
-#[cfg(not(target_os = "android"))]
+#[cfg(all(feature = "gui", not(target_os = "android")))]
 pub(crate) use desktop::UpdateCoordinator;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +30,32 @@ pub struct UpdateStatus {
     pub downloaded_bytes: u64,
     pub content_length: Option<u64>,
     pub error: Option<String>,
+}
+
+#[cfg(any(
+    all(feature = "gui", not(target_os = "android")),
+    all(feature = "headless", target_os = "linux")
+))]
+pub(super) fn is_due(
+    frequency: crate::runtime::UpdateFrequency,
+    last_checked_at_ms: Option<i64>,
+    pending: bool,
+    retry_at_ms: Option<i64>,
+    now_ms: i64,
+    manual: bool,
+) -> bool {
+    if manual || frequency == crate::runtime::UpdateFrequency::Disabled {
+        return manual;
+    }
+    if let Some(retry_at_ms) = retry_at_ms {
+        return now_ms >= retry_at_ms;
+    }
+    pending
+        || last_checked_at_ms.is_none_or(|at| {
+            frequency
+                .period_ms()
+                .is_some_and(|period| now_ms.saturating_sub(at) >= period)
+        })
 }
 
 pub(crate) struct UpdateInstallGuard<'a> {
