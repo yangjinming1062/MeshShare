@@ -47,7 +47,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: http:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http: ws:"
+      "csp": "default-src 'self'; img-src 'self' data: http:; style-src 'self' 'unsafe-inline'; style-src-attr 'none'; script-src 'self'; connect-src 'self' ipc: http: ws:",
+      "dangerousDisableAssetCspModification": ["style-src"]
     },
     "trayIcon": {
       "id": "meshshare",
