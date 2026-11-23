@@ -78,7 +78,7 @@ test('large pastes and following keystrokes stay ordered; a disconnected tab dro
   assert.deepEqual(tab.states, ['connected', 'ended']);
 });
 
-test('resizes during pairing apply once after connection and closing a pending tab cancels its eventual session', async () => {
+test('resizes during connection apply once and closing a pending tab cancels its eventual session', async () => {
   const open = deferred();
   const tab = session(open.promise);
   tab.ui.resize(90, 24);

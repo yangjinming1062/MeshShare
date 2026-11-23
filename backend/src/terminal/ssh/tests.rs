@@ -7,18 +7,28 @@ use std::fs;
 use std::net::SocketAddr;
 use tokio::io::AsyncReadExt;
 
-fn inject_host_key(node: &NodeRuntime) {
-    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-    node.ssh.host.inject_key(key);
+fn remote_source() -> SocketAddr {
+    let local = crate::runtime::bind_addresses();
+    let ip = (1..=254)
+        .map(|last| std::net::Ipv4Addr::new(192, 168, 217, last))
+        .find(|ip| !local.contains(ip))
+        .unwrap();
+    SocketAddr::from((ip, 45123))
 }
 
-async fn wait_for_peer(node: &NodeRuntime, peer: &NodeRuntime, enabled: bool) {
+async fn wait_for_peer(node: &NodeRuntime, peer: &NodeRuntime, offers_host: bool) {
     let id = peer.node_id();
+    let client = peer.ssh.client_fingerprint();
+    let host = if offers_host {
+        peer.ssh.host_fingerprint()
+    } else {
+        None
+    };
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !node.terminal_peer_keys(&id).is_some_and(|keys| {
-            keys.client_fingerprint == peer.ssh.client_fingerprint()
-                && keys.host_fingerprint.is_some() == enabled
-        }) || node.peer_supports(&id, crate::model::TERMINAL_SSH_CAPABILITY) != enabled
+        while !node
+            .terminal_peer_keys(&id)
+            .is_some_and(|keys| keys.client_fingerprint == client && keys.host_fingerprint == host)
+            || node.peer_supports(&id, crate::model::TERMINAL_SSH_CAPABILITY) != offers_host
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -61,7 +71,18 @@ async fn serve_host(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     host.node.write().port = address.port();
-    let app = crate::server::router(host.clone(), dir.join("www"));
+    // 两个节点共用测试机。只为 SSH 正向用例提供外部设备的套接字来源，WebSocket 仍走实际端口。
+    let source = remote_source();
+    let app =
+        crate::server::router(host.clone(), dir.join("www")).layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                if req.uri().path() == ROUTE {
+                    req.extensions_mut()
+                        .insert(axum::extract::ConnectInfo(source));
+                }
+                next.run(req).await
+            },
+        ));
     let task = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -106,10 +127,40 @@ async fn wait_disconnected(session: &mut SessionIo) {
     .expect("revoking terminal access must close the stream");
 }
 
+#[test]
+fn legacy_default_stays_closed_until_the_local_choice_is_saved() {
+    let dir = std::env::temp_dir().join(format!("meshshare-ssh-default-{}", uuid::Uuid::new_v4()));
+    let start = || NodeRuntime::new(dir.clone(), 0, "test".into()).unwrap();
+    let path = dir.join("node.json");
+    assert!(start().ssh.host_fingerprint().is_some());
+    let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    old.as_object_mut()
+        .unwrap()
+        .remove("terminal_access_migration")
+        .unwrap();
+    fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    assert!(!dir.join("terminal-access.json").exists());
+    let upgraded = start();
+    upgraded.restore_legacy_terminal_grant().unwrap();
+    assert!(upgraded.ssh.host_fingerprint().is_none());
+    let tmp = crate::fsutil::temp_path(&path);
+    fs::create_dir(&tmp).unwrap();
+    assert!(upgraded.accept_terminal_migration(None).is_err());
+    assert!(upgraded.ssh.host_fingerprint().is_none());
+    fs::remove_dir(tmp).unwrap();
+    assert!(start().ssh.host_fingerprint().is_none());
+    upgraded.accept_terminal_migration(None).unwrap();
+    upgraded.accept_terminal_migration(None).unwrap();
+    assert!(start().ssh.host_fingerprint().is_some());
+    fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn desktop_and_android_follow_the_host_switch_on_live_node_connections() {
-    let dir = std::env::temp_dir().join(format!("meshshare-ssh-switch-{}", uuid::Uuid::new_v4()));
+async fn desktop_and_android_can_open_terminals_on_first_hello_and_after_host_restart() {
+    let dir = std::env::temp_dir().join(format!("meshshare-ssh-start-{}", uuid::Uuid::new_v4()));
     let host = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
+    let policy_path = dir.join("host/terminal-access.json");
+    assert!(!policy_path.exists());
     let desktop = NodeRuntime::new(dir.join("desktop"), 0, "test".into()).unwrap();
     let phone = NodeRuntime::new_with_profile(
         dir.join("phone"),
@@ -119,12 +170,15 @@ async fn desktop_and_android_follow_the_host_switch_on_live_node_connections() {
     )
     .unwrap();
     phone.node.write().platform = "android".into();
-    assert!(!host.ssh.host_settings(None).await.unwrap());
-    inject_host_key(&host);
-    inject_host_key(&desktop);
+    assert!(host.ssh.host_fingerprint().is_some());
+    assert_ne!(
+        host.ssh.host_fingerprint(),
+        Some(host.ssh.client_fingerprint())
+    );
+    assert!(phone.ssh.host_fingerprint().is_none());
     let (host_addr, host_task) = serve_host(&host, &dir).await;
     let (desktop_addr, desktop_task) = serve_host(&desktop, &dir).await;
-    // 两种节点连接方向都要收到后续 Hello。
+    // 目标桌面主动和被动建立的节点连接都能承载终端身份。
     connect_nodes(&host, &desktop, desktop_addr).await;
     connect_nodes(&phone, &host, host_addr).await;
     let host_id = host.node_id();
@@ -132,78 +186,110 @@ async fn desktop_and_android_follow_the_host_switch_on_live_node_connections() {
         .http1_only()
         .build()
         .unwrap();
-    let upgrade = || {
-        http.get(format!("http://{host_addr}{ROUTE}"))
-            .header("Connection", "upgrade")
-            .header("Upgrade", UPGRADE)
-            .header("X-MeshShare-Terminal-Target", &host_id)
-            .send()
-    };
-    assert_eq!(
-        upgrade().await.unwrap().status(),
-        reqwest::StatusCode::FORBIDDEN
-    );
-    assert!(desktop
-        .connect_terminal(host_id.clone(), 80, 25)
-        .await
-        .is_err());
-
-    host.ssh.host_settings(Some(true)).await.unwrap();
-    wait_for_peer(&desktop, &host, true).await;
-    wait_for_peer(&phone, &host, true).await;
     let mut first = open_shell(&desktop, &host).await;
     let mut second = open_shell(&phone, &host).await;
-    assert!(!host.begin_update_install());
-    let mut local = crate::terminal::spawn_pty(80, 25, host.reserve_terminal().unwrap()).unwrap();
-    #[cfg(windows)]
-    crate::terminal::tests::wait_for_windows_shell(&mut local).await;
-
-    desktop.ssh.host_settings(Some(true)).await.unwrap();
-    wait_for_peer(&host, &desktop, true).await;
     let mut outbound = open_shell(&host, &desktop).await;
-    let mut handshake = upgrade().await.unwrap().upgrade().await.unwrap();
-    host.ssh.host_settings(Some(false)).await.unwrap();
-    wait_for_peer(&desktop, &host, false).await;
-    wait_for_peer(&phone, &host, false).await;
-    assert_eq!(
-        upgrade().await.unwrap().status(),
-        reqwest::StatusCode::FORBIDDEN
-    );
-    assert!(phone
-        .connect_terminal(host_id.clone(), 80, 25)
+    assert!(!host.begin_update_install());
+    let mut handshake = http
+        .get(format!("http://{host_addr}{ROUTE}"))
+        .header("Connection", "upgrade")
+        .header("Upgrade", UPGRADE)
+        .header("X-MeshShare-Terminal-Target", &host_id)
+        .send()
         .await
-        .is_err());
-    // 快速重新开启时，先前代次的会话和握手仍须结束。
-    host.ssh.host_settings(Some(true)).await.unwrap();
+        .unwrap()
+        .upgrade()
+        .await
+        .unwrap();
+    host.stopping
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    host.ssh.shutdown();
+    host_task.abort();
     tokio::join!(
         wait_disconnected(&mut first),
-        wait_disconnected(&mut second)
+        wait_disconnected(&mut second),
+        wait_disconnected(&mut outbound)
     );
     let mut banner = Vec::new();
     // TCP EOF 和连接重置都表示旧握手已被中断。
     let _ = tokio::time::timeout(Duration::from_secs(3), handshake.read_to_end(&mut banner))
         .await
         .expect("old handshake must be closed");
-    expect_shell_response(&mut local).await;
-    drop(local);
-    expect_shell_response(&mut outbound).await;
-    wait_for_peer(&phone, &host, true).await;
-    drop(open_shell(&phone, &host).await);
-    drop(outbound);
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !host.begin_update_install() {
+        while host.update_has_active_work() || phone.has_peer_channel(&host_id) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("all inbound PTYs released their update reservations");
-    for node in [&host, &desktop, &phone] {
+    .expect("shutdown must release the PTYs and the previous node channel");
+    let previous = host.node_info().terminal.unwrap();
+    drop(host);
+
+    // 旧版已明确关闭入站，即使凭据库不可用也要保留其限制。
+    let old_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let disabled = serde_json::json!({ "enabled": false });
+    let signature = old_key
+        .sign(
+            "meshshare-terminal-policy-v2",
+            HashAlg::Sha256,
+            &serde_json::to_vec(&disabled).unwrap(),
+        )
+        .unwrap()
+        .to_pem(russh::keys::ssh_key::LineEnding::LF)
+        .unwrap();
+    let policy =
+        serde_json::to_vec(&serde_json::json!({ "policy": disabled, "signature": signature }))
+            .unwrap();
+    fs::write(&policy_path, &policy).unwrap();
+    let restarted = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
+    assert_eq!(restarted.node_id(), host_id);
+    assert_ne!(
+        restarted.ssh.client_fingerprint(),
+        previous.client_fingerprint
+    );
+    assert!(restarted.ssh.host_fingerprint().is_none());
+    restarted.restore_legacy_terminal_grant().unwrap();
+    let (new_addr, restarted_task) = serve_host(&restarted, &dir).await;
+    connect_nodes(&phone, &restarted, new_addr).await;
+    connect_nodes(&restarted, &desktop, desktop_addr).await;
+    assert!(phone
+        .connect_terminal(host_id.clone(), 80, 25)
+        .await
+        .is_err());
+    assert_eq!(
+        http.get(format!("http://{new_addr}{ROUTE}"))
+            .header("Connection", "upgrade")
+            .header("Upgrade", UPGRADE)
+            .header("X-MeshShare-Terminal-Target", &host_id)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    drop(open_shell(&restarted, &desktop).await);
+    restarted.accept_terminal_migration(None).unwrap();
+    wait_for_peer(&phone, &restarted, true).await;
+    wait_for_peer(&desktop, &restarted, true).await;
+    assert_ne!(restarted.ssh.host_fingerprint(), previous.host_fingerprint);
+    drop(open_shell(&phone, &restarted).await);
+    assert_eq!(fs::read(&policy_path).unwrap(), policy);
+    for node in [&restarted, &desktop, &phone] {
         node.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         node.ssh.shutdown();
     }
-    host_task.abort();
+    restarted_task.abort();
     desktop_task.abort();
+    let restored = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
+    assert!(restored.ssh.host_fingerprint().is_some());
+    assert_ne!(
+        restored.ssh.host_fingerprint(),
+        restarted.ssh.host_fingerprint()
+    );
+    fs::write(policy_path, b"damaged or replaced policy").unwrap();
+    let restricted = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
+    assert!(restricted.ssh.host_fingerprint().is_none());
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -223,6 +309,8 @@ async fn legacy_nodes_share_the_node_protocol_and_browser_sockets_stay_ui_only()
     let mut old = runtime.node_info();
     old.node_id = "previous-version".to_owned();
     old.terminal = None;
+    old.capabilities
+        .retain(|cap| cap != crate::model::TERMINAL_SSH_CAPABILITY);
     old.capabilities.push("terminal.ssh.v2".to_string());
     let hello = Message::Text(serde_json::to_string(&WireMessage::Hello { node: old }).unwrap());
     let mut request = url.as_str().into_client_request().unwrap();
@@ -274,8 +362,6 @@ async fn authentication_requires_both_keys_from_a_registered_node_channel() {
     let dir = std::env::temp_dir().join(format!("meshshare-ssh-identity-{}", uuid::Uuid::new_v4()));
     let host = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
     let caller = NodeRuntime::new(dir.join("caller"), 0, "test".into()).unwrap();
-    inject_host_key(&host);
-    host.ssh.host_settings(Some(true)).await.unwrap();
     let (addr, task) = serve_host(&host, &dir).await;
     // 发起端拥有目标通道，但目标尚未登记此发起端。
     let peer = crate::server::peer_from_hello(

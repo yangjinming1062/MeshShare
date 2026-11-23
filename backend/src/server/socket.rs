@@ -4,7 +4,7 @@ use crate::model::{
     TransferStatus, WireMessage, CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY,
     METRICS_SYSTEM_CAPABILITY,
 };
-use crate::runtime::{valid_history_delete_ids, NodeRuntime, PeerSession};
+use crate::runtime::{is_allowed_peer_address, valid_history_delete_ids, NodeRuntime, PeerSession};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -14,12 +14,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use std::{
-    collections::HashSet,
-    net::{IpAddr, SocketAddr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 
 pub(super) const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -198,10 +193,9 @@ pub(super) fn incoming_peer_from_hello(
     runtime: &NodeRuntime,
     remote_address: Option<SocketAddr>,
 ) -> Option<PeerInfo> {
-    let endpoint = remote_address
-        .filter(|address| is_allowed_peer_address(address.ip()))
-        .map(|address| format!("ws://{}:{}/api/v1/ws", address.ip(), node.port));
-    peer_from_hello(node, runtime, endpoint)
+    let address = remote_address.filter(|address| is_allowed_peer_address(address.ip()))?;
+    let endpoint = format!("ws://{}:{}/api/v1/ws", address.ip(), node.port);
+    peer_from_hello(node, runtime, Some(endpoint))
 }
 
 pub(crate) fn peer_from_hello(
@@ -543,13 +537,6 @@ pub(crate) fn validate_node_info(node: &NodeInfo) -> bool {
 
 fn is_allowed_advertised_address(address: &AddressInfo) -> bool {
     address.address.parse().is_ok_and(is_allowed_peer_address)
-}
-
-fn is_allowed_peer_address(address: IpAddr) -> bool {
-    match address {
-        IpAddr::V4(address) => address.is_loopback() || crate::runtime::is_network_ipv4(address),
-        IpAddr::V6(_) => false,
-    }
 }
 
 fn apply_transfer_action(

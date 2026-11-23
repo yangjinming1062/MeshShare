@@ -149,13 +149,12 @@ pub fn run() {
             monitor_window::set_monitor_position,
             links::open_project_page,
             links::open_transfer_location,
+            terminal::commands::terminal_accept_migration,
             terminal::commands::terminal_open,
             terminal::commands::terminal_close,
             terminal::commands::terminal_resize,
             terminal::commands::terminal_write,
-            terminal::commands::terminal_ack,
-            terminal::commands::terminal_settings,
-            terminal::commands::terminal_set_enabled
+            terminal::commands::terminal_ack
         ])
         .build(tauri::generate_context!())
         .expect("error while building MeshShare")

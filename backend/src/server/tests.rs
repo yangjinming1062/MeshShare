@@ -42,12 +42,18 @@ fn origin_policy_allows_lan_and_tauri_but_rejects_public_websites() {
 
 #[cfg(not(target_os = "android"))]
 #[tokio::test]
-async fn terminal_upgrade_rejects_browser_origins_including_localhost() {
+async fn terminal_upgrade_requires_a_native_request_from_a_known_mesh_socket() {
     let dir = std::env::temp_dir().join(format!("meshshare-terminal-origin-{}", Uuid::new_v4()));
     let runtime = NodeRuntime::new(dir.clone(), 0, "test".into()).unwrap();
     let state = super::AppState {
         control: super::ControlPlane::runtime_only(runtime.clone()),
         runtime,
+    };
+    let request = || {
+        Request::builder()
+            .header("Connection", "upgrade")
+            .header("Upgrade", "meshshare-ssh-v3")
+            .header("X-MeshShare-Terminal-Target", state.runtime.node_id())
     };
     for origin in [
         "http://localhost",
@@ -55,7 +61,12 @@ async fn terminal_upgrade_rejects_browser_origins_including_localhost() {
         "https://192.168.1.42",
         "null",
     ] {
-        let req = Request::builder()
+        let req = request()
+            .extension(super::ConnectInfo(
+                "192.168.217.2:45123"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap(),
+            ))
             .header("Origin", origin)
             .body(axum::body::Body::empty())
             .unwrap();
@@ -66,6 +77,64 @@ async fn terminal_upgrade_rejects_browser_origins_including_localhost() {
             super::StatusCode::FORBIDDEN
         );
     }
+    let local = if_addrs::get_if_addrs()
+        .unwrap()
+        .into_iter()
+        .map(|iface| Some(std::net::SocketAddr::new(iface.ip(), 45123)));
+    let forbidden = [
+        None,
+        Some("127.0.0.1:45123"),
+        Some("127.0.0.2:45123"),
+        Some("203.0.113.5:45123"),
+        Some("[2001:db8::5]:45123"),
+    ];
+    for source in forbidden
+        .map(|addr| addr.map(|addr| addr.parse().unwrap()))
+        .into_iter()
+        .chain(local)
+    {
+        let mut req = request().body(axum::body::Body::empty()).unwrap();
+        if let Some(source) = source {
+            req.extensions_mut().insert(super::ConnectInfo(source));
+        }
+        assert_eq!(
+            super::terminal_upgrade(super::State(state.clone()), req)
+                .await
+                .status(),
+            super::StatusCode::FORBIDDEN
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(not(target_os = "android"))]
+#[tokio::test]
+async fn loopback_listener_rejects_terminal_upgrade_before_ssh() {
+    let dir = std::env::temp_dir().join(format!("meshshare-local-ssh-{}", Uuid::new_v4()));
+    let node = NodeRuntime::new(dir.clone(), 0, "test".into()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = super::router(node.clone(), dir.join("www"));
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    let response = node
+        .http
+        .get(format!("http://{addr}/api/v1/terminal/ssh"))
+        .header("Connection", "upgrade")
+        .header("Upgrade", "meshshare-ssh-v3")
+        .header("X-MeshShare-Terminal-Target", node.node_id())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), super::StatusCode::FORBIDDEN);
+    assert!(!node.update_has_active_work());
+    server.abort();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -412,7 +481,15 @@ async fn incoming_websocket_uses_the_verified_remote_address_for_http_peer_endpo
     let mut node = runtime.node_info();
     node.node_id = "incoming-peer".to_string();
     node.port = 37880;
-    node.addresses.reverse();
+    node.addresses.push(crate::model::AddressInfo {
+        address: "192.168.1.8".into(),
+        url: "http://192.168.1.8:37880".into(),
+        label: "LAN".into(),
+        kind: "lan".into(),
+    });
+    for source in [None, Some("203.0.113.5:43122".parse().unwrap())] {
+        assert!(incoming_peer_from_hello(node.clone(), &runtime, source).is_none());
+    }
     let peer = incoming_peer_from_hello(
         node,
         &runtime,
@@ -919,7 +996,8 @@ fn terminal_hello_requires_consistent_host_and_client_keys() {
     use super::socket::validate_node_info;
     use crate::model::TERMINAL_SSH_CAPABILITY;
     let dir = std::env::temp_dir().join(format!("meshshare-hello-keys-{}", Uuid::new_v4()));
-    let runtime = NodeRuntime::new(dir.clone(), 0, "test".into()).unwrap();
+    let runtime =
+        NodeRuntime::new_with_profile(dir.clone(), 0, "test".into(), NodeProfile::Android).unwrap();
     let mut info = runtime.node_info();
     info.platform = "linux".to_owned();
     assert!(validate_node_info(&info));
@@ -2076,7 +2154,12 @@ async fn websocket_keeps_one_channel_for_normal_peer_messages() {
         .expect("bind test listener");
     let address = listener.local_addr().expect("listener address");
     let server_task = tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("serve test router");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("serve test router");
     });
     let denied_request = Request::builder()
         .uri(format!("ws://{address}/api/v1/ws"))

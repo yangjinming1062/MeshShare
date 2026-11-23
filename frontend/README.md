@@ -19,7 +19,7 @@
 | 流式下载、摘要与本地目录保存 | `src/mobileSave.ts`、`src/sha256.ts` |
 | 传输进度与显示格式 | `src/transferProgress.ts`、`src/format.ts` |
 | 历史预览的子序列匹配与排序 | `src/clipboardSearch.ts` |
-| 桌面与 Android 终端标签、本机接入开关 | `src/components/TerminalWorkspace.svelte`、`src/components/TerminalAccess.svelte` |
+| 桌面与 Android 终端入口和标签 | `src/terminal.ts` 按在线状态、v3 能力和主机指纹判断入口，`src/components/TerminalWorkspace.svelte` 管理标签。 |
 | 终端输入输出 | `src/terminal.ts` 每个会话独立排队，通过 `src/terminalNative.ts` 调用本机 IPC。xterm 渲染完数据块后确认序号。 |
 | 图标与共享样式 | `src/icons.ts`、`src/app.css` |
 

@@ -1338,6 +1338,12 @@
     }
   }
 
+  async function acceptTerminalMigration() {
+    if (!isDesktopWindow || remoteMode) return;
+    const updated = await invoke<NodeInfo>('terminal_accept_migration');
+    if (!remoteMode && node?.node_id === updated.node_id) node = updated;
+  }
+
   function startChooseMobile(session: MobileSession, folder = false) {
     selectedMobileSession = session;
     selectedPeer = null;
@@ -2206,6 +2212,7 @@
       onHistoryMode={setClipboardHistoryMode}
       onHistoryValue={setClipboardHistoryValue}
       onRemoteFileAccess={setRemoteFileAccess}
+      onAcceptTerminalMigration={isDesktopWindow && !remoteMode ? acceptTerminalMigration : null}
       onClose={() => (settingsOpen = false)}
     />
 

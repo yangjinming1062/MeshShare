@@ -1,6 +1,5 @@
 <script lang="ts">
   import Dialog from './Dialog.svelte';
-  import TerminalAccess from './TerminalAccess.svelte';
   import TogglePill from './TogglePill.svelte';
   import { clipboardHistoryRetentionLabel, updateStatusLabel } from '../format';
   import type {
@@ -30,7 +29,23 @@
   export let onHistoryMode: (value: ClipboardHistoryMode) => void = () => {};
   export let onHistoryValue: (value: number) => void = () => {};
   export let onRemoteFileAccess: (value: boolean) => void = () => {};
+  export let onAcceptTerminalMigration: (() => Promise<void>) | null = null;
   export let onClose: () => void = () => {};
+
+  let migrationBusy = false;
+  let migrationError = '';
+  async function acceptTerminalMigration() {
+    if (!onAcceptTerminalMigration || migrationBusy) return;
+    migrationBusy = true;
+    migrationError = '';
+    try {
+      await onAcceptTerminalMigration();
+    } catch (error) {
+      migrationError = error instanceof Error ? error.message : String(error);
+    } finally {
+      migrationBusy = false;
+    }
+  }
 
   $: historyValue = historySettings.mode === 'count' ? historySettings.count : historySettings.days;
   $: historyMax = historySettings.mode === 'count' ? 500 : 365;
@@ -78,7 +93,18 @@
   </div>
 
   {#if localMode}
-    {#if open}<TerminalAccess />{/if}
+    {#if onAcceptTerminalMigration && node?.terminal && !node.terminal.host_fingerprint}
+      <div class="setting-block">
+        <div class="setting">
+          <div class="setting-copy">
+            <strong>迁移远程终端授权</strong>
+            <span>已保留旧版访问限制。允许后，局域网或 Tailscale 中已连接的原生设备可以用当前系统账号运行命令。</span>
+          </div>
+          <button type="button" class="btn btn-sm" disabled={migrationBusy} on:click={acceptTerminalMigration}>允许远程终端</button>
+        </div>
+        {#if migrationError}<span role="alert">{migrationError}</span>{/if}
+      </div>
+    {/if}
     <div class="setting-block">
       <div class="setting">
         <div class="setting-copy">

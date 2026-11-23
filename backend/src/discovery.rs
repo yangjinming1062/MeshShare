@@ -1,10 +1,9 @@
 use crate::model::{NodeInfo, PeerInfo, WireMessage, PROTOCOL_VERSION};
-use crate::runtime::{NodeRuntime, PeerEndpoint, PeerEndpointSource};
+use crate::runtime::{is_allowed_peer_address, NodeRuntime, PeerEndpoint, PeerEndpointSource};
 use crate::server;
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
@@ -37,7 +36,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                 };
                 let node = runtime.node_info();
                 let mut registered_address = register_service(&daemon, &node);
-                let mut registered_capabilities = node.capabilities.clone();
+                let mut registered_capabilities = node.capabilities;
                 let Ok(receiver) = daemon.browse(SERVICE_TYPE) else {
                     if let Ok(status) = daemon.shutdown() {
                         let _ = status.recv_timeout(Duration::from_secs(1));
@@ -88,12 +87,12 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                         {
                             continue;
                         }
-                        let Some(address) = info.get_addresses().iter().find_map(|address| {
-                            let IpAddr::V4(address) = address else {
-                                return None;
-                            };
-                            is_allowed_ipv4(*address).then_some(*address)
-                        }) else {
+                        let Some(address) = info
+                            .get_addresses()
+                            .iter()
+                            .copied()
+                            .find(|ip| is_allowed_peer_address(*ip))
+                        else {
                             continue;
                         };
                         let endpoint = format!("ws://{}:{}/api/v1/ws", address, info.get_port());
@@ -189,6 +188,12 @@ async fn fetch_node_info(client: &reqwest::Client, base: &str) -> anyhow::Result
     const MAX_INFO_BYTES: usize = 128 * 1024;
     let mut response = client.get(format!("{base}/api/v1/info")).send().await?;
     anyhow::ensure!(
+        response
+            .remote_addr()
+            .is_some_and(|peer| is_allowed_peer_address(peer.ip())),
+        "节点连接地址不在局域网或 Tailscale 范围内"
+    );
+    anyhow::ensure!(
         response.status().is_success(),
         "读取节点信息失败（HTTP {}）",
         response.status()
@@ -217,10 +222,6 @@ fn normalize_http_base_url(value: &str) -> Result<String, String> {
     crate::runtime::normalize_peer_http_base(candidate.as_str()).ok_or_else(|| {
         "节点地址必须是不含凭据与查询参数的本机、局域网、链路本地或 Tailscale 地址".to_string()
     })
-}
-
-fn is_allowed_ipv4(address: Ipv4Addr) -> bool {
-    address.is_loopback() || crate::runtime::is_network_ipv4(address)
 }
 
 fn websocket_endpoint(base_url: &str) -> Result<String, String> {
@@ -332,6 +333,17 @@ async fn run_peer_session(
     is_candidate: impl FnOnce() -> bool,
     socket: PeerSocket,
 ) -> bool {
+    let tcp = match socket.get_ref() {
+        MaybeTlsStream::Plain(stream) => stream,
+        MaybeTlsStream::Rustls(stream) => stream.get_ref().0,
+        _ => return false,
+    };
+    if !tcp
+        .peer_addr()
+        .is_ok_and(|peer| is_allowed_peer_address(peer.ip()))
+    {
+        return false;
+    }
     let (mut writer, mut reader) = socket.split();
     let Ok(Some(Ok(Message::Text(body)))) =
         tokio::time::timeout(Duration::from_secs(10), reader.next()).await
@@ -582,9 +594,12 @@ mod tests {
         let address = listener.local_addr().expect("server address");
         let server_app = server::router(server_runtime.clone(), static_root.clone());
         let mut server_task = tokio::spawn(async move {
-            axum::serve(listener, server_app)
-                .await
-                .expect("serve server router");
+            axum::serve(
+                listener,
+                server_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("serve server router");
         });
         let peer_id = server_runtime.node_id();
         let working_url = format!("ws://{address}/api/v1/ws");
@@ -670,9 +685,12 @@ mod tests {
             .expect("rebind server listener");
         let server_app = server::router(server_runtime.clone(), static_root);
         server_task = tokio::spawn(async move {
-            axum::serve(listener, server_app)
-                .await
-                .expect("serve restarted router");
+            axum::serve(
+                listener,
+                server_app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .expect("serve restarted router");
         });
 
         tokio::time::timeout(Duration::from_secs(8), async {

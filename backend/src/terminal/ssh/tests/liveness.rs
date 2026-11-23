@@ -11,8 +11,6 @@ async fn inbound_shells_end_with_the_authenticated_peer_session_or_client_key() 
     let host = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
     let client = NodeRuntime::new(dir.join("client"), 0, "test".into()).unwrap();
     let other = NodeRuntime::new(dir.join("other"), 0, "test".into()).unwrap();
-    inject_host_key(&host);
-    host.ssh.host_settings(Some(true)).await.unwrap();
     let (addr, server) = serve_host(&host, &dir).await;
     connect_nodes(&other, &host, addr).await;
     let mut independent = open_shell(&other, &host).await;
@@ -24,19 +22,24 @@ async fn inbound_shells_end_with_the_authenticated_peer_session_or_client_key() 
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let _target = client.attach_peer_session(target, tx).unwrap();
     let hello = |node| Message::Text(serde_json::to_string(&WireMessage::Hello { node }).unwrap());
+    let mut legacy_disabled = client.node_info();
+    legacy_disabled.terminal.as_mut().unwrap().host_fingerprint = None;
+    legacy_disabled
+        .capabilities
+        .retain(|cap| cap != crate::model::TERMINAL_SSH_CAPABILITY);
     let connect = || async {
         let (mut ws, _) = connect_async(&url).await.unwrap();
-        ws.send(hello(client.node_info())).await.unwrap();
-        wait_for_peer(&host, &client, client.ssh.host_fingerprint().is_some()).await;
+        ws.send(hello(legacy_disabled.clone())).await.unwrap();
+        wait_for_peer(&host, &client, false).await;
         ws
     };
     let mut ws = connect().await;
     let mut first = open_shell(&client, &host).await;
-    // 只改变客户端自己的接入开关，不影响它在另一台电脑上已打开的 shell。
-    inject_host_key(&client);
-    client.ssh.host_settings(Some(true)).await.unwrap();
+    // 旧版 v3 可以在同一通道更新主机能力，出站 shell 仍绑定原客户端密钥。
     ws.send(hello(client.node_info())).await.unwrap();
     wait_for_peer(&host, &client, true).await;
+    ws.send(hello(legacy_disabled.clone())).await.unwrap();
+    wait_for_peer(&host, &client, false).await;
     expect_shell_response(&mut first).await;
 
     let mut rotated = client.node_info();
@@ -80,7 +83,6 @@ async fn idle_and_backpressured_shell_survives_until_silent_link_loss() {
     let dir = std::env::temp_dir().join(format!("meshshare-ssh-idle-{}", uuid::Uuid::new_v4()));
     let host = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
     let client = NodeRuntime::new(dir.join("client"), 0, "test".into()).unwrap();
-    inject_host_key(&host);
     let (host_addr, server) = serve_host(&host, &dir).await;
 
     let relay = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -103,7 +105,6 @@ async fn idle_and_backpressured_shell_survives_until_silent_link_loss() {
         );
     });
 
-    host.ssh.host_settings(Some(true)).await.unwrap();
     let host_id = host.node_id();
     connect_nodes(&client, &host, host_addr).await;
     // 节点连接仍直连，只有 SSH 走可独立断流的中继。

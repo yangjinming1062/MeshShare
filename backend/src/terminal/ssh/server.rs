@@ -1,13 +1,14 @@
 use super::*;
-use crate::runtime::NodeRuntime;
+use crate::runtime::{is_allowed_peer_address, NodeRuntime};
 use crate::terminal::{spawn_pty, validate_size, Input, Output};
 use anyhow::Context;
 use axum::{
-    extract::Request as HttpRequest,
+    extract::{ConnectInfo, Request as HttpRequest},
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
 use russh::{server as ssh, Channel, ChannelMsg};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{watch, Notify};
 use tokio_util::io::InspectReader;
@@ -19,6 +20,15 @@ struct Host {
     started: watch::Sender<bool>,
 }
 
+fn is_remote_terminal_source(ip: IpAddr) -> bool {
+    // 本机账号也能连接本机的 LAN 或 Tailscale 地址。本机 shell 只走主窗口 IPC。
+    is_allowed_peer_address(ip)
+        && !ip.is_loopback()
+        && if_addrs::get_if_addrs().is_ok_and(|interfaces| {
+            !interfaces.is_empty() && interfaces.iter().all(|iface| iface.ip() != ip)
+        })
+}
+
 impl SshService {
     pub(crate) async fn upgrade(
         self: &Arc<Self>,
@@ -26,7 +36,10 @@ impl SshService {
         runtime: Arc<NodeRuntime>,
     ) -> Response {
         let headers = req.headers();
-        if headers.contains_key(header::ORIGIN) {
+        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>();
+        if headers.contains_key(header::ORIGIN)
+            || !peer.is_some_and(|addr| is_remote_terminal_source(addr.0.ip()))
+        {
             return StatusCode::FORBIDDEN.into_response();
         }
         if !headers
@@ -50,12 +63,17 @@ impl SshService {
         {
             return StatusCode::MISDIRECTED_REQUEST.into_response();
         }
-        let Some((key, connection)) = self.host.accept() else {
+        let Some(key) = self.active_host_key() else {
             return StatusCode::FORBIDDEN.into_response();
         };
-        let Ok(slot) = self.host.sockets.clone().try_acquire_owned() else {
+        let connection = self.stopped.child_token();
+        if connection.is_cancelled() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        let Ok(slot) = self.sockets.clone().try_acquire_owned() else {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         };
+        let key = key.clone();
         let upgrade = hyper::upgrade::on(&mut req);
         tokio::spawn(async move {
             let _slot = slot;
@@ -79,7 +97,7 @@ impl SshService {
             );
             let stream = cancellable_stream(stream, connection.clone());
             let config = ssh::Config {
-                keys: vec![(*key).clone()],
+                keys: vec![key],
                 inactivity_timeout: None,
                 keepalive_interval: None,
                 ..Default::default()

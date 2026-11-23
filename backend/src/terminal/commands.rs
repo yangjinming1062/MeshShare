@@ -83,6 +83,20 @@ fn describe(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
+#[cfg(not(target_os = "android"))]
+#[tauri::command]
+pub(crate) async fn terminal_accept_migration(
+    main: MainTerminal,
+) -> Result<crate::model::NodeInfo, String> {
+    tokio::task::spawn_blocking(move || {
+        main.0.accept_terminal_migration(None)?;
+        Ok(main.0.node_info())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(describe)
+}
+
 #[tauri::command]
 pub(crate) async fn terminal_open(
     main: MainTerminal,
@@ -176,25 +190,6 @@ pub(crate) fn terminal_ack(main: MainTerminal, id: String, sequence: u64) -> Res
         .terminals
         .sessions
         .ack(&id, sequence)
-        .map_err(describe)
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-pub(crate) async fn terminal_settings(main: MainTerminal) -> Result<bool, String> {
-    main.0.ssh.host_settings(None).await.map_err(describe)
-}
-
-#[cfg(not(target_os = "android"))]
-#[tauri::command]
-pub(crate) async fn terminal_set_enabled(
-    main: MainTerminal,
-    enabled: bool,
-) -> Result<bool, String> {
-    main.0
-        .ssh
-        .host_settings(Some(enabled))
-        .await
         .map_err(describe)
 }
 

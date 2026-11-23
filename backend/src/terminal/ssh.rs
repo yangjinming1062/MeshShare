@@ -1,17 +1,17 @@
-#[cfg(not(target_os = "android"))]
-mod access;
 mod client;
 #[cfg(not(target_os = "android"))]
-mod server;
+pub(crate) mod migration;
 #[cfg(not(target_os = "android"))]
-mod trust;
+mod server;
 
+use crate::runtime::NodeProfile;
 use anyhow::{anyhow, bail, ensure, Result};
 use russh::keys::{Algorithm, HashAlg, PrivateKey};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
+#[cfg(not(target_os = "android"))]
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(not(test))]
@@ -28,22 +28,28 @@ const OUTPUT_BARRIER: u32 = 0xfe00_0000;
 pub(crate) struct SshService {
     node_id: String,
     client_key: Arc<PrivateKey>,
-    host_fingerprint: watch::Sender<Option<String>>,
+    host_key: Option<PrivateKey>,
+    host_ready: watch::Sender<bool>,
     stopped: CancellationToken,
     #[cfg(not(target_os = "android"))]
-    host: access::HostAccess,
+    sockets: Arc<Semaphore>,
 }
 
 impl SshService {
-    pub(crate) fn new(_data_dir: &Path, node_id: String) -> Result<Self> {
-        let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+    pub(crate) fn new(node_id: String, profile: NodeProfile, host_ready: bool) -> Result<Self> {
+        let new_key = || PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519);
         Ok(Self {
             node_id,
-            client_key: Arc::new(client_key),
-            host_fingerprint: watch::Sender::new(None),
+            client_key: Arc::new(new_key()?),
+            host_key: if profile.is_android() {
+                None
+            } else {
+                Some(new_key()?)
+            },
+            host_ready: watch::Sender::new(host_ready && !profile.is_android()),
             stopped: CancellationToken::new(),
             #[cfg(not(target_os = "android"))]
-            host: access::HostAccess::new(_data_dir.to_owned()),
+            sockets: Arc::new(Semaphore::new(16)),
         })
     }
 
@@ -55,11 +61,25 @@ impl SshService {
     }
 
     pub(crate) fn host_fingerprint(&self) -> Option<String> {
-        self.host_fingerprint.borrow().clone()
+        self.active_host_key()
+            .map(|key| key.public_key().fingerprint(HashAlg::Sha256).to_string())
     }
 
-    pub(crate) fn subscribe_host(&self) -> watch::Receiver<Option<String>> {
-        self.host_fingerprint.subscribe()
+    fn active_host_key(&self) -> Option<&PrivateKey> {
+        self.host_key.as_ref().filter(|_| *self.host_ready.borrow())
+    }
+
+    pub(crate) fn subscribe_host(&self) -> watch::Receiver<bool> {
+        self.host_ready.subscribe()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn activate_host(&self) {
+        self.host_ready.send_if_modified(|ready| {
+            let changed = !*ready;
+            *ready = true;
+            changed
+        });
     }
 
     pub(crate) fn shutdown(&self) {

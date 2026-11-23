@@ -80,9 +80,11 @@
 
 ### 桌面终端
 
-新版原生节点在 WebSocket `Hello` 的可选 `node.terminal` 中通告进程级 Ed25519 客户端公钥指纹 `client_fingerprint`。已开启接入且主机密钥就绪的桌面同时通告 `terminal.ssh.v3` 和 `host_fingerprint`。指纹使用 OpenSSH SHA-256 格式。关闭开关会撤下能力和主机指纹，取消已升级的连接并结束相应的 shell。已连接的两端通过后续 `Hello` 更新状态，重新连接时使用最新通告。`GET /api/v1/info` 和 `GET /api/v1/peers` 提供相应快照。旧版 v2 终端与 v3 的授权方式不同，终端连接要求两端支持 v3。
+原生节点在首次 WebSocket `Hello` 的可选 `node.terminal` 中通告进程级 Ed25519 客户端公钥指纹 `client_fingerprint`。允许入站终端的桌面同时通告 `terminal.ssh.v3` 和独立的 `host_fingerprint`。保留旧版访问限制的桌面只通告客户端指纹，完成本机迁移后向已有连接发送新的 `Hello`。指纹使用 OpenSSH SHA-256 格式。客户端按当前连接最新一次 `Hello` 更新终端入口，兼容旧版 v3 桌面在运行期间通告或撤下主机能力。`GET /api/v1/info` 和 `GET /api/v1/peers` 提供相应快照。仅支持 v2 终端的设备可交换其他节点消息，远程终端要求两端支持 v3。
 
-发起端按已连接的目标节点 ID 选择可达地址，对 `GET /api/v1/terminal/ssh` 发送 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v3` 和 `X-MeshShare-Terminal-Target`（目标节点 ID）。返回 101 后，同一连接承载 SSH。浏览器 Origin 返回 403，目标 ID 不符返回 421，升级协议不符返回 426，关闭接入返回 403。节点 WebSocket 只允许原生连接登记终端身份。发起端校验主机密钥，目标端按 SSH 用户名查找当前节点通道，校验客户端指纹和公钥签名后才接受交互 shell。开关只能从目标桌面的本机 IPC 修改。
+发起端按已连接的目标节点 ID 选择可达地址，对 `GET /api/v1/terminal/ssh` 发送 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v3` 和 `X-MeshShare-Terminal-Target`（目标节点 ID）。返回 101 后，同一连接承载 SSH。请求带有浏览器 Origin、目标保留旧版访问限制、实际来源缺失或不属于其他设备上的节点网络地址时返回 403。回环和本机各网卡地址均属于本机来源。目标 ID 不符返回 421，升级协议不符返回 426。入站连接已满返回 429，节点正在退出返回 503。
+
+节点 WebSocket 只允许原生连接登记终端身份。发起端校验主机密钥，目标端按 SSH 用户名查找当前节点通道，校验客户端指纹和公钥签名后才接受交互 shell。
 
 通过公钥认证的入站 SSH 绑定到当时的节点 WebSocket 和客户端指纹。该 WebSocket 断开、超时，或后续 `Hello` 更换或撤下客户端指纹时，目标端立即关闭相应的 SSH 连接并回收 shell。同一节点重新连接后需要重新打开终端。
 
@@ -117,7 +119,7 @@
 
 消息使用 `{ "type": "VariantName", "payload": ... }`，结构以 `backend/src/model.rs` 中的 `WireMessage` 为准。
 
-- `Hello` 携带节点身份、能力和 `protocol_version`。当前节点握手版本为 `2`，双方版本一致才会注册并出现在设备列表。HTTP 和 WebSocket 路径使用 `/api/v1`。
+- `Hello` 携带节点身份、能力和 `protocol_version`。当前节点握手版本为 `2`。实际连接对端属于节点监听支持的 IPv4 范围、双方版本一致且通告有效时，节点才会注册并出现在设备列表。HTTP 和 WebSocket 路径使用 `/api/v1`。
 - `Ping` / `Pong` 用于保活。
 - `ClipboardUpdate` 的 `payload.event` 包含事件 ID、原始来源节点、HLC 和内容。接收端用当前 Peer Channel 确认发送方；多跳转发时来源可以与当前发送方不同。
 - `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新快照，保留原始 `source_node_id`；接收端按 HLC 比较新旧并按事件 ID 去重。

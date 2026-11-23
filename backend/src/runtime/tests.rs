@@ -612,10 +612,10 @@ fn terminal_reservation_and_update_install_exclude_each_other() {
     assert!(runtime.reserve_terminal().is_err());
     runtime.end_update_install();
     assert!(runtime.reserve_terminal().is_ok());
-    assert!(!NodeProfile::Desktop
-        .capabilities()
-        .iter()
-        .any(|item| item == crate::model::TERMINAL_SSH_CAPABILITY));
+    assert_eq!(
+        runtime.supports_capability(crate::model::TERMINAL_SSH_CAPABILITY),
+        !runtime.is_android_profile()
+    );
     assert!(!NodeProfile::Android
         .capabilities()
         .iter()

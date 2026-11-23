@@ -16,7 +16,9 @@
 
 共享设置由 `runtime/config.rs` 的 `PersistedConfig` 落盘，经 `control.rs` 的补丁与快照提供给界面。远程文件访问开关仅由本机原生命令读写。
 
-桌面将终端开关保存在 `terminal-access.json`，由系统凭据库中的主机私钥签名。启动或查看设置时，若文件缺失或开关为关闭，接入保持关闭，无需访问凭据库。首次从磁盘恢复已开启的接入，或重启后首次主动开启时，先读取主机密钥并验证已有策略的完整签名。旧配对格式在验证后原子迁移，只保留开关。回退到配对版本时可恢复升级前的授权文件备份，或先移走新文件，再在旧版重新授权。新安装在首次开启接入时才创建主机凭据。恢复失败时终端保持关闭，可在本机设置查看原因。若已丢失主机密钥或授权文件损坏，退出应用，将该文件移到备份位置，再打开设置重新开启。
+SSH 会话使用进程内生成的密钥。桌面配置在 `node.json` 的 `terminal_access_migration` 中记录新版终端授权对应的旧策略摘要，或记录确认时没有旧策略。已有配置缺少此字段时保留旧版限制，即使从未生成过 `terminal-access.json`。桌面仅在自动继承旧版「允许所有节点」授权时从系统凭据库读取旧密钥并验证签名。新安装及本机手动确认均可在无 Secret Service 的 Linux 会话中使用。原策略文件和旧凭据保留供回退，操作入口见[使用指南](../docs/DESIGN.md#桌面终端)。
+
+如果迁移时报旧授权文件不可读或无效，请从备份恢复该节点可读的普通文件后重试。如果 `node.json` 写入失败，修复本机数据目录的写入权限或可用空间后再确认。写入成功前，入站终端保持关闭。
 
 数据目录保存 `node.json`、`clipboard-history.json` 与 payload 目录、`clipboard-current.json`、`transfer-history.json`、`desktop-transfer-temp-files.json`、`mobile-tls/`，Android 另有 `android-update.json`。
 

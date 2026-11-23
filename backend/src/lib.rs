@@ -213,6 +213,15 @@ async fn start_node(
         app.clone(),
     )
     .await?;
+    #[cfg(not(target_os = "android"))]
+    if runtime.ssh.host_fingerprint().is_none() {
+        let owner = runtime.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            if let Err(error) = owner.restore_legacy_terminal_grant() {
+                eprintln!("自动核验旧版终端授权失败：{error:#}");
+            }
+        });
+    }
     let cleanup_runtime = runtime.clone();
     tauri::async_runtime::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(15));
@@ -238,15 +247,6 @@ async fn start_node(
     });
     clipboard::start_monitor(runtime.clone());
     metrics::start(runtime.clone());
-    #[cfg(not(target_os = "android"))]
-    {
-        let ssh = runtime.ssh.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = ssh.host_settings(None).await {
-                eprintln!("恢复远程终端开关失败：{error:#}");
-            }
-        });
-    }
     discovery::start(runtime.clone());
     app.manage(runtime.clone());
     Ok((runtime, control))

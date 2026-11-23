@@ -5,8 +5,12 @@ pub(crate) fn is_tailscale_ipv4(address: Ipv4Addr) -> bool {
     (u32::from(address) & 0xffc00000) == 0x64400000
 }
 
-pub(crate) fn is_network_ipv4(address: Ipv4Addr) -> bool {
+fn is_network_ipv4(address: Ipv4Addr) -> bool {
     address.is_private() || address.is_link_local() || is_tailscale_ipv4(address)
+}
+
+pub(crate) fn is_allowed_peer_address(address: IpAddr) -> bool {
+    matches!(address, IpAddr::V4(ip) if ip.is_loopback() || is_network_ipv4(ip))
 }
 
 pub(crate) fn node_http_client() -> reqwest::ClientBuilder {
@@ -104,9 +108,7 @@ pub(crate) fn normalize_peer_http_base(raw: &str) -> Option<String> {
     let host = url.host_str()?.trim_end_matches('.');
     let allowed_host = host.eq_ignore_ascii_case("localhost")
         || host.ends_with(".local")
-        || host
-            .parse::<Ipv4Addr>()
-            .is_ok_and(|address| address.is_loopback() || is_network_ipv4(address));
+        || host.parse().is_ok_and(is_allowed_peer_address);
     if !allowed_host {
         return None;
     }
@@ -136,10 +138,7 @@ pub(super) fn mobile_ca_url(raw: &str) -> Result<reqwest::Url, String> {
         return Err("CA 地址只支持 HTTP 或 HTTPS".to_string());
     }
     let host = url.host_str().unwrap_or_default();
-    let Some(address) = host.parse::<Ipv4Addr>().ok() else {
-        return Err("CA 地址必须是节点的私网 IPv4 地址".to_string());
-    };
-    if !(address.is_loopback() || is_network_ipv4(address)) {
+    if !host.parse().is_ok_and(is_allowed_peer_address) {
         return Err("CA 地址必须是节点的私网 IPv4 地址".to_string());
     }
     Ok(url)

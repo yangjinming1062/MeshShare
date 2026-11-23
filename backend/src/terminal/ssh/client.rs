@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::NodeRuntime;
+use crate::runtime::{is_allowed_peer_address, NodeRuntime};
 use crate::terminal::{Input, Output, SessionIo};
 use russh::keys::{Algorithm, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{client as ssh, Channel, ChannelMsg};
@@ -27,7 +27,7 @@ impl ssh::Handler for Controller {
             .and_then(|keys| keys.host_fingerprint);
         ensure!(
             host.as_ref() == Some(&pin),
-            "目标终端密钥与当前节点连接不一致，或目标已关闭终端"
+            "无法从当前节点连接确认目标终端的主机密钥"
         );
         Ok(true)
     }
@@ -64,6 +64,13 @@ async fn upgrade(peer: &str, bases: Vec<String>) -> Result<reqwest::Upgraded> {
                 continue;
             }
         };
+        if !res
+            .remote_addr()
+            .is_some_and(|peer| is_allowed_peer_address(peer.ip()))
+        {
+            last = anyhow!("终端连接地址不在局域网或 Tailscale 范围内");
+            continue;
+        }
         match res.status() {
             reqwest::StatusCode::SWITCHING_PROTOCOLS => {
                 ensure!(
@@ -75,7 +82,7 @@ async fn upgrade(peer: &str, bases: Vec<String>) -> Result<reqwest::Upgraded> {
                 );
                 return Ok(res.upgrade().await?);
             }
-            reqwest::StatusCode::FORBIDDEN => bail!("目标机尚未开启远程终端"),
+            reqwest::StatusCode::FORBIDDEN => bail!("目标节点拒绝了终端连接"),
             reqwest::StatusCode::TOO_MANY_REQUESTS => bail!("目标机的终端连接已满"),
             status => last = anyhow!("目标节点返回 {status}"),
         }
@@ -102,7 +109,7 @@ impl NodeRuntime {
             self.terminal_peer_keys(&peer_id)
                 .and_then(|keys| keys.host_fingerprint)
                 .is_some(),
-            "目标节点已离线或未开启远程终端"
+            "目标节点已离线或未提供远程终端"
         );
         let bases = self.peer_http_bases(&peer_id);
         let key = self.ssh.client_key.clone();

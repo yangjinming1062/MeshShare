@@ -11,7 +11,7 @@ use crate::model::{
     MAX_TRANSFER_HISTORY_PATHS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
     METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
     METRICS_SYSTEM_VIEW_CAPABILITY, REMOTE_FILES_CAPABILITY, REMOTE_MANAGEMENT_CAPABILITY,
-    TRANSFER_HISTORY_CAPABILITY, TRANSFER_HISTORY_LIMIT,
+    TERMINAL_SSH_CAPABILITY, TRANSFER_HISTORY_CAPABILITY, TRANSFER_HISTORY_LIMIT,
 };
 use futures_util::StreamExt;
 use parking_lot::Condvar;
@@ -54,7 +54,8 @@ pub use network::bind_addresses;
 #[cfg(not(target_os = "android"))]
 pub(crate) use network::is_tailscale_ipv4;
 pub(crate) use network::{
-    is_network_ipv4, node_http_client, normalize_peer_http_base, PeerEndpoint, PeerEndpointSource,
+    is_allowed_peer_address, node_http_client, normalize_peer_http_base, PeerEndpoint,
+    PeerEndpointSource,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -332,9 +333,14 @@ impl NodeRuntime {
         if let Some(snapshot) = clipboard.as_ref() {
             clock.observe(&snapshot.clock);
         }
+        #[cfg(not(target_os = "android"))]
+        let host_ready = !profile.is_android() && config.terminal_host_ready(&data_dir);
+        #[cfg(target_os = "android")]
+        let host_ready = false;
         let ssh = Arc::new(crate::terminal::ssh::SshService::new(
-            &data_dir,
             config.node_id.clone(),
+            profile,
+            host_ready,
         )?);
         let node = NodeInfo {
             node_id: config.node_id.clone(),
@@ -423,8 +429,8 @@ impl NodeRuntime {
     }
 
     pub fn supports_capability(&self, capability: &str) -> bool {
-        if capability == crate::model::TERMINAL_SSH_CAPABILITY {
-            return !self.is_android_profile() && self.ssh.host_fingerprint().is_some();
+        if capability == TERMINAL_SSH_CAPABILITY {
+            return self.ssh.host_fingerprint().is_some();
         }
         self.node
             .read()
@@ -434,15 +440,12 @@ impl NodeRuntime {
     }
 
     pub fn node_info(&self) -> NodeInfo {
-        let mut info = self.node.read().clone();
-        if !self.is_android_profile() {
-            if let (Some(keys), Some(host)) = (&mut info.terminal, self.ssh.host_fingerprint()) {
-                keys.host_fingerprint = Some(host);
-                info.capabilities
-                    .push(crate::model::TERMINAL_SSH_CAPABILITY.to_owned());
-            }
+        let mut node = self.node.read().clone();
+        if let (Some(keys), Some(host)) = (&mut node.terminal, self.ssh.host_fingerprint()) {
+            keys.host_fingerprint = Some(host);
+            node.capabilities.push(TERMINAL_SSH_CAPABILITY.to_owned());
         }
-        info
+        node
     }
 
     pub fn node_id(&self) -> String {

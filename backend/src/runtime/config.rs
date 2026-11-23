@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(not(target_os = "android"))]
+use crate::terminal::ssh::migration::LegacyPolicy;
 use std::path::{Path, PathBuf};
 
 pub(super) const ANDROID_DEFAULT_NODE_NAME: &str = "移动设备";
@@ -112,6 +114,8 @@ pub(super) fn load_or_create_config_with_hostname(
         clipboard_history_days: DEFAULT_CLIPBOARD_HISTORY_DAYS,
         receive_mode: ReceiveMode::default(),
         remote_file_access: false,
+        #[cfg(not(target_os = "android"))]
+        terminal_access_migration: TerminalAccessMigration::NoLegacyPolicy,
         receive_directory: None,
         receive_directory_bookmark: None,
     };
@@ -259,6 +263,45 @@ pub(super) struct PersistedConfig {
     pub(super) receive_directory_bookmark: Option<Vec<u8>>,
     /// 是否允许其他设备在远程管理中浏览本机目录并选择发送；默认关闭。
     remote_file_access: bool,
+    #[cfg(not(target_os = "android"))]
+    #[serde(default)]
+    terminal_access_migration: TerminalAccessMigration,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalAccessMigration {
+    // 已有 node.json 缺少此字段时按旧版处理。旧版从未启用终端也不会创建授权文件。
+    #[default]
+    Pending,
+    NoLegacyPolicy,
+    AcceptedPolicy(String),
+}
+
+#[cfg(not(target_os = "android"))]
+impl TerminalAccessMigration {
+    fn from_policy(policy: Option<LegacyPolicy>) -> Self {
+        match policy {
+            Some(policy) => Self::AcceptedPolicy(policy.digest),
+            None => Self::NoLegacyPolicy,
+        }
+    }
+}
+
+#[cfg(not(target_os = "android"))]
+impl PersistedConfig {
+    pub(super) fn terminal_host_ready(&self, dir: &Path) -> bool {
+        match LegacyPolicy::read(dir) {
+            Ok(policy) => {
+                self.terminal_access_migration == TerminalAccessMigration::from_policy(policy)
+            }
+            Err(error) => {
+                eprintln!("保留旧版终端访问限制：{error:#}");
+                false
+            }
+        }
+    }
 }
 
 /// 界面使用的接收设置：配置保留规范化路径，展示时去掉 Windows 扩展长度前缀。
@@ -281,6 +324,39 @@ pub(super) fn history_settings(config: &PersistedConfig) -> ClipboardHistorySett
 }
 
 impl NodeRuntime {
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn restore_legacy_terminal_grant(&self) -> anyhow::Result<()> {
+        if let Some(policy) = LegacyPolicy::read(&self.data_dir)? {
+            if policy.was_enabled(&self.node_id())? {
+                self.accept_terminal_migration(Some(&policy.digest))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub(crate) fn accept_terminal_migration(
+        &self,
+        verified_digest: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.is_android_profile(), "只有桌面可以提供远程终端");
+        if self.ssh.host_fingerprint().is_some() {
+            return Ok(());
+        }
+        self.update_config(|config| {
+            let policy = LegacyPolicy::read(&self.data_dir)?;
+            anyhow::ensure!(
+                verified_digest.is_none()
+                    || verified_digest == policy.as_ref().map(|policy| policy.digest.as_str()),
+                "核验期间旧版终端授权已更改"
+            );
+            config.terminal_access_migration = TerminalAccessMigration::from_policy(policy);
+            Ok(())
+        })?;
+        self.ssh.activate_host();
+        Ok(())
+    }
+
     pub fn monitor_visible(&self) -> bool {
         self.config.lock().monitor_visible
     }
