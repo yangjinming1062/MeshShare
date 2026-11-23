@@ -154,7 +154,7 @@ impl NodeRuntime {
         if transfers.len() >= MAX_MOBILE_TRANSFER_RECORDS {
             return Err("手机传输记录资源暂时不足，请稍后重试".to_string());
         }
-        let progress = transfer_progress(offer, "receive");
+        let progress = transfer_progress(offer.into(), "receive");
         // `transfer_id` 由对端提供，也会出现在 HTTP API 中。
         // 它只作为协议键使用，绝不作为路径组件：
         // 新生成的 UUID 给每个传输一个不透明的暂存目录，
@@ -437,11 +437,14 @@ impl NodeRuntime {
         ) {
             return None;
         }
-        let item = record.progress.offer.as_mut()?.items.get_mut(index)?;
+        let offer = record.progress.offer.as_mut()?;
+        let item = offer.items.get(index)?;
         if item.item_id != item_id || item.size != bytes {
             return None;
         }
-        item.sha256 = digest;
+        if item.sha256 != digest {
+            Arc::make_mut(offer).items[index].sha256 = digest;
+        }
         if record.staged_items.insert(item_id.to_string()) {
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
             record.progress.completed_bytes = record.progress.completed_bytes.saturating_add(bytes);

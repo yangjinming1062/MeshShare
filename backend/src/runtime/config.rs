@@ -1,6 +1,4 @@
 use super::*;
-#[cfg(all(feature = "gui", not(target_os = "android")))]
-use crate::terminal::ssh::migration::LegacyPolicy;
 use std::path::{Path, PathBuf};
 
 pub(super) const ANDROID_DEFAULT_NODE_NAME: &str = "移动设备";
@@ -233,11 +231,6 @@ pub enum UpdateFrequency {
 }
 
 impl UpdateFrequency {
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value))
-            .ok()
-    }
-
     pub fn period_ms(self) -> Option<i64> {
         match self {
             Self::Daily => Some(24 * 60 * 60 * 1000),
@@ -288,23 +281,41 @@ enum TerminalAccessMigration {
 
 #[cfg(all(feature = "gui", not(target_os = "android")))]
 impl TerminalAccessMigration {
-    fn from_policy(policy: Option<LegacyPolicy>) -> Self {
-        match policy {
-            Some(policy) => Self::AcceptedPolicy(policy.digest),
-            None => Self::NoLegacyPolicy,
-        }
+    fn current(data_dir: &Path) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        use std::io::Read;
+        const MAX_BYTES: u64 = 1024 * 1024;
+
+        let path = data_dir.join("terminal-access.json");
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::NoLegacyPolicy)
+            }
+            Err(error) => return Err(error).context("无法检查本机终端授权记录"),
+        };
+        ensure!(
+            metadata.is_file() && metadata.len() <= MAX_BYTES,
+            "本机终端授权文件无效"
+        );
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .context("无法打开本机终端授权文件")?
+            .take(MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("无法读取本机终端授权文件")?;
+        ensure!(bytes.len() as u64 <= MAX_BYTES, "本机终端授权文件过大");
+        Ok(Self::AcceptedPolicy(format!("{:x}", Sha256::digest(bytes))))
     }
 }
 
 #[cfg(all(feature = "gui", not(target_os = "android")))]
 impl PersistedConfig {
-    pub(super) fn terminal_host_ready(&self, dir: &Path) -> bool {
-        match LegacyPolicy::read(dir) {
-            Ok(policy) => {
-                self.terminal_access_migration == TerminalAccessMigration::from_policy(policy)
-            }
+    pub(super) fn terminal_host_ready(&self, data_dir: &Path) -> bool {
+        match TerminalAccessMigration::current(data_dir) {
+            Ok(current) => self.terminal_access_migration == current,
             Err(error) => {
-                eprintln!("保留旧版终端访问限制：{error:#}");
+                eprintln!("保持入站终端关闭：{error:#}");
                 false
             }
         }
@@ -332,35 +343,19 @@ pub(super) fn history_settings(config: &PersistedConfig) -> ClipboardHistorySett
 
 impl NodeRuntime {
     #[cfg(all(feature = "gui", not(target_os = "android")))]
-    pub(crate) fn restore_legacy_terminal_grant(&self) -> anyhow::Result<()> {
-        if let Some(policy) = LegacyPolicy::read(&self.data_dir)? {
-            if policy.was_enabled(&self.node_id())? {
-                self.accept_terminal_migration(Some(&policy.digest))?;
-            }
+    pub(crate) fn allow_remote_terminal(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.profile == NodeProfile::Desktop,
+            "只有本机桌面可以确认终端访问"
+        );
+        if self.ssh.host_fingerprint().is_none() {
+            self.update_config(|config| {
+                config.terminal_access_migration =
+                    TerminalAccessMigration::current(&self.data_dir)?;
+                Ok(())
+            })?;
+            self.ssh.activate_host();
         }
-        Ok(())
-    }
-
-    #[cfg(all(feature = "gui", not(target_os = "android")))]
-    pub(crate) fn accept_terminal_migration(
-        &self,
-        verified_digest: Option<&str>,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.is_android_profile(), "只有桌面可以提供远程终端");
-        if self.ssh.host_fingerprint().is_some() {
-            return Ok(());
-        }
-        self.update_config(|config| {
-            let policy = LegacyPolicy::read(&self.data_dir)?;
-            anyhow::ensure!(
-                verified_digest.is_none()
-                    || verified_digest == policy.as_ref().map(|policy| policy.digest.as_str()),
-                "核验期间旧版终端授权已更改"
-            );
-            config.terminal_access_migration = TerminalAccessMigration::from_policy(policy);
-            Ok(())
-        })?;
-        self.ssh.activate_host();
         Ok(())
     }
 

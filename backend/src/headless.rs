@@ -73,17 +73,13 @@ async fn serve() -> Result<()> {
         Err(error) => return Err(error.into()),
     };
     let mut terminate = signal(SignalKind::terminate())?;
-    let (node, _control, listener_task) = listeners::start(
+    let (node, listener_task) = listeners::start(
         data_dir,
         WEB_DIR.into(),
         VERSION.into(),
         port,
         NodeProfile::Headless,
-        |runtime| {
-            let control = ControlPlane::runtime_only(runtime);
-            control.start_headless();
-            control
-        },
+        ControlPlane::with_headless,
     )
     .await?;
     publish_port(node.node_info().port)?;

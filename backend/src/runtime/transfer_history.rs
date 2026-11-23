@@ -12,25 +12,25 @@ impl NodeRuntime {
         let receive = match record.progress.direction.as_deref() {
             Some("receive") => true,
             Some(_) => false,
-            None => record.offer.target_node_id == self.node_id(),
+            None => record.offer().target_node_id == self.node_id(),
         };
         let (direction, peer_node_id, peer_name) = if receive {
             (
                 "receive".to_string(),
-                record.offer.source_node_id.clone(),
+                record.offer().source_node_id.clone(),
                 record
                     .peer_name
                     .clone()
-                    .unwrap_or_else(|| record.offer.source_name.clone()),
+                    .unwrap_or_else(|| record.offer().source_name.clone()),
             )
         } else {
             (
                 "send".to_string(),
-                record.offer.target_node_id.clone(),
+                record.offer().target_node_id.clone(),
                 record
                     .peer_name
                     .clone()
-                    .unwrap_or_else(|| short_node_id(&record.offer.target_node_id)),
+                    .unwrap_or_else(|| short_node_id(&record.offer().target_node_id)),
             )
         };
         let item_root = record

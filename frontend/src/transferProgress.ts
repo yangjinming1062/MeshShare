@@ -24,13 +24,18 @@ export function mergeTransferProgress(current: TransferProgress | undefined, nex
   if (!current) return next;
   const currentRetry = current.retry_count ?? 0;
   const nextRetry = next.retry_count ?? 0;
-  const keepCurrent = currentRetry > nextRetry
-    || (currentRetry === nextRetry && transferStatusRank(current) > transferStatusRank(next));
-  const preferred = keepCurrent ? current : next;
+  const sameAttempt = currentRetry === nextRetry;
+  const order = currentRetry - nextRetry
+    || transferStatusRank(current) - transferStatusRank(next)
+    || current.completed_items - next.completed_items
+    || current.completed_bytes - next.completed_bytes;
+  const preferred = order > 0 ? current : next;
+  const other = order > 0 ? next : current;
   return {
-    ...(keepCurrent ? next : current),
     ...preferred,
-    awaiting_offer_reply: preferred.awaiting_offer_reply,
-    offer: next.offer ?? current.offer,
+    direction: preferred.direction ?? other.direction,
+    offer: preferred.offer ?? other.offer,
+    completed_bytes: sameAttempt ? Math.max(current.completed_bytes, next.completed_bytes) : preferred.completed_bytes,
+    completed_items: sameAttempt ? Math.max(current.completed_items, next.completed_items) : preferred.completed_items,
   };
 }

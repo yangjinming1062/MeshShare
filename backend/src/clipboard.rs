@@ -100,19 +100,11 @@ fn monitor_loop(runtime: Arc<NodeRuntime>) {
                         if hash != last_hash {
                             last_hash = hash;
                             let image = image.as_ref().and_then(encode_image);
-                            if let Some(event) = runtime.create_local_clipboard(
+                            runtime.create_local_clipboard(
                                 text,
                                 image,
                                 observed_event_id.as_deref(),
-                            ) {
-                                runtime.publish_event(crate::model::WireMessage::ClipboardUpdate {
-                                    event: event.clone(),
-                                });
-                                runtime.send_to_peers_except(
-                                    None,
-                                    crate::model::WireMessage::ClipboardUpdate { event },
-                                );
-                            }
+                            );
                         }
                     }
                 }

@@ -15,13 +15,9 @@
 
 ## 设置与持久化
 
-Headless 新建的 `node.json` 带有 `headless: true`。已有配置缺少该字段时按原桌面或 Android 节点读取；角色不符时启动会在清理暂存目录前退出。每个服务实例独占自己的数据目录。
+桌面和 Android 使用现有应用数据目录，Headless 使用服务数据目录（可由 `MESHSHARE_DATA_DIR` 指定）。节点直接恢复原目录中的身份、网页 CA、设置和历史。Headless 配置带有 `headless: true`，角色不符时在清理暂存目录前退出。
 
-共享设置由 `runtime/config.rs` 的 `PersistedConfig` 落盘，经 `control.rs` 的补丁与快照提供给界面。桌面上的远程文件授权仅由本机原生命令修改。Headless 初始允许远程文件访问，设置接口同样不能扩大该授权。
-
-SSH 会话使用进程内生成的密钥。桌面配置在 `node.json` 的 `terminal_access_migration` 中记录新版终端授权对应的旧策略摘要，或记录确认时没有旧策略。已有配置缺少此字段时保留旧版限制，即使从未生成过 `terminal-access.json`。桌面仅在自动继承旧版「允许所有节点」授权时从系统凭据库读取旧密钥并验证签名。新安装及本机手动确认均可在无 Secret Service 的 Linux 会话中使用。原策略文件和旧凭据保留供回退，操作入口见[使用指南](../docs/DESIGN.md#桌面终端)。
-
-如果迁移时报旧授权文件不可读或无效，请从备份恢复该节点可读的普通文件后重试。如果 `node.json` 写入失败，修复本机数据目录的写入权限或可用空间后再确认。写入成功前，入站终端保持关闭。
+共享设置由 `runtime/config.rs` 的 `PersistedConfig` 落盘，经 `control.rs` 的补丁与快照提供给界面。桌面上的远程文件和入站终端授权仅由本机主窗口设置。Headless 初始允许服务账户的远程文件访问。SSH 会话使用进程内生成的密钥；桌面继续核对已保存的本机授权；已有授权绑定策略文件时，策略文件变化后需要重新确认。[终端使用说明](../docs/DESIGN.md#桌面终端)
 
 数据目录保存 `node.json`、`clipboard-history.json` 与 payload 目录、`clipboard-current.json`、`transfer-history.json`、`desktop-transfer-temp-files.json`、`mobile-tls/`，Android 另有 `android-update.json`。
 

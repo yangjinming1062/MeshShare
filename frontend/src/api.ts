@@ -1,10 +1,13 @@
 import { invoke, isTauri } from '@tauri-apps/api/core';
 import type { BrowseListing, BrowseRoots, ClipboardHistoryDetail, ClipboardHistoryResponse, ClipboardSnapshot, HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, NodeSettings, NodeSettingsPatch, OutgoingPrepareView, OutgoingStagingView, PeerInfo, TransferHistoryCleared, TransferHistoryEntry, TransferOffer, TransferProgress } from './types';
 
+export const NODE_PROTOCOL_VERSION = 2;
+
 let baseUrl = '';
 let suspendedBase = '';
 type ManagedTarget = { nodeId: string; onMismatch: () => void };
 let managedTarget: ManagedTarget | undefined;
+const READ_TIMEOUT_MS = 6000;
 const SETTINGS_WRITE_TIMEOUT_MS = 30_000;
 
 /** HTTP 状态码保留在错误上，调用方才能区分对端拒绝与网络不可达。 */
@@ -40,11 +43,11 @@ export function websocketUrl(target = baseUrl): string {
   return apiUrl('/api/v1/ws', target).replace(/^http/, 'ws');
 }
 
-export async function request<T>(path: string, options: RequestInit = {}, target = baseUrl): Promise<T> {
+async function fetchNode(path: string, options: RequestInit, target: string): Promise<Response> {
   const url = apiUrl(path, target);
   const managed = target === baseUrl && path !== '/api/v1/info' ? managedTarget : undefined;
   if (managed && options.method && options.method !== 'GET') {
-    // 旧节点也能通过 info 核实身份。写操作只向验证过的地址提交一次。
+    // 地址可能在重新发现前已被其他设备使用。只向当前验证过的节点写入。
     try {
       await verifyPeerAddress(managed.nodeId, target);
     } catch (error) {
@@ -53,26 +56,38 @@ export async function request<T>(path: string, options: RequestInit = {}, target
     }
     if (managed !== managedTarget) throw new ApiError('管理目标已变更', 421);
   }
+  const headers = new Headers(options.headers);
+  if (options.body && !(options.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  if (managed) {
+    const expected = headers.get('X-MeshShare-Target');
+    if (expected && expected !== managed.nodeId) throw new ApiError('管理目标已变更', 421);
+    headers.set('X-MeshShare-Target', managed.nodeId);
+  }
   const response = await fetch(url, {
     ...options,
     cache: 'no-store',
     redirect: 'error',
-    headers: {
-      ...(options.body && !(options.body instanceof FormData) ? { 'Content-Type': 'application/json' } : {}),
-      ...(options.headers ?? {}),
-      ...(managed ? { 'X-MeshShare-Target': managed.nodeId } : {}),
-    },
+    headers,
   });
   if (!response.ok) {
     if (response.status === 421 && managed && managed === managedTarget) managed.onMismatch();
     throw await responseError(response);
   }
+  return response;
+}
+
+function readJson<T>(response: Response, path: string): Promise<T> {
   return response.json().catch((cause: unknown) => {
+    if (!(cause instanceof SyntaxError)) throw cause;
     const message = response.headers.get('content-type')?.startsWith('text/html')
       ? '未连接到 MeshShare 节点，请启动桌面应用'
       : `节点返回了无效的 JSON (${path})`;
     throw new Error(message, { cause });
   });
+}
+
+export async function request<T>(path: string, options: RequestInit = {}, target = baseUrl): Promise<T> {
+  return readJson<T>(await fetchNode(path, options, target), path);
 }
 
 export async function responseError(response: Response): Promise<ApiError> {
@@ -92,8 +107,9 @@ export function isTransportFailure(error: unknown): boolean {
   return error instanceof TypeError || (error instanceof DOMException && error.name === 'AbortError');
 }
 
-async function verifyPeerAddress(nodeId: string, base: string, timeoutMs = 6000): Promise<void> {
+async function verifyPeerAddress(nodeId: string, base: string, timeoutMs = READ_TIMEOUT_MS): Promise<void> {
   const info = await requestWithTimeout<NodeInfo>('/api/v1/info', {}, base, timeoutMs);
+  if (info.protocol_version !== NODE_PROTOCOL_VERSION) throw new ApiError('节点协议版本不匹配', 421);
   if (info.node_id !== nodeId) throw new ApiError('地址上的设备与目标不匹配', 421);
 }
 
@@ -105,7 +121,7 @@ export async function withPeerAddress<T>(nodeId: string, candidates: string[], p
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     try {
-      await verifyPeerAddress(nodeId, base, Math.min(6000, remaining));
+      await verifyPeerAddress(nodeId, base, Math.min(READ_TIMEOUT_MS, remaining));
     } catch (error) {
       lastError = error;
       continue;
@@ -120,7 +136,7 @@ export async function withPeerAddress<T>(nodeId: string, candidates: string[], p
   throw lastError instanceof Error ? lastError : new Error('目标设备没有可访问地址');
 }
 
-export async function requestWithTimeout<T>(path: string, options: RequestInit, target: string, timeoutMs = 6000): Promise<T> {
+export async function requestWithTimeout<T>(path: string, options: RequestInit, target: string, timeoutMs = READ_TIMEOUT_MS): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -130,18 +146,39 @@ export async function requestWithTimeout<T>(path: string, options: RequestInit, 
   }
 }
 
-async function requestList<T>(path: string, target = baseUrl, timeoutMs?: number): Promise<T[]> {
-  const payload = timeoutMs === undefined
-    ? await request<unknown>(path, {}, target)
-    : await requestWithTimeout<unknown>(path, {}, target, timeoutMs);
+async function requestList<T>(path: string, target = baseUrl): Promise<T[]> {
+  const payload = await requestWithTimeout<unknown>(path, {}, target);
   if (!Array.isArray(payload)) throw new Error(`节点返回的列表格式无效 (${path})`);
   return payload;
 }
 
-export const getInfo = (target = baseUrl) => request<NodeInfo>('/api/v1/info', {}, target);
-export const getPeers = (target = baseUrl) => requestList<PeerInfo>('/api/v1/peers', target, 6000);
-export const getMetrics = (target = baseUrl) => request<HardwareMetrics | null>('/api/v1/metrics', {}, target);
-export const getClipboard = (target = baseUrl) => request<ClipboardSnapshot | null>('/api/v1/clipboard', {}, target);
+export const getInfo = (target = baseUrl) => requestWithTimeout<NodeInfo>('/api/v1/info', {}, target);
+export const getPeers = (target = baseUrl) => requestList<PeerInfo>('/api/v1/peers', target);
+export const getMetrics = (target = baseUrl) => requestWithTimeout<HardwareMetrics | null>('/api/v1/metrics', {}, target);
+/** 大快照按读取空闲时间超时，收到响应头或下一块内容即重新计时。 */
+export async function getClipboard(target = baseUrl, controller = new AbortController()): Promise<ClipboardSnapshot | null> {
+  const path = '/api/v1/clipboard';
+  const abort = () => controller.abort(new DOMException('读取剪贴板超时', 'AbortError'));
+  let timer = setTimeout(abort, READ_TIMEOUT_MS);
+  const resetTimer = () => {
+    clearTimeout(timer);
+    timer = setTimeout(abort, READ_TIMEOUT_MS);
+  };
+  try {
+    const response = await fetchNode(path, { signal: controller.signal }, target);
+    resetTimer();
+    const body = response.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, output) {
+        resetTimer();
+        output.enqueue(chunk);
+      },
+    }));
+    return await readJson<ClipboardSnapshot | null>(new Response(body, { headers: response.headers }), path);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export const getSettings = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', {}, target);
 export const patchSettings = (patch: NodeSettingsPatch, target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', { method: 'PATCH', body: JSON.stringify(patch) }, target, SETTINGS_WRITE_TIMEOUT_MS);
 export const requestUpdateCheck = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target, SETTINGS_WRITE_TIMEOUT_MS);
@@ -161,7 +198,7 @@ export async function restartService(target: string, nodeId: string): Promise<vo
   }
 }
 
-export const getClipboardHistory = (target = baseUrl) => request<ClipboardHistoryResponse>('/api/v1/clipboard/history', {}, target);
+export const getClipboardHistory = (target = baseUrl) => requestWithTimeout<ClipboardHistoryResponse>('/api/v1/clipboard/history', {}, target);
 export const getClipboardHistoryDetail = (eventId: string, target = baseUrl) => request<ClipboardHistoryDetail>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}`, {}, target);
 export const clipboardHistoryThumbnailUrl = (eventId: string, target = baseUrl) => apiUrl(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/thumbnail`, target);
 export const restoreClipboardHistory = (eventId: string, target = baseUrl) => request<ClipboardSnapshot>(`/api/v1/clipboard/history/${encodeURIComponent(eventId)}/restore`, { method: 'POST' }, target);
@@ -186,14 +223,19 @@ export const getManagedRoots = (target = baseUrl) => request<BrowseRoots>('/api/
 export const browseManagedPath = (path: string, target = baseUrl) => request<BrowseListing>(`/api/v1/management/files?path=${encodeURIComponent(path)}`, {}, target);
 
 /** 按路径发送的准备任务始终由创建它的节点读取、取消和清理。 */
-export function outgoingPathsApi(owner: string, managed: boolean) {
-  const root = managed ? '/api/v1/management/outgoing' : '/api/v1/outgoing';
+export function outgoingPathsApi(owner: string, managedNodeId?: string) {
+  const root = managedNodeId ? '/api/v1/management/outgoing' : '/api/v1/outgoing';
+  const headers = managedNodeId ? { 'X-MeshShare-Target': managedNodeId } : undefined;
   return {
     create: (targetNodeId: string, paths: string[]) => request<OutgoingPrepareView>(root + '/paths', {
-      method: 'POST', body: JSON.stringify({ target_node_id: targetNodeId, paths }),
+      method: 'POST', headers, body: JSON.stringify({ target_node_id: targetNodeId, paths }),
     }, owner),
-    status: (id: string) => request<OutgoingPrepareView>(root + '/' + encodeURIComponent(id), {}, owner),
-    cancel: (id: string) => request(root + '/' + encodeURIComponent(id) + '/cancel', { method: 'POST' }, owner),
+    status: (id: string) => requestWithTimeout<OutgoingPrepareView>(root + '/' + encodeURIComponent(id), { headers }, owner),
+    cancel: async (id: string) => {
+      // 离开管理页后仍只能取消原节点上的准备任务。
+      if (managedNodeId && owner !== baseUrl) await verifyPeerAddress(managedNodeId, owner);
+      return request(root + '/' + encodeURIComponent(id) + '/cancel', { method: 'POST', headers }, owner);
+    },
   };
 }
 

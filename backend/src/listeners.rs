@@ -48,9 +48,9 @@ pub async fn start(
     preferred_port: u16,
     profile: runtime::NodeProfile,
     make_control: impl FnOnce(Arc<runtime::NodeRuntime>) -> Arc<ControlPlane>,
-) -> anyhow::Result<(Arc<runtime::NodeRuntime>, Arc<ControlPlane>, JoinHandle<()>)> {
+) -> anyhow::Result<(Arc<runtime::NodeRuntime>, JoinHandle<()>)> {
     let addresses = runtime::bind_addresses();
-    let (mut listeners, runtime, control) = Listeners::start(
+    let (mut listeners, runtime) = Listeners::start(
         data_dir,
         static_root,
         version,
@@ -75,7 +75,7 @@ pub async fn start(
         }
         listeners.shutdown().await;
     });
-    Ok((runtime, control, listener_task))
+    Ok((runtime, listener_task))
 }
 
 impl Listeners {
@@ -87,7 +87,7 @@ impl Listeners {
         addresses: &BTreeSet<Ipv4Addr>,
         profile: runtime::NodeProfile,
         make_control: impl FnOnce(Arc<runtime::NodeRuntime>) -> Arc<ControlPlane>,
-    ) -> anyhow::Result<(Self, Arc<runtime::NodeRuntime>, Arc<ControlPlane>)> {
+    ) -> anyhow::Result<(Self, Arc<runtime::NodeRuntime>)> {
         let local = Ipv4Addr::LOCALHOST;
         let http = match TcpListener::bind((local, preferred_port)).await {
             Ok(listener) => listener,
@@ -101,14 +101,14 @@ impl Listeners {
         let http_port = http.local_addr()?.port();
         let https_port = https.local_addr()?.port();
         let certificate_addresses = addresses.iter().copied().collect::<Vec<_>>();
+        let runtime =
+            runtime::NodeRuntime::new_with_profile(data_dir.clone(), http_port, version, profile)?;
         let tls = mobile_tls::ensure(&data_dir, &certificate_addresses)?;
         let config =
             RustlsConfig::from_pem_file(&tls.server_certificate_path, &tls.server_key_path).await?;
-        let runtime =
-            runtime::NodeRuntime::new_with_profile(data_dir.clone(), http_port, version, profile)?;
         runtime.set_mobile_ca(tls.ca_certificate_path, tls.fingerprint);
         let control = make_control(runtime.clone());
-        let app = server::router_with_control(runtime.clone(), static_root, control.clone());
+        let app = server::router_with_control(runtime.clone(), static_root, control);
         let listeners = Self {
             http: BTreeMap::from([(local, serve_listener(http, app.clone(), None)?)]),
             https: BTreeMap::from([(
@@ -125,7 +125,7 @@ impl Listeners {
             tls_data_dir: data_dir,
             app,
         };
-        Ok((listeners, runtime, control))
+        Ok((listeners, runtime))
     }
 
     async fn reconcile(&mut self, runtime: &runtime::NodeRuntime, candidates: &BTreeSet<Ipv4Addr>) {
@@ -329,7 +329,7 @@ mod tests {
             std::env::temp_dir().join(format!("meshshare-listeners-{}", uuid::Uuid::new_v4()));
         let local_only = BTreeSet::from([local]);
         let with_network = BTreeSet::from([local, ip]);
-        let (mut listeners, runtime, _) = Listeners::start(
+        let (mut listeners, runtime) = Listeners::start(
             path.clone(),
             path.clone(),
             "test".into(),

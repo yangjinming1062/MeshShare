@@ -16,7 +16,7 @@
     ]
   },
   "build": {
-    "beforeBuildCommand": "npm --prefix ../frontend run build -- --target chrome74"
+    "beforeBuildCommand": "npm --prefix ../frontend run build -- --target chrome108"
   },
   "bundle": {
     "android": {

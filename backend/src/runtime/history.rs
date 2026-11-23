@@ -540,43 +540,43 @@ impl NodeRuntime {
     }
 }
 
+enum ClipboardSource<'a> {
+    #[cfg(all(any(feature = "gui", test), not(target_os = "android")))]
+    System,
+    Local,
+    Peer(&'a str),
+}
+
 impl NodeRuntime {
-    pub fn accept_clipboard(&self, event: ClipboardEvent, source_name: String) -> bool {
-        let _update_guard = self.clipboard_update.lock();
-        self.accept_clipboard_locked(event, source_name, true)
+    pub(crate) fn receive_clipboard(&self, peer_id: &str, mut snapshot: ClipboardSnapshot) -> bool {
+        if snapshot.source_name.len() <= 256 && snapshot.source_name.trim().is_empty() {
+            snapshot.source_name = self.peer_name(peer_id).unwrap_or_else(|| "远端设备".into());
+        }
+        let _guard = self.clipboard_update.lock();
+        self.accept_clipboard_locked(snapshot, ClipboardSource::Peer(peer_id))
+            .is_some()
     }
 
     fn accept_clipboard_locked(
         &self,
-        event: ClipboardEvent,
-        source_name: String,
-        write_to_system: bool,
-    ) -> bool {
+        snapshot: ClipboardSnapshot,
+        source: ClipboardSource<'_>,
+    ) -> Option<ClipboardSnapshot> {
         let now = now_millis();
         let mut seen = self.seen_events.lock();
         seen.retain(|_, timestamp| now.saturating_sub(*timestamp) < 10 * 60 * 1000);
-        if seen.contains_key(&event.event_id) {
-            return false;
+        if seen.contains_key(&snapshot.event_id) {
+            return None;
         }
-        let event_id = event.event_id.clone();
-        let snapshot = ClipboardSnapshot {
-            event_id: event.event_id,
-            source_node_id: event.origin_node_id,
-            source_name,
-            clock: event.clock,
-            text: event.text,
-            image_png: event.image_png,
-            updated_at_ms: event.updated_at_ms,
-        };
         let image = match validated_clipboard_image(&snapshot) {
             Ok(image) => image,
             Err(error) => {
                 eprintln!("忽略无效剪贴板内容：{error}");
-                return false;
+                return None;
             }
         };
         // 只有校验通过的负载才登记为已见，避免非法内容占用去重标识。
-        seen.insert(event_id, now);
+        seen.insert(snapshot.event_id.clone(), now);
         while seen.len() > MAX_SEEN_CLIPBOARD_EVENTS {
             let Some(oldest) = seen
                 .iter()
@@ -587,6 +587,7 @@ impl NodeRuntime {
             };
             seen.remove(&oldest);
         }
+        drop(seen);
         let (replayed_current, newer) =
             self.clipboard
                 .lock()
@@ -606,25 +607,34 @@ impl NodeRuntime {
             }
         }
         if !newer {
-            return false;
+            return None;
         }
         self.clock.observe(&snapshot.clock);
         if let Err(error) = persist_clipboard_current(&self.data_dir, &snapshot) {
             eprintln!("保存当前剪贴板失败：{error}");
         }
-        let mut clipboard = self.clipboard.lock();
-        clipboard.snapshot = Some(snapshot);
-        #[cfg(not(target_os = "android"))]
         {
-            clipboard.pending_system_write =
-                write_to_system && self.profile == NodeProfile::Desktop;
-            if clipboard.pending_system_write {
-                self.system_clipboard_ready.notify_one();
+            let mut clipboard = self.clipboard.lock();
+            clipboard.snapshot = Some(snapshot.clone());
+            #[cfg(not(target_os = "android"))]
+            {
+                clipboard.pending_system_write = self.profile == NodeProfile::Desktop
+                    && matches!(source, ClipboardSource::Local | ClipboardSource::Peer(_));
+                if clipboard.pending_system_write {
+                    self.system_clipboard_ready.notify_one();
+                }
             }
         }
-        #[cfg(target_os = "android")]
-        let _ = write_to_system;
-        true
+        let update = WireMessage::ClipboardUpdate {
+            event: snapshot.clone().into(),
+        };
+        self.publish_event(update.clone());
+        match source {
+            ClipboardSource::Peer(_) if self.is_android_profile() => {}
+            ClipboardSource::Peer(peer_id) => self.send_to_peers_except(Some(peer_id), update),
+            _ => self.send_to_peers_except(None, update),
+        }
+        Some(snapshot)
     }
 
     fn upsert_clipboard_history_locked(
@@ -673,15 +683,14 @@ impl NodeRuntime {
         text: Option<String>,
         image_png: Option<Vec<u8>>,
         observed_event_id: Option<&str>,
-    ) -> Option<ClipboardEvent> {
-        let source_name = self.node.read().node_name.clone();
-        let event = self.local_clipboard_event(text, image_png, &source_name)?;
-        let _update_guard = self.clipboard_update.lock();
+    ) -> Option<ClipboardSnapshot> {
+        let _guard = self.clipboard_update.lock();
         if self.clipboard_event_id().as_deref() != observed_event_id {
             return None;
         }
-        self.accept_clipboard_locked(event.clone(), source_name, false)
-            .then_some(event)
+        let source_name = self.node.read().node_name.clone();
+        let snapshot = self.local_clipboard_snapshot(text, image_png, source_name)?;
+        self.accept_clipboard_locked(snapshot, ClipboardSource::System)
     }
 
     pub fn create_local_clipboard_named(
@@ -689,18 +698,18 @@ impl NodeRuntime {
         text: Option<String>,
         image_png: Option<Vec<u8>>,
         source_name: String,
-    ) -> Option<ClipboardEvent> {
-        let event = self.local_clipboard_event(text, image_png, &source_name)?;
-        self.accept_clipboard(event.clone(), source_name)
-            .then_some(event)
+    ) -> Option<ClipboardSnapshot> {
+        let _guard = self.clipboard_update.lock();
+        let snapshot = self.local_clipboard_snapshot(text, image_png, source_name)?;
+        self.accept_clipboard_locked(snapshot, ClipboardSource::Local)
     }
 
-    fn local_clipboard_event(
+    fn local_clipboard_snapshot(
         &self,
         text: Option<String>,
         image_png: Option<Vec<u8>>,
-        source_name: &str,
-    ) -> Option<ClipboardEvent> {
+        source_name: String,
+    ) -> Option<ClipboardSnapshot> {
         if !self.sync_enabled.load(Ordering::SeqCst) {
             return None;
         }
@@ -717,9 +726,10 @@ impl NodeRuntime {
         if text.is_none() && image_png.is_none() {
             return None;
         }
-        Some(ClipboardEvent {
+        Some(ClipboardSnapshot {
             event_id: Uuid::new_v4().to_string(),
-            origin_node_id: self.node_id(),
+            source_node_id: self.node_id(),
+            source_name,
             clock: self.clock.tick(),
             text,
             image_png,
@@ -727,7 +737,7 @@ impl NodeRuntime {
         })
     }
 
-    pub fn restore_clipboard_history(&self, event_id: &str) -> Option<ClipboardEvent> {
+    pub fn restore_clipboard_history(&self, event_id: &str) -> Option<ClipboardSnapshot> {
         let detail = self.clipboard_history_detail(event_id)?;
         let image = detail
             .snapshot

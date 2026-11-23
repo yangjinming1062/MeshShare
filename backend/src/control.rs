@@ -11,12 +11,6 @@ use crate::updater::UpdateStatus;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(any(
-    all(feature = "gui", not(target_os = "android")),
-    all(feature = "headless", target_os = "linux")
-))]
-use std::sync::OnceLock;
-
 #[cfg(feature = "gui")]
 use tauri::AppHandle;
 
@@ -57,7 +51,7 @@ pub struct MonitorSettingsPatch {
 pub struct SettingsPatch {
     pub clipboard_sync_enabled: Option<bool>,
     pub autostart_enabled: Option<bool>,
-    pub update_frequency: Option<String>,
+    pub update_frequency: Option<UpdateFrequency>,
     pub receive_settings: Option<ReceiveSettings>,
     pub clipboard_history_settings: Option<ClipboardHistoryPatch>,
     pub monitor: Option<MonitorSettingsPatch>,
@@ -68,10 +62,15 @@ pub struct ControlPlane {
     runtime: Arc<NodeRuntime>,
     #[cfg(feature = "gui")]
     app: Option<AppHandle>,
-    #[cfg(all(feature = "headless", target_os = "linux"))]
-    headless: OnceLock<Arc<crate::headless_service::Coordinator>>,
+    updates: UpdateBackend,
+}
+
+enum UpdateBackend {
+    Standalone,
     #[cfg(all(feature = "gui", not(target_os = "android")))]
-    updater: OnceLock<Arc<UpdateCoordinator>>,
+    Desktop(Arc<UpdateCoordinator>),
+    #[cfg(all(feature = "headless", target_os = "linux"))]
+    Headless(Arc<crate::headless_service::Coordinator>),
 }
 
 impl ControlPlane {
@@ -80,41 +79,45 @@ impl ControlPlane {
             runtime,
             #[cfg(feature = "gui")]
             app: None,
-            #[cfg(all(feature = "headless", target_os = "linux"))]
-            headless: OnceLock::new(),
-            #[cfg(all(feature = "gui", not(target_os = "android")))]
-            updater: OnceLock::new(),
+            updates: UpdateBackend::Standalone,
         })
     }
 
     #[cfg(all(feature = "headless", target_os = "linux"))]
-    pub fn start_headless(&self) {
-        self.headless
-            .get_or_init(|| crate::headless_service::Coordinator::start(self.runtime.clone()));
+    pub fn with_headless(runtime: Arc<NodeRuntime>) -> Arc<Self> {
+        Arc::new(Self {
+            updates: UpdateBackend::Headless(crate::headless_service::Coordinator::start(
+                runtime.clone(),
+            )),
+            runtime,
+            #[cfg(feature = "gui")]
+            app: None,
+        })
     }
 
     #[cfg(all(feature = "headless", target_os = "linux"))]
     pub fn headless(&self) -> Option<&Arc<crate::headless_service::Coordinator>> {
-        self.headless.get()
+        match &self.updates {
+            UpdateBackend::Headless(service) => Some(service),
+            _ => None,
+        }
     }
 
     #[cfg(feature = "gui")]
     pub fn with_app(runtime: Arc<NodeRuntime>, app: AppHandle) -> Arc<Self> {
+        #[cfg(not(target_os = "android"))]
+        let updates = {
+            let updater = UpdateCoordinator::new(app.clone(), runtime.clone());
+            updater.start();
+            UpdateBackend::Desktop(updater)
+        };
+        #[cfg(target_os = "android")]
+        let updates = UpdateBackend::Standalone;
         Arc::new(Self {
             runtime,
             app: Some(app),
-            #[cfg(all(feature = "headless", target_os = "linux"))]
-            headless: OnceLock::new(),
-            #[cfg(all(feature = "gui", not(target_os = "android")))]
-            updater: OnceLock::new(),
+            updates,
         })
-    }
-
-    #[cfg(all(feature = "gui", not(target_os = "android")))]
-    pub fn install_updater(&self, updater: Arc<UpdateCoordinator>) -> Result<(), String> {
-        self.updater
-            .set(updater)
-            .map_err(|_| "更新服务已经初始化".to_string())
     }
 
     fn monitor_capabilities(&self) -> crate::MonitorCapabilities {
@@ -142,15 +145,13 @@ impl ControlPlane {
             Some(service) => service.autostart().await,
             None => autostart,
         };
-        #[cfg(all(feature = "gui", not(target_os = "android")))]
-        let update_status = self.updater.get().map(|updater| updater.status());
-        #[cfg(not(all(feature = "gui", not(target_os = "android"))))]
-        let update_status = None;
-        #[cfg(all(feature = "headless", target_os = "linux"))]
-        let update_status = self
-            .headless()
-            .map(|service| service.status())
-            .or(update_status);
+        let update_status = match &self.updates {
+            #[cfg(all(feature = "gui", not(target_os = "android")))]
+            UpdateBackend::Desktop(updater) => Some(updater.status()),
+            #[cfg(all(feature = "headless", target_os = "linux"))]
+            UpdateBackend::Headless(service) => Some(service.status()),
+            UpdateBackend::Standalone => None,
+        };
         SettingsSnapshot {
             clipboard_sync_enabled: self
                 .runtime
@@ -164,8 +165,7 @@ impl ControlPlane {
             clipboard_history_settings: self.runtime.clipboard_history_settings(),
             clipboard_status: self.runtime.clipboard_status(),
             monitor: MonitorSettingsSnapshot {
-                visible: !self.runtime.supports_capability("node.headless.v1")
-                    && self.runtime.monitor_visible(),
+                visible: !self.runtime.is_headless() && self.runtime.monitor_visible(),
                 locked,
                 capabilities: monitor_capabilities,
             },
@@ -173,8 +173,7 @@ impl ControlPlane {
     }
 
     pub async fn apply_patch(&self, patch: SettingsPatch) -> Result<SettingsSnapshot, String> {
-        #[cfg(all(feature = "headless", target_os = "linux"))]
-        if self.headless().is_some() && patch.monitor.is_some() {
+        if self.runtime.is_headless() && patch.monitor.is_some() {
             return Err("无界面服务没有监控窗口".into());
         }
         if let Some(value) = patch.clipboard_sync_enabled {
@@ -191,9 +190,7 @@ impl ControlPlane {
             self.set_autostart(value).await?;
         }
 
-        if let Some(value) = patch.update_frequency {
-            let frequency =
-                UpdateFrequency::parse(&value).ok_or_else(|| "自动更新频率无效".to_string())?;
+        if let Some(frequency) = patch.update_frequency {
             self.set_update_frequency(frequency)?;
         }
 
@@ -223,31 +220,27 @@ impl ControlPlane {
     }
 
     pub async fn request_update_check(&self) -> Result<SettingsSnapshot, String> {
-        #[cfg(all(feature = "gui", not(target_os = "android")))]
-        if let Some(updater) = self.updater.get() {
-            updater.request_manual_check()?;
-            return Ok(self.snapshot().await);
-        }
-        #[cfg(all(feature = "headless", target_os = "linux"))]
-        if let Some(service) = self.headless() {
-            service.request()?;
-            return Ok(self.snapshot().await);
-        }
-        Err("更新服务尚未初始化".to_string())
+        match &self.updates {
+            #[cfg(all(feature = "gui", not(target_os = "android")))]
+            UpdateBackend::Desktop(updater) => updater.request_manual_check(),
+            #[cfg(all(feature = "headless", target_os = "linux"))]
+            UpdateBackend::Headless(service) => service.request(),
+            UpdateBackend::Standalone => Err("此节点没有远程更新服务".to_string()),
+        }?;
+        Ok(self.snapshot().await)
     }
 
     fn set_update_frequency(&self, frequency: UpdateFrequency) -> Result<(), String> {
-        #[cfg(all(feature = "gui", not(target_os = "android")))]
-        if let Some(updater) = self.updater.get() {
-            return updater.set_frequency(frequency);
+        match &self.updates {
+            #[cfg(all(feature = "gui", not(target_os = "android")))]
+            UpdateBackend::Desktop(updater) => updater.set_frequency(frequency),
+            #[cfg(all(feature = "headless", target_os = "linux"))]
+            UpdateBackend::Headless(service) => service.set_frequency(frequency),
+            UpdateBackend::Standalone => self
+                .runtime
+                .set_update_frequency(frequency)
+                .map_err(|error| error.to_string()),
         }
-        #[cfg(all(feature = "headless", target_os = "linux"))]
-        if let Some(service) = self.headless() {
-            return service.set_frequency(frequency);
-        }
-        self.runtime
-            .set_update_frequency(frequency)
-            .map_err(|error| format!("保存自动更新设置失败：{error}"))
     }
 
     async fn set_autostart(&self, enabled: bool) -> Result<(), String> {

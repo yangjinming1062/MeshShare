@@ -2,13 +2,14 @@
   import { onMount, tick } from 'svelte';
   import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
-  import { addPluginListener, invoke, isTauri } from '@tauri-apps/api/core';
+  import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { getCurrentWindow } from '@tauri-apps/api/window';
-  import { buildOffer, putFile, randomId, uploadFileWithRetry } from './upload';
+  import { buildOffer, uploadItems, randomId, uploadFileWithRetry } from './upload';
+  import { snapshotRead } from './snapshotRead';
   import { filesFromDataTransfer } from './drop';
   import { HEADLESS_CAPABILITY, peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
-  import { ApiError, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, sendManagedPathsToMobile, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restartService, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
+  import { ApiError, NODE_PROTOCOL_VERSION, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, sendManagedPathsToMobile, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restartService, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { mergeTransferProgress } from './transferProgress';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
@@ -46,11 +47,14 @@
   let localNodeId = '';
   let peers: PeerInfo[] = [];
   let clipboard: ClipboardSnapshot | null = null;
+  let clipboardReadError = '';
+  let clipboardRequest: AbortController | undefined;
   let clipboardHistory: ClipboardHistoryItem[] = [];
-  let clipboardHistorySettings: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
+  const defaultHistory: ClipboardHistorySettings = { mode: 'count', count: 50, days: 30 };
+  let webHistorySettings = defaultHistory;
   let selectedClipboardHistory: ClipboardHistoryDetail | null = null;
   let clipboardHistoryBusy = false;
-  let clipboardStatus: ClipboardStatus = { session: 'unknown', available: false, retrying: true, message: '正在连接系统剪贴板…' };
+  const loadingClipboard: ClipboardStatus = { session: 'unknown', available: false, retrying: true, message: '正在连接系统剪贴板…' };
   type AndroidReceiveStorage = { directory: string; public_download: boolean };
   let androidReceiveStorage: AndroidReceiveStorage | null = null;
   let metrics: HardwareMetrics | null = null;
@@ -61,14 +65,21 @@
   let mobileAddresses: AddressInfo[] = [];
   let selectedAddress = '';
   let mobileQr: { url: string; image: string } | null = null;
-  let syncEnabled = true;
-  let autostartEnabled = true;
-  let updateFrequency: UpdateFrequency = 'weekly';
-  let updateStatus: UpdateStatus | null = null;
   const UNKNOWN_MONITOR_CAPABILITIES: MonitorCapabilities = { backend: 'unknown', can_persist_position: false, can_click_through: false, can_keep_above: false };
-  let monitorCapabilities: MonitorCapabilities = UNKNOWN_MONITOR_CAPABILITIES;
-  let receiveSettings: ReceiveSettings = { mode: 'confirm' };
-  let settingsReady = false;
+  let settingsSnapshot: NodeSettings | null = null;
+  const defaultReceive: ReceiveSettings = { mode: 'confirm' };
+  $: settingsReady = settingsSnapshot !== null;
+  $: syncEnabled = settingsSnapshot?.clipboard_sync_enabled ?? true;
+  $: autostartEnabled = settingsSnapshot?.autostart_enabled ?? true;
+  $: receiveSettings = settingsSnapshot?.receive_settings ?? defaultReceive;
+  $: clipboardHistorySettings = settingsSnapshot?.clipboard_history_settings ?? webHistorySettings;
+  $: clipboardStatus = settingsSnapshot?.clipboard_status ?? loadingClipboard;
+  $: updateFrequency = settingsSnapshot?.update_frequency ?? 'weekly';
+  $: updateStatus = settingsSnapshot?.update_status ?? null;
+  $: serviceControlError = settingsSnapshot?.service_control_error ?? '';
+  $: monitorLocked = settingsSnapshot?.monitor.locked ?? false;
+  $: monitorVisible = settingsSnapshot?.monitor.visible ?? true;
+  $: monitorCapabilities = settingsSnapshot?.monitor.capabilities ?? UNKNOWN_MONITOR_CAPABILITIES;
   let settingsRead: Promise<NodeSettings> | null = null;
   let settingsWrites = new Set<string>();
   let remoteFileAccess = false;
@@ -104,10 +115,7 @@
   let transferActionBusy = '';
   let manualAddress = '';
   let savedNodeUrls: string[] = [];
-  let monitorLocked = false;
-  let monitorVisible = true;
   let settingsOpen = false;
-  let serviceControlError = '';
   let restartBusy = false;
   let restartError = '';
   let terminalWorkspace: TerminalWorkspace;
@@ -142,14 +150,14 @@
     pathPrompt = null;
   }
   type TransferRoute = { target: string; peer: PeerInfo };
-  type PendingUpload = TransferRoute & { files: File[]; offer: TransferOffer };
+  type UploadFiles = { files: File[]; offer: TransferOffer; completedItemIds: Set<string>; attempts: number; controller?: AbortController };
+  type PendingUpload = TransferRoute & UploadFiles;
+  type MobileUpload = UploadFiles & { sessionId: string; readonly base: string; failure?: TransferFailure };
   const pendingUploads = new Map<string, PendingUpload>();
   let remoteMode = false;
-  const uploading = new Set<string>();
   const watching = new Set<string>();
-  const pendingMobileUploads = new Map<string, { files: File[]; completedItemIds: Set<string>; sessionId: string; offer: TransferOffer; base: string; controller?: AbortController; failure?: TransferFailure }>();
-  const uploadAttempts = new Map<string, number>();
-  const uploadStopped = new Set<string>();
+  const pendingMobileUploads = new Map<string, MobileUpload>();
+  let localMobileRead: Promise<MobileTransferView[]> | undefined;
   // 用户取消时通知任务所属节点；离开界面只停止页面的准备工作。
   const prepareTasks = new Map<string, { controller: AbortController; cancel: (id: string) => Promise<unknown> }>();
   let mobileDownloading = new Set<string>();
@@ -157,6 +165,8 @@
   const pendingMobileCompletions = new Map<string, PendingMobileCompletion>();
   let mobileBrowserDownloadStarted = new Set<string>();
   const MAX_UPLOAD_ATTEMPTS = 6;
+  const SAVED_NODE_URLS_KEY = 'meshshare-saved-node-urls';
+  const MOBILE_SESSION_KEY = 'meshshare-mobile-session';
   const REMOTE_MANAGEMENT_CAPABILITY = 'management.remote.v1';
   const REMOTE_FILES_CAPABILITY = 'management.files.v1';
   const WS_RECONNECT_BASE_MS = 1500;
@@ -169,10 +179,20 @@
   let wsPingTimer: number | undefined;
   let targetGeneration = 0;
   let rediscoveringGeneration: number | undefined;
-  let refreshRequestId = 0;
+  const nodeRead = snapshotRead(refreshTarget);
+  const clipboardRead = snapshotRead(readSharedClipboard);
+  const historyRead = snapshotRead(loadTransferHistory);
+  const refresh = () => nodeRead.refresh(true);
   const FAILURE_RETENTION_MS = 24 * 60 * 60 * 1000;
   const MAX_FAILURES = 20;
   const dismissedFailures = new Map<string, number>();
+
+  function resetSnapshotReads() {
+    nodeRead.reset();
+    clipboardRead.reset();
+    historyRead.reset();
+    clipboardRequest?.abort();
+  }
 
   $: mobileAddress = mobileAddresses.find((address) => address.url === selectedAddress);
   $: mobileUrl = mobileAddress ? mobileAddress.url : '';
@@ -239,10 +259,9 @@
   }
 
   function forgetPendingTransfer(transferId: string) {
+    (pendingUploads.get(transferId) ?? pendingMobileUploads.get(transferId))?.controller?.abort();
     pendingUploads.delete(transferId);
     pendingMobileUploads.delete(transferId);
-    uploadAttempts.delete(transferId);
-    uploadStopped.delete(transferId);
   }
 
   function pruneFailures() {
@@ -411,7 +430,7 @@
     document.addEventListener('visibilitychange', resumeNotice);
     window.addEventListener('focus', resumeNotice);
     try {
-      const stored = window.localStorage.getItem('meshshare-saved-node-urls');
+      const stored = window.localStorage.getItem(SAVED_NODE_URLS_KEY);
       const parsed = stored ? JSON.parse(stored) : [];
       if (Array.isArray(parsed)) {
         savedNodeUrls = parsed
@@ -427,24 +446,13 @@
     let monitorPositionWriteInFlight = false;
     let monitorPositionUnlisten: (() => void) | undefined;
     let updateStatusUnlisten: (() => void) | undefined;
-    let androidNetworkUnlisten: (() => void) | undefined;
     if (isDesktopWindow) {
       void listen<UpdateStatus>('update-status', ({ payload }) => {
-        if (!remoteMode) updateStatus = payload;
+        if (!remoteTarget && settingsSnapshot) settingsSnapshot = { ...settingsSnapshot, update_status: payload };
       }).then((unlisten) => {
         if (pageStopped) unlisten();
         else updateStatusUnlisten = unlisten;
       }).catch((error) => console.error('监听更新状态失败', error));
-    }
-    if (isAndroidApp) {
-      void addPluginListener<{ network_handle: number }>('android-network', 'network_changed', () => {
-        void invoke('android_network_changed').catch((error) => {
-          console.error('通知 Rust 网络绑定变化失败', error);
-        });
-      }).then((listener) => {
-        if (pageStopped) void listener.unregister();
-        else androidNetworkUnlisten = () => { void listener.unregister(); };
-      }).catch((error) => console.error('监听 Android 网络绑定变化失败', error));
     }
     const flushMonitorPosition = async () => {
       if (!pendingMonitorPosition || monitorPositionWriteInFlight) return;
@@ -492,11 +500,14 @@
         if (pageStopped) return;
         connectWebSocket();
         timer = window.setInterval(() => {
+          if (remoteTarget && [...pendingMobileUploads.values()].some(upload => !upload.failure)) {
+            void readLocalMobileTransfers().catch(error => console.error('读取本机网页传输失败', error));
+          }
           const generation = targetGeneration;
-          void refresh().catch(async (error) => {
+          void nodeRead.refresh().catch(async (error) => {
             if (pageStopped || generation !== targetGeneration) return;
             if (remoteTarget) {
-              settingsReady = false;
+              settingsSnapshot = null;
               if (await rediscoverRemote(generation, activeBaseUrl)) return;
             }
             if (generation !== targetGeneration) return;
@@ -511,15 +522,17 @@
         timer = window.setTimeout(start, 3000);
       }
     };
-    if (isWeb) mobileSessionId = window.sessionStorage.getItem('meshshare-mobile-session') ?? '';
+    if (isWeb) mobileSessionId = window.sessionStorage.getItem(MOBILE_SESSION_KEY) ?? '';
     void start();
     return () => {
       pageStopped = true;
+      resetSnapshotReads();
       document.removeEventListener('visibilitychange', resumeNotice);
       window.removeEventListener('focus', resumeNotice);
       window.clearTimeout(noticeTimer);
       if (timer) window.clearInterval(timer);
       for (const { controller } of prepareTasks.values()) controller.abort();
+      for (const pending of [...pendingUploads.values(), ...pendingMobileUploads.values()]) pending.controller?.abort();
       if (wsReconnectTimer) window.clearTimeout(wsReconnectTimer);
       wsReconnectTimer = undefined;
       if (wsPingTimer) window.clearInterval(wsPingTimer);
@@ -529,7 +542,6 @@
       if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
       monitorPositionUnlisten?.();
       updateStatusUnlisten?.();
-      androidNetworkUnlisten?.();
       void flushMonitorPosition();
     };
   });
@@ -552,15 +564,14 @@
     }
   }
 
-  async function refresh() {
-    const requestId = ++refreshRequestId;
+  async function refreshTarget() {
     const generation = targetGeneration;
     const target = activeBaseUrl;
     if (remoteTarget && !target) {
       await rediscoverRemote(generation, '');
       return;
     }
-    const current = () => !pageStopped && requestId === refreshRequestId && generation === targetGeneration;
+    const current = () => !pageStopped && generation === targetGeneration;
     if (isMonitor) {
       const [nextNode, nextMetrics] = await Promise.all([getInfo(target), getMetrics(target)]);
       if (!current()) return;
@@ -572,21 +583,28 @@
       return;
     }
 
-    const nextNode = await requestWithTimeout<NodeInfo>('/api/v1/info', {}, target);
+    const nextNode = await getInfo(target);
     if (!current()) return;
-    if (remoteTarget && nextNode.node_id !== remoteTarget.node_id) {
+    if (remoteTarget && (nextNode.node_id !== remoteTarget.node_id || nextNode.protocol_version !== NODE_PROTOCOL_VERSION)) {
       suspendRemoteTarget();
       return;
     }
-    await Promise.all([
+    void clipboardRead.refresh().catch(error => {
+      if (!current()) return;
+      const message = error instanceof Error ? error.message : '无法读取共享剪贴板';
+      if (message !== clipboardReadError) showTransientNotice(message, 6000);
+      clipboardReadError = message;
+    });
+    const results = await Promise.allSettled([
       refreshOverview(current, generation, target, nextNode),
-      refreshTransfers(current, generation, target),
+      refreshTransfers(current, target),
     ]);
+    for (const result of results) if (result.status === 'rejected') throw result.reason;
   }
 
   async function refreshOverview(current: () => boolean, generation: number, target: string, nextNode: NodeInfo) {
-    const [nextPeers, nextClipboard, nextMetrics, nextHistory, sessions] = await Promise.all([
-      getPeers(target), getClipboard(target), getMetrics(target), getClipboardHistory(target),
+    const [nextPeers, nextMetrics, sessions] = await Promise.all([
+      getPeers(target), getMetrics(target),
       isWeb ? [] : getMobileSessions(target),
     ]);
     if (!current()) return;
@@ -595,20 +613,11 @@
     node = nextNode;
     if (!remoteMode) localNodeId = nextNode.node_id;
     peers = nextPeers.filter((peer) => peer.online);
-    clipboard = nextClipboard;
-    clipboardHistory = nextHistory.items;
-    if (isWeb) clipboardHistorySettings = nextHistory.settings;
-    if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
-      selectedClipboardHistory = null;
-      historyDetailToken += 1;
-      historyDetailLoading = false;
-    }
     metrics = nextMetrics;
     if (selectedMetricsPeer) {
       selectedMetricsPeer = peers.find((peer) => peer.node_id === selectedMetricsPeer?.node_id) ?? null;
       if (!selectedMetricsPeer) metricsPeerOpen = false;
     }
-    if (clipboard && document.activeElement?.id !== 'clipboard-editor') clipboardDraft = clipboard.text ?? '';
     mobileAddresses = nextNode.addresses.filter((address) => !address.address.startsWith('127.'));
     if (!mobileAddresses.some((address) => address.url === selectedAddress)) {
       selectedAddress = mobileAddresses[0]?.url ?? '';
@@ -619,7 +628,7 @@
   }
 
   /** 文件由持有源内容的一端推进，节点概览的可用性不影响传输。 */
-  async function refreshTransfers(current: () => boolean, generation: number, target: string) {
+  async function refreshTransfers(current: () => boolean, target: string) {
     for (const [id, pending] of pendingUploads) {
       const progress = transfers.find((item) => item.transfer_id === id);
       if (progress && isActiveTransferStatus(progress.status)) void pollTransfer(id, pending);
@@ -642,11 +651,41 @@
     ];
     for (const transfer of refreshedTransfers) observeFailure(transfer);
     pruneFailures();
-    await loadTransferHistory(generation, target);
+    await historyRead.refresh();
+  }
+
+  /** 页面持有的源文件只属于本机。查看其他节点期间仍按本机的确认、取消和完成状态推进上传。 */
+  function readLocalMobileTransfers(): Promise<MobileTransferView[]> {
+    if (localMobileRead) return localMobileRead;
+    const uploads = [...pendingMobileUploads];
+    localMobileRead = getMobileTransfers(undefined, localBaseUrl).then(views => {
+      if (pageStopped || !uploads.length) return views;
+      const progressById = new Map(views.map(({ progress }) => [progress.transfer_id, progress]));
+      for (const [id, upload] of uploads) {
+        if (pendingMobileUploads.get(id) !== upload) continue;
+        const progress = progressById.get(id);
+        if (!progress) {
+          // 建单失败的源文件仍用于手动重试，已从节点清单移除的任务可以释放。
+          if (!upload.failure) forgetPendingTransfer(id);
+        } else if (progress.status === 'accepted' || progress.status === 'uploading') {
+          void uploadPendingFiles(upload);
+        } else if (progress.status === 'failed') {
+          upload.controller?.abort();
+          upload.failure ??= { progress: { ...progress, direction: 'send' }, failed_at_ms: Date.now(), retryable: true };
+        } else if (progress.status !== 'waiting') {
+          forgetPendingTransfer(id);
+        }
+      }
+      return views;
+    }).finally(() => { localMobileRead = undefined; });
+    return localMobileRead;
   }
 
   async function refreshMobileTransfers(current: () => boolean, target: string): Promise<MobileTransferView[]> {
-    const views = isWeb ? await getMobileTransfersWithRecovery() : await getMobileTransfers(undefined, target);
+    let views: MobileTransferView[];
+    if (isWeb) views = await getMobileTransfersWithRecovery();
+    else if (target === localBaseUrl) views = await readLocalMobileTransfers();
+    else views = await getMobileTransfers(undefined, target);
     if (!current()) return views;
     mobileTransfers = views;
     if (isWeb) {
@@ -658,18 +697,9 @@
           pruneMobileDownloadKeys(view);
         }
       }
-    } else {
-      const owner = remoteTarget?.node_id ?? localNodeId;
+    } else if (!remoteTarget) {
       for (const [id, pending] of pendingMobileUploads) {
-        if (pending.offer.source_node_id !== owner) continue;
-        pending.base = target;
         if (pending.failure && !failures.some((failure) => failure.progress.transfer_id === id)) failures = [pending.failure, ...failures];
-      }
-      for (const { progress } of views) {
-        if (progress.status === 'accepted' || progress.status === 'uploading') void uploadMobileTransfer(progress.transfer_id);
-        if (progress.status === 'ready' || (!isActiveTransferStatus(progress.status) && progress.status !== 'failed')) {
-          forgetPendingTransfer(progress.transfer_id);
-        }
       }
     }
     return views;
@@ -683,11 +713,10 @@
     try {
       const settings = await read;
       if (pageStopped || settingsRead !== read) return;
-      applySettings(settings);
-      settingsReady = true;
+      settingsSnapshot = settings;
     } catch (error) {
       if (pageStopped || settingsRead !== read) return;
-      settingsReady = false;
+      settingsSnapshot = null;
       status = error instanceof Error ? error.message : '无法读取节点设置';
       statusKind = 'warn';
     } finally {
@@ -710,12 +739,12 @@
     try {
       const settings = await change(target);
       if (pageStopped || generation !== targetGeneration) return false;
-      applySettings(settings);
+      settingsSnapshot = settings;
       showTransientNotice(typeof success === 'string' ? success : success(settings));
       return true;
     } catch (error) {
       if (!pageStopped && generation === targetGeneration) {
-        settingsReady = false;
+        settingsSnapshot = null;
         showTransientNotice(error instanceof Error ? error.message : failure, 6000);
       }
       return false;
@@ -723,28 +752,14 @@
       const remaining = new Set(settingsWrites);
       remaining.delete(nodeId);
       settingsWrites = remaining;
-      if (!settingsReady && node?.node_id === nodeId) void refreshSettings();
+      if (!settingsSnapshot && node?.node_id === nodeId) void refreshSettings();
     }
-  }
-
-  function applySettings(settings: NodeSettings) {
-    syncEnabled = settings.clipboard_sync_enabled;
-    autostartEnabled = settings.autostart_enabled;
-    updateFrequency = settings.update_frequency;
-    updateStatus = settings.update_status;
-    serviceControlError = settings.service_control_error ?? '';
-    receiveSettings = settings.receive_settings;
-    clipboardHistorySettings = settings.clipboard_history_settings;
-    clipboardStatus = settings.clipboard_status;
-    monitorLocked = settings.monitor.locked;
-    monitorVisible = settings.monitor.visible;
-    monitorCapabilities = settings.monitor.capabilities;
   }
 
   async function createSession(): Promise<string> {
     const session = await createMobileSession(webSessionLabel(navigator.userAgent));
     mobileSessionId = session.session_id;
-    window.sessionStorage.setItem('meshshare-mobile-session', mobileSessionId);
+    window.sessionStorage.setItem(MOBILE_SESSION_KEY, mobileSessionId);
     return mobileSessionId;
   }
 
@@ -805,7 +820,7 @@
       try {
         const message = JSON.parse(event.data) as WireMessage;
         if (expectedId && message.type === 'Hello') {
-          identified = message.payload.node.node_id === expectedId;
+          identified = message.payload.node.node_id === expectedId && message.payload.node.protocol_version === NODE_PROTOCOL_VERSION;
           if (!identified) { suspendRemoteTarget(); return; }
         }
         if (identified) handleWireMessage(message);
@@ -835,8 +850,12 @@
       }
       return;
     }
-    if (type === 'Hello' || type === 'ClipboardUpdate' || type === 'ClipboardSnapshot') {
+    if (type === 'Hello') {
       void refresh().catch(() => { /* 定期刷新负责重新发现并报告离线。 */ });
+      return;
+    }
+    if (type === 'ClipboardUpdate' || type === 'ClipboardSnapshot') {
+      if (!isMonitor) void clipboardRead.refresh(true).catch(() => {});
       return;
     }
     if (type === 'MetricsUpdate') {
@@ -854,14 +873,14 @@
       return;
     }
     if (type === 'TransferHistoryDeleted') {
-      void loadTransferHistory();
+      void historyRead.refresh(true);
       return;
     }
     // 进度同时携带清单与接收状态。网页只展示页面发起的发送和会话下载。
     if (type === 'TransferProgress' && !isWeb) {
       const progress = payload.progress;
       const next = recordProgress(progress);
-      if (!isActiveTransferStatus(next.status)) void loadTransferHistory();
+      if (!isActiveTransferStatus(next.status)) void historyRead.refresh(true);
     }
   }
 
@@ -890,7 +909,7 @@
       if (session === mobileSessionId) {
         mobileSessionId = '';
         resetTransferHistory();
-        window.sessionStorage.removeItem('meshshare-mobile-session');
+        window.sessionStorage.removeItem(MOBILE_SESSION_KEY);
       }
       return getMobileTransfers(await ensureMobileSession());
     }
@@ -997,15 +1016,25 @@
       '无法更新剪贴板历史设置',
     );
     if (saved) {
-      await refreshClipboardHistory(generation, target).catch((error) => console.error('刷新剪贴板历史失败', error));
+      if (generation === targetGeneration && target === activeBaseUrl) await clipboardRead.refresh(true).catch((error) => console.error('刷新剪贴板历史失败', error));
     }
   }
 
-  async function refreshClipboardHistory(generation = targetGeneration, target = activeBaseUrl) {
-    if (generation !== targetGeneration) return;
-    const response = await getClipboardHistory(target);
+  async function readSharedClipboard() {
+    const generation = targetGeneration;
+    const target = activeBaseUrl;
+    const controller = new AbortController();
+    clipboardRequest = controller;
+    const [snapshot, response] = await Promise.all([getClipboard(target, controller), getClipboardHistory(target)]).finally(() => {
+      // 历史请求可能先失败，此时快照仍在传输。
+      controller.abort();
+      if (clipboardRequest === controller) clipboardRequest = undefined;
+    });
     if (generation !== targetGeneration || pageStopped) return;
-    if (isWeb) clipboardHistorySettings = response.settings;
+    clipboardReadError = '';
+    clipboard = snapshot;
+    if (snapshot && document.activeElement?.id !== 'clipboard-editor') clipboardDraft = snapshot.text ?? '';
+    if (isWeb) webHistorySettings = response.settings;
     clipboardHistory = response.items;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
       selectedClipboardHistory = null;
@@ -1108,7 +1137,7 @@
 
   function openClipboardHistoryBrowser() {
     clipboardHistoryOpen = true;
-    void refreshClipboardHistory().catch((error) => console.error('刷新剪贴板历史失败', error));
+    void clipboardRead.refresh(true).catch((error) => console.error('刷新剪贴板历史失败', error));
   }
 
   async function selectClipboardHistory(item: ClipboardHistoryItem | null) {
@@ -1142,10 +1171,10 @@
       if (generation !== targetGeneration) return;
       clipboard = restored;
       clipboardDraft = clipboard.text ?? '';
-      await refreshClipboardHistory();
-      showTransientNotice('已恢复并同步剪贴板内容');
+      await clipboardRead.refresh(true);
+      if (generation === targetGeneration && !pageStopped) showTransientNotice('已恢复并同步剪贴板内容');
     } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法恢复剪贴板历史', 6000);
+      if (generation === targetGeneration && !pageStopped) showTransientNotice(error instanceof Error ? error.message : '无法恢复剪贴板历史', 6000);
     } finally {
       if (generation === targetGeneration) clipboardHistoryBusy = false;
     }
@@ -1183,7 +1212,7 @@
       const next = [url, ...savedNodeUrls.filter((item) => item !== url)].slice(0, 8);
       savedNodeUrls = next;
       try {
-        window.localStorage.setItem('meshshare-saved-node-urls', JSON.stringify(next));
+        window.localStorage.setItem(SAVED_NODE_URLS_KEY, JSON.stringify(next));
       } catch {
         // Persisting a convenience shortcut must not block the connection.
       }
@@ -1294,7 +1323,8 @@
    */
   async function sendPaths(peer: PeerInfo, paths: string[], managed: boolean) {
     const generation = targetGeneration;
-    const api = outgoingPathsApi(activeBaseUrl, managed);
+    if (managed && !remoteTarget) return;
+    const api = outgoingPathsApi(activeBaseUrl, managed ? remoteTarget?.node_id : undefined);
     let prepareId = '';
     const controller = new AbortController();
     try {
@@ -1406,14 +1436,18 @@
     }
   }
 
-  async function acceptTerminalMigration() {
+  async function allowRemoteTerminal() {
     if (!isDesktopWindow || remoteMode) return;
     const updated = await invoke<NodeInfo>('terminal_accept_migration');
     if (!remoteMode && node?.node_id === updated.node_id) node = updated;
   }
 
   function startChooseMobile(session: MobileSession, folder = false) {
-    if (remoteMode && node?.capabilities.includes('management.mobile-paths.v1')) {
+    if (remoteMode) {
+      if (!node?.capabilities.includes('management.mobile-paths.v1')) {
+        showTransientNotice('目标节点不支持从其磁盘发送文件到网页会话，请升级目标节点后重试', 6000);
+        return;
+      }
       browseForSend({ mobile: session });
       return;
     }
@@ -1430,27 +1464,18 @@
     input.value = '';
   }
 
-  async function onDrop(peer: PeerInfo, event: DragEvent) {
-    event.preventDefault();
-    dragPeer = '';
-    // 远程管理页面的文件只存在于目标机器上，本机拖放会被静默当作另一条来源。
-    if (remoteMode) {
-      showTransientNotice('远程管理页面的发送从目标机器选择文件', 6000);
-      return;
-    }
-    const files = event.dataTransfer ? await filesFromDataTransfer(event.dataTransfer) : [];
-    if (files.length) await sendFiles(peer, files);
-  }
-
-  async function onDropMobile(session: MobileSession, event: DragEvent) {
+  async function dropFiles(recipient: BrowseRecipient, event: DragEvent) {
     event.preventDefault();
     dragPeer = '';
     if (remoteMode) {
       showTransientNotice('远程管理页面的发送从目标机器选择文件', 6000);
       return;
     }
+    const generation = targetGeneration;
     const files = event.dataTransfer ? await filesFromDataTransfer(event.dataTransfer) : [];
-    if (files.length) await sendFilesToMobile(session, files);
+    if (!files.length || generation !== targetGeneration || pageStopped) return;
+    if ('peer' in recipient) await sendFiles(recipient.peer, files);
+    else await sendFilesToMobile(recipient.mobile, files);
   }
 
   const webContext = (): PeerWebContext | null => (isWeb
@@ -1471,19 +1496,22 @@
     return error instanceof Error ? error.message : '文件传输失败';
   }
 
-  async function onTransferRoute<T>(route: TransferRoute, perform: (base: string) => Promise<T>): Promise<T> {
+  async function onTransferRoute<T>(route: TransferRoute, perform: (base: string, nodeId: string) => Promise<T>): Promise<T> {
     const peer = peers.find((candidate) => candidate.node_id === route.peer.node_id) ?? route.peer;
     return withPeerAddress(peer.node_id, [route.target, ...targetCandidates(peer)], async (base) => {
-      const result = await perform(base);
+      // HTTPS 网页的请求先由同源接入节点处理，代理在转发时重新绑定最终接收节点。
+      const hop = isWeb && base.startsWith(window.location.origin + '/api/v1/mobile/peers/') ? localNodeId : peer.node_id;
+      if (!hop) throw new ApiError('尚未取得节点标识', 421);
+      const result = await perform(base, hop);
       route.target = base;
       return result;
     });
   }
 
   async function createTransferOnCandidates(offer: TransferOffer, route: TransferRoute): Promise<TransferProgress> {
-    const post = (base: string) => requestWithTimeout<TransferProgress>(
+    const post = (base: string, nodeId: string) => requestWithTimeout<TransferProgress>(
       '/api/v1/transfers',
-      { method: 'POST', body: JSON.stringify(offer) },
+      { method: 'POST', headers: { 'X-MeshShare-Target': nodeId }, body: JSON.stringify(offer) },
       base,
     );
     try {
@@ -1497,22 +1525,23 @@
 
   function resetTargetUi() {
     targetGeneration += 1;
+    resetSnapshotReads();
+    webHistorySettings = defaultHistory;
     resetTransferHistory();
-    settingsReady = false;
+    settingsSnapshot = null;
     settingsRead = null;
     closeBrowse();
     resolvePathPrompt(null);
     node = null;
     peers = [];
     clipboard = null;
+    clipboardReadError = '';
     clipboardDraft = '';
     clipboardHistoryBusy = false;
     metrics = null;
-    clipboardStatus = { session: 'unknown', available: false, retrying: true, message: '正在连接系统剪贴板…' };
     settingsOpen = false;
     restartBusy = false;
     restartError = '';
-    serviceControlError = '';
     mobileAccessOpen = false;
     addDeviceOpen = false;
     clearHistoryOpen = false;
@@ -1549,12 +1578,6 @@
 
   function suspendRemoteTarget() {
     if (!remoteTarget || !activeBaseUrl) return;
-    for (const pending of pendingMobileUploads.values()) {
-      if (pending.base === activeBaseUrl) {
-        pending.controller?.abort();
-        pending.base = '';
-      }
-    }
     activeBaseUrl = setApiTarget('');
     disconnectTargetSocket();
     resetTargetUi();
@@ -1701,12 +1724,12 @@
         total_bytes: offer.total_bytes, hashed_bytes: 0, phase: 'stage',
       }, ...prepares];
       let stagedBytes = 0;
-      for (const [index, item] of offer.items.entries()) {
+      await uploadItems(offer, files, controller.signal, async (item, file) => {
         const url = apiUrl(`/api/v1/outgoing/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`, owner);
-        await putFile(url, files[index], item.media_type, controller.signal);
+        await uploadFileWithRetry(url, file, item.media_type, source.node_id, controller.signal);
         stagedBytes += item.size;
         updatePrepare(id, stagedBytes);
-      }
+      });
       if (controller.signal.aborted || generation !== targetGeneration) return;
       // 从 start 起节点负责暂存的回收，响应丢失时接收方可能已经接受任务。
       finishPrepare(id);
@@ -1752,7 +1775,7 @@
     selectedPeer = null;
     const offer = buildOffer(source, peer.node_id, files);
     try {
-      const pending: PendingUpload = { target: candidates[0], peer, files, offer };
+      const pending: PendingUpload = { target: candidates[0], peer, files, offer, completedItemIds: new Set(), attempts: 0 };
       const created = await createTransferOnCandidates(offer, pending);
       if (created.status === 'failed') {
         throw new Error(created.error ?? '无法创建传输');
@@ -1768,63 +1791,61 @@
   }
 
   async function sendFilesToMobile(session: MobileSession, files: File[]) {
-    if (!node) return;
+    if (remoteTarget || !node) return;
     const offer = buildOffer(node, node.node_id, files);
-    const base = activeBaseUrl;
+    const base = localBaseUrl;
     const generation = targetGeneration;
     selectedMobileSession = null;
-    pendingMobileUploads.set(offer.transfer_id, { files, completedItemIds: new Set(), sessionId: session.session_id, offer, base });
+    const upload: MobileUpload = { files, completedItemIds: new Set(), attempts: 0, sessionId: session.session_id, offer, base };
     try {
       const view = await createMobileTransfer(session.session_id, offer, base);
+      if (pageStopped) return;
+      pendingMobileUploads.set(offer.transfer_id, upload);
       if (generation !== targetGeneration) return;
       recordProgress({ ...view.progress, direction: 'send' });
       showTransientNotice('已发送，等待网页端确认', 3600);
     } catch (error) {
-      if (generation === targetGeneration) recordSendFailure(offer, error instanceof Error ? error.message : '无法发送到网页端');
-      else forgetPendingTransfer(offer.transfer_id);
+      if (!pageStopped && generation === targetGeneration) {
+        pendingMobileUploads.set(offer.transfer_id, upload);
+        recordSendFailure(offer, error instanceof Error ? error.message : '无法发送到网页端');
+      }
     }
   }
 
-  async function uploadMobileTransfer(id: string) {
-    const pending = pendingMobileUploads.get(id);
-    if (!pending?.base || pending.base !== activeBaseUrl || uploading.has(id) || uploadStopped.has(id)) return;
+  async function uploadPendingFiles(pending: PendingUpload | MobileUpload) {
+    if (pending.controller || pending.attempts >= MAX_UPLOAD_ATTEMPTS) return;
+    const mobile = 'sessionId' in pending;
+    const id = pending.offer.transfer_id;
+    const generation = targetGeneration;
+    const visible = () => !pageStopped && (mobile ? activeBaseUrl === pending.base : generation === targetGeneration);
+    const path = (mobile ? '/api/v1/mobile/transfers/' : '/api/v1/transfers/') + encodeURIComponent(id);
+    const route = <T,>(send: (base: string, nodeId: string) => Promise<T>) =>
+      mobile ? send(pending.base, pending.offer.source_node_id) : onTransferRoute(pending, send);
     const controller = new AbortController();
     pending.controller = controller;
-    uploading.add(id);
     try {
-      for (const [index, item] of pending.offer.items.entries()) {
-        // 已确认的项目跳过；节点对重复写入按幂等处理，丢失响应后可安全重试。
-        if (pending.completedItemIds.has(item.item_id)) continue;
-        const file = pending.files[index];
-        if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
-        await uploadFileWithRetry(
-          apiUrl(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`, pending.base),
-          file,
-          item.media_type,
-          controller.signal,
-        );
-        pending.completedItemIds.add(item.item_id);
-      }
-      uploadAttempts.delete(id);
-      showTransientNotice('文件已准备好，网页端可以下载');
+      await uploadItems(pending.offer, pending.files, controller.signal, (item, file) => route((base, nodeId) =>
+        uploadFileWithRetry(apiUrl(path + '/items/' + encodeURIComponent(item.item_id), base), file, item.media_type, nodeId, controller.signal)
+      ), pending.completedItemIds);
+      pending.attempts = 0;
+      if (visible()) showTransientNotice(mobile ? '文件已准备好，网页端可以下载' : '文件发送完成');
     } catch (error) {
       if (controller.signal.aborted) return;
-      const attempts = (uploadAttempts.get(id) ?? 0) + 1;
-      uploadAttempts.set(id, attempts);
-      const message = error instanceof Error ? error.message : '网页端文件上传失败';
-      if (attempts >= MAX_UPLOAD_ATTEMPTS) {
-        uploadStopped.add(id);
-        await request(`/api/v1/mobile/transfers/${encodeURIComponent(id)}/fail`, {
-          method: 'POST',
-          body: JSON.stringify({ error: message }),
-        }, pending.base).catch(() => undefined);
-        showTransientNotice(`${message}，已停止重试`);
-      } else {
-        showTransientNotice(`${message}，正在重试（${attempts}/${MAX_UPLOAD_ATTEMPTS}）`, 6000);
+      const message = mobile
+        ? (error instanceof Error ? error.message : '网页端文件上传失败')
+        : describeTransferFailure(error, pending.peer.node_name, pending.target);
+      pending.attempts += 1;
+      if (pending.attempts >= MAX_UPLOAD_ATTEMPTS) {
+        const failed = message + '，已停止重试';
+        await route((base, nodeId) => requestWithTimeout(path + '/fail', {
+          method: 'POST', headers: { 'X-MeshShare-Target': nodeId }, body: JSON.stringify({ error: failed }),
+        }, base)).catch(() => undefined);
+        if (visible()) showTransientNotice(failed, 8000);
+      } else if (visible()) {
+        showTransientNotice(`${message}，连接恢复后将继续（${pending.attempts}/${MAX_UPLOAD_ATTEMPTS}）`, 6000);
       }
     } finally {
       pending.controller = undefined;
-      uploading.delete(id);
     }
   }
 
@@ -1887,53 +1908,18 @@
     if (watching.has(id)) return;
     watching.add(id);
     try {
-      const progress = await onTransferRoute(route, (base) => requestWithTimeout<TransferProgress>(
-        `/api/v1/transfers/${encodeURIComponent(id)}/status`, {}, base,
+      const progress = await onTransferRoute(route, (base, nodeId) => requestWithTimeout<TransferProgress>(
+        `/api/v1/transfers/${encodeURIComponent(id)}/status`, { headers: { 'X-MeshShare-Target': nodeId } }, base,
       ));
-      if (pageStopped || !pendingUploads.has(id)) return;
+      const pending = pendingUploads.get(id);
+      if (pageStopped || !pending) return;
       const next = recordProgress({ ...progress, direction: 'send' });
-      if (next.status === 'accepted' || next.status === 'uploading') await uploadTransfer(id);
+      if (next.status === 'accepted' || next.status === 'uploading') await uploadPendingFiles(pending);
       if (!isActiveTransferStatus(next.status) && next.status !== 'failed') forgetPendingTransfer(id);
     } catch {
       // 接收节点暂时不可达时保留页面持有的源文件。
     } finally {
       watching.delete(id);
-    }
-  }
-
-  async function uploadTransfer(id: string) {
-    const pending = pendingUploads.get(id);
-    if (!pending || uploading.has(id) || uploadStopped.has(id)) return;
-    uploading.add(id);
-    try {
-      for (const [index, item] of pending.offer.items.entries()) {
-        const file = pending.files[index];
-        if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
-        await onTransferRoute(pending, (base) => uploadFileWithRetry(
-          `${base}/api/v1/transfers/${encodeURIComponent(id)}/items/${encodeURIComponent(item.item_id)}`,
-          file,
-          item.media_type,
-        ));
-      }
-      uploadAttempts.delete(id);
-      showTransientNotice('文件发送完成');
-    } catch (error) {
-      const message = describeTransferFailure(error, pending.peer.node_name, pending.target);
-      const attempts = (uploadAttempts.get(id) ?? 0) + 1;
-      uploadAttempts.set(id, attempts);
-      if (attempts >= MAX_UPLOAD_ATTEMPTS) {
-        uploadStopped.add(id);
-        const failed = `${message}，已停止重试`;
-        const failPath = `/api/v1/transfers/${encodeURIComponent(id)}/fail`;
-        await onTransferRoute(pending, (base) => requestWithTimeout(
-          failPath, { method: 'POST', body: JSON.stringify({ error: failed }) }, base,
-        )).catch(() => undefined);
-        showTransientNotice(failed, 8000);
-      } else {
-        showTransientNotice(`${message}，连接恢复后将继续（${attempts}/${MAX_UPLOAD_ATTEMPTS}）`, 6000);
-      }
-    } finally {
-      uploading.delete(id);
     }
   }
 
@@ -1949,7 +1935,7 @@
         const offer = { ...mobile.offer, transfer_id: randomId(), created_at_ms: Date.now() };
         const view = await createMobileTransfer(mobile.sessionId, offer, mobile.base);
         forgetPendingTransfer(id);
-        pendingMobileUploads.set(offer.transfer_id, { ...mobile, offer, failure: undefined, completedItemIds: new Set() });
+        pendingMobileUploads.set(offer.transfer_id, { ...mobile, offer, failure: undefined, controller: undefined, attempts: 0, completedItemIds: new Set() });
         if (generation !== targetGeneration) return;
         transfers = transfers.filter((item) => item.transfer_id !== id);
         recordProgress({ ...view.progress, direction: 'send' });
@@ -1961,13 +1947,13 @@
         const peer = pending?.peer ?? peers.find((item) => item.node_id === failure.progress.offer?.target_node_id);
         const target = pending?.target ?? (peer && targetBase(peer));
         if (!peer || !target) throw new Error('目标设备当前不可用，无法重试');
-        const progress = await onTransferRoute(pending ?? { target, peer }, (base) => requestWithTimeout<TransferProgress>(
-          `/api/v1/transfers/${encodeURIComponent(id)}/retry`, { method: 'POST' }, base,
+        const progress = await onTransferRoute(pending ?? { target, peer }, (base, nodeId) => requestWithTimeout<TransferProgress>(
+          `/api/v1/transfers/${encodeURIComponent(id)}/retry`, { method: 'POST', headers: { 'X-MeshShare-Target': nodeId } }, base,
         ));
         if (generation !== targetGeneration) return;
         if (pending) {
-          uploadAttempts.delete(id);
-          uploadStopped.delete(id);
+          pending.attempts = 0;
+          pending.completedItemIds.clear();
           recordProgress({ ...progress, offer: pending.offer, direction: 'send' });
           void pollTransfer(id, pending);
         } else await refresh();
@@ -2103,6 +2089,7 @@
       const defaultPath = settingsReady ? receiveSettings.default_path ?? '' : '';
       if (!managedFilesSupported) {
         const path = await askPath('输入接收目录', defaultPath);
+        if (generation !== targetGeneration) return;
         if (!path) {
           showTransientNotice('需要输入目标节点上的接收目录', 6000);
           return;
@@ -2170,14 +2157,16 @@
     transferActionBusy = transfer.transfer_id;
     // 页面直发的任务在目标节点上，沿用建单时验证过的路由；本机任务直接取消。
     const pending = pendingUploads.get(transfer.transfer_id);
-    const cancel = (base: string) => request(
+    const cancel = (base: string, nodeId?: string) => request(
       `/api/v1/transfers/${encodeURIComponent(transfer.transfer_id)}/cancel`,
-      { method: 'POST' },
+      { method: 'POST', headers: nodeId ? { 'X-MeshShare-Target': nodeId } : undefined },
       base,
     );
     try {
-      if (pending) await onTransferRoute(pending, cancel);
-      else await cancel(activeBaseUrl);
+      if (pending) {
+        pending.controller?.abort();
+        await onTransferRoute(pending, cancel);
+      } else await cancel(activeBaseUrl);
       await refresh();
     } catch (error) {
       showTransientNotice(error instanceof Error ? error.message : '无法取消传输', 6000);
@@ -2307,8 +2296,8 @@
         onSendMobileFolder={(session) => startChooseMobile(session, true)}
         onDragEnter={(key) => (dragPeer = key)}
         onDragLeave={(key) => { if (dragPeer === key) dragPeer = ''; }}
-        onDropPeer={onDrop}
-        onDropMobile={onDropMobile}
+        onDropPeer={(peer, event) => dropFiles({ peer }, event)}
+        onDropMobile={(mobile, event) => dropFiles({ mobile }, event)}
         allowFolderSend={!remoteMode}
       />
       <HardwarePanel
@@ -2355,7 +2344,7 @@
       onHistoryMode={setClipboardHistoryMode}
       onHistoryValue={setClipboardHistoryValue}
       onRemoteFileAccess={setRemoteFileAccess}
-      onAcceptTerminalMigration={isDesktopWindow && !remoteMode ? acceptTerminalMigration : null}
+      onAllowRemoteTerminal={isDesktopWindow && !remoteMode ? allowRemoteTerminal : null}
       onClose={() => (settingsOpen = false)}
     />
 

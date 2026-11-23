@@ -141,16 +141,15 @@ fn legacy_default_stays_closed_until_the_local_choice_is_saved() {
     fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
     assert!(!dir.join("terminal-access.json").exists());
     let upgraded = start();
-    upgraded.restore_legacy_terminal_grant().unwrap();
     assert!(upgraded.ssh.host_fingerprint().is_none());
     let tmp = crate::fsutil::temp_path(&path);
     fs::create_dir(&tmp).unwrap();
-    assert!(upgraded.accept_terminal_migration(None).is_err());
+    assert!(upgraded.allow_remote_terminal().is_err());
     assert!(upgraded.ssh.host_fingerprint().is_none());
     fs::remove_dir(tmp).unwrap();
     assert!(start().ssh.host_fingerprint().is_none());
-    upgraded.accept_terminal_migration(None).unwrap();
-    upgraded.accept_terminal_migration(None).unwrap();
+    upgraded.allow_remote_terminal().unwrap();
+    upgraded.allow_remote_terminal().unwrap();
     assert!(start().ssh.host_fingerprint().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
@@ -225,22 +224,9 @@ async fn desktop_and_android_can_open_terminals_on_first_hello_and_after_host_re
     let previous = host.node_info().terminal.unwrap();
     drop(host);
 
-    // 旧版已明确关闭入站，即使凭据库不可用也要保留其限制。
-    let old_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
-    let disabled = serde_json::json!({ "enabled": false });
-    let signature = old_key
-        .sign(
-            "meshshare-terminal-policy-v2",
-            HashAlg::Sha256,
-            &serde_json::to_vec(&disabled).unwrap(),
-        )
-        .unwrap()
-        .to_pem(russh::keys::ssh_key::LineEnding::LF)
-        .unwrap();
-    let policy =
-        serde_json::to_vec(&serde_json::json!({ "policy": disabled, "signature": signature }))
-            .unwrap();
-    fs::write(&policy_path, &policy).unwrap();
+    // 新产生的策略还没有本机确认，与原来的无策略授权不匹配。
+    let policy = br#"{"policy":{"enabled":false}}"#;
+    fs::write(&policy_path, policy).unwrap();
     let restarted = NodeRuntime::new(dir.join("host"), 0, "test".into()).unwrap();
     assert_eq!(restarted.node_id(), host_id);
     assert_ne!(
@@ -248,7 +234,6 @@ async fn desktop_and_android_can_open_terminals_on_first_hello_and_after_host_re
         previous.client_fingerprint
     );
     assert!(restarted.ssh.host_fingerprint().is_none());
-    restarted.restore_legacy_terminal_grant().unwrap();
     let (new_addr, restarted_task) = serve_host(&restarted, &dir).await;
     connect_nodes(&phone, &restarted, new_addr).await;
     connect_nodes(&restarted, &desktop, desktop_addr).await;
@@ -268,7 +253,7 @@ async fn desktop_and_android_can_open_terminals_on_first_hello_and_after_host_re
         reqwest::StatusCode::FORBIDDEN
     );
     drop(open_shell(&restarted, &desktop).await);
-    restarted.accept_terminal_migration(None).unwrap();
+    restarted.allow_remote_terminal().unwrap();
     wait_for_peer(&phone, &restarted, true).await;
     wait_for_peer(&desktop, &restarted, true).await;
     assert_ne!(restarted.ssh.host_fingerprint(), previous.host_fingerprint);

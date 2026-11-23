@@ -382,6 +382,19 @@ async fn settings_and_remote_accept_endpoints_update_runtime_state() {
         .expect("send allowed origin request");
     assert!(allowed.status().is_success());
 
+    let invalid = runtime
+        .http
+        .patch(format!("http://{address}/api/v1/settings"))
+        .json(&serde_json::json!({"clipboard_sync_enabled": false, "update_frequency": "monthly"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(invalid.json::<serde_json::Value>().await.unwrap()["error"].is_string());
+    assert!(runtime
+        .sync_enabled
+        .load(std::sync::atomic::Ordering::SeqCst));
+
     let patched = runtime
         .http
         .patch(format!("http://{address}/api/v1/settings"))
@@ -567,7 +580,7 @@ async fn duplicate_transfer_offer_replays_current_progress_to_source() {
     };
     let _ = handle_wire_message(
         WireMessage::TransferOffer {
-            offer: offer.clone(),
+            offer: offer.clone().into(),
         },
         &runtime,
         Some("source"),
@@ -581,7 +594,9 @@ async fn duplicate_transfer_offer_replays_current_progress_to_source() {
         .set_transfer_acceptance("duplicate-offer", destination)
         .expect("accept transfer");
     let _ = handle_wire_message(
-        WireMessage::TransferOffer { offer },
+        WireMessage::TransferOffer {
+            offer: offer.into(),
+        },
         &runtime,
         Some("source"),
     )
@@ -622,7 +637,9 @@ async fn outgoing_progress_tracks_the_receivers_decision_for_each_offer() {
     let mut relay = async |(offer, expected_status): (TransferOffer, TransferStatus)| {
         let id = offer.transfer_id.clone();
         handle_wire_message(
-            WireMessage::TransferOffer { offer },
+            WireMessage::TransferOffer {
+                offer: offer.into(),
+            },
             &receiver,
             Some(&sender_id),
         )
@@ -2897,8 +2914,7 @@ async fn restart_refuses_wrong_target_and_an_active_terminal_before_contacting_s
             .unwrap();
     node.set_update_frequency(crate::runtime::UpdateFrequency::Disabled)
         .unwrap();
-    let control = super::ControlPlane::runtime_only(node.clone());
-    control.start_headless();
+    let control = super::ControlPlane::with_headless(node.clone());
     let state = super::AppState {
         runtime: node.clone(),
         control,

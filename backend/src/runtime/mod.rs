@@ -1,11 +1,11 @@
 use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
-    AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryItem,
-    ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSession,
-    ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession,
-    MobileTransferView, MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings,
-    TransferHistoryEntry, TransferItem, TransferOffer, TransferProgress, TransferStatus,
-    WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY,
+    AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryList,
+    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSession, ClipboardSnapshot,
+    ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView,
+    MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferHistoryEntry,
+    TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
+    CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY,
     DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT,
     MAX_CLIPBOARD_HISTORY_DAYS, MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS,
     MAX_TRANSFER_HISTORY_PATHS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
@@ -55,8 +55,8 @@ pub use network::bind_addresses;
 #[cfg(not(target_os = "android"))]
 pub(crate) use network::is_tailscale_ipv4;
 pub(crate) use network::{
-    is_allowed_peer_address, node_http_client, normalize_peer_http_base, PeerEndpoint,
-    PeerEndpointSource,
+    fetch_node_info, is_allowed_peer_address, node_http_client, normalize_peer_http_base,
+    PeerEndpoint, PeerEndpointSource,
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -220,7 +220,7 @@ impl NodeProfile {
     }
 }
 
-fn transfer_progress(offer: TransferOffer, direction: &str) -> TransferProgress {
+fn transfer_progress(offer: Arc<TransferOffer>, direction: &str) -> TransferProgress {
     TransferProgress {
         transfer_id: offer.transfer_id.clone(),
         retry_count: 0,

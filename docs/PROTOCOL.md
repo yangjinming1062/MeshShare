@@ -2,7 +2,7 @@
 
 ## HTTP 接口
 
-业务错误使用 `{ "error": "..." }`。远程管理请求可以通过 `X-MeshShare-Target` 指定预期节点 ID；节点在处理请求前校验该值，不匹配时返回 421。桌面端在写入前还会用 `GET /api/v1/info` 核对地址，以兼容忽略该请求头的旧节点。适用网络与授权条件见[信任边界](ARCHITECTURE.md#信任边界)。
+业务错误使用 `{ "error": "..." }`。远程管理请求可以通过 `X-MeshShare-Target` 指定预期节点 ID；节点在处理请求前校验该值，不匹配时返回 421。远程管理写入前用 `GET /api/v1/info` 核对候选地址。若地址在预检后易主，请求内的目标校验由实际处理写入的节点执行。适用网络与授权条件见[信任边界](ARCHITECTURE.md#信任边界)。
 
 ### 节点与设置
 
@@ -85,9 +85,9 @@ Headless 的 `autostart_enabled` 读写 systemd 自启状态。如果无法读�
 
 ### 桌面终端
 
-原生节点在首次 WebSocket `Hello` 的可选 `node.terminal` 中通告进程级 Ed25519 客户端公钥指纹 `client_fingerprint`。允许入站终端的桌面同时通告 `terminal.ssh.v3` 和独立的 `host_fingerprint`。保留旧版访问限制的桌面只通告客户端指纹，完成本机迁移后向已有连接发送新的 `Hello`。指纹使用 OpenSSH SHA-256 格式。客户端按当前连接最新一次 `Hello` 更新终端入口，兼容旧版 v3 桌面在运行期间通告或撤下主机能力。`GET /api/v1/info` 和 `GET /api/v1/peers` 提供相应快照。仅支持 v2 终端的设备可交换其他节点消息，远程终端要求两端支持 v3。
+原生节点在首次 WebSocket `Hello` 的可选 `node.terminal` 中通告进程级 Ed25519 客户端公钥指纹 `client_fingerprint`。允许入站终端的桌面同时通告 `terminal.ssh.v3` 和独立的 `host_fingerprint`。等待本机授权的桌面只通告客户端指纹，授权后向已有连接发送新的 `Hello`。指纹使用 OpenSSH SHA-256 格式。客户端按当前连接最新一次 `Hello` 更新终端入口。`GET /api/v1/info` 和 `GET /api/v1/peers` 提供相应快照。仅支持 v2 终端的设备可交换其他节点消息，远程终端要求两端支持 v3。
 
-发起端按已连接的目标节点 ID 选择可达地址，对 `GET /api/v1/terminal/ssh` 发送 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v3` 和 `X-MeshShare-Terminal-Target`（目标节点 ID）。返回 101 后，同一连接承载 SSH。请求带有浏览器 Origin、目标保留旧版访问限制、实际来源缺失或不属于其他设备上的节点网络地址时返回 403。回环和本机各网卡地址均属于本机来源。目标 ID 不符返回 421，升级协议不符返回 426。入站连接已满返回 429，节点正在退出返回 503。
+发起端按已连接的目标节点 ID 选择可达地址，对 `GET /api/v1/terminal/ssh` 发送 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v3` 和 `X-MeshShare-Terminal-Target`（目标节点 ID）。返回 101 后，同一连接承载 SSH。请求带有浏览器 Origin、目标尚未允许入站终端、实际来源缺失或不属于其他设备上的节点网络地址时返回 403。回环和本机各网卡地址均属于本机来源。目标 ID 不符返回 421，升级协议不符返回 426。入站连接已满返回 429，节点正在退出返回 503。
 
 节点 WebSocket 只允许原生连接登记终端身份。发起端校验主机密钥，目标端按 SSH 用户名查找当前节点通道，校验客户端指纹和公钥签名后才接受交互 shell。
 
@@ -130,7 +130,7 @@ Headless 的 `autostart_enabled` 读写 systemd 自启状态。如果无法读�
 - `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新快照，保留原始 `source_node_id`；接收端按 HLC 比较新旧并按事件 ID 去重。
 - `TransferOffer` 的 `payload.offer` 包含清单、总大小和发送节点。
 - `TransferAction` 支持 `accept`、`reject`、`cancel` 和 `fail`，每条消息携带 `retry_count`。接收端只应用当前代次的操作。重试由目标节点的 HTTP `retry` 接口发起，通过 `TransferProgress` 同步新代次。接收目录仅由接收节点本地选择。
-- `TransferProgress` 的 `payload.progress` 包含状态、已完成字节、错误和可选的 `retry_count`。只有代次递增才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。传输进行中，节点本地进度与状态接口返回的 `completed_bytes` 还包含当前条目已接收但尚未提交的字节，`completed_items` 仍只统计已提交条目；两者都不回退且不超过总量。
+- `TransferProgress` 的 `payload.progress` 包含状态、已完成字节、错误和可选的 `retry_count`。在途字节更新省略 `offer`，客户端沿用该任务清单；建单、项目提交和列表或状态查询提供完整清单。只有代次递增才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。传输进行中，节点本地进度与状态接口返回的 `completed_bytes` 还包含当前条目已接收但尚未提交的字节，`completed_items` 仍只统计已提交条目；两者都不回退且不超过总量。
 - `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
 - `TransferHistoryDeleted` 的 `payload.transfer_ids` 请求对端删除配对记录；接收端只接受有限数量，只删除当前 Peer 自己的记录，不反向转发。
 
@@ -156,5 +156,5 @@ Headless 的 `autostart_enabled` 读写 systemd 自启状态。如果无法读�
 
 - **路径。** `relative_path` 必须是目标目录下的相对路径，禁止盘符、分隔符穿越、`.` 和 `..`，同一清单不能出现归一化后的重复路径。清单和内容没有固定业务上限，但受控制面解析预算、网页清单内存预算、`u64` 溢出检查、磁盘安全余量和运行时清理约束。运行时最多保留有限条桌面传输记录，优先淘汰终态；失败记录最长保留 24 小时且数量受限。
 - **写入。** 接收端逐级检查目录并拒绝符号链接，同一项目加锁避免并发写入。先在同目录创建随机 `.part` 文件并登记，校验清单大小；清单携带 SHA-256 时核对内容摘要，留空时以写入内容的摘要回填清单（页面创建的清单留空，节点直传的清单必须携带），随后提交为最终文件名，不覆盖已有文件。节点启动时清理仍登记的遗留 `.part`；读取、写入、校验或提交报错，以及请求被取消时都会尝试清理，提交成功后才移除登记。
-- **网页。** 接入节点持有短期会话，桌面先把文件上传到暂存区。HTTP 页面逐项流式下载，`Content-Disposition` 同时提供 ASCII `filename` 和 UTF-8 `filename*` 并过滤路径分隔符与控制字符；`auto_complete=true` 在节点提供完整响应时确认项目，空文件在响应准备好时确认。`retryable_download_item_ids` 标记仍可重新下载的项目，暂存文件随会话到期、终态任务回收或显式确认清理。HTTPS 页面校验并流式写入本地目录后调用 `complete`，网页选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径；HTTPS 网页经接入节点同源代理向其他桌面节点流式上传。会话空闲 90 秒后后台清理任务和临时目录，活动传输五分钟无进展也会失败并清理。
+- **网页。** 接入节点持有短期会话，桌面先把文件上传到暂存区。HTTP 页面逐项流式下载，`Content-Disposition` 同时提供 ASCII `filename` 和 UTF-8 `filename*` 并过滤路径分隔符与控制字符；`auto_complete=true` 在节点提供完整响应时确认项目，空文件在响应准备好时确认。`retryable_download_item_ids` 标记仍可重新下载的项目，暂存文件随会话到期、终态任务回收或显式确认清理。HTTPS 页面校验并流式写入本地目录后调用 `complete`，网页选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径；HTTPS 网页经接入节点同源代理向其他桌面节点流式上传。每一跳按实际接收节点核对目标 ID，接入节点转发时使用最终接收节点的 ID。会话空闲 90 秒后后台清理任务和临时目录，活动传输五分钟无进展也会失败并清理。
 - **原生态发送。** 桌面上传前比对源文件大小与修改时间，变化时直接失败。发送端只接受与清单总量和当前代次一致的 PUT 确认。网络中断、响应丢失或服务端暂时不可用时按项目退避重试，耗尽后通过 `fail` 标记失败。手动重试递增代次并保留已提交项目。重复 PUT 会重新校验已落盘的文件，返回当前代次的 `uploading` 或 `completed` 确认，已提交项目只计数一次。接收目录失效时回到等待确认。已接受但迟迟未开始上传的传输约 90 秒后失败并通知对端，上传中仍按五分钟无进展判定停滞。

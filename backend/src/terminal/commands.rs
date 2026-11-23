@@ -89,7 +89,7 @@ pub(crate) async fn terminal_accept_migration(
     main: MainTerminal,
 ) -> Result<crate::model::NodeInfo, String> {
     tokio::task::spawn_blocking(move || {
-        main.0.accept_terminal_migration(None)?;
+        main.0.allow_remote_terminal()?;
         Ok(main.0.node_info())
     })
     .await

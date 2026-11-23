@@ -1,5 +1,5 @@
-import { ApiError, isRetryableHttpStatus, responseError } from './api';
-import type { NodeInfo, TransferOffer } from './types';
+import { ApiError, isRetryableHttpStatus, responseError } from './api.ts';
+import type { NodeInfo, TransferItem, TransferOffer } from './types';
 
 export function randomId(): string {
   // 非安全上下文（局域网 HTTP）也需要生成传输标识。
@@ -27,21 +27,36 @@ export function buildOffer(source: NodeInfo, targetNodeId: string, files: File[]
   };
 }
 
-export async function putFile(url: string, file: File, mediaType: string, signal?: AbortSignal): Promise<void> {
-  const response = await fetch(url, {
-    method: 'PUT', redirect: 'error', headers: { 'Content-Type': mediaType }, body: file, signal,
-  });
-  if (!response.ok) throw await responseError(response);
+export async function uploadItems(
+  offer: TransferOffer,
+  files: File[],
+  signal: AbortSignal,
+  send: (item: TransferItem, file: File) => Promise<void>,
+  completed = new Set<string>(),
+) {
+  for (const [index, item] of offer.items.entries()) {
+    signal.throwIfAborted();
+    if (completed.has(item.item_id)) continue;
+    const file = files[index];
+    if (!file) throw new Error(`找不到待上传文件：${item.relative_path}`);
+    await send(item, file);
+    completed.add(item.item_id);
+  }
 }
 
-/** 接收节点对同一项目的 PUT 幂等，暂时断网或服务忙时可以重发。 */
-export async function uploadFileWithRetry(url: string, file: File, mediaType: string, signal?: AbortSignal): Promise<void> {
+/** 同一项目的 PUT 幂等。重试时仍绑定原请求的接收节点。 */
+export async function uploadFileWithRetry(url: string, file: File, mediaType: string, nodeId: string, signal: AbortSignal): Promise<void> {
   for (let attempt = 0; ; attempt += 1) {
+    signal.throwIfAborted();
     try {
-      return await putFile(url, file, mediaType, signal);
+      const response = await fetch(url, {
+        method: 'PUT', redirect: 'error', headers: { 'Content-Type': mediaType, 'X-MeshShare-Target': nodeId }, body: file, signal,
+      });
+      if (!response.ok) throw await responseError(response);
+      return;
     } catch (error) {
-      if (signal?.aborted || attempt >= 3 || (error instanceof ApiError && !isRetryableHttpStatus(error.status))) throw error;
-      await new Promise((resolve) => window.setTimeout(resolve, 800 * 2 ** attempt));
+      if (signal.aborted || attempt >= 3 || (error instanceof ApiError && !isRetryableHttpStatus(error.status))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 800 * 2 ** attempt));
     }
   }
 }

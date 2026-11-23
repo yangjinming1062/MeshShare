@@ -3,10 +3,10 @@ use crate::clipboard;
 use crate::control::{accept_transfer_at, ControlPlane, SettingsPatch, SettingsSnapshot};
 use crate::discovery;
 use crate::model::{
-    ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot,
-    HardwareMetrics, MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferAction,
-    TransferHistoryEntry, TransferOffer, TransferProgress, TransferStatus, WireMessage,
-    CLIPBOARD_TEXT_LIMIT, MAX_WIRE_ERROR_LENGTH,
+    ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot, HardwareMetrics,
+    MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferAction, TransferHistoryEntry,
+    TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_TEXT_LIMIT,
+    MAX_WIRE_ERROR_LENGTH,
 };
 use crate::runtime::{
     validate_receive_directory, NodeRuntime, OutgoingPrepareView, TransferRetryError,
@@ -22,7 +22,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use futures_util::StreamExt;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(not(target_os = "android"))]
 pub(crate) use socket::validate_node_info;
@@ -246,7 +246,7 @@ pub fn router_with_control(
         app.route("/api/v1/terminal/ssh", get(terminal_upgrade))
     };
     #[cfg(all(feature = "headless", target_os = "linux"))]
-    let app = if state.runtime.supports_capability("node.headless.v1") {
+    let app = if state.runtime.is_headless() {
         app.route("/api/v1/management/service/restart", post(restart_headless))
     } else {
         app
@@ -425,7 +425,7 @@ async fn target_guard(
 ) -> AxumResponse {
     if request
         .headers()
-        .get("x-meshshare-target")
+        .get(crate::model::TARGET_HEADER)
         .is_some_and(|id| id.as_bytes() != runtime.node_id().as_bytes())
     {
         return ApiError::new(StatusCode::MISDIRECTED_REQUEST, "地址上的设备与目标不匹配")
@@ -516,7 +516,7 @@ async fn restart_headless(
     headers: axum::http::HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     if headers
-        .get("x-meshshare-target")
+        .get(crate::model::TARGET_HEADER)
         .and_then(|id| id.to_str().ok())
         != Some(&state.runtime.node_id())
     {
@@ -542,8 +542,15 @@ async fn restart_headless(
 
 async fn patch_settings(
     State(state): State<AppState>,
-    Json(patch): Json<SettingsPatch>,
+    patch: Result<Json<SettingsPatch>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<SettingsSnapshot>, ApiError> {
+    let Json(patch) = patch.map_err(|error| {
+        let status = match &error {
+            axum::extract::rejection::JsonRejection::JsonDataError(_) => StatusCode::BAD_REQUEST,
+            _ => error.status(),
+        };
+        ApiError::new(status, error.body_text())
+    })?;
     state
         .control
         .apply_patch(patch)
@@ -591,77 +598,100 @@ async fn download_mobile_ca(State(state): State<AppState>) -> Result<Response, A
     Ok(response)
 }
 
-fn proxy_peer_base(state: &AppState, peer_id: &str) -> Result<String, ApiError> {
-    if peer_id == state.runtime.node_id() {
-        return Err(ApiError::bad_request("本机传输不需要代理"));
-    }
-    state
-        .runtime
-        .peer_http_base(peer_id)
-        .ok_or_else(|| ApiError::not_found("目标设备当前不可用"))
+struct ProxyPeer<'a> {
+    runtime: &'a NodeRuntime,
+    id: &'a str,
+    base: String,
 }
 
-async fn proxy_json<T: DeserializeOwned>(response: reqwest::Response) -> Result<Json<T>, ApiError> {
+impl<'a> ProxyPeer<'a> {
+    fn connected(runtime: &'a NodeRuntime, id: &'a str) -> Result<Self, ApiError> {
+        if id == runtime.node_id() {
+            return Err(ApiError::bad_request("本机传输不需要代理"));
+        }
+        let base = runtime
+            .peer_http_base(id)
+            .ok_or_else(|| ApiError::not_found("目标设备当前不可用"))?;
+        Ok(Self { runtime, id, base })
+    }
+
+    async fn info(&self) -> Result<NodeInfo, ApiError> {
+        let info = crate::runtime::fetch_node_info(&self.runtime.http, &self.base)
+            .await
+            .map_err(|error| {
+                let status = error
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(reqwest::Error::status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                ApiError::new(status, format!("无法读取目标设备信息：{error}"))
+            })?;
+        if info.node_id != self.id {
+            return Err(ApiError::new(
+                StatusCode::MISDIRECTED_REQUEST,
+                "地址上的设备与传输目标不匹配",
+            ));
+        }
+        Ok(info)
+    }
+
+    fn transfer(&self, method: Method, segments: &[&str]) -> reqwest::RequestBuilder {
+        let mut url = format!("{}/api/v1/transfers", self.base);
+        for segment in segments {
+            url.push('/');
+            url.push_str(&encode_path_segment(segment));
+        }
+        self.runtime
+            .proxy_http
+            .request(method, url)
+            .header(crate::model::TARGET_HEADER, self.id)
+    }
+}
+
+async fn proxy_progress(
+    request: reqwest::RequestBuilder,
+) -> Result<Json<TransferProgress>, ApiError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
     let status = response.status();
+    if status.is_success() {
+        return response
+            .json()
+            .await
+            .map(Json)
+            .map_err(|error| ApiError::internal(error.to_string()));
+    }
     let payload = response
         .json::<serde_json::Value>()
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    if !status.is_success() {
-        let message = payload
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("目标设备请求失败");
-        let error = match status {
-            StatusCode::BAD_REQUEST => ApiError::bad_request(message),
-            StatusCode::FORBIDDEN => ApiError::forbidden(message),
-            StatusCode::NOT_FOUND => ApiError::not_found(message),
-            StatusCode::CONFLICT => ApiError::conflict(message),
-            StatusCode::MISDIRECTED_REQUEST => {
-                ApiError::new(StatusCode::MISDIRECTED_REQUEST, message)
-            }
-            StatusCode::TOO_EARLY => ApiError::new(StatusCode::TOO_EARLY, message),
-            StatusCode::REQUEST_TIMEOUT => ApiError::new(StatusCode::REQUEST_TIMEOUT, message),
-            StatusCode::TOO_MANY_REQUESTS => ApiError::new(StatusCode::TOO_MANY_REQUESTS, message),
-            StatusCode::PAYLOAD_TOO_LARGE => ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, message),
-            _ if status.is_server_error() => ApiError::internal(message),
-            _ => ApiError::conflict(message),
-        };
-        return Err(error);
-    }
-    serde_json::from_value(payload)
-        .map(Json)
-        .map_err(|error| ApiError::internal(error.to_string()))
-}
-
-async fn read_proxy_peer_info(
-    state: &AppState,
-    base: &str,
-    peer_id: &str,
-) -> Result<NodeInfo, ApiError> {
-    let response = state
-        .runtime
-        .http
-        .get(format!("{base}/api/v1/info"))
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
-    let Json(info) = proxy_json::<NodeInfo>(response).await?;
-    if info.node_id != peer_id {
-        return Err(ApiError::new(
-            StatusCode::MISDIRECTED_REQUEST,
-            "地址上的设备与传输目标不匹配",
-        ));
-    }
-    Ok(info)
+    let message = payload
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("目标设备请求失败");
+    let status = match status {
+        StatusCode::BAD_REQUEST
+        | StatusCode::FORBIDDEN
+        | StatusCode::NOT_FOUND
+        | StatusCode::CONFLICT
+        | StatusCode::MISDIRECTED_REQUEST
+        | StatusCode::TOO_EARLY
+        | StatusCode::REQUEST_TIMEOUT
+        | StatusCode::TOO_MANY_REQUESTS
+        | StatusCode::PAYLOAD_TOO_LARGE => status,
+        _ if status.is_server_error() => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::CONFLICT,
+    };
+    Err(ApiError::new(status, message))
 }
 
 async fn proxy_peer_info(
     AxumPath(peer_id): AxumPath<String>,
     State(state): State<AppState>,
 ) -> Result<Json<NodeInfo>, ApiError> {
-    let base = proxy_peer_base(&state, &peer_id)?;
-    read_proxy_peer_info(&state, &base, &peer_id)
+    ProxyPeer::connected(&state.runtime, &peer_id)?
+        .info()
         .await
         .map(Json)
 }
@@ -674,32 +704,17 @@ async fn proxy_create_transfer(
     if offer.target_node_id != peer_id {
         return Err(ApiError::bad_request("目标设备标识不匹配"));
     }
-    let base = proxy_peer_base(&state, &peer_id)?;
-    read_proxy_peer_info(&state, &base, &peer_id).await?;
-    let response = state
-        .runtime
-        .proxy_http
-        .post(format!("{base}/api/v1/transfers"))
-        .json(&offer)
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
-    proxy_json(response).await
+    let peer = ProxyPeer::connected(&state.runtime, &peer_id)?;
+    peer.info().await?;
+    proxy_progress(peer.transfer(Method::POST, &[]).json(&offer)).await
 }
 
 async fn proxy_transfer_status(
     AxumPath((peer_id, transfer_id)): AxumPath<(String, String)>,
     State(state): State<AppState>,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    let base = proxy_peer_base(&state, &peer_id)?;
-    let response = state
-        .runtime
-        .proxy_http
-        .get(format!("{base}/api/v1/transfers/{transfer_id}/status"))
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
-    proxy_json(response).await
+    let peer = ProxyPeer::connected(&state.runtime, &peer_id)?;
+    proxy_progress(peer.transfer(Method::GET, &[&transfer_id, "status"])).await
 }
 
 async fn proxy_transfer_action(
@@ -708,15 +723,8 @@ async fn proxy_transfer_action(
     action: &str,
     state: &AppState,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    let base = proxy_peer_base(state, &peer_id)?;
-    let response = state
-        .runtime
-        .proxy_http
-        .post(format!("{base}/api/v1/transfers/{transfer_id}/{action}"))
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
-    proxy_json(response).await
+    let peer = ProxyPeer::connected(&state.runtime, &peer_id)?;
+    proxy_progress(peer.transfer(Method::POST, &[&transfer_id, action])).await
 }
 
 async fn proxy_reject_transfer(
@@ -738,16 +746,12 @@ async fn proxy_fail_transfer(
     State(state): State<AppState>,
     Json(payload): Json<MobileTransferFailureRequest>,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    let base = proxy_peer_base(&state, &peer_id)?;
-    let response = state
-        .runtime
-        .proxy_http
-        .post(format!("{base}/api/v1/transfers/{transfer_id}/fail"))
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
-    proxy_json(response).await
+    let peer = ProxyPeer::connected(&state.runtime, &peer_id)?;
+    proxy_progress(
+        peer.transfer(Method::POST, &[&transfer_id, "fail"])
+            .json(&payload),
+    )
+    .await
 }
 
 async fn proxy_retry_transfer(
@@ -762,21 +766,13 @@ async fn proxy_upload_item(
     State(state): State<AppState>,
     body: Body,
 ) -> Result<Json<TransferProgress>, ApiError> {
-    let base = proxy_peer_base(&state, &peer_id)?;
-    let stream = body
-        .into_data_stream()
-        .map(|chunk| chunk.map_err(|error| std::io::Error::other(error.to_string())));
-    let response = state
-        .runtime
-        .proxy_http
-        .put(format!(
-            "{base}/api/v1/transfers/{transfer_id}/items/{item_id}"
-        ))
-        .body(reqwest::Body::wrap_stream(stream))
-        .send()
-        .await
-        .map_err(|error| ApiError::internal(format!("无法连接目标设备：{error}")))?;
-    proxy_json(response).await
+    let peer = ProxyPeer::connected(&state.runtime, &peer_id)?;
+    let stream = body.into_data_stream();
+    proxy_progress(
+        peer.transfer(Method::PUT, &[&transfer_id, "items", &item_id])
+            .body(reqwest::Body::wrap_stream(stream)),
+    )
+    .await
 }
 
 async fn connect_peer(
@@ -842,11 +838,11 @@ async fn restore_clipboard_history(
     if event_id.is_empty() || event_id.len() > 256 {
         return Err(ApiError::bad_request("剪贴板历史 ID 无效"));
     }
-    let event = state
+    state
         .runtime
         .restore_clipboard_history(&event_id)
-        .ok_or_else(|| ApiError::not_found("剪贴板历史不存在或内容无效"))?;
-    publish_local_clipboard(&state.runtime, event).map(Json)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("剪贴板历史不存在或内容无效"))
 }
 
 async fn clear_clipboard_history(
@@ -908,7 +904,7 @@ async fn post_clipboard(
     {
         return Err(ApiError::bad_request("剪贴板来源名称过长"));
     }
-    let event = state
+    state
         .runtime
         .create_local_clipboard_named(
             payload.text,
@@ -917,23 +913,8 @@ async fn post_clipboard(
                 .source_name
                 .unwrap_or_else(|| "手机浏览器".to_string()),
         )
-        .ok_or_else(|| ApiError::bad_request("剪贴板内容为空或同步已暂停"))?;
-    publish_local_clipboard(&state.runtime, event).map(Json)
-}
-
-/// 把已接受的本机剪贴板事件发给界面与其他节点。
-fn publish_local_clipboard(
-    runtime: &NodeRuntime,
-    event: ClipboardEvent,
-) -> Result<ClipboardSnapshot, ApiError> {
-    let snapshot = runtime
-        .clipboard_snapshot()
-        .ok_or_else(|| ApiError::internal("剪贴板状态不可用"))?;
-    runtime.publish_event(WireMessage::ClipboardUpdate {
-        event: event.clone(),
-    });
-    runtime.send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
-    Ok(snapshot)
+        .map(Json)
+        .ok_or_else(|| ApiError::bad_request("剪贴板内容为空或同步已暂停"))
 }
 
 async fn create_transfer(
@@ -948,10 +929,11 @@ async fn create_transfer(
         ));
     }
     offer.created_at_ms = crate::clock::now_millis();
-    state.runtime.add_transfer(offer.clone());
+    let transfer_id = offer.transfer_id.clone();
+    state.runtime.add_transfer(offer);
     let progress = state
         .runtime
-        .transfer(&offer.transfer_id)
+        .transfer(&transfer_id)
         .map(|record| record.progress)
         .ok_or_else(|| ApiError::internal("无法创建传输"))?;
     Ok(Json(progress))
@@ -1882,7 +1864,7 @@ async fn retry_transfer(
         .runtime
         .transfer(&id)
         .ok_or_else(|| ApiError::not_found("传输不存在"))?;
-    if record.offer.target_node_id != state.runtime.node_id() {
+    if record.offer().target_node_id != state.runtime.node_id() {
         return Err(ApiError::bad_request("只有目标节点可以重试该传输"));
     }
     let status = if record
@@ -2240,7 +2222,7 @@ async fn upload_item(
         .clone()
         .ok_or_else(|| ApiError::conflict("接收目录不可用"))?;
     let item = record
-        .offer
+        .offer()
         .items
         .iter()
         .find(|item| item.item_id == item_id)

@@ -182,6 +182,29 @@
   }
 </script>
 
+{#snippet activeActions(transfer: PhoneTransfer, compact: boolean)}
+  {#if mode === 'web' && transfer.status === 'ready'}
+    {#if canChooseDirectory}
+      <button type="button" class="btn btn-primary" class:btn-sm={compact} on:click={() => onSaveToDirectory(transfer)} disabled={downloadingIds.includes(transfer.transfer_id)}>
+        {receiveDirectoryName ? '保存到已选目录' : '选择目录并保存'}
+      </button>
+    {:else}
+      {#each transfer.offer?.items ?? [] as item (item.item_id)}
+        {#if !downloaded(transfer, item) || canRetryDownload(transfer, item)}
+          <button type="button" class="btn btn-primary" class:btn-sm={compact} on:click={() => onStartDownload(transfer, item)}>
+            {downloadStarted(transfer, item) || downloaded(transfer, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
+          </button>
+        {/if}
+      {/each}
+    {/if}
+  {/if}
+  {#if transfer.status === 'accepted' || transfer.status === 'uploading' || (mode === 'web' && transfer.status === 'ready')}
+    <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(transfer)}>
+      {mode === 'android' ? '取消接收' : '取消'}
+    </button>
+  {/if}
+{/snippet}
+
 <header class="phone-header" hidden={terminalVisible}>
   <img class="phone-logo" src="/meshshare.svg" width="22" height="22" alt="" />
   <div class="phone-title">
@@ -246,26 +269,7 @@
             <span title={transferItemsLabel(inbox)}>{transferItemsLabel(inbox)}</span>
           </div>
           <div class="inbox-actions">
-            {#if mode === 'web' && inbox.status === 'ready'}
-              {#if canChooseDirectory}
-                <button type="button" class="btn btn-primary" disabled={downloadingIds.includes(inbox.transfer_id)} on:click={() => onSaveToDirectory(inbox)}>
-                  {receiveDirectoryName ? '保存到已选目录' : '选择目录并保存'}
-                </button>
-              {:else}
-                {#each inbox.offer?.items ?? [] as item (item.item_id)}
-                  {#if !downloaded(inbox, item) || canRetryDownload(inbox, item)}
-                    <button type="button" class="btn btn-primary" on:click={() => onStartDownload(inbox, item)}>
-                      {downloadStarted(inbox, item) || downloaded(inbox, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
-                    </button>
-                  {/if}
-                {/each}
-              {/if}
-            {/if}
-            {#if inbox.status === 'accepted' || inbox.status === 'uploading' || (mode === 'web' && inbox.status === 'ready')}
-              <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(inbox)}>
-                {mode === 'android' ? '取消接收' : '取消'}
-              </button>
-            {/if}
+            {@render activeActions(inbox, false)}
           </div>
         </article>
       {/if}
@@ -358,26 +362,7 @@
               <span>{transferState(transfer)}</span>
             </div>
             <div class="transfer-actions">
-              {#if mode === 'web' && transfer.status === 'ready'}
-                {#if canChooseDirectory}
-                  <button type="button" class="btn btn-primary btn-sm" on:click={() => onSaveToDirectory(transfer)} disabled={downloadingIds.includes(transfer.transfer_id)}>
-                    {receiveDirectoryName ? '保存到已选目录' : '选择目录并保存'}
-                  </button>
-                {:else}
-                  {#each transfer.offer?.items ?? [] as item (item.item_id)}
-                    {#if !downloaded(transfer, item) || canRetryDownload(transfer, item)}
-                      <button type="button" class="btn btn-primary btn-sm" on:click={() => onStartDownload(transfer, item)}>
-                        {downloadStarted(transfer, item) || downloaded(transfer, item) ? '重新下载 ' + item.name : '下载 ' + item.name}
-                      </button>
-                    {/if}
-                  {/each}
-                {/if}
-              {/if}
-              {#if transfer.status === 'accepted' || transfer.status === 'uploading' || (mode === 'web' && transfer.status === 'ready')}
-                <button type="button" class="btn btn-ghost btn-sm" on:click={() => onCancelTransfer(transfer)}>
-                  {mode === 'android' ? '取消接收' : '取消'}
-                </button>
-              {/if}
+              {@render activeActions(transfer, true)}
             </div>
           </article>
         {/each}

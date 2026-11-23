@@ -145,7 +145,7 @@ enum OutgoingItemSource {
 /// 发送端已经接手本次传输：清单完整后就不再需要页面持有源文件。
 #[derive(Debug, Clone)]
 pub(super) struct StagedOutgoing {
-    pub offer: TransferOffer,
+    pub offer: Arc<TransferOffer>,
     pub directory: PathBuf,
     sources: HashMap<String, OutgoingItemSource>,
     pub created_at_ms: i64,
@@ -306,7 +306,8 @@ impl NodeRuntime {
         staged.iter().any(|id| !transfers.contains_key(id))
     }
 
-    pub fn add_outgoing_transfer(&self, offer: TransferOffer) -> TransferProgress {
+    pub fn add_outgoing_transfer(&self, offer: impl Into<Arc<TransferOffer>>) -> TransferProgress {
+        let offer = offer.into();
         let peer_name = self.peer_name(&offer.target_node_id);
         let _update_gate = self.transfer_update_gate.lock();
         if self.update_installing.load(Ordering::SeqCst) {
@@ -330,7 +331,6 @@ impl NodeRuntime {
         transfers.insert(
             offer.transfer_id.clone(),
             TransferRecord {
-                offer,
                 progress: progress.clone(),
                 accepted_destination: None,
                 received_items: HashSet::new(),
@@ -392,7 +392,7 @@ impl NodeRuntime {
         staged.insert(
             offer.transfer_id.clone(),
             StagedOutgoing {
-                offer,
+                offer: offer.into(),
                 directory,
                 sources: HashMap::new(),
                 created_at_ms: now_millis(),
@@ -566,6 +566,7 @@ impl NodeRuntime {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let offer = Arc::new(offer);
         if let Err(error) = self.install_outgoing_paths(offer.clone(), sources_by_item) {
             self.fail_outgoing_prepare(transfer_id, error);
             return;
@@ -637,7 +638,7 @@ impl NodeRuntime {
 
     fn install_outgoing_paths(
         &self,
-        offer: TransferOffer,
+        offer: Arc<TransferOffer>,
         sources: HashMap<String, OutgoingItemSource>,
     ) -> Result<(), String> {
         let directory = self.outgoing_staging_directory(&offer.transfer_id);
@@ -687,8 +688,7 @@ impl NodeRuntime {
     /// digest 是暂存上传实际写入内容的摘要，回填后随清单发给接收端。
     pub fn mark_outgoing_item_staged(&self, transfer_id: &str, item_id: &str, digest: String) {
         if let Some(record) = self.staged_outgoing.lock().get_mut(transfer_id) {
-            if let Some(item) = record
-                .offer
+            if let Some(item) = Arc::make_mut(&mut record.offer)
                 .items
                 .iter_mut()
                 .find(|item| item.item_id == item_id)
@@ -701,7 +701,7 @@ impl NodeRuntime {
         }
     }
 
-    pub fn outgoing_offer_if_ready(&self, transfer_id: &str) -> Result<TransferOffer, String> {
+    pub fn outgoing_offer_if_ready(&self, transfer_id: &str) -> Result<Arc<TransferOffer>, String> {
         let staged = self.staged_outgoing.lock();
         let record = staged
             .get(transfer_id)
@@ -800,22 +800,10 @@ impl NodeRuntime {
 
     async fn resolve_outgoing_target(&self, node_id: &str) -> Option<String> {
         for base in self.peer_http_bases(node_id) {
-            let response = self
-                .upload_http
-                .get(format!("{base}/api/v1/info"))
-                .timeout(Duration::from_secs(6))
-                .send()
-                .await;
-            let Ok(response) = response else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            let Ok(info) = response.json::<NodeInfo>().await else {
-                continue;
-            };
-            if info.node_id == node_id {
+            let result =
+                tokio::time::timeout(Duration::from_secs(6), fetch_node_info(&self.http, &base))
+                    .await;
+            if matches!(result, Ok(Ok(info)) if info.node_id == node_id) {
                 return Some(base);
             }
         }
@@ -825,7 +813,7 @@ impl NodeRuntime {
     async fn put_outgoing_item(
         self: &Arc<Self>,
         base: &str,
-        transfer_id: &str,
+        offer: &TransferOffer,
         item: &TransferItem,
         path: &Path,
     ) -> Result<TransferProgress, (String, bool)> {
@@ -834,11 +822,11 @@ impl NodeRuntime {
             .map_err(|error| (format!("读取源文件失败：{error}"), false))?;
         let url = format!(
             "{base}/api/v1/transfers/{}/items/{}",
-            crate::server::encode_path_segment(transfer_id),
+            crate::server::encode_path_segment(&offer.transfer_id),
             crate::server::encode_path_segment(&item.item_id)
         );
         let runtime = self.clone();
-        let progress_id = transfer_id.to_string();
+        let progress_id = offer.transfer_id.clone();
         let item_id = item.item_id.clone();
         let stream = ReaderStream::new(file).scan(
             (0u64, Instant::now()),
@@ -860,6 +848,7 @@ impl NodeRuntime {
         let response = self
             .upload_http
             .put(url)
+            .header(crate::model::TARGET_HEADER, &offer.target_node_id)
             .header(reqwest::header::CONTENT_TYPE, item.media_type.clone())
             .body(reqwest::Body::wrap_stream(stream))
             .send()
@@ -870,7 +859,7 @@ impl NodeRuntime {
                     .json::<TransferProgress>()
                     .await
                     .map_err(|error| (format!("接收端未返回传输进度：{error}"), true))?;
-                if progress.transfer_id != transfer_id {
+                if progress.transfer_id != offer.transfer_id {
                     return Err(("接收端返回了其他任务的进度".to_string(), false));
                 }
                 Ok(progress)
@@ -1012,7 +1001,7 @@ impl NodeRuntime {
             let reported = loop {
                 attempt += 1;
                 match self
-                    .put_outgoing_item(&base, transfer_id, item, &path)
+                    .put_outgoing_item(&base, &entry.offer, item, &path)
                     .await
                 {
                     Ok(progress) => break progress,

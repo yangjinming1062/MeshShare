@@ -34,21 +34,21 @@
   export let onHistoryMode: (value: ClipboardHistoryMode) => void = () => {};
   export let onHistoryValue: (value: number) => void = () => {};
   export let onRemoteFileAccess: (value: boolean) => void = () => {};
-  export let onAcceptTerminalMigration: (() => Promise<void>) | null = null;
+  export let onAllowRemoteTerminal: (() => Promise<void>) | null = null;
   export let onClose: () => void = () => {};
 
-  let migrationBusy = false;
-  let migrationError = '';
-  async function acceptTerminalMigration() {
-    if (!onAcceptTerminalMigration || migrationBusy) return;
-    migrationBusy = true;
-    migrationError = '';
+  let termPermissionBusy = false;
+  let termPermissionError = '';
+  async function allowRemoteTerminal() {
+    if (!onAllowRemoteTerminal || termPermissionBusy) return;
+    termPermissionBusy = true;
+    termPermissionError = '';
     try {
-      await onAcceptTerminalMigration();
+      await onAllowRemoteTerminal();
     } catch (error) {
-      migrationError = error instanceof Error ? error.message : String(error);
+      termPermissionError = error instanceof Error ? error.message : String(error);
     } finally {
-      migrationBusy = false;
+      termPermissionBusy = false;
     }
   }
 
@@ -98,16 +98,16 @@
   </div>
 
   {#if localMode}
-    {#if onAcceptTerminalMigration && node?.terminal && !node.terminal.host_fingerprint}
+    {#if onAllowRemoteTerminal && node?.terminal && !node.terminal.host_fingerprint}
       <div class="setting-block">
         <div class="setting">
           <div class="setting-copy">
-            <strong>迁移远程终端授权</strong>
-            <span>已保留旧版访问限制。允许后，局域网或 Tailscale 中已连接的原生设备可以用当前系统账号运行命令。</span>
+            <strong>远程终端授权</strong>
+            <span>允许后，局域网或 Tailscale 中已连接的原生设备可以用当前系统账号运行命令。</span>
           </div>
-          <button type="button" class="btn btn-sm" disabled={migrationBusy} on:click={acceptTerminalMigration}>允许远程终端</button>
+          <button type="button" class="btn btn-sm" disabled={termPermissionBusy} on:click={allowRemoteTerminal}>允许远程终端</button>
         </div>
-        {#if migrationError}<span role="alert">{migrationError}</span>{/if}
+        {#if termPermissionError}<span role="alert">{termPermissionError}</span>{/if}
       </div>
     {/if}
     <div class="setting-block">

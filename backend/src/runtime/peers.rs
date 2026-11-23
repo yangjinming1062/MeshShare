@@ -20,6 +20,7 @@ impl PeerChannel {
 
 impl NodeRuntime {
     pub fn publish_metrics(&self, metrics: HardwareMetrics) {
+        *self.local_metrics.write() = Some(metrics.clone());
         let _ = self.events.send(WireMessage::MetricsUpdate {
             metrics: metrics.clone(),
         });
@@ -350,10 +351,6 @@ impl NodeRuntime {
 
     pub fn local_metrics(&self) -> Option<HardwareMetrics> {
         self.local_metrics.read().clone()
-    }
-
-    pub fn set_local_metrics(&self, metrics: HardwareMetrics) {
-        *self.local_metrics.write() = Some(metrics);
     }
 
     pub fn peers_snapshot(&self) -> Vec<PeerInfo> {

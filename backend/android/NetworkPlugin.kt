@@ -10,13 +10,22 @@ import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import app.tauri.annotation.Command
+import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
+import app.tauri.plugin.Channel
+import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.net.InetAddress
 
 private const val LOG_TAG = "MeshShareNetwork"
 private const val LAN_BIND_RETRY_MS = 1_000L
+
+@InvokeArg
+class ObserveArgs {
+    lateinit var channel: Channel
+}
 
 /**
  * 普通 VPN 成为进程默认网络时，把 MeshShare 的 socket 固定在物理局域网上。Rust 节点直接
@@ -32,6 +41,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
     private var boundNetworkHandle: Long? = null
     private var bindRetryPosted = false
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var observer: Channel? = null
 
     private val lanRequest = NetworkRequest.Builder()
         .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
@@ -66,8 +76,30 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
         rebindProcessNetwork()
     }
 
+    @Command
+    fun observe(invoke: Invoke) {
+        val channel = invoke.parseArgs(ObserveArgs::class.java).channel
+        main.post {
+            if (destroyed) {
+                invoke.reject("网络监听已停止")
+                return@post
+            }
+            try {
+                if (observer?.id != channel.id) {
+                    // 通知节点重新读取注册期间可能已经变化的绑定。
+                    channel.send(JSObject())
+                    observer = channel
+                }
+                invoke.resolve()
+            } catch (error: Exception) {
+                invoke.reject("无法登记网络绑定监听", error)
+            }
+        }
+    }
+
     override fun onDestroy(activity: androidx.appcompat.app.AppCompatActivity) {
         destroyed = true
+        observer = null
         try {
             connectivity.unregisterNetworkCallback(defaultNetworkCallback)
         } catch (_: Exception) {
@@ -121,12 +153,7 @@ class NetworkPlugin(activity: Activity) : Plugin(activity) {
                 scheduleBindRetry(targetHandle)
             }
             if (boundNetworkHandle != previousHandle) {
-                trigger(
-                    "network_changed",
-                    JSObject().apply {
-                        put("network_handle", boundNetworkHandle ?: 0L)
-                    },
-                )
+                observer?.send(JSObject())
             }
         }
     }

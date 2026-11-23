@@ -1,7 +1,5 @@
 #[cfg(feature = "gui")]
 mod client;
-#[cfg(all(feature = "gui", not(target_os = "android")))]
-pub(crate) mod migration;
 #[cfg(not(target_os = "android"))]
 mod server;
 

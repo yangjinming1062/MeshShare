@@ -36,9 +36,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
             let mut collector = Collector::new(&runtime.node_id(), network_only);
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 let started = Instant::now();
-                let snapshot = collector.sample();
-                runtime.set_local_metrics(snapshot.clone());
-                runtime.publish_metrics(snapshot);
+                runtime.publish_metrics(collector.sample());
                 thread::sleep(SAMPLE_INTERVAL.saturating_sub(started.elapsed()));
             }
         })

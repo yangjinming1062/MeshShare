@@ -2,7 +2,6 @@ use super::*;
 
 #[derive(Debug, Clone)]
 pub struct TransferRecord {
-    pub offer: TransferOffer,
     pub progress: TransferProgress,
     pub accepted_destination: Option<PathBuf>,
     pub received_items: HashSet<String>,
@@ -19,8 +18,18 @@ pub struct TransferRecord {
     pub updated_at_ms: i64,
 }
 
+impl TransferRecord {
+    pub fn offer(&self) -> &TransferOffer {
+        self.progress
+            .offer
+            .as_deref()
+            .expect("已登记的传输始终保留清单")
+    }
+}
+
 impl NodeRuntime {
-    pub fn add_transfer(&self, offer: TransferOffer) -> bool {
+    pub fn add_transfer(&self, offer: impl Into<Arc<TransferOffer>>) -> bool {
+        let offer = offer.into();
         let _update_gate = self.transfer_update_gate.lock();
         if self.update_installing.load(Ordering::SeqCst) {
             return false;
@@ -41,7 +50,6 @@ impl NodeRuntime {
         transfers.insert(
             offer.transfer_id.clone(),
             TransferRecord {
-                offer: offer.clone(),
                 progress: progress.clone(),
                 accepted_destination,
                 received_items: HashSet::new(),
@@ -54,11 +62,7 @@ impl NodeRuntime {
             },
         );
         drop(transfers);
-        // 进度事件同时携带提议。先发布进度，
-        // 使自动接受的传输不会在
-        // 分时收到两个事件的 UI 中短暂显示为新的确认请求。
         self.publish_event(WireMessage::TransferProgress { progress });
-        self.publish_event(WireMessage::TransferOffer { offer });
         true
     }
 
@@ -77,13 +81,13 @@ impl NodeRuntime {
         let Some(record) = transfers.get_mut(&next.transfer_id) else {
             return false;
         };
-        if (record.offer.source_node_id != peer && record.offer.target_node_id != peer)
+        if (record.offer().source_node_id != peer && record.offer().target_node_id != peer)
             || !valid_progress_transition(&record.progress, &next)
         {
             return false;
         }
         if let Some(id) = acknowledged_item {
-            if record.offer.target_node_id != peer
+            if record.offer().target_node_id != peer
                 || !matches!(
                     next.status,
                     TransferStatus::Uploading | TransferStatus::Completed
@@ -98,7 +102,7 @@ impl NodeRuntime {
             record.upload_in_flight = None;
         }
         let was_terminal = is_terminal_transfer(&record.progress.status);
-        next.offer = Some(record.offer.clone());
+        next.offer = record.progress.offer.take();
         next.direction = record.progress.direction.clone();
         next.awaiting_offer_reply = false;
         record.progress = next;
@@ -132,7 +136,6 @@ impl NodeRuntime {
         record.updated_at_ms = now_millis();
         record.progress.destination = Some(crate::fsutil::display_absolute_path(&destination));
         record.progress.status = TransferStatus::Accepted;
-        record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
     }
 
@@ -156,15 +159,19 @@ impl NodeRuntime {
         ) {
             return None;
         }
-        let item = record
-            .offer
+        let offer = record.progress.offer.as_mut()?;
+        let index = offer
             .items
-            .iter_mut()
-            .find(|item| item.item_id == item_id)?;
+            .iter()
+            .position(|item| item.item_id == item_id)?;
+        let item = &offer.items[index];
         if item.size != bytes {
             return None;
         }
-        item.sha256 = digest;
+        if item.sha256 != digest {
+            Arc::make_mut(offer).items[index].sha256 = digest;
+        }
+        let item = &offer.items[index];
         if record.received_items.insert(item_id.to_string()) {
             record.committed_bytes = record.committed_bytes.saturating_add(bytes);
             record.progress.completed_items = record.progress.completed_items.saturating_add(1);
@@ -194,8 +201,7 @@ impl NodeRuntime {
         record.progress.completed_bytes = record
             .progress
             .completed_bytes
-            .max(record.committed_bytes.min(record.offer.total_bytes));
-        record.progress.offer = Some(record.offer.clone());
+            .max(record.committed_bytes.min(record.progress.total_bytes));
         if record.progress.status == TransferStatus::Completed {
             self.record_terminal_transfer(record);
         }
@@ -259,7 +265,6 @@ impl NodeRuntime {
         record.progress.error = Some(message);
         record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
-        record.progress.offer = Some(record.offer.clone());
         self.record_terminal_transfer(record);
         Some(record.progress.clone())
     }
@@ -298,7 +303,6 @@ impl NodeRuntime {
         record.progress.error = None;
         record.upload_in_flight = None;
         record.updated_at_ms = now_millis();
-        record.progress.offer = Some(record.offer.clone());
         self.remove_transfer_history_entry(transfer_id);
         Ok(record.progress.clone())
     }
@@ -359,13 +363,12 @@ impl NodeRuntime {
                     }
                     .to_string(),
                 );
-                record.progress.offer = Some(record.offer.clone());
                 record.updated_at_ms = now;
                 self.record_terminal_transfer(record);
                 stale.push((
                     record.progress.clone(),
-                    record.offer.source_node_id.clone(),
-                    record.offer.target_node_id.clone(),
+                    record.offer().source_node_id.clone(),
+                    record.offer().target_node_id.clone(),
                 ));
             }
         }
@@ -424,14 +427,14 @@ impl NodeRuntime {
         self.transfers
             .read()
             .get(transfer_id)
-            .map(|record| record.offer.source_node_id.clone())
+            .map(|record| record.offer().source_node_id.clone())
     }
 
     pub fn transfer_peer_ids(&self, transfer_id: &str) -> Option<(String, String)> {
         self.transfers.read().get(transfer_id).map(|record| {
             (
-                record.offer.source_node_id.clone(),
-                record.offer.target_node_id.clone(),
+                record.offer().source_node_id.clone(),
+                record.offer().target_node_id.clone(),
             )
         })
     }
@@ -452,7 +455,6 @@ impl NodeRuntime {
         record.progress.status = TransferStatus::Accepted;
         record.progress.awaiting_offer_reply = false;
         record.updated_at_ms = now_millis();
-        record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
     }
 
@@ -519,7 +521,6 @@ impl NodeRuntime {
         }
         record.progress.status = TransferStatus::Uploading;
         record.updated_at_ms = now_millis();
-        record.progress.offer = Some(record.offer.clone());
         Some(record.progress.clone())
     }
 
@@ -543,7 +544,7 @@ impl NodeRuntime {
             return None;
         }
         let item_size = record
-            .offer
+            .offer()
             .items
             .iter()
             .find(|item| item.item_id == item_id)?
@@ -557,11 +558,13 @@ impl NodeRuntime {
         let displayed = record
             .committed_bytes
             .saturating_add(received)
-            .min(record.offer.total_bytes);
+            .min(record.progress.total_bytes);
         record.progress.completed_bytes = record.progress.completed_bytes.max(displayed);
         record.updated_at_ms = now_millis();
-        record.progress.offer = Some(record.offer.clone());
-        Some(record.progress.clone())
+        Some(TransferProgress {
+            offer: None,
+            ..record.progress.clone()
+        })
     }
 
     pub fn touch_transfer_activity(&self, transfer_id: &str) -> bool {

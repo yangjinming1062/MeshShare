@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 pub const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const TARGET_HEADER: &str = "x-meshshare-target";
 pub const MAX_WIRE_ERROR_LENGTH: usize = 4_096;
 pub const CLIPBOARD_TEXT_LIMIT: usize = 16 * 1024 * 1024;
 pub const CLIPBOARD_IMAGE_LIMIT: usize = 16 * 1024 * 1024;
@@ -194,6 +196,33 @@ pub struct ClipboardSnapshot {
     pub updated_at_ms: i64,
 }
 
+impl ClipboardEvent {
+    pub(crate) fn into_snapshot(self, source_name: String) -> ClipboardSnapshot {
+        ClipboardSnapshot {
+            event_id: self.event_id,
+            source_node_id: self.origin_node_id,
+            source_name,
+            clock: self.clock,
+            text: self.text,
+            image_png: self.image_png,
+            updated_at_ms: self.updated_at_ms,
+        }
+    }
+}
+
+impl From<ClipboardSnapshot> for ClipboardEvent {
+    fn from(snapshot: ClipboardSnapshot) -> Self {
+        Self {
+            event_id: snapshot.event_id,
+            origin_node_id: snapshot.source_node_id,
+            clock: snapshot.clock,
+            text: snapshot.text,
+            image_png: snapshot.image_png,
+            updated_at_ms: snapshot.updated_at_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ClipboardSession {
@@ -326,7 +355,7 @@ pub struct TransferProgress {
     pub destination: Option<String>,
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub offer: Option<TransferOffer>,
+    pub offer: Option<Arc<TransferOffer>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<String>,
 }
@@ -411,7 +440,7 @@ pub enum WireMessage {
         snapshot: ClipboardSnapshot,
     },
     TransferOffer {
-        offer: TransferOffer,
+        offer: Arc<TransferOffer>,
     },
     TransferAction {
         transfer_id: String,
@@ -539,7 +568,7 @@ mod tests {
         let cases = [
             (
                 serde_json::to_value(WireMessage::TransferOffer {
-                    offer: offer.clone(),
+                    offer: offer.clone().into(),
                 })
                 .expect("serialize offer"),
                 "offer",
@@ -557,7 +586,7 @@ mod tests {
                         total_items: 1,
                         destination: None,
                         error: None,
-                        offer: Some(offer),
+                        offer: Some(offer.into()),
                         direction: Some("receive".to_string()),
                     },
                 })

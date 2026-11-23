@@ -1,8 +1,7 @@
 use super::{validate_offer, AppState, MAX_WIRE_ERROR_LENGTH};
 use crate::model::{
-    AddressInfo, ClipboardEvent, HardwareMetrics, NodeInfo, PeerInfo, TransferAction,
-    TransferStatus, WireMessage, CLIPBOARD_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY,
-    METRICS_SYSTEM_CAPABILITY,
+    AddressInfo, HardwareMetrics, NodeInfo, PeerInfo, TransferAction, TransferStatus, WireMessage,
+    METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
 };
 use crate::runtime::{is_allowed_peer_address, valid_history_delete_ids, NodeRuntime, PeerSession};
 use axum::{
@@ -166,28 +165,6 @@ async fn handle_socket(
     }
 }
 
-/// 接受远端剪贴板内容。桌面与无界面节点向其他对端转发，移动节点仅更新本地快照。
-fn accept_remote_clipboard(
-    runtime: &Arc<NodeRuntime>,
-    peer_id: &str,
-    event: ClipboardEvent,
-    source_name: String,
-) {
-    let can_write_system_clipboard = runtime.supports_capability("clipboard.text");
-    if !can_write_system_clipboard && !runtime.supports_capability(CLIPBOARD_VIEW_CAPABILITY) {
-        return;
-    }
-    if !runtime.accept_clipboard(event.clone(), source_name) {
-        return;
-    }
-    runtime.publish_event(WireMessage::ClipboardUpdate {
-        event: event.clone(),
-    });
-    if can_write_system_clipboard || runtime.is_headless() {
-        runtime.send_to_peers_except(Some(peer_id), WireMessage::ClipboardUpdate { event });
-    }
-}
-
 pub(super) fn incoming_peer_from_hello(
     node: NodeInfo,
     runtime: &NodeRuntime,
@@ -283,33 +260,12 @@ pub(crate) async fn handle_wire_message(
         WireMessage::Pong { .. } => current_peer.map(str::to_string),
         WireMessage::ClipboardUpdate { event } => {
             let peer_id = current_peer?;
-            let source_name = runtime
-                .peer_name(peer_id)
-                .unwrap_or_else(|| "远端设备".to_string());
-            accept_remote_clipboard(runtime, peer_id, event, source_name);
+            runtime.receive_clipboard(peer_id, event.into_snapshot(String::new()));
             Some(peer_id.to_string())
         }
         WireMessage::ClipboardSnapshot { snapshot } => {
             let peer_id = current_peer?;
-            if snapshot.source_name.len() > 256 {
-                return Some(peer_id.to_string());
-            }
-            let source_name = if snapshot.source_name.trim().is_empty() {
-                runtime
-                    .peer_name(peer_id)
-                    .unwrap_or_else(|| "远端设备".to_string())
-            } else {
-                snapshot.source_name.clone()
-            };
-            let event = crate::model::ClipboardEvent {
-                event_id: snapshot.event_id,
-                origin_node_id: snapshot.source_node_id,
-                clock: snapshot.clock,
-                text: snapshot.text,
-                image_png: snapshot.image_png,
-                updated_at_ms: snapshot.updated_at_ms,
-            };
-            accept_remote_clipboard(runtime, peer_id, event, source_name);
+            runtime.receive_clipboard(peer_id, snapshot);
             Some(peer_id.to_string())
         }
         WireMessage::TransferOffer { offer } => {

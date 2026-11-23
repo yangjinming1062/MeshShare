@@ -142,12 +142,6 @@ fn set_remote_file_access(
 }
 
 #[cfg(all(feature = "gui", target_os = "android"))]
-#[tauri::command]
-fn android_network_changed(state: State<'_, Arc<NodeRuntime>>) {
-    state.request_network_rebind();
-}
-
-#[cfg(all(feature = "gui", target_os = "android"))]
 pub(crate) fn sync_tray_labels(_app: &AppHandle) {}
 
 #[cfg(feature = "gui")]
@@ -214,15 +208,12 @@ fn stop_node(app: &AppHandle, wait: bool) {
 }
 
 #[cfg(feature = "gui")]
-async fn start_node(
-    app: &AppHandle,
-    data_dir: PathBuf,
-) -> anyhow::Result<(Arc<NodeRuntime>, Arc<control::ControlPlane>)> {
+async fn start_node(app: &AppHandle, data_dir: PathBuf) -> anyhow::Result<Arc<NodeRuntime>> {
     let preferred_port = std::env::var("MESHSHARE_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_NODE_PORT);
-    let (runtime, control, _listener_task) = listeners::start(
+    let (runtime, _listener_task) = listeners::start(
         data_dir,
         static_root(app),
         app.package_info().version.to_string(),
@@ -231,19 +222,12 @@ async fn start_node(
         |runtime| control::ControlPlane::with_app(runtime, app.clone()),
     )
     .await?;
-    #[cfg(not(target_os = "android"))]
-    if runtime.ssh.host_fingerprint().is_none() {
-        let owner = runtime.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            if let Err(error) = owner.restore_legacy_terminal_grant() {
-                eprintln!("自动核验旧版终端授权失败：{error:#}");
-            }
-        });
-    }
+    #[cfg(target_os = "android")]
+    android::network::observe(app, runtime.clone());
     start_workers(&runtime);
     clipboard::start_monitor(runtime.clone());
     app.manage(runtime.clone());
-    Ok((runtime, control))
+    Ok(runtime)
 }
 
 fn start_workers(runtime: &Arc<NodeRuntime>) {
@@ -303,7 +287,7 @@ pub fn run() {
         .plugin(android::update::app::plugin())
         .setup(|app| {
             let data_dir = node_data_dir(app.handle());
-            let (runtime, _) =
+            let runtime =
                 tauri::async_runtime::block_on(start_node(app.handle(), data_dir.clone()))?;
             if let Err(error) = android::update::app::start(app.handle(), runtime, &data_dir) {
                 eprintln!("启动 Android 更新服务失败：{error:#}");
@@ -312,7 +296,6 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             node_base_url,
-            android_network_changed,
             terminal::commands::terminal_open,
             terminal::commands::terminal_close,
             terminal::commands::terminal_resize,

@@ -9,10 +9,10 @@ use super::{
     TRANSFER_HISTORY_FILE, TRANSFER_HISTORY_LIMIT,
 };
 use crate::model::{
-    AddressInfo, ClipboardEvent, ClipboardHistoryMode, DiskMetrics, GpuMemoryKind, GpuMetrics,
-    HardwareMetrics, Hlc, LoadAverage, NodeInfo, PeerInfo, ReceiveMode, TransferItem,
-    TransferOffer, TransferProgress, TransferStatus, WireMessage, CLIPBOARD_VIEW_CAPABILITY,
-    MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
+    AddressInfo, ClipboardEvent, ClipboardHistoryMode, ClipboardSnapshot, DiskMetrics,
+    GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, LoadAverage, NodeInfo, PeerInfo, ReceiveMode,
+    TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
+    CLIPBOARD_VIEW_CAPABILITY, MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
     METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
     METRICS_SYSTEM_VIEW_CAPABILITY, TRANSFER_HISTORY_CAPABILITY,
 };
@@ -509,7 +509,7 @@ fn auto_receive_settings_are_persisted_and_used_for_new_transfers() {
 }
 
 #[tokio::test]
-async fn auto_receive_publishes_progress_before_offer() {
+async fn auto_receive_publishes_one_progress_with_the_manifest() {
     let path = temp_data_dir();
     let destination = path.join("received");
     std::fs::create_dir_all(&destination).expect("create receive directory");
@@ -522,13 +522,15 @@ async fn auto_receive_publishes_progress_before_offer() {
 
     assert!(runtime.add_transfer(mobile_offer(&runtime, "auto-order", 1)));
     let first = events.recv().await.expect("receive progress event");
-    let second = events.recv().await.expect("receive offer event");
     assert!(matches!(
         first,
         WireMessage::TransferProgress { progress }
-            if progress.status == TransferStatus::Accepted
+            if progress.status == TransferStatus::Accepted && progress.offer.is_some()
     ));
-    assert!(matches!(second, WireMessage::TransferOffer { .. }));
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     let _ = std::fs::remove_dir_all(path);
 }
 
@@ -542,6 +544,84 @@ fn corrupted_config_is_reported_without_replacing_node_identity() {
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), contents);
     }
     let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
+fn existing_install_opens_its_saved_identity_permissions_and_history() {
+    use serde_json::json;
+    use std::fs;
+    let root = temp_data_dir();
+    let policy = br#"{"policy":{"enabled":true},"signature":"previously confirmed locally"}"#;
+    fs::write(root.join("terminal-access.json"), policy).unwrap();
+    let name = default_node_name(NodeProfile::Desktop, super::system_hostname());
+    let config = serde_json::to_vec(&json!({
+        "node_id": "original-node", "node_name": name, "monitor_visible": false,
+        "monitor_position": {"x": 10, "y": 20}, "monitor_locked": true,
+        "autostart_enabled": false, "update_frequency": "disabled",
+        "clipboard_history_mode": "count", "clipboard_history_count": 42, "clipboard_history_days": 7,
+        "receive_mode": "confirm", "remote_file_access": true,
+        "terminal_access_migration": {"accepted_policy": format!("{:x}", Sha256::digest(policy))}
+    })).unwrap();
+    fs::write(root.join("node.json"), &config).unwrap();
+    let ca = crate::mobile_tls::ensure(&root, &[std::net::Ipv4Addr::LOCALHOST]).unwrap();
+    let ca_bytes = fs::read(&ca.ca_certificate_path).unwrap();
+    let ca_key_path = root.join("mobile-tls/ca-key.pem");
+    let ca_key_bytes = fs::read(&ca_key_path).unwrap();
+
+    let clock = json!({"physical_ms": 1, "logical": 0, "node_id": "from"});
+    let snapshot = json!({
+        "event_id": "copy", "source_node_id": "from", "source_name": "source",
+        "clock": clock, "text": "hello", "updated_at_ms": 1
+    });
+    fs::write(root.join("clipboard-current.json"), snapshot.to_string()).unwrap();
+    fs::create_dir(root.join(CLIPBOARD_PAYLOAD_DIR)).unwrap();
+    fs::write(root.join(CLIPBOARD_PAYLOAD_DIR).join("copy.txt"), b"hello").unwrap();
+    let clipboard_index = json!([{
+        "event_id": "copy", "source_node_id": "from", "source_name": "source", "clock": clock,
+        "updated_at_ms": 1, "recorded_at_ms": 1, "content_hash": crate::clipboard::payload_hash(Some("hello"), None),
+        "text_path": "copy.txt", "text_len": 5, "image_len": 0
+    }]);
+    fs::write(
+        root.join(CLIPBOARD_HISTORY_FILE),
+        clipboard_index.to_string(),
+    )
+    .unwrap();
+    let transfer_history = json!({"entries": [{
+        "transfer_id": "sent", "direction": "send", "peer_node_id": "target", "peer_name": "target",
+        "status": "completed", "completed_bytes": 3, "total_bytes": 3,
+        "completed_items": 1, "total_items": 1, "finished_at_ms": 1
+    }], "pending_deletions": {}});
+    fs::write(
+        root.join(TRANSFER_HISTORY_FILE),
+        transfer_history.to_string(),
+    )
+    .unwrap();
+
+    let node = NodeRuntime::new_with_profile(root.clone(), 0, "test".into(), NodeProfile::Desktop)
+        .unwrap();
+    assert_eq!(node.node_id(), "original-node");
+    assert_eq!(node.update_settings().0, UpdateFrequency::Disabled);
+    assert!(node.remote_file_access());
+    assert_eq!(node.clipboard_history_settings().count, 42);
+    assert_eq!(
+        node.clipboard_history_detail("copy")
+            .unwrap()
+            .snapshot
+            .text
+            .as_deref(),
+        Some("hello")
+    );
+    assert_eq!(node.clipboard_snapshot().unwrap().event_id, "copy");
+    assert_eq!(node.transfer_history_snapshot(None)[0].transfer_id, "sent");
+    #[cfg(all(feature = "gui", not(target_os = "android")))]
+    assert!(node.ssh.host_fingerprint().is_some());
+    let reopened_ca = crate::mobile_tls::ensure(&root, &[std::net::Ipv4Addr::LOCALHOST]).unwrap();
+    assert_eq!(reopened_ca.fingerprint, ca.fingerprint);
+    assert_eq!(fs::read(reopened_ca.ca_certificate_path).unwrap(), ca_bytes);
+    assert_eq!(fs::read(ca_key_path).unwrap(), ca_key_bytes);
+    assert_eq!(fs::read(root.join("node.json")).unwrap(), config);
+    assert_eq!(fs::read(root.join("terminal-access.json")).unwrap(), policy);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -579,23 +659,6 @@ fn update_preference_and_pending_state_are_persisted() {
         (UpdateFrequency::Daily, Some(123), Some("1.2.3".to_string()))
     );
     let _ = std::fs::remove_dir_all(path);
-}
-
-#[test]
-fn update_frequency_parser_rejects_unknown_values() {
-    assert_eq!(
-        UpdateFrequency::parse("daily"),
-        Some(UpdateFrequency::Daily)
-    );
-    assert_eq!(
-        UpdateFrequency::parse("weekly"),
-        Some(UpdateFrequency::Weekly)
-    );
-    assert_eq!(
-        UpdateFrequency::parse("disabled"),
-        Some(UpdateFrequency::Disabled)
-    );
-    assert_eq!(UpdateFrequency::parse("monthly"), None);
 }
 
 #[test]
@@ -1093,6 +1156,7 @@ fn transfer_progress_reports_in_flight_bytes_without_double_counting() {
             .report_transfer_progress("live-progress", "live-progress-item", received)
             .expect("report progress");
         assert_eq!(progress.completed_bytes, expected);
+        assert!(progress.offer.is_none());
         assert_eq!(progress.completed_items, 0);
         assert_eq!(progress.status, TransferStatus::Uploading);
     }
@@ -1100,6 +1164,12 @@ fn transfer_progress_reports_in_flight_bytes_without_double_counting() {
         .report_transfer_progress("live-progress", "live-progress-item", 999)
         .expect("report capped progress");
     assert_eq!(capped.completed_bytes, 100);
+    let snapshot = runtime.transfers_snapshot().pop().unwrap();
+    assert_eq!(snapshot.completed_bytes, 100);
+    assert_eq!(
+        snapshot.offer.unwrap().items[0].item_id,
+        "live-progress-item"
+    );
 
     let completed = runtime
         .mark_item_received("live-progress", "live-progress-item", 100, "0".repeat(64))
@@ -2237,7 +2307,7 @@ fn clipboard_queue_overflow_schedules_latest_snapshot_resync() {
     assert!(!runtime.send_to_peer(
         "peer",
         WireMessage::ClipboardUpdate {
-            event: event.clone(),
+            event: event.clone().into(),
         }
     ));
     let _ = rx.try_recv().expect("drain full queue");
@@ -2272,10 +2342,15 @@ fn clipboard_messages_skip_peers_without_clipboard_capability() {
     assert!(runtime.send_to_peer(
         "android",
         WireMessage::ClipboardUpdate {
-            event: event.clone()
+            event: event.clone().into()
         },
     ));
-    runtime.send_to_peers_except(None, WireMessage::ClipboardUpdate { event });
+    runtime.send_to_peers_except(
+        None,
+        WireMessage::ClipboardUpdate {
+            event: event.into(),
+        },
+    );
     assert!(rx.try_recv().is_err());
 
     let _ = std::fs::remove_dir_all(path);
@@ -2296,7 +2371,12 @@ fn clipboard_messages_reach_view_only_peers() {
     ));
     runtime.add_peer_channel("android".to_string(), tx);
 
-    assert!(runtime.send_to_peer("android", WireMessage::ClipboardUpdate { event },));
+    assert!(runtime.send_to_peer(
+        "android",
+        WireMessage::ClipboardUpdate {
+            event: event.into()
+        },
+    ));
     assert!(matches!(
         rx.try_recv(),
         Ok(WireMessage::ClipboardUpdate { .. })
@@ -2310,6 +2390,7 @@ fn concurrent_clipboard_updates_keep_the_newest_hlc() {
     let path = temp_data_dir();
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
+    let mut updates = runtime.subscribe();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let older = ClipboardEvent {
         event_id: "older".to_string(),
@@ -2339,13 +2420,13 @@ fn concurrent_clipboard_updates_keep_the_newest_hlc() {
     let older_barrier = barrier.clone();
     let older_thread = std::thread::spawn(move || {
         older_barrier.wait();
-        older_runtime.accept_clipboard(older, "older".to_string());
+        older_runtime.receive_clipboard("peer-a", older.into_snapshot("older".into()));
     });
     let newer_runtime = runtime.clone();
     let newer_barrier = barrier.clone();
     let newer_thread = std::thread::spawn(move || {
         newer_barrier.wait();
-        newer_runtime.accept_clipboard(newer, "newer".to_string());
+        newer_runtime.receive_clipboard("peer-b", newer.into_snapshot("newer".into()));
     });
     barrier.wait();
     older_thread.join().expect("older update thread");
@@ -2358,6 +2439,14 @@ fn concurrent_clipboard_updates_keep_the_newest_hlc() {
             .as_deref(),
         Some("newer")
     );
+    let mut delivered = Vec::new();
+    while let Ok(WireMessage::ClipboardUpdate { event }) = updates.try_recv() {
+        delivered.push(event);
+    }
+    assert!(delivered
+        .windows(2)
+        .all(|pair| pair[0].clock.compare(&pair[1].clock).is_lt()));
+    assert_eq!(delivered.last().unwrap().event_id, "newer");
     let _ = std::fs::remove_dir_all(path);
 }
 
@@ -2431,16 +2520,17 @@ fn persisted_current_snapshot_advances_clock_after_restart() {
         logical: 7,
         node_id: "peer".to_string(),
     };
-    assert!(runtime.accept_clipboard(
-        ClipboardEvent {
+    assert!(runtime.receive_clipboard(
+        "peer",
+        ClipboardSnapshot {
+            source_name: "peer".into(),
             event_id: "future-event".to_string(),
-            origin_node_id: "peer".to_string(),
+            source_node_id: "peer".to_string(),
             clock: future_clock,
             text: Some("future".to_string()),
             image_png: None,
             updated_at_ms: crate::clock::now_millis(),
         },
-        "peer".to_string(),
     ));
     let current = runtime.clipboard_snapshot().expect("current snapshot");
     drop(runtime);
@@ -2490,17 +2580,7 @@ fn replaying_current_snapshot_does_not_recreate_cleared_history() {
     restored
         .clear_clipboard_history()
         .expect("clear clipboard history");
-    assert!(!restored.accept_clipboard(
-        ClipboardEvent {
-            event_id: current.event_id.clone(),
-            origin_node_id: current.source_node_id.clone(),
-            clock: current.clock.clone(),
-            text: current.text.clone(),
-            image_png: current.image_png.clone(),
-            updated_at_ms: current.updated_at_ms,
-        },
-        current.source_name.clone(),
-    ));
+    assert!(!restored.receive_clipboard("peer", current));
     assert!(restored.clipboard_history_list().items.is_empty());
     let _ = std::fs::remove_dir_all(path);
 }
@@ -2711,10 +2791,12 @@ fn older_hlc_event_is_kept_in_history_without_replacing_current() {
     runtime
         .create_local_clipboard_named(Some("new".to_string()), None, "local".to_string())
         .expect("create clipboard event");
-    let accepted_as_current = runtime.accept_clipboard(
-        ClipboardEvent {
+    let accepted_as_current = runtime.receive_clipboard(
+        "peer",
+        ClipboardSnapshot {
+            source_name: "peer".into(),
             event_id: "older-event".to_string(),
-            origin_node_id: "peer".to_string(),
+            source_node_id: "peer".to_string(),
             clock: Hlc {
                 physical_ms: 1,
                 logical: 0,
@@ -2724,7 +2806,6 @@ fn older_hlc_event_is_kept_in_history_without_replacing_current() {
             image_png: None,
             updated_at_ms: 1,
         },
-        "peer".to_string(),
     );
     assert!(!accepted_as_current);
     assert_eq!(
@@ -2812,7 +2893,19 @@ async fn accepted_outgoing_transfer_streams_staged_items_without_page_state() {
         env!("CARGO_PKG_VERSION").into(),
     )
     .expect("create receiver runtime");
-    let app = crate::server::router(receiver.clone(), static_root);
+    let target_id = receiver.node_id();
+    let app =
+        crate::server::router(receiver.clone(), static_root).layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                if req.method() == axum::http::Method::PUT {
+                    assert_eq!(
+                        req.headers().get(crate::model::TARGET_HEADER).unwrap(),
+                        target_id.as_str()
+                    );
+                }
+                next.run(req)
+            },
+        ));
     let server = tokio::spawn(async move {
         axum::serve(listener, app).await.expect("serve receiver");
     });
@@ -3157,6 +3250,75 @@ async fn outgoing_receiver_fixture() -> (
         .expect("create sender runtime");
     register_peer_endpoint(&sender, receiver.node_info());
     (receiver, sender, address, server, sender_dir)
+}
+
+#[tokio::test]
+async fn mobile_proxy_uses_the_final_target_on_every_transfer_request() {
+    let (occupant, gateway, _, receiver_task, dir) = outgoing_receiver_fixture().await;
+    let mut stale = occupant.node_info();
+    stale.node_id = "previous-node".into();
+    register_peer_endpoint(&gateway, stale);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = crate::server::router(gateway.clone(), dir.join("web"));
+    let gateway_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let special_id = "传输 #3?50%";
+    occupant.add_transfer(incoming_history_offer(&occupant, special_id, "source"));
+    let path = crate::server::encode_path_segment(special_id);
+    let url = format!(
+        "http://{address}/api/v1/mobile/peers/{}/api/v1/transfers/{path}/status",
+        occupant.node_id()
+    );
+    let progress = gateway
+        .http
+        .get(url)
+        .header(crate::model::TARGET_HEADER, gateway.node_id())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<TransferProgress>()
+        .await
+        .unwrap();
+    assert_eq!(progress.transfer_id, special_id);
+
+    let offer = incoming_history_offer(&occupant, "proxy-target", "source");
+    occupant.add_transfer(offer.clone());
+    let transfers = format!("http://{address}/api/v1/mobile/peers/previous-node/api/v1/transfers");
+    let transfer = format!("{transfers}/proxy-target");
+    let mut requested = offer;
+    requested.target_node_id = "previous-node".into();
+    for request in [
+        gateway.http.post(&transfers).json(&requested),
+        gateway.http.get(format!("{transfer}/status")),
+        gateway.http.post(format!("{transfer}/cancel")),
+        gateway.http.post(format!("{transfer}/retry")),
+        gateway
+            .http
+            .post(format!("{transfer}/fail"))
+            .json(&serde_json::json!({"error":"test"})),
+        gateway
+            .http
+            .put(format!("{transfer}/items/proxy-target-item"))
+            .body("data"),
+    ] {
+        let response = request
+            .header(crate::model::TARGET_HEADER, gateway.node_id())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::MISDIRECTED_REQUEST);
+    }
+    assert_eq!(
+        occupant.transfer("proxy-target").unwrap().progress.status,
+        TransferStatus::Waiting
+    );
+    gateway_task.abort();
+    receiver_task.abort();
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(&occupant.data_dir);
 }
 
 #[tokio::test]

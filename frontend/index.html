@@ -13,6 +13,7 @@
         overflow: hidden;
         background: transparent;
       }
+      html[data-update-webview] #webview-update { display: block; margin: 2em 1em; }
       /* 开发时只在主窗口显示 Vite 可滚动的错误面板。 */
       html[data-window="monitor"] vite-error-overlay { display: none; }
     </style>
@@ -21,6 +22,7 @@
     <title>MeshShare · 局域网共享</title>
   </head>
   <body>
+    <p id="webview-update" hidden>请将 Android System WebView 或 Chrome 更新至 108 或更高版本，然后重新打开 MeshShare。</p>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

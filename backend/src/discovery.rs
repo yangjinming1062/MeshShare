@@ -1,5 +1,7 @@
 use crate::model::{NodeInfo, PeerInfo, WireMessage, PROTOCOL_VERSION};
-use crate::runtime::{is_allowed_peer_address, NodeRuntime, PeerEndpoint, PeerEndpointSource};
+use crate::runtime::{
+    fetch_node_info, is_allowed_peer_address, NodeRuntime, PeerEndpoint, PeerEndpointSource,
+};
 use crate::server;
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -182,34 +184,6 @@ pub async fn connect_manual(
         },
     );
     Ok(runtime.peer(&peer.node_id).unwrap_or(peer))
-}
-
-async fn fetch_node_info(client: &reqwest::Client, base: &str) -> anyhow::Result<NodeInfo> {
-    const MAX_INFO_BYTES: usize = 128 * 1024;
-    let mut response = client.get(format!("{base}/api/v1/info")).send().await?;
-    anyhow::ensure!(
-        response
-            .remote_addr()
-            .is_some_and(|peer| is_allowed_peer_address(peer.ip())),
-        "节点连接地址不在局域网或 Tailscale 范围内"
-    );
-    anyhow::ensure!(
-        response.status().is_success(),
-        "读取节点信息失败（HTTP {}）",
-        response.status()
-    );
-    anyhow::ensure!(
-        response
-            .content_length()
-            .is_none_or(|len| len <= MAX_INFO_BYTES as u64),
-        "节点信息过大"
-    );
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        anyhow::ensure!(chunk.len() <= MAX_INFO_BYTES - body.len(), "节点信息过大");
-        body.extend_from_slice(&chunk);
-    }
-    Ok(serde_json::from_slice(&body)?)
 }
 
 fn normalize_http_base_url(value: &str) -> Result<String, String> {

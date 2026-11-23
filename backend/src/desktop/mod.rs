@@ -3,7 +3,7 @@ pub(crate) mod tray;
 
 use crate::{
     apply_monitor_locked, apply_monitor_visible, autostart, links, monitor, node_data_dir,
-    start_node, terminal, updater::UpdateCoordinator, NodeRuntime,
+    start_node, terminal, NodeRuntime,
 };
 #[cfg(target_os = "linux")]
 use crate::{linux, MonitorBackend, MonitorCapabilities};
@@ -82,13 +82,10 @@ pub fn run() {
                     });
                 app.manage(MonitorCapabilities::for_backend(backend));
             }
-            let (runtime, control) = tauri::async_runtime::block_on(start_node(
+            let runtime = tauri::async_runtime::block_on(start_node(
                 app.handle(),
                 node_data_dir(app.handle()),
             ))?;
-            let updater = UpdateCoordinator::new(app.handle().clone(), runtime.clone());
-            control.install_updater(updater.clone())?;
-            updater.start();
             if !cfg!(debug_assertions) {
                 if let Err(error) = autostart::set_enabled(runtime.autostart_enabled()) {
                     eprintln!("同步开机自启动失败：{error}");
