@@ -3,6 +3,8 @@
 
   export let open = false;
   export let title = '';
+  export let subtitle = '';
+  export let remote = false;
   export let width = 520;
   export let bodyClass = '';
   export let onClose: () => void = () => {};
@@ -27,9 +29,12 @@
   }
 </script>
 
-<dialog bind:this={dialogEl} class="sheet" style="--sheet-w:{width}px" aria-label={title} on:cancel={handleCancel} on:click={handleBackdrop}>
+<dialog bind:this={dialogEl} class="sheet" class:sheet--remote={remote} style="--sheet-w:{width}px" aria-label={title} on:cancel={handleCancel} on:click={handleBackdrop}>
   <div class="sheet-head">
-    <h2>{title}</h2>
+    <div class="sheet-title">
+      <h2>{title}</h2>
+      {#if subtitle}<p class="sheet-subtitle">{subtitle}</p>{/if}
+    </div>
     <button type="button" class="btn-icon" aria-label="关闭" on:click={onClose}>
       <Icon name="close" size={16} />
     </button>

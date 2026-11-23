@@ -8,8 +8,8 @@
   import { buildOffer, uploadItems, randomId, uploadFileWithRetry } from './upload';
   import { snapshotRead } from './snapshotRead';
   import { filesFromDataTransfer } from './drop';
-  import { HEADLESS_CAPABILITY, peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
-  import { ApiError, NODE_PROTOCOL_VERSION, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, sendManagedPathsToMobile, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restartService, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl } from './api';
+  import { HEADLESS_CAPABILITY, REMOTE_MANAGEMENT_CAPABILITY, canOpenRemoteSettings, peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
+  import { ApiError, NODE_PROTOCOL_VERSION, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, sendManagedPathsToMobile, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restartService, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl, type ManagedRequestTarget, type RequestTarget } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { mergeTransferProgress } from './transferProgress';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
@@ -43,6 +43,7 @@
   let node: NodeInfo | null = null;
   let activeBaseUrl = '';
   let remoteTarget: PeerInfo | null = null;
+  let remoteAddress = '';
   let localBaseUrl = '';
   let localNodeId = '';
   let peers: PeerInfo[] = [];
@@ -74,14 +75,12 @@
   $: receiveSettings = settingsSnapshot?.receive_settings ?? defaultReceive;
   $: clipboardHistorySettings = settingsSnapshot?.clipboard_history_settings ?? webHistorySettings;
   $: clipboardStatus = settingsSnapshot?.clipboard_status ?? loadingClipboard;
-  $: updateFrequency = settingsSnapshot?.update_frequency ?? 'weekly';
-  $: updateStatus = settingsSnapshot?.update_status ?? null;
   $: serviceControlError = settingsSnapshot?.service_control_error ?? '';
   $: monitorLocked = settingsSnapshot?.monitor.locked ?? false;
   $: monitorVisible = settingsSnapshot?.monitor.visible ?? true;
   $: monitorCapabilities = settingsSnapshot?.monitor.capabilities ?? UNKNOWN_MONITOR_CAPABILITIES;
   let settingsRead: Promise<NodeSettings> | null = null;
-  let settingsWrites = new Set<string>();
+  let settingsWrites = new Map<string, Promise<NodeSettings | void>>();
   let remoteFileAccess = false;
   let remoteFileAccessBusy = false;
   let browseOpen = false;
@@ -90,7 +89,7 @@
   type BrowseRecipient = { peer: PeerInfo } | { mobile: MobileSession };
   let browseRecipient: BrowseRecipient | null = null;
   let browseTransfer: TransferProgress | null = null;
-  let browseReceiveMode: ReceiveMode | null = null;
+  let browseReceiveSettings: { scope: SettingsScope; mode?: ReceiveMode } | null = null;
   let ws: WebSocket | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
@@ -116,8 +115,27 @@
   let manualAddress = '';
   let savedNodeUrls: string[] = [];
   let settingsOpen = false;
+  type RemoteSettingsSession = {
+    peer: PeerInfo;
+    node: NodeInfo | null;
+    target: ManagedRequestTarget | null;
+    address: string;
+    snapshot: NodeSettings | null;
+    error: string;
+  };
+  type SettingsScope = {
+    target: RequestTarget;
+    nodeId: string;
+    snapshot: NodeSettings;
+    isCurrent: () => boolean;
+    dialog: boolean;
+  };
+  let settingsSession = 0;
+  let settingsTrigger: HTMLButtonElement | null = null;
+  let remoteSettings: RemoteSettingsSession | null = null;
+  let remoteSettingsRead: Promise<NodeSettings> | null = null;
+  let settingsFeedback: { text: string; error: boolean } | null = null;
   let restartBusy = false;
-  let restartError = '';
   let terminalWorkspace: TerminalWorkspace;
   let terminalVisible = false;
   let terminalCount = 0;
@@ -137,11 +155,11 @@
   let metricsPeerOpen = false;
   let clearHistoryOpen = false;
   // window.prompt 在部分桌面 WebView（macOS）上不可用，统一走内联输入对话框。
-  let pathPrompt: { title: string; initial: string; resolve: (value: string | null) => void } | null = null;
+  let pathPrompt: { title: string; initial: string; settings: boolean; resolve: (value: string | null) => void } | null = null;
 
-  function askPath(title: string, initial: string): Promise<string | null> {
+  function askPath(title: string, initial: string, settings = false): Promise<string | null> {
     return new Promise((resolve) => {
-      pathPrompt = { title, initial, resolve };
+      pathPrompt = { title, initial, settings, resolve };
     });
   }
 
@@ -167,7 +185,6 @@
   const MAX_UPLOAD_ATTEMPTS = 6;
   const SAVED_NODE_URLS_KEY = 'meshshare-saved-node-urls';
   const MOBILE_SESSION_KEY = 'meshshare-mobile-session';
-  const REMOTE_MANAGEMENT_CAPABILITY = 'management.remote.v1';
   const REMOTE_FILES_CAPABILITY = 'management.files.v1';
   const WS_RECONNECT_BASE_MS = 1500;
   const WS_RECONNECT_MAX_MS = 30000;
@@ -223,8 +240,17 @@
     : transferHistory;
   $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
-  $: headless = remoteMode && !!node?.capabilities.includes(HEADLESS_CAPABILITY);
+  $: headless = remoteMode && !!(node ?? remoteTarget)?.capabilities.includes(HEADLESS_CAPABILITY);
   $: settingsDisabled = !settingsReady || !node || settingsWrites.has(node.node_id);
+  $: dialogNode = remoteSettings ? remoteSettings.node : node;
+  $: dialogSnapshot = remoteSettings ? remoteSettings.snapshot : settingsSnapshot;
+  $: dialogSettingsDisabled = !dialogSnapshot || !dialogNode || settingsWrites.has(dialogNode.node_id);
+  $: dialogRemote = remoteSettings && {
+    name: remoteSettings.node?.node_name ?? remoteSettings.peer.node_name,
+    address: !remoteSettings.target && remoteSettings.address ? '上次连接 ' + remoteSettings.address : remoteSettings.address,
+    platform: remoteSettings.node?.platform ?? remoteSettings.peer.platform,
+    headless: (remoteSettings.node ?? remoteSettings.peer).capabilities.includes(HEADLESS_CAPABILITY),
+  };
   // 远程管理页的发送由目标机器选文件，需要目标节点声明对应的管理能力。
   $: managedFilesSupported = remoteMode && !!node?.capabilities.includes(REMOTE_FILES_CAPABILITY);
   $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
@@ -500,6 +526,7 @@
         if (pageStopped) return;
         connectWebSocket();
         timer = window.setInterval(() => {
+          void refreshRemoteSettings();
           if (remoteTarget && [...pendingMobileUploads.values()].some(upload => !upload.failure)) {
             void readLocalMobileTransfers().catch(error => console.error('读取本机网页传输失败', error));
           }
@@ -511,7 +538,7 @@
               if (await rediscoverRemote(generation, activeBaseUrl)) return;
             }
             if (generation !== targetGeneration) return;
-            status = error instanceof Error ? error.message : '无法刷新节点状态';
+            status = remoteTarget ? remoteConnectionError(error) : error instanceof Error ? error.message : '无法刷新节点状态';
             statusKind = 'error';
           });
         }, 2500);
@@ -724,35 +751,166 @@
     }
   }
 
+  function openSettings(trigger: HTMLButtonElement, peer = remoteTarget) {
+    if (settingsOpen) return;
+    settingsSession += 1;
+    settingsTrigger = trigger;
+    settingsOpen = true;
+    if (peer) void connectRemoteSettings(peer);
+  }
+
+  function openPeerSettings(peer: PeerInfo, trigger: HTMLButtonElement) {
+    if (!remoteMode && canOpenRemoteSettings(peer, localNodeId)) openSettings(trigger, peer);
+  }
+
+  function closeSettingsChildren() {
+    if (browseReceiveSettings) closeBrowse();
+    if (pathPrompt?.settings) resolvePathPrompt(null);
+  }
+
+  function closeSettings(restoreFocus = true) {
+    if (!settingsOpen) return;
+    const trigger = settingsTrigger;
+    settingsOpen = false;
+    settingsSession += 1;
+    settingsTrigger = null;
+    settingsFeedback = null;
+    remoteSettings = null;
+    remoteSettingsRead = null;
+    restartBusy = false;
+    closeSettingsChildren();
+    if (restoreFocus) void tick().then(() => {
+      if (!settingsOpen && !pageStopped) trigger?.focus();
+    });
+  }
+
+  function disconnectRemoteSettings(error: string) {
+    if (!remoteSettings) return;
+    settingsSession += 1;
+    remoteSettings = { ...remoteSettings, target: null, snapshot: null, error };
+    remoteSettingsRead = null;
+    settingsFeedback = null;
+    restartBusy = false;
+    closeSettingsChildren();
+  }
+
+  async function connectRemoteSettings(peer: PeerInfo, rediscover = false) {
+    const session = ++settingsSession;
+    const isCurrent = () => !pageStopped && settingsOpen && session === settingsSession;
+    remoteSettings = {
+      peer, node: remoteSettings?.node ?? null, address: remoteSettings?.address ?? '',
+      target: null, snapshot: null, error: '',
+    };
+    try {
+      const online = rediscover ? await getPeers(localBaseUrl).catch(() => []) : [];
+      const candidate = online.find((item) => item.online && item.node_id === peer.node_id) ?? peer;
+      const preferred = remoteTarget?.node_id === peer.node_id && activeBaseUrl ? [activeBaseUrl] : [];
+      const connected = await withPeerAddress(peer.node_id, [...preferred, ...targetCandidates(candidate)], async (base, info) => {
+        if (!info.capabilities.includes(REMOTE_MANAGEMENT_CAPABILITY)) throw new Error('目标节点暂不支持远程管理');
+        const target: ManagedRequestTarget = {
+          base, nodeId: peer.node_id, isCurrent,
+          onMismatch: () => {
+            if (remoteSettings?.target !== target) return;
+            disconnectRemoteSettings('地址上的设备与目标不匹配');
+            if (remoteTarget?.node_id === target.nodeId && activeBaseUrl === target.base) suspendRemoteTarget();
+          },
+        };
+        await settingsWrites.get(peer.node_id)?.catch(() => undefined);
+        const snapshot = await getSettings(target);
+        return { peer: candidate, node: info, target, address: new URL(base).host, snapshot, error: '' };
+      }, isCurrent);
+      if (isCurrent()) remoteSettings = connected;
+    } catch (error) {
+      if (isCurrent()) disconnectRemoteSettings(remoteConnectionError(error));
+    }
+  }
+
+  function remoteConnectionError(error: unknown): string {
+    return error instanceof Error && error.name !== 'AbortError' && !(error instanceof TypeError)
+      ? error.message : '无法连接目标节点，请确认设备在线';
+  }
+
+  async function refreshRemoteSettings() {
+    const target = remoteSettings?.target;
+    if (!target || remoteSettingsRead || settingsWrites.has(target.nodeId)) return;
+    const read = getSettings(target);
+    remoteSettingsRead = read;
+    try {
+      const snapshot = await read;
+      if (target.isCurrent() && remoteSettingsRead === read && remoteSettings?.target === target) {
+        remoteSettings = { ...remoteSettings, snapshot };
+      }
+    } catch (error) {
+      if (target.isCurrent() && remoteSettingsRead === read) disconnectRemoteSettings(remoteConnectionError(error));
+    } finally {
+      if (remoteSettingsRead === read) remoteSettingsRead = null;
+    }
+  }
+
+  function settingsScope(dialog = false): SettingsScope | null {
+    if (pageStopped || (dialog && !settingsOpen)) return null;
+    if (dialog && remoteSettings) {
+      const { target, snapshot } = remoteSettings;
+      return target && snapshot ? { target, snapshot, nodeId: target.nodeId, isCurrent: target.isCurrent, dialog } : null;
+    }
+    if (!node || !settingsSnapshot) return null;
+    const generation = targetGeneration;
+    const session = settingsSession;
+    const isCurrent = () => !pageStopped && generation === targetGeneration && (!dialog || session === settingsSession);
+    return { target: activeBaseUrl, snapshot: settingsSnapshot, nodeId: node.node_id, isCurrent, dialog };
+  }
+
+  function showSettingsFeedback(scope: SettingsScope, text: string, error = false) {
+    if (scope.dialog) settingsFeedback = { text, error };
+    else showTransientNotice(text, error ? 6000 : undefined);
+  }
+
   /** 同一节点串行写入，旧上下文的结果不更新当前界面。 */
   async function saveSettings(
-    change: (target: string) => Promise<NodeSettings>,
+    scope: SettingsScope | null,
+    change: (target: RequestTarget) => Promise<NodeSettings | void>,
     success: string | ((settings: NodeSettings) => string),
     failure: string,
   ): Promise<boolean> {
-    if (pageStopped || !settingsReady || !node || settingsWrites.has(node.node_id)) return false;
-    const nodeId = node.node_id;
-    const generation = targetGeneration;
-    const target = activeBaseUrl;
-    settingsRead = null;
-    settingsWrites = new Set(settingsWrites).add(nodeId);
+    if (!scope || !scope.isCurrent() || settingsWrites.has(scope.nodeId)) return false;
+    const { target, nodeId } = scope;
+    const explicit = typeof target !== 'string';
+    const base = explicit ? target.base : target;
+    const ownsOverview = () => node?.node_id === nodeId && base === activeBaseUrl;
+    if (ownsOverview()) settingsRead = null;
+    if (explicit) remoteSettingsRead = null;
+    if (scope.dialog) settingsFeedback = null;
+    const write = Promise.resolve().then(() => change(target));
+    settingsWrites = new Map(settingsWrites).set(nodeId, write);
+    let failed = false;
     try {
-      const settings = await change(target);
-      if (pageStopped || generation !== targetGeneration) return false;
-      settingsSnapshot = settings;
-      showTransientNotice(typeof success === 'string' ? success : success(settings));
+      const settings = await write;
+      if (!scope.isCurrent()) return false;
+      if (settings) {
+        if (ownsOverview()) settingsSnapshot = settings;
+        if (explicit && remoteSettings?.target === target) remoteSettings = { ...remoteSettings, snapshot: settings };
+      }
+      showSettingsFeedback(scope, typeof success === 'string' ? success : success(settings ?? scope.snapshot));
       return true;
     } catch (error) {
-      if (!pageStopped && generation === targetGeneration) {
-        settingsSnapshot = null;
-        showTransientNotice(error instanceof Error ? error.message : failure, 6000);
+      failed = true;
+      if (scope.isCurrent()) {
+        if (explicit && (error instanceof TypeError || (error instanceof ApiError && error.status === 421)
+          || (error instanceof DOMException && error.name === 'AbortError'))) {
+          disconnectRemoteSettings(error instanceof ApiError
+            ? error.message : failure + '，未收到目标节点确认。请重新连接后核对节点状态。');
+        } else {
+          if (!explicit && ownsOverview()) settingsSnapshot = null;
+          showSettingsFeedback(scope, error instanceof Error ? error.message : failure, true);
+        }
       }
       return false;
     } finally {
-      const remaining = new Set(settingsWrites);
+      const remaining = new Map(settingsWrites);
       remaining.delete(nodeId);
       settingsWrites = remaining;
-      if (!settingsSnapshot && node?.node_id === nodeId) void refreshSettings();
+      if (ownsOverview() && (!settingsSnapshot || failed || !scope.isCurrent())) void refreshSettings();
+      if (failed && explicit && remoteSettings?.target === target) void refreshRemoteSettings();
     }
   }
 
@@ -915,18 +1073,25 @@
     }
   }
 
-  async function toggleSync() {
-    const feature = headless ? '目标节点的剪贴板发布' : remoteMode ? '目标节点的剪贴板自动同步' : '剪贴板自动同步';
+  async function toggleSync(dialog = false) {
+    const scope = settingsScope(dialog);
+    if (!scope) return;
+    const remoteNode = dialog && remoteSettings ? remoteSettings.node : remoteMode ? node : null;
+    const feature = remoteNode?.capabilities.includes(HEADLESS_CAPABILITY) ? '剪贴板发布' : '剪贴板自动同步';
     await saveSettings(
-      (target) => patchSettings({ clipboard_sync_enabled: !syncEnabled }, target),
+      scope,
+      (target) => patchSettings({ clipboard_sync_enabled: !scope.snapshot.clipboard_sync_enabled }, target),
       (settings) => settings.clipboard_sync_enabled ? `${feature}已恢复` : `${feature}已暂停`,
       '无法更新剪贴板同步设置',
     );
   }
 
-  async function toggleAutostart() {
+  async function toggleAutostart(dialog = false) {
+    const scope = settingsScope(dialog);
+    if (!scope || scope.snapshot.service_control_error) return;
     await saveSettings(
-      (target) => patchSettings({ autostart_enabled: !autostartEnabled }, target),
+      scope,
+      (target) => patchSettings({ autostart_enabled: !scope.snapshot.autostart_enabled }, target),
       (settings) => settings.autostart_enabled ? '开机自启动已开启' : '开机自启动已关闭',
       '无法更新开机自启动设置',
     );
@@ -941,7 +1106,10 @@
   }
 
   async function setUpdateFrequency(next: UpdateFrequency) {
+    const scope = settingsScope(true);
+    if (!scope || next === scope.snapshot.update_frequency) return;
     await saveSettings(
+      scope,
       (target) => patchSettings({ update_frequency: next }, target),
       next === 'disabled' ? '自动更新已关闭' : `自动更新已设为${updateFrequencyLabel(next)}`,
       '无法更新自动更新设置',
@@ -949,28 +1117,27 @@
   }
 
   async function setReceiveMode(mode: ReceiveMode) {
-    if (settingsDisabled) return;
-    if (mode === 'auto' && !receiveSettings.default_path) {
-      await chooseReceiveDirectory(mode);
+    const scope = settingsScope(true);
+    if (!scope || mode === scope.snapshot.receive_settings.mode || settingsWrites.has(scope.nodeId)) return;
+    const path = scope.snapshot.receive_settings.default_path;
+    if (mode === 'auto' && !path) {
+      await chooseReceiveDirectory(mode, scope);
       return;
     }
-    await saveReceiveSettings(mode, receiveSettings.default_path);
+    await saveReceiveSettings(scope, mode, path);
   }
 
-  async function chooseReceiveDirectory(mode?: ReceiveMode) {
-    if (settingsDisabled) return;
-    const generation = targetGeneration;
-    if (managedFilesSupported) {
-      browseMode = 'directory';
-      browseStartPath = receiveSettings.default_path ?? '';
-      browseReceiveMode = mode ?? receiveSettings.mode;
-      browseOpen = true;
-      return;
-    }
-    if (remoteMode) {
-      const path = await askPath('设置默认接收目录', receiveSettings.default_path ?? '');
-      if (path === null || generation !== targetGeneration) return;
-      await saveReceiveSettings(mode ?? receiveSettings.mode, path || receiveSettings.default_path);
+  async function chooseReceiveDirectory(mode?: ReceiveMode, scope = settingsScope(true)) {
+    if (!scope || !scope.isCurrent() || settingsWrites.has(scope.nodeId)) return;
+    if (typeof scope.target !== 'string') {
+      if (remoteSettings?.node?.capabilities.includes(REMOTE_FILES_CAPABILITY)) {
+        browseMode = 'directory';
+        browseStartPath = scope.snapshot.receive_settings.default_path ?? '';
+        browseReceiveSettings = { scope, mode };
+        browseOpen = true;
+      } else {
+        await enterSettingsDirectory(scope, mode);
+      }
       return;
     }
     let destination: string | string[] | null = null;
@@ -980,43 +1147,55 @@
       destination = null;
     }
     const path = Array.isArray(destination) ? destination[0] : destination;
-    if (!path || generation !== targetGeneration) return;
-    await saveReceiveSettings(mode ?? receiveSettings.mode, path);
+    if (path) await saveReceiveSettings(scope, mode, path);
   }
 
-  async function saveReceiveSettings(mode: ReceiveMode, defaultPath?: string | null) {
+  async function enterSettingsDirectory(scope: SettingsScope, mode?: ReceiveMode) {
+    if (!scope.isCurrent() || !dialogRemote) return;
+    const path = await askPath(`在 ${dialogRemote.name} 上输入接收目录`, scope.snapshot.receive_settings.default_path ?? '', true);
+    if (path) await saveReceiveSettings(scope, mode, path);
+  }
+
+  async function saveReceiveSettings(scope: SettingsScope, mode: ReceiveMode | undefined, defaultPath?: string | null) {
     await saveSettings(
-      (target) => patchSettings({ receive_settings: { mode, default_path: defaultPath ?? null } }, target),
-      mode === 'auto' ? '已启用自动接收' : '已设为每次确认',
+      scope,
+      async (target) => {
+        // 只改目录时，保留选择期间其他客户端已经保存的接收方式。
+        const nextMode = mode ?? (await getSettings(target)).receive_settings.mode;
+        if (!scope.isCurrent()) return;
+        return patchSettings({ receive_settings: { mode: nextMode, default_path: defaultPath ?? null } }, target);
+      },
+      ({ receive_settings: saved }) => mode === undefined || (saved.default_path && saved.default_path !== scope.snapshot.receive_settings.default_path)
+        ? '默认接收目录已保存'
+        : saved.mode === 'auto' ? '已启用自动接收' : '已设为每次确认',
       '无法更新接收设置',
     );
   }
 
   async function setClipboardHistoryMode(mode: ClipboardHistoryMode) {
-    await saveClipboardHistorySettings(mode, historyValue(mode));
+    const scope = settingsScope(true);
+    if (!scope || mode === scope.snapshot.clipboard_history_settings.mode) return;
+    const retention = scope.snapshot.clipboard_history_settings;
+    await saveClipboardHistorySettings(scope, mode, mode === 'count' ? retention.count : retention.days);
   }
 
   async function setClipboardHistoryValue(value: number) {
-    if (!Number.isFinite(value)) return;
-    await saveClipboardHistorySettings(clipboardHistorySettings.mode, value);
+    const scope = settingsScope(true);
+    if (!scope || !Number.isFinite(value)) return;
+    await saveClipboardHistorySettings(scope, scope.snapshot.clipboard_history_settings.mode, value);
   }
 
-  function historyValue(mode: ClipboardHistoryMode) {
-    return mode === 'count' ? clipboardHistorySettings.count : clipboardHistorySettings.days;
-  }
-
-  async function saveClipboardHistorySettings(mode: ClipboardHistoryMode, value: number) {
-    const generation = targetGeneration;
-    const target = activeBaseUrl;
+  async function saveClipboardHistorySettings(scope: SettingsScope, mode: ClipboardHistoryMode, value: number) {
     const saved = await saveSettings(
+      scope,
       (base) => patchSettings({ clipboard_history_settings: { mode, value } }, base),
       ({ clipboard_history_settings: settings }) => settings.mode === 'count'
         ? `已保留最近 ${settings.count} 条剪贴板内容`
         : `已保留最近 ${settings.days} 天剪贴板内容`,
       '无法更新剪贴板历史设置',
     );
-    if (saved) {
-      if (generation === targetGeneration && target === activeBaseUrl) await clipboardRead.refresh(true).catch((error) => console.error('刷新剪贴板历史失败', error));
+    if (saved && scope.isCurrent() && node?.node_id === scope.nodeId) {
+      await clipboardRead.refresh(true).catch((error) => console.error('刷新剪贴板历史失败', error));
     }
   }
 
@@ -1044,7 +1223,7 @@
   }
 
   async function checkForUpdates() {
-    await saveSettings(requestUpdateCheck, '已发起更新检查', '无法检查更新');
+    await saveSettings(settingsScope(true), requestUpdateCheck, '已发起更新检查', '无法检查更新');
   }
 
   function selectMetricsPeer(peer: PeerInfo) {
@@ -1093,17 +1272,23 @@
     }
   }
 
-  async function toggleMonitorLock() {
+  async function toggleMonitorLock(dialog = false) {
+    const scope = settingsScope(dialog);
+    if (!scope?.snapshot.monitor.capabilities.can_click_through) return;
     await saveSettings(
-      (target) => patchSettings({ monitor: { locked: !monitorLocked } }, target),
+      scope,
+      (target) => patchSettings({ monitor: { locked: !scope.snapshot.monitor.locked } }, target),
       (settings) => settings.monitor.locked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动',
       '无法更新悬浮监控条状态',
     );
   }
 
-  async function toggleMonitorVisibility() {
+  async function toggleMonitorVisibility(dialog = false) {
+    const scope = settingsScope(dialog);
+    if (!scope) return;
     await saveSettings(
-      (target) => patchSettings({ monitor: { visible: !monitorVisible } }, target),
+      scope,
+      (target) => patchSettings({ monitor: { visible: !scope.snapshot.monitor.visible } }, target),
       (settings) => settings.monitor.visible ? '悬浮监控条已显示' : '悬浮监控条已隐藏',
       '无法更新悬浮监控条可见性',
     );
@@ -1263,9 +1448,8 @@
   }
 
   async function copyAccessAddress() {
-    const target = node?.addresses[0];
-    if (!target) return;
-    const value = target.url;
+    const value = remoteMode ? activeBaseUrl : node?.addresses[0]?.url;
+    if (!value) return;
     try {
       await navigator.clipboard.writeText(value);
       showTransientNotice('已复制访问地址');
@@ -1374,11 +1558,11 @@
     const recipient = browseRecipient;
     const transfer = browseTransfer;
     const directory = browseMode === 'directory';
-    const receiveMode = browseReceiveMode;
+    const setting = browseReceiveSettings;
     closeBrowse();
     if (!paths.length) return;
     if (directory) {
-      if (receiveMode) await saveReceiveSettings(receiveMode, paths[0]);
+      if (setting) await saveReceiveSettings(setting.scope, setting.mode, paths[0]);
       else if (transfer) await acceptTransferAt(transfer, paths[0]);
       return;
     }
@@ -1403,24 +1587,27 @@
     browseStartPath = '';
     browseRecipient = null;
     browseTransfer = null;
-    browseReceiveMode = null;
+    browseReceiveSettings = null;
   }
 
   /** 目标机器未开启远程文件访问时，接收目录仍可手输。 */
   async function requestManualAcceptPath() {
     const transfer = browseTransfer;
-    const mode = browseReceiveMode;
+    const setting = browseReceiveSettings;
     const generation = targetGeneration;
     closeBrowse();
-    if (!transfer && !mode) return;
+    if (setting) {
+      await enterSettingsDirectory(setting.scope, setting.mode);
+      return;
+    }
+    if (!transfer) return;
     const path = await askPath('输入接收目录', settingsReady ? receiveSettings.default_path ?? '' : '');
     if (!path) {
       showTransientNotice('需要输入目标节点上的接收目录', 6000);
       return;
     }
     if (generation !== targetGeneration) return;
-    if (mode) await saveReceiveSettings(mode, path);
-    else if (transfer) await acceptTransferAt(transfer, path);
+    await acceptTransferAt(transfer, path);
   }
 
   async function setRemoteFileAccess(enabled: boolean) {
@@ -1523,15 +1710,16 @@
     }
   }
 
-  function resetTargetUi() {
+  function resetTargetUi(keepSettings = false) {
     targetGeneration += 1;
     resetSnapshotReads();
     webHistorySettings = defaultHistory;
     resetTransferHistory();
     settingsSnapshot = null;
     settingsRead = null;
-    closeBrowse();
-    resolvePathPrompt(null);
+    if (!keepSettings || !browseReceiveSettings) closeBrowse();
+    if (!keepSettings || !pathPrompt?.settings) resolvePathPrompt(null);
+    if (!keepSettings) closeSettings(false);
     node = null;
     peers = [];
     clipboard = null;
@@ -1539,9 +1727,6 @@
     clipboardDraft = '';
     clipboardHistoryBusy = false;
     metrics = null;
-    settingsOpen = false;
-    restartBusy = false;
-    restartError = '';
     mobileAccessOpen = false;
     addDeviceOpen = false;
     clearHistoryOpen = false;
@@ -1578,18 +1763,24 @@
 
   function suspendRemoteTarget() {
     if (!remoteTarget || !activeBaseUrl) return;
+    const keepSettings = remoteSettings?.peer.node_id === remoteTarget.node_id;
+    if (keepSettings && remoteSettings?.target?.base === activeBaseUrl) {
+      disconnectRemoteSettings('地址上的设备与目标不匹配');
+    }
     activeBaseUrl = setApiTarget('');
     disconnectTargetSocket();
-    resetTargetUi();
+    resetTargetUi(keepSettings);
     statusKind = 'warn';
     status = '节点地址已变更，正在重新发现目标节点';
   }
 
   async function applyTargetContext(baseUrl: string, target: PeerInfo | null) {
     disconnectTargetSocket();
+    const keepSettings = !!target && target.node_id === remoteTarget?.node_id && target.node_id === remoteSettings?.peer.node_id;
     remoteTarget = target;
     activeBaseUrl = setApiTarget(baseUrl, target ? { nodeId: target.node_id, onMismatch: suspendRemoteTarget } : undefined);
-    resetTargetUi();
+    remoteAddress = target ? new URL(activeBaseUrl).host : '';
+    resetTargetUi(keepSettings);
     const context = targetGeneration;
     status = target ? '正在连接目标节点…' : '正在返回本机…';
     statusKind = 'warn';
@@ -1598,7 +1789,7 @@
     if (context !== targetGeneration) return;
     await refresh().catch((error) => {
       if (context !== targetGeneration) return;
-      status = error instanceof Error ? error.message : target ? '无法连接目标节点' : '无法连接本机节点';
+      status = target ? remoteConnectionError(error) : error instanceof Error ? error.message : '无法连接本机节点';
       statusKind = 'error';
     });
     if (context !== targetGeneration) return;
@@ -1606,21 +1797,19 @@
   }
 
   async function restartManagedNode() {
-    if (!headless || !remoteTarget || !settingsReady || restartBusy) return;
-    const generation = targetGeneration;
+    const scope = settingsScope(true);
+    if (!scope || typeof scope.target === 'string' || !dialogRemote?.headless || scope.snapshot.service_control_error
+      || settingsWrites.has(scope.nodeId)) return;
+    const target = scope.target;
+    const notice = `已向 ${dialogRemote.name}（${dialogRemote.address}）发出重启请求`;
     restartBusy = true;
-    restartError = '';
     try {
-      await restartService(activeBaseUrl, remoteTarget.node_id);
-      if (generation !== targetGeneration) return;
-      settingsOpen = false;
-      showTransientNotice('重启请求已接受，正在等待目标节点重新连接');
-    } catch (error) {
-      if (generation !== targetGeneration) return;
-      if (error instanceof ApiError && error.status === 421) suspendRemoteTarget();
-      else restartError = error instanceof Error ? error.message : '重启请求失败';
+      if (await saveSettings(scope, () => restartService(target), notice, '未能确认重启请求') && scope.isCurrent()) {
+        closeSettings();
+        showTransientNotice(notice);
+      }
     } finally {
-      if (generation === targetGeneration) restartBusy = false;
+      if (scope.isCurrent()) restartBusy = false;
     }
   }
 
@@ -1640,13 +1829,15 @@
 
   async function selectRemoteAddress(peer: PeerInfo, skipBase?: string): Promise<boolean> {
     const generation = targetGeneration;
+    const isCurrent = () => !pageStopped && generation === targetGeneration;
     const candidates = targetCandidates(peer).filter((url) => url !== skipBase);
     try {
-      const target = await withPeerAddress(peer.node_id, candidates, async (base) => base);
-      if (generation === targetGeneration) await applyTargetContext(target, peer);
+      const target = await withPeerAddress(peer.node_id, candidates, async (base) => base, isCurrent);
+      if (!isCurrent()) return false;
+      await applyTargetContext(target, peer);
       return true;
     } catch {
-      if (skipBase === undefined && generation === targetGeneration) showTransientNotice('目标设备没有可访问地址', 6000);
+      if (skipBase === undefined && isCurrent()) showTransientNotice('目标设备没有可访问地址', 6000);
       return false;
     }
   }
@@ -1667,6 +1858,7 @@
 
   async function returnToLocal() {
     if (!remoteMode) return;
+    terminalVisible = false;
     await applyTargetContext(localBaseUrl, null);
   }
 
@@ -2191,7 +2383,7 @@
   <title>{isMonitor ? 'MeshShare · 硬件监控' : isWeb ? 'MeshShare · 临时加入' : 'MeshShare · 局域网共享'}</title>
 </svelte:head>
 
-<div class:phone-shell={isPhone} class:monitor-shell={isMonitor} class:app-shell={!isPhone && !isMonitor}>
+<div class:phone-shell={isPhone} class:monitor-shell={isMonitor} class:app-shell={!isPhone && !isMonitor} class:app-shell--remote={remoteMode && !terminalVisible}>
   {#if isMonitor}
     <main class="monitor-main" data-tauri-drag-region="deep" on:contextmenu={openMonitorMenu}>
       <div class="monitor-metric"><b>CPU</b><span>{formatPercent(monitorMetrics?.cpu_usage_percent)}</span></div>
@@ -2246,7 +2438,9 @@
   {:else}
     <AppHeader
       {node}
-      remote={remoteMode}
+      {remoteTarget}
+      {remoteAddress}
+      remoteAddressLive={!!activeBaseUrl && statusKind !== 'error'}
       {headless}
       {serviceControlError}
       {status}
@@ -2255,9 +2449,9 @@
       {autostartEnabled}
       {settingsReady}
       {settingsDisabled}
-      onSync={toggleSync}
-      onAutostart={toggleAutostart}
-      onSettings={() => (settingsOpen = true)}
+      onSync={() => toggleSync()}
+      onAutostart={() => toggleAutostart()}
+      onSettings={openSettings}
       {terminalCount}
       {terminalVisible}
       onTerminal={() => {
@@ -2276,7 +2470,7 @@
     <main class="app-main" hidden={terminalVisible || (remoteMode && !node)}>
       <DevicePanel
         peers={peers}
-        homeNodeId={remoteMode ? localNodeId : ''}
+        homeNodeId={localNodeId}
         activePeerIds={activeLinkPeers}
         {mobileSessions}
         savedAddresses={savedNodeUrls}
@@ -2287,6 +2481,7 @@
         onConnect={connectManualPeer}
         onConnectSaved={connectSavedPeer}
         onOpenPeer={openRemotePeer}
+        onSettings={remoteMode ? null : openPeerSettings}
         onTerminal={remoteMode ? null : openPeerTerminal}
         onMobileAccess={openMobileAccess}
         onSendPeer={(peer) => startChoose(peer)}
@@ -2308,8 +2503,8 @@
         {monitorVisible}
         {settingsDisabled}
         canClickThrough={monitorCapabilities.can_click_through}
-        onToggleLock={toggleMonitorLock}
-        onToggleVisible={toggleMonitorVisibility}
+        onToggleLock={() => toggleMonitorLock()}
+        onToggleVisible={() => toggleMonitorVisibility()}
       />
       <ClipboardPanel
         {headless}
@@ -2323,18 +2518,19 @@
     </main>
     <SettingsDialog
       open={settingsOpen}
-      {node}
-      {updateFrequency}
-      {updateStatus}
-      {settingsDisabled}
-      localMode={!remoteMode}
-      {headless}
-      {serviceControlError}
+      node={dialogNode}
+      snapshot={dialogSnapshot}
+      remote={dialogRemote}
+      settingsDisabled={dialogSettingsDisabled}
+      connectionError={remoteSettings?.error ?? ''}
+      feedback={settingsFeedback}
       {restartBusy}
-      {restartError}
+      onReconnect={() => remoteSettings && connectRemoteSettings(remoteSettings.peer, true)}
+      onSync={() => toggleSync(true)}
+      onAutostart={() => toggleAutostart(true)}
+      onToggleMonitor={() => toggleMonitorVisibility(true)}
+      onToggleMonitorLock={() => toggleMonitorLock(true)}
       onRestart={restartManagedNode}
-      {receiveSettings}
-      historySettings={clipboardHistorySettings}
       {remoteFileAccess}
       {remoteFileAccessBusy}
       onFrequency={setUpdateFrequency}
@@ -2344,8 +2540,8 @@
       onHistoryMode={setClipboardHistoryMode}
       onHistoryValue={setClipboardHistoryValue}
       onRemoteFileAccess={setRemoteFileAccess}
-      onAllowRemoteTerminal={isDesktopWindow && !remoteMode ? allowRemoteTerminal : null}
-      onClose={() => (settingsOpen = false)}
+      onAllowRemoteTerminal={isDesktopWindow && !remoteSettings ? allowRemoteTerminal : null}
+      onClose={() => closeSettings()}
     />
 
     <MobileAccessDialog
@@ -2368,8 +2564,9 @@
     <RemoteFileBrowser
       open={browseOpen}
       mode={browseMode}
-      targetBase={activeBaseUrl}
-      targetLabel={remoteTarget?.node_name ?? ''}
+      target={browseReceiveSettings?.scope.target ?? activeBaseUrl}
+      targetLabel={browseReceiveSettings ? dialogRemote?.name ?? '' : node?.node_name ?? remoteTarget?.node_name ?? ''}
+      targetAddress={browseReceiveSettings ? dialogRemote?.address ?? '' : remoteAddress}
       startPath={browseStartPath}
       onConfirm={confirmBrowse}
       onFallback={browseMode === 'directory' ? requestManualAcceptPath : null}
@@ -2378,6 +2575,9 @@
     <PromptDialog
       open={!!pathPrompt}
       title={pathPrompt?.title ?? ''}
+      subtitle={pathPrompt?.settings ? dialogRemote?.address ?? '' : remoteAddress}
+      remote={!!pathPrompt && (pathPrompt.settings || remoteMode)}
+      label="接收目录"
       initialValue={pathPrompt?.initial ?? ''}
       onSubmit={(value) => resolvePathPrompt(value)}
       onClose={() => resolvePathPrompt(null)}

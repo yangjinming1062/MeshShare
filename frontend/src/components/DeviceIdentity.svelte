@@ -19,6 +19,7 @@
   export let peer: PeerInfo | null = null;
   export let browserSource: string | undefined = undefined;
   export let isHome = false;
+  export let preferredAddress = '';
   export let descriptionId: string | undefined = undefined;
 
   $: browser = browserSource !== undefined;
@@ -27,15 +28,15 @@
   $: headless = peer?.platform === 'linux' && peer.capabilities.includes(HEADLESS_CAPABILITY);
   $: system = browser ? '浏览器' : headless ? 'Linux 无界面服务' : (platform?.label ?? '未知系统');
   $: platformText = isHome ? '本机 · ' + system : system;
-  $: address = browser ? browserSource : (peer?.addresses[0]?.address ?? '在线');
+  $: address = browser ? browserSource : preferredAddress || (peer?.addresses[0]?.address ?? '在线');
   $: meta = address ? platformText + ' · ' + address : platformText;
 </script>
 
 <span class="device-icon" aria-hidden="true"><Icon name={icon} size={18} /></span>
 <span class="device-id">
   <strong title={name}>{name}</strong>
-  <span id={descriptionId} class="device-meta" title={meta}>
+  <span id={descriptionId} class="device-meta" class:device-meta--preferred={!!preferredAddress} title={meta}>
     <span class="device-platform">{platformText}</span>
-    {#if address}<span class="device-address">· {address}</span>{/if}
+    {#if address}<span class="device-address">{preferredAddress ? address : '· ' + address}</span>{/if}
   </span>
 </span>

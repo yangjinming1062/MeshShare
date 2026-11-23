@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { isAllowedPeerBase, normalizePeerEndpoint, peerTargetBase, peerTargetCandidates, type PeerWebContext } from '../src/peers.ts';
+import { canOpenRemoteSettings, isAllowedPeerBase, normalizePeerEndpoint, peerManagementAddress, peerTargetBase, peerTargetCandidates, REMOTE_MANAGEMENT_CAPABILITY, type PeerWebContext } from '../src/peers.ts';
 import type { AddressInfo, PeerInfo } from '../src/types.ts';
 
 function address(url: string, kind = 'lan'): AddressInfo {
@@ -22,6 +22,15 @@ function peer(overrides: Partial<PeerInfo> = {}): PeerInfo {
 }
 
 const web: PeerWebContext = { selfNodeId: 'node-a', origin: 'https://hub.test', secure: true };
+
+test('remote settings require online management and an eligible address independently of terminal support', () => {
+  const target = peer({ capabilities: [REMOTE_MANAGEMENT_CAPABILITY], endpoint: 'ws://192.168.1.5:7880/api/v1/ws' });
+  assert.equal(canOpenRemoteSettings(target, 'home'), true);
+  assert.equal(canOpenRemoteSettings(target, target.node_id), false);
+  assert.equal(canOpenRemoteSettings({ ...target, online: false }, 'home'), false);
+  assert.equal(canOpenRemoteSettings({ ...target, capabilities: [] }, 'home'), false);
+  assert.equal(canOpenRemoteSettings({ ...target, endpoint: undefined }, 'home'), false);
+});
 
 test('normalizePeerEndpoint maps websocket endpoints to http bases', () => {
   assert.equal(normalizePeerEndpoint('ws://192.168.1.5:7880/api/v1/ws'), 'http://192.168.1.5:7880');
@@ -93,4 +102,14 @@ test('peerTargetCandidates dedupes and drops link-local when alternatives exist'
   assert.deepEqual(peerTargetCandidates(target, null), ['http://192.168.1.5:7880', 'http://100.64.0.1:7880']);
   assert.deepEqual(peerTargetCandidates(peer({ addresses: [address('http://169.254.1.2:7880')] }), null), ['http://169.254.1.2:7880']);
   assert.deepEqual(peerTargetCandidates(peer({ node_id: 'node-b' }), web), ['https://hub.test/api/v1/mobile/peers/node-b']);
+});
+
+test('management addresses distinguish peers that announce the same name and LAN address', () => {
+  const addresses = [address('http://192.168.1.10:37880')];
+  const first = peer({ addresses, endpoint: 'ws://100.64.0.1:37880/api/v1/ws' });
+  const second = peer({ node_id: 'node-b', addresses, endpoint: 'ws://100.64.0.2:37881/api/v1/ws' });
+  assert.equal(peerManagementAddress(first), '100.64.0.1:37880');
+  assert.equal(peerManagementAddress(second), '100.64.0.2:37881');
+  assert.equal(peerManagementAddress({ ...first, endpoint: 'ws://169.254.1.2:37880/api/v1/ws' }), '192.168.1.10:37880');
+  assert.equal(peerManagementAddress(peer()), '');
 });

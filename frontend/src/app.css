@@ -13,6 +13,9 @@
   --primary: #2f5fe0;
   --primary-hover: #2447c4;
   --primary-soft: #eef3ff;
+  --remote-bg: #f2eef8;
+  --remote-header: #34245d;
+  --remote-text: #efe9fc;
   --positive: #0f9d78;
   --positive-ink: #0b7a5d;
   --positive-glow: rgba(153, 245, 220, .5);
@@ -93,6 +96,9 @@ select.field { cursor: pointer; }
 .field-label { display: block; margin-bottom: 5px; color: var(--muted); font-size: 11px; font-weight: 600; }
 
 .app-shell { height: 100vh; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+.app-shell--remote { background: var(--remote-bg); }
+.app-shell--remote .app-main { padding-top: var(--gap); }
+.app-shell--remote .platform-notice { margin-top: var(--gap); margin-bottom: 0; }
 .app-header { flex: 0 0 auto; height: var(--header-h); display: flex; align-items: center; gap: 8px; padding: 0 14px; }
 .app-header h1 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .node-status { display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; }
@@ -102,8 +108,31 @@ select.field { cursor: pointer; }
 .status-dot--warning { background: var(--warning); box-shadow: 0 0 0 3px rgba(180, 83, 9, .16); }
 .status-text { color: var(--muted); font-size: 12px; }
 .header-chips { display: flex; align-items: center; gap: 6px; min-width: 0; flex: 0 1 auto; }
-.remote-chip { color: var(--primary); background: var(--primary-soft); }
 .header-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.app-header.app-header--remote {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px 16px;
+  height: auto;
+  min-height: 66px;
+  padding: 9px var(--pad);
+  background: var(--remote-header);
+  color: #fff;
+}
+.remote-identity { display: grid; min-width: 0; gap: 4px; }
+.remote-identity h1 { font-size: 18px; }
+.remote-identity .header-chips { flex-wrap: wrap; }
+.remote-identity .chip, .app-header--remote .header-actions > .chip { background: #564677; color: var(--remote-text); }
+.remote-identity .chip-button:hover { background: #6b5a8d; }
+.remote-status { display: inline-flex; align-items: center; gap: 7px; min-height: 20px; padding: 0 4px; color: var(--remote-text); font-size: 12px; overflow-wrap: anywhere; }
+.remote-status .status-dot { background: #ffce88; }
+.remote-status [data-kind="ok"] .status-dot { background: #6ee7b7; box-shadow: none; }
+.remote-status [data-kind="error"] .status-dot { background: #ffb4af; }
+.app-header--remote .btn-icon, .sheet--remote .sheet-head .btn-icon { color: var(--remote-text); }
+.app-header--remote .btn-icon:hover, .sheet--remote .sheet-head .btn-icon:hover { background: #564677; }
+.app-header--remote :focus-visible, .sheet--remote .sheet-head :focus-visible { outline-color: #fff; }
+.app-header--remote .remote-back { height: 32px; background: #554375; color: #fff; border: 1px solid #8979a7; }
+.app-header--remote .remote-back:hover { background: #6b5a8d; }
 
 .app-main { flex: 1; min-height: 0; display: grid; gap: var(--gap); padding: 0 var(--pad) var(--pad); grid-template-columns: minmax(0, 1fr) clamp(320px, 33%, 400px); grid-template-rows: auto minmax(0, 1fr) auto; grid-template-areas: "devices hardware" "devices clipboard" "transfers transfers"; }
 .app-main[hidden] { display: none; }
@@ -144,8 +173,10 @@ select.field { cursor: pointer; }
 .device-id { min-width: 0; display: grid; gap: 2px; }
 .device-id strong { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .device-meta { display: flex; align-items: baseline; gap: 4px; overflow: hidden; color: var(--muted); font-size: 12px; }
+.device-meta--preferred { flex-wrap: wrap; gap: 0 6px; }
 .device-platform { flex: none; max-width: 100%; overflow-wrap: anywhere; }
 .device-address { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device-meta--preferred .device-address { max-width: 100%; }
 .device-metrics {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr)) minmax(0, 1.1fr);
@@ -162,7 +193,7 @@ button.device-metrics:enabled:hover, button.device-metrics:focus-visible { backg
 .device-metrics-empty[data-stale="true"] { color: var(--warning-ink); }
 .device-metrics--mobile { display: block; width: auto; justify-self: end; font-size: 12px; }
 .device-actions { display: flex; align-items: center; gap: 8px; }
-.device-list--with-terminal .device-actions--without-terminal::before { content: ""; flex: none; width: 30px; }
+.device-action-spacer { flex: none; width: 30px; }
 .drop-hint { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; border-radius: inherit; background: rgba(238, 243, 255, .94); color: var(--primary-hover); font-size: 12px; font-weight: 600; }
 
 .meter { display: flex; align-items: center; gap: 4px; min-width: 0; }
@@ -313,10 +344,22 @@ html[data-shell="web"] .clip-history-clear { min-height: 44px; }
 .sheet { width: min(var(--sheet-w, 520px), calc(100vw - 32px)); max-height: calc(100vh - 48px); padding: 0; border: 0; border-radius: var(--r-lg); background: var(--surface); color: var(--ink); box-shadow: 0 24px 64px -24px rgba(15, 23, 42, .45); }
 .sheet::backdrop { background: rgba(15, 23, 42, .36); backdrop-filter: blur(2px); }
 .sheet[open] { animation: sheet-in 160ms var(--ease); }
+.sheet--remote[open] { display: flex; flex-direction: column; }
 .sheet-head { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
-.sheet-head h2 { margin-right: auto; font-size: 15px; font-weight: 650; }
+.sheet-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.sheet-head h2 { font-size: 15px; font-weight: 650; }
+.sheet-subtitle { margin-top: 3px; color: var(--muted); font-size: 12px; }
+.sheet--remote .sheet-head { background: var(--remote-header); color: #fff; }
+.sheet--remote .sheet-head, .sheet--remote .sheet-foot { flex: none; }
+.sheet--remote .sheet-subtitle { color: var(--remote-text); }
+.sheet-head .btn-icon { flex: none; }
 .sheet-body { max-height: min(62vh, 520px); display: grid; gap: 14px; padding: 14px; overflow: auto; scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.sheet--remote .sheet-body { min-height: 0; }
 .sheet-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); }
+.settings-connection { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.settings-connection p, .settings-feedback { min-width: 0; overflow-wrap: anywhere; }
+.settings-feedback { margin-right: auto; max-height: 4.5em; overflow: auto; font-size: 12px; }
+.settings-feedback + .btn { flex: none; }
 .browse { display: grid; gap: 10px; min-height: 0; }
 .browse-bar { display: flex; align-items: center; gap: 8px; }
 .browse-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 6px 8px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-2); font-size: 12px; }
@@ -533,6 +576,9 @@ html[data-shell="android"] {
   .device-row .device-icon { width: 32px; height: 32px; border-radius: 10px; }
   .device-row .device-identity, .device-row .device-actions { gap: 6px; }
   .device-row .device-meta { font-size: 11px; }
+  .device-list--with-settings .device-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .device-list--with-settings .device-actions { grid-column: 2; grid-row: 1; }
+  .device-list--with-settings .device-metrics { grid-column: 1 / -1; grid-row: 2; }
   .meter-track { display: none; }
 }
 
@@ -540,6 +586,8 @@ html[data-shell="android"] {
 @media (max-width: 900px) {
   .app-shell { height: auto; min-height: 100vh; overflow: visible; }
   .app-header { position: sticky; top: 0; z-index: 20; gap: 6px; padding: 0 10px; background: var(--bg); border-bottom: 1px solid var(--line); }
+  .app-header.app-header--remote { grid-template-columns: auto minmax(0, 1fr); gap: 8px 12px; }
+  .app-header--remote .header-actions { grid-column: 1 / -1; margin-left: 0; flex-wrap: wrap; }
   .header-actions { gap: 6px; }
   .app-main { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; grid-template-areas: "devices" "hardware" "clipboard" "transfers"; padding-bottom: 24px; }
   .devices-column { min-height: 0; }

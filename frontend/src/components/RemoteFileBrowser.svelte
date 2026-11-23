@@ -1,15 +1,17 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import Dialog from './Dialog.svelte';
   import Icon from './Icon.svelte';
-  import { browseManagedPath, getManagedRoots } from '../api';
+  import { browseManagedPath, getManagedRoots, type RequestTarget } from '../api';
   import { formatSize } from '../format';
   import type { BrowseEntry, BrowseRoots } from '../types';
 
   export let open = false;
   /** send：多选文件与文件夹；directory：把当前目录作为选择结果；view：只读浏览位置。 */
   export let mode: 'send' | 'directory' | 'view' = 'send';
-  export let targetBase: string;
+  export let target: RequestTarget;
   export let targetLabel = '';
+  export let targetAddress = '';
   export let startPath = '';
   export let onConfirm: (paths: string[]) => void = () => {};
   export let onFallback: (() => void) | null = null;
@@ -17,27 +19,37 @@
 
   let roots: BrowseRoots | null = null;
   let currentPath = '';
+  let requestedPath = '';
   let parent: string | null = null;
   let entries: BrowseEntry[] = [];
   let truncated = false;
   let loading = false;
   let loadError = '';
   let selected: string[] = [];
-  let requestSeq = 0;
+  let activeRead: AbortController | null = null;
   let wasOpen = false;
 
   $: label = targetLabel || '目标机器';
-  $: canConfirm = mode !== 'view' && !loading && (mode === 'directory' ? !!currentPath : selected.length > 0);
+  $: displayPath = currentPath || requestedPath;
+  $: canConfirm = mode !== 'view' && !loading && (mode === 'directory' ? !!currentPath && !loadError : selected.length > 0);
   $: if (open !== wasOpen) {
     wasOpen = open;
-    if (open) void begin();
-    else reset();
+    reset();
+    if (open) void load(startPath);
+  }
+
+  onDestroy(cancelRead);
+
+  function cancelRead() {
+    activeRead?.abort();
+    activeRead = null;
   }
 
   function reset() {
-    requestSeq += 1;
+    cancelRead();
     roots = null;
     currentPath = '';
+    requestedPath = '';
     parent = null;
     entries = [];
     truncated = false;
@@ -46,47 +58,44 @@
     selected = [];
   }
 
-  async function begin() {
-    reset();
-    loading = true;
-    const seq = ++requestSeq;
-    const target = targetBase;
-    const initialPath = startPath;
-    try {
-      const next = await getManagedRoots(target);
-      if (seq !== requestSeq) return;
-      roots = next;
-      const start = initialPath || next.home || next.roots[0]?.path || '';
-      if (!start) throw new Error('目标机器没有可浏览的目录');
-      await load(start, target);
-    } catch (cause) {
-      if (seq === requestSeq) loadError = describeError(cause);
-    } finally {
-      if (seq === requestSeq) loading = false;
-    }
-  }
-
-  async function load(path: string, target = targetBase) {
-    const seq = ++requestSeq;
+  async function load(path: string) {
+    cancelRead();
+    const read = new AbortController();
+    activeRead = read;
+    const { signal } = read;
+    const source = target;
+    requestedPath = path;
     loading = true;
     loadError = '';
     try {
-      const listing = await browseManagedPath(path, target);
-      if (seq !== requestSeq) return;
+      if (!roots) {
+        const next = await getManagedRoots(source, signal);
+        if (signal.aborted) return;
+        path = path || next.home || next.roots[0]?.path || '';
+        if (!path) throw new Error('目标机器没有可浏览的目录');
+        roots = next;
+      }
+      requestedPath = path;
+      const listing = await browseManagedPath(path, source, signal);
+      if (signal.aborted) return;
       currentPath = listing.path;
       parent = listing.parent;
       entries = listing.entries;
       truncated = listing.truncated;
     } catch (cause) {
-      if (seq !== requestSeq) return;
+      if (signal.aborted) return;
       entries = [];
       loadError = describeError(cause);
     } finally {
-      if (seq === requestSeq) loading = false;
+      if (activeRead === read) {
+        activeRead = null;
+        loading = false;
+      }
     }
   }
 
   function describeError(cause: unknown): string {
+    if (cause instanceof DOMException && cause.name === 'AbortError') return '读取目录超时，请重试';
     return cause instanceof Error && cause.message ? cause.message : '无法读取目标机器目录';
   }
 
@@ -111,6 +120,8 @@
 <Dialog
   {open}
   title={mode === 'send' ? '从 ' + label + ' 选择要发送的文件' : mode === 'view' ? '查看 ' + label + ' 上的文件' : '在 ' + label + ' 上选择接收目录'}
+  subtitle={targetAddress}
+  remote
   width={620}
   {onClose}
 >
@@ -126,7 +137,7 @@
       >
         <Icon name="arrow-left" size={16} />
       </button>
-      <span class="browse-path mono" title={currentPath}>{currentPath || '—'}</span>
+      <span class="browse-path mono" title={displayPath}>{displayPath || '—'}</span>
     </div>
     {#if roots && roots.roots.length}
       <div class="browse-roots" aria-label="常用位置">
@@ -138,12 +149,15 @@
       </div>
     {/if}
     {#if loadError}
-      <p class="browse-error">{loadError}</p>
+      <div class="action-row">
+        <p class="browse-error" role="alert">{loadError}</p>
+        <button type="button" class="btn btn-sm" on:click={() => void load(requestedPath)}>重试</button>
+      </div>
       {#if loadError.includes('远程文件访问')}
         <p class="hint">到 {label} 的 MeshShare 设置里打开「允许远程浏览本机文件」后重试。</p>
       {/if}
     {:else if loading}
-      <p class="browse-empty">正在读取目录…</p>
+      <p class="browse-empty" role="status">正在读取目录…</p>
     {:else if !entries.length}
       <p class="browse-empty">这个目录是空的。</p>
     {:else}

@@ -3,6 +3,7 @@
   import Icon from './Icon.svelte';
   import Meter from './Meter.svelte';
   import { formatConnectedSince, formatPercent, formatRate, formatRateCompact, gpuMemoryPercent, gpuUtilization, memoryPercent } from '../format';
+  import { peerManagementAddress } from '../peers';
   import type { MobileSession, PeerInfo } from '../types';
 
   export let kind: 'peer' | 'mobile' = 'peer';
@@ -15,6 +16,9 @@
   export let onSendFolder: () => void = () => {};
   export let onDetails: () => void = () => {};
   export let onTerminal: (() => void) | null = null;
+  export let onSettings: ((trigger: HTMLButtonElement) => void) | null = null;
+  export let settingsSlot = false;
+  export let terminalSlot = false;
   export let onOpen: () => void = () => {};
   export let allowFolderSend = true;
   export let onDragOver: () => void = () => {};
@@ -23,6 +27,8 @@
 
   $: name = kind === 'mobile' ? (session?.label ?? '网页设备') : (peer?.node_name ?? '设备');
   $: browserSource = kind === 'mobile' ? (session?.node_name ?? '') : undefined;
+  $: preferredAddress = onSettings && peer ? peerManagementAddress(peer) : '';
+  $: settingsLabel = preferredAddress ? `设置 ${name}（${preferredAddress}）` : '设置 ' + name;
   $: peerKey = peer ? encodeURIComponent(peer.node_id) : undefined;
   $: identityDescriptionId = peerKey ? 'device-meta-' + peerKey : undefined;
   $: metricsDescriptionId = peerKey ? 'device-metrics-' + peerKey : undefined;
@@ -77,7 +83,7 @@
     title={isHome ? '返回本机' : openable ? '进入 ' + name : name}
     on:click|stopPropagation={onOpen}
   >
-    <DeviceIdentity {name} {peer} {browserSource} {isHome} descriptionId={identityDescriptionId} />
+    <DeviceIdentity {name} {peer} {browserSource} {isHome} {preferredAddress} descriptionId={identityDescriptionId} />
   </button>
   {#if kind === 'mobile'}
     <div class="device-metrics device-metrics--mobile">
@@ -106,9 +112,22 @@
       {/if}
     </button>
   {/if}
-  <div class="device-actions" class:device-actions--without-terminal={!onTerminal}>
+  <div class="device-actions">
+    {#if onSettings}
+      <button
+        type="button"
+        class="btn-icon"
+        aria-label={settingsLabel}
+        title={settingsLabel}
+        on:click={(event) => onSettings?.(event.currentTarget)}
+      ><Icon name="settings" size={16} /></button>
+    {:else if settingsSlot}
+      <span class="device-action-spacer" aria-hidden="true"></span>
+    {/if}
     {#if onTerminal}
       <button type="button" class="btn-icon" aria-label={'打开 ' + name + ' 的终端'} title={'打开 ' + name + ' 的终端'} on:click={onTerminal}><Icon name="terminal" size={16} /></button>
+    {:else if terminalSlot}
+      <span class="device-action-spacer" aria-hidden="true"></span>
     {/if}
     <button type="button" class="btn btn-send btn-sm" title="发送文件" on:click={onSend}>
       <Icon name="send" size={13} />

@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
+  import { canOpenRemoteSettings } from '../peers';
   import { canOpenTerminal } from '../terminal';
   import DeviceRow from './DeviceRow.svelte';
   import type { MobileSession, PeerInfo } from '../types';
@@ -20,6 +21,7 @@
   export let onSendPeerFolder: (peer: PeerInfo) => void = () => {};
   export let onDetails: (peer: PeerInfo) => void = () => {};
   export let onTerminal: ((peer: PeerInfo) => void) | null = null;
+  export let onSettings: ((peer: PeerInfo, trigger: HTMLButtonElement) => void) | null = null;
   export let onOpenPeer: (peer: PeerInfo) => void = () => {};
   export let allowFolderSend = true;
   export let onSendMobile: (session: MobileSession) => void = () => {};
@@ -31,6 +33,7 @@
 
   $: total = peers.length + mobileSessions.length;
   $: hasTerminalActions = !!onTerminal && peers.some(canOpenTerminal);
+  $: hasSettingsActions = !!onSettings && peers.some((peer) => canOpenRemoteSettings(peer, homeNodeId));
 </script>
 
 <div class="devices-column">
@@ -72,7 +75,7 @@
       {/if}
     {/if}
     <div class="surface-body">
-      <ul class="device-list" class:device-list--with-terminal={hasTerminalActions} role="list">
+      <ul class="device-list" class:device-list--with-settings={hasSettingsActions} role="list">
         {#each peers as peer (peer.node_id)}
           <DeviceRow
             kind="peer"
@@ -84,7 +87,10 @@
             onSendFolder={() => onSendPeerFolder(peer)}
             onDetails={() => onDetails(peer)}
             onOpen={() => onOpenPeer(peer)}
+            onSettings={onSettings && canOpenRemoteSettings(peer, homeNodeId) ? (trigger) => onSettings?.(peer, trigger) : null}
             onTerminal={onTerminal && canOpenTerminal(peer) ? () => onTerminal?.(peer) : null}
+            settingsSlot={hasSettingsActions}
+            terminalSlot={hasTerminalActions}
             {allowFolderSend}
             onDragOver={() => onDragEnter('peer:' + peer.node_id)}
             onDragLeave={() => onDragLeave('peer:' + peer.node_id)}
@@ -98,6 +104,8 @@
             dragging={draggingKey === 'mobile:' + session.session_id}
             onSend={() => onSendMobile(session)}
             onSendFolder={() => onSendMobileFolder(session)}
+            settingsSlot={hasSettingsActions}
+            terminalSlot={hasTerminalActions}
             onDragOver={() => onDragEnter('mobile:' + session.session_id)}
             onDragLeave={() => onDragLeave('mobile:' + session.session_id)}
             onDropFile={(event) => onDropMobile(session, event)}

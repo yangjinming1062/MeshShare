@@ -7,8 +7,15 @@ let baseUrl = '';
 let suspendedBase = '';
 type ManagedTarget = { nodeId: string; onMismatch: () => void };
 let managedTarget: ManagedTarget | undefined;
+export type ManagedRequestTarget = ManagedTarget & {
+  base: string;
+  isCurrent: () => boolean;
+};
+export type RequestTarget = string | ManagedRequestTarget;
 const READ_TIMEOUT_MS = 6000;
 const SETTINGS_WRITE_TIMEOUT_MS = 30_000;
+// 目录浏览可能逐项读取 NAS 或网络挂载上的元数据。
+const FILE_BROWSE_TIMEOUT_MS = 60_000;
 
 /** HTTP 状态码保留在错误上，调用方才能区分对端拒绝与网络不可达。 */
 export class ApiError extends Error {
@@ -43,18 +50,22 @@ export function websocketUrl(target = baseUrl): string {
   return apiUrl('/api/v1/ws', target).replace(/^http/, 'ws');
 }
 
-async function fetchNode(path: string, options: RequestInit, target: string): Promise<Response> {
-  const url = apiUrl(path, target);
-  const managed = target === baseUrl && path !== '/api/v1/info' ? managedTarget : undefined;
+async function fetchNode(path: string, options: RequestInit, target: RequestTarget): Promise<Response> {
+  const explicit = typeof target === 'string' ? undefined : target;
+  const base = typeof target === 'string' ? target : target.base;
+  const managed = path === '/api/v1/info' ? undefined : explicit ?? (base === baseUrl ? managedTarget : undefined);
+  const isCurrent = () => explicit ? explicit.isCurrent() : managed === managedTarget;
+  if (explicit && !isCurrent()) throw new ApiError('管理目标已变更', 421);
+  const url = apiUrl(path, base);
   if (managed && options.method && options.method !== 'GET') {
     // 地址可能在重新发现前已被其他设备使用。只向当前验证过的节点写入。
     try {
-      await verifyPeerAddress(managed.nodeId, target);
+      await verifyPeerAddress(managed.nodeId, base);
     } catch (error) {
-      if (managed === managedTarget && error instanceof ApiError && error.status === 421) managed.onMismatch();
+      if (isCurrent() && error instanceof ApiError && error.status === 421) managed.onMismatch();
       throw error;
     }
-    if (managed !== managedTarget) throw new ApiError('管理目标已变更', 421);
+    if (!isCurrent()) throw new ApiError('管理目标已变更', 421);
   }
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
@@ -70,7 +81,7 @@ async function fetchNode(path: string, options: RequestInit, target: string): Pr
     headers,
   });
   if (!response.ok) {
-    if (response.status === 421 && managed && managed === managedTarget) managed.onMismatch();
+    if (response.status === 421 && managed && isCurrent()) managed.onMismatch();
     throw await responseError(response);
   }
   return response;
@@ -86,7 +97,7 @@ function readJson<T>(response: Response, path: string): Promise<T> {
   });
 }
 
-export async function request<T>(path: string, options: RequestInit = {}, target = baseUrl): Promise<T> {
+export async function request<T>(path: string, options: RequestInit = {}, target: RequestTarget = baseUrl): Promise<T> {
   return readJson<T>(await fetchNode(path, options, target), path);
 }
 
@@ -107,27 +118,35 @@ export function isTransportFailure(error: unknown): boolean {
   return error instanceof TypeError || (error instanceof DOMException && error.name === 'AbortError');
 }
 
-async function verifyPeerAddress(nodeId: string, base: string, timeoutMs = READ_TIMEOUT_MS): Promise<void> {
+async function verifyPeerAddress(nodeId: string, base: string, timeoutMs = READ_TIMEOUT_MS): Promise<NodeInfo> {
   const info = await requestWithTimeout<NodeInfo>('/api/v1/info', {}, base, timeoutMs);
   if (info.protocol_version !== NODE_PROTOCOL_VERSION) throw new ApiError('节点协议版本不匹配', 421);
   if (info.node_id !== nodeId) throw new ApiError('地址上的设备与目标不匹配', 421);
+  return info;
 }
 
 /** 操作前核对候选地址上的节点身份，非暂时性的业务错误交还调用方。 */
-export async function withPeerAddress<T>(nodeId: string, candidates: string[], perform: (base: string) => Promise<T>): Promise<T> {
+export async function withPeerAddress<T>(
+  nodeId: string,
+  candidates: string[],
+  perform: (base: string, node: NodeInfo) => Promise<T>,
+  isCurrent: () => boolean = () => true,
+): Promise<T> {
   const deadline = Date.now() + 12000;
   let lastError: unknown;
   for (const base of new Set(candidates)) {
     const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
+    if (remaining <= 0 || !isCurrent()) break;
+    let info: NodeInfo;
     try {
-      await verifyPeerAddress(nodeId, base, Math.min(READ_TIMEOUT_MS, remaining));
+      info = await verifyPeerAddress(nodeId, base, Math.min(READ_TIMEOUT_MS, remaining));
     } catch (error) {
       lastError = error;
       continue;
     }
+    if (!isCurrent()) break;
     try {
-      return await perform(base);
+      return await perform(base, info);
     } catch (error) {
       if (!isTransportFailure(error)) throw error;
       lastError = error;
@@ -136,13 +155,18 @@ export async function withPeerAddress<T>(nodeId: string, candidates: string[], p
   throw lastError instanceof Error ? lastError : new Error('目标设备没有可访问地址');
 }
 
-export async function requestWithTimeout<T>(path: string, options: RequestInit, target: string, timeoutMs = READ_TIMEOUT_MS): Promise<T> {
+export async function requestWithTimeout<T>(path: string, options: RequestInit, target: RequestTarget, timeoutMs = READ_TIMEOUT_MS): Promise<T> {
   const controller = new AbortController();
+  const signal = options.signal;
+  const cancel = () => controller.abort(signal?.reason);
+  if (signal?.aborted) cancel();
+  else signal?.addEventListener('abort', cancel, { once: true });
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await request<T>(path, { ...options, signal: controller.signal }, target);
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', cancel);
   }
 }
 
@@ -179,19 +203,17 @@ export async function getClipboard(target = baseUrl, controller = new AbortContr
   }
 }
 
-export const getSettings = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', {}, target);
-export const patchSettings = (patch: NodeSettingsPatch, target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings', { method: 'PATCH', body: JSON.stringify(patch) }, target, SETTINGS_WRITE_TIMEOUT_MS);
-export const requestUpdateCheck = (target: string) => requestWithTimeout<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target, SETTINGS_WRITE_TIMEOUT_MS);
+export const getSettings = (target: RequestTarget) => requestWithTimeout<NodeSettings>('/api/v1/settings', {}, target);
+export const patchSettings = (patch: NodeSettingsPatch, target: RequestTarget) => requestWithTimeout<NodeSettings>('/api/v1/settings', { method: 'PATCH', body: JSON.stringify(patch) }, target, SETTINGS_WRITE_TIMEOUT_MS);
+export const requestUpdateCheck = (target: RequestTarget) => requestWithTimeout<NodeSettings>('/api/v1/settings/update-check', { method: 'POST' }, target, SETTINGS_WRITE_TIMEOUT_MS);
 // 节点可能在响应到达前重启；自动重试会对同一节点重复执行操作。
-export async function restartService(target: string, nodeId: string): Promise<void> {
+export async function restartService(target: ManagedRequestTarget): Promise<void> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), SETTINGS_WRITE_TIMEOUT_MS);
   try {
-    const response = await fetch(apiUrl('/api/v1/management/service/restart', target), {
-      method: 'POST', cache: 'no-store', redirect: 'error', signal: controller.signal,
-      headers: { 'X-MeshShare-Target': nodeId },
-    });
-    if (!response.ok) throw await responseError(response);
+    const response = await fetchNode('/api/v1/management/service/restart', {
+      method: 'POST', signal: controller.signal,
+    }, target);
     if (response.status !== 202) throw new Error('节点未确认重启请求');
   } finally {
     clearTimeout(timer);
@@ -219,8 +241,10 @@ export const mobileDownloadUrl = (transferId: string, itemId: string, sessionId:
 /** 原生发送：先把清单和源文件交给本机节点，之后的上传由节点负责。 */
 export const createOutgoingStaging = (offer: TransferOffer, target = baseUrl) => request<OutgoingStagingView>('/api/v1/outgoing', { method: 'POST', body: JSON.stringify(offer) }, target);
 /** 远程管理页浏览目标机器目录：只读元数据，需要目标机器开启远程文件访问。 */
-export const getManagedRoots = (target = baseUrl) => request<BrowseRoots>('/api/v1/management/files/roots', {}, target);
-export const browseManagedPath = (path: string, target = baseUrl) => request<BrowseListing>(`/api/v1/management/files?path=${encodeURIComponent(path)}`, {}, target);
+export const getManagedRoots = (target: RequestTarget = baseUrl, signal?: AbortSignal) =>
+  requestWithTimeout<BrowseRoots>('/api/v1/management/files/roots', { signal }, target, FILE_BROWSE_TIMEOUT_MS);
+export const browseManagedPath = (path: string, target: RequestTarget = baseUrl, signal?: AbortSignal) =>
+  requestWithTimeout<BrowseListing>(`/api/v1/management/files?path=${encodeURIComponent(path)}`, { signal }, target, FILE_BROWSE_TIMEOUT_MS);
 
 /** 按路径发送的准备任务始终由创建它的节点读取、取消和清理。 */
 export function outgoingPathsApi(owner: string, managedNodeId?: string) {

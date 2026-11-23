@@ -1,6 +1,12 @@
 import type { PeerInfo } from './types';
 
 export const HEADLESS_CAPABILITY = 'node.headless.v1';
+export const REMOTE_MANAGEMENT_CAPABILITY = 'management.remote.v1';
+
+export function canOpenRemoteSettings(peer: PeerInfo, localNodeId: string): boolean {
+  return peer.online && peer.node_id !== localNodeId && peer.capabilities.includes(REMOTE_MANAGEMENT_CAPABILITY)
+    && peerTargetCandidates(peer, null).length > 0;
+}
 
 /** 网页模式下其他节点只能经接入节点的同源代理访问；非网页环境传 null。 */
 export type PeerWebContext = {
@@ -67,4 +73,9 @@ export function peerTargetCandidates(peer: PeerInfo, web: PeerWebContext | null)
   // 链路本地地址只有在没有其他入口时才值得尝试，否则先试常规地址。
   const routable = candidates.filter((base) => !base.includes('//169.254.'));
   return routable.length ? routable : candidates;
+}
+
+export function peerManagementAddress(peer: PeerInfo): string {
+  const [base] = peerTargetCandidates(peer, null);
+  return base ? new URL(base).host : '';
 }
