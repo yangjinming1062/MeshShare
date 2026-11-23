@@ -4,6 +4,7 @@
   import { canOpenTerminal } from '../terminal';
   import AndroidUpdatePanel from './AndroidUpdatePanel.svelte';
   import ClipboardImage from './ClipboardImage.svelte';
+  import DeviceIdentity from './DeviceIdentity.svelte';
   import Icon from './Icon.svelte';
   import {
     formatPercent,
@@ -433,11 +434,7 @@
       {#each peers as peer (peer.node_id)}
         <li class="device-card" data-link={linkPeers.has(peer.node_id) ? 'active' : undefined}>
           <div class="device-card-id">
-            <span class="device-icon" aria-hidden="true"><Icon name="monitor" size={18} /></span>
-            <span class="device-id">
-              <strong title={peer.node_name}>{peer.node_name}</strong>
-              <span class="device-meta">{platformLabel(peer.platform)} · {peer.addresses[0]?.address ?? '在线'}</span>
-            </span>
+            <div class="device-identity"><DeviceIdentity {peer} name={peer.node_name} /></div>
             <div class="device-actions">
               {#if mode === 'android' && canOpenTerminal(peer)}
                 <button type="button" class="btn-icon" aria-label={'打开 ' + peer.node_name + ' 的终端'} on:click={() => terminalWorkspace.openSession({ peerId: peer.node_id, name: peer.node_name })}><Icon name="terminal" size={18} /></button>

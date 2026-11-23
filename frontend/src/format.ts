@@ -18,6 +18,7 @@ export function formatRate(value: number | null | undefined): string {
 
 export function formatRateCompact(value: number | null | undefined): string {
   if (value == null) return '—';
+  if (value >= 1024 ** 3) return (value / 1024 ** 3).toFixed(1) + 'G';
   if (value >= 1024 ** 2) return (value / 1024 ** 2).toFixed(1) + 'M';
   if (value >= 1024) return Math.round(value / 1024) + 'K';
   return Math.round(value) + 'B';
@@ -68,7 +69,7 @@ export function diskUsedPercent(value: DiskMetrics | null | undefined): number |
   return diskUsedBytes(value) / value.total_bytes * 100;
 }
 
-export function memoryPercent(value: HardwareMetrics | null | undefined): number | undefined {
+export function memoryPercent(value: Pick<HardwareMetrics, 'memory_used_bytes' | 'memory_total_bytes'> | null | undefined): number | undefined {
   if (value?.memory_used_bytes == null || value.memory_total_bytes == null) return undefined;
   if (value.memory_total_bytes <= 0) return undefined;
   return value.memory_used_bytes / value.memory_total_bytes * 100;
@@ -81,7 +82,8 @@ export function gpuUtilization(value: HardwareMetrics | null | undefined): numbe
 
 export function gpuMemoryPercent(value: HardwareMetrics | null | undefined): number | undefined {
   const values = (value?.gpus ?? [])
-    .map((gpu) => (gpu.memory_used_bytes != null && gpu.memory_total_bytes ? gpu.memory_used_bytes / gpu.memory_total_bytes * 100 : undefined))
+    .filter((gpu) => gpu.memory_kind === 'dedicated')
+    .map(memoryPercent)
     .filter((item): item is number => item != null);
   return values.length ? Math.max(...values) : undefined;
 }

@@ -30,6 +30,7 @@
   export let onDropMobile: (session: MobileSession, event: DragEvent) => void = () => {};
 
   $: total = peers.length + mobileSessions.length;
+  $: hasTerminalActions = !!onTerminal && peers.some(canOpenTerminal);
 </script>
 
 <div class="devices-column">
@@ -71,7 +72,7 @@
       {/if}
     {/if}
     <div class="surface-body">
-      <ul class="device-list" role="list">
+      <ul class="device-list" class:device-list--with-terminal={hasTerminalActions} role="list">
         {#each peers as peer (peer.node_id)}
           <DeviceRow
             kind="peer"
