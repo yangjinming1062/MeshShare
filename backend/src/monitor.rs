@@ -127,6 +127,35 @@ fn log_change(previous: &mut Option<String>, error: Option<String>, context: &st
     }
 }
 
+fn apply_window_presentation(
+    app: &AppHandle,
+    #[cfg(target_os = "linux")] window: &gtk::Window,
+    #[cfg(not(target_os = "linux"))] window: &tauri::WebviewWindow,
+    applied_visibility: Option<bool>,
+    (visible, locked): (bool, bool),
+) -> Result<()> {
+    if crate::current_monitor_capabilities(app).can_click_through {
+        #[cfg(target_os = "linux")]
+        monitor_window::set_click_through(window, locked);
+        #[cfg(not(target_os = "linux"))]
+        window.set_ignore_cursor_events(locked)?;
+    }
+    // Win32 的穿透样式变更也可能按 Tao 的初始隐藏标记隐藏窗口，因此每次都提交显隐。
+    if cfg!(target_os = "windows") || applied_visibility != Some(visible) {
+        #[cfg(target_os = "windows")]
+        platform::set_visible(window, visible)?;
+        #[cfg(target_os = "linux")]
+        platform::set_visible(window, visible);
+        #[cfg(target_os = "macos")]
+        if visible {
+            window.show()?;
+        } else {
+            window.hide()?;
+        }
+    }
+    Ok(())
+}
+
 /// 仅在主线程调用；不要用 GTK 的 is_visible() 判断异步 show/hide 是否完成。
 fn reconcile(app: &AppHandle, reapply: bool) {
     let (Some(controller), Some(node)) = (
@@ -169,29 +198,12 @@ fn reconcile(app: &AppHandle, reapply: bool) {
     if state.applied == Some(desired) {
         return;
     }
-    let result = (|| -> Result<()> {
-        if crate::current_monitor_capabilities(app).can_click_through {
-            #[cfg(target_os = "linux")]
-            monitor_window::set_click_through(&window, desired.1);
-            #[cfg(not(target_os = "linux"))]
-            window.set_ignore_cursor_events(desired.1)?;
-        }
-        // Win32 的穿透样式变更也可能按 Tao 的初始隐藏标记隐藏窗口，因此每次都提交显隐。
-        #[cfg(target_os = "windows")]
-        platform::set_visible(&window, desired.0)?;
-        #[cfg(not(target_os = "windows"))]
-        if state.applied.map(|value| value.0) != Some(desired.0) {
-            #[cfg(target_os = "linux")]
-            platform::set_visible(&window, desired.0);
-            #[cfg(not(target_os = "linux"))]
-            if desired.0 {
-                window.show()?;
-            } else {
-                window.hide()?;
-            }
-        }
-        Ok(())
-    })();
+    let result = apply_window_presentation(
+        app,
+        &window,
+        state.applied.map(|(visible, _)| visible),
+        desired,
+    );
     if result.is_ok() {
         state.applied = Some(desired);
     }
