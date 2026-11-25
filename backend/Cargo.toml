@@ -38,8 +38,8 @@ tempfile = { version = "3", optional = true }
 minisign-verify = { version = "0.3", optional = true }
 mdns-sd = "0.11"
 parking_lot = "0.12"
+png = "0.18"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-raw-window-handle = { version = "0.6", optional = true }
 russh = { version = "0.65.4", default-features = false, features = ["ring"] }
 rand = "0.10"
 rcgen = { version = "0.14", features = ["x509-parser"] }
@@ -67,8 +67,8 @@ gui = [
     "dep:tauri-plugin-single-instance",
     "dep:tauri-plugin-updater",
     "dep:arboard",
-    "dep:raw-window-handle",
     "dep:gtk",
+    "dep:gdkx11",
     "dep:x11rb",
 ]
 headless = ["dep:minisign-verify", "dep:tempfile"]
@@ -87,13 +87,14 @@ core-foundation = { version = "0.10", features = ["mac_os_10_8_features"] }
 core-foundation-sys = "0.8"
 core-graphics = "0.25"
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSScreen", "NSWindow"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSPasteboard", "NSResponder", "NSScreen", "NSWindow"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+gdkx11 = { version = "0.18", optional = true }
 gtk = { version = "0.18", optional = true }
 x11rb = { version = "0.13", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-registry = "0.6"
 windows-result = "0.4"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }

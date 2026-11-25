@@ -1,11 +1,13 @@
 <script lang="ts">
   import ClipboardImage from './ClipboardImage.svelte';
+  import { clipboardPreviewPath } from '../api';
   import { formatTime } from '../format';
   import type { ClipboardSnapshot } from '../types';
 
   export let headless = false;
   export let clipboard: ClipboardSnapshot | null = null;
   export let draft = '';
+  export let onDraftBlur: () => void;
   export let historyCount = 0;
   export let onPublish: () => void = () => {};
   export let onOpenHistory: () => void = () => {};
@@ -24,12 +26,13 @@
   <div class="surface-body">
     <div class="clip-grid">
       {#if clipboard?.image_png}
-        <ClipboardImage imagePng={clipboard.image_png} />
+        <ClipboardImage imagePng={clipboard.image_png} previewPath={clipboardPreviewPath(clipboard)} />
       {/if}
       <textarea
         id="clipboard-editor"
         class="field clip-editor"
         bind:value={draft}
+        on:blur={onDraftBlur}
         placeholder="在任意设备复制文字或图片，这里会显示最近内容"
       ></textarea>
     </div>

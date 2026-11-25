@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
@@ -341,7 +341,7 @@ async fn run_peer_session(
     let Some(peer) = server::peer_from_hello(node, runtime, Some(endpoint.url.clone())) else {
         return false;
     };
-    let (tx, mut rx) = mpsc::channel::<WireMessage>(64);
+    let (tx, mut rx) = crate::runtime::peer_channel(64);
     let Some(_session) = runtime.attach_peer_session(peer, tx) else {
         return false;
     };

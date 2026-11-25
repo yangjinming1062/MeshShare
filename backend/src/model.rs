@@ -152,10 +152,25 @@ pub struct HardwareMetrics {
     pub disks: Vec<DiskMetrics>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MonitorPosition {
     pub x: i32,
     pub y: i32,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<f64>,
+}
+
+#[cfg(any(test, all(feature = "gui", not(target_os = "android"))))]
+impl MonitorPosition {
+    pub(crate) fn new(x: i32, y: i32) -> Self {
+        Self {
+            x,
+            y,
+            #[cfg(target_os = "macos")]
+            scale_factor: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -175,13 +190,44 @@ impl Hlc {
     }
 }
 
+/// 快照、系统写入和对端消息共享同一份载荷，序列化时仍使用 JSON 字符串。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ClipboardValue(Arc<String>);
+
+impl std::ops::Deref for ClipboardValue {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl From<String> for ClipboardValue {
+    fn from(value: String) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl From<&str> for ClipboardValue {
+    fn from(value: &str) -> Self {
+        value.to_owned().into()
+    }
+}
+
+impl ClipboardValue {
+    pub fn into_string(self) -> String {
+        Arc::unwrap_or_clone(self.0)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardEvent {
     pub event_id: String,
     pub origin_node_id: String,
     pub clock: Hlc,
-    pub text: Option<String>,
-    pub image_png: Option<String>,
+    pub text: Option<ClipboardValue>,
+    pub image_png: Option<ClipboardValue>,
     pub updated_at_ms: i64,
 }
 
@@ -191,8 +237,8 @@ pub struct ClipboardSnapshot {
     pub source_node_id: String,
     pub source_name: String,
     pub clock: Hlc,
-    pub text: Option<String>,
-    pub image_png: Option<String>,
+    pub text: Option<ClipboardValue>,
+    pub image_png: Option<ClipboardValue>,
     pub updated_at_ms: i64,
 }
 
@@ -438,6 +484,9 @@ pub enum WireMessage {
     },
     ClipboardSnapshot {
         snapshot: ClipboardSnapshot,
+    },
+    ClipboardChanged {
+        event_id: String,
     },
     TransferOffer {
         offer: Arc<TransferOffer>,

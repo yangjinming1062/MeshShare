@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setImmediate as nextTurn } from 'node:timers/promises';
-import { ApiError, browseManagedPath, getClipboard, getManagedRoots, getSettings, outgoingPathsApi, patchSettings, request, requestUpdateCheck, restartService, setApiTarget, withPeerAddress, type ManagedRequestTarget } from '../src/api.ts';
+import { ApiError, browseManagedPath, clipboardPreviewPath, getClipboard, isNewerClipboardSnapshot, getManagedRoots, getSettings, outgoingPathsApi, patchSettings, request, requestUpdateCheck, restartService, setApiTarget, withPeerAddress, type ManagedRequestTarget } from '../src/api.ts';
 
 test('clipboard keeps reading while bytes arrive, including UTF-8 split across chunks', async t => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -56,6 +56,40 @@ test('malformed clipboard JSON reports the endpoint and keeps the parse error', 
   t.mock.method(globalThis, 'fetch', () => new Response('{"text":'));
   await assert.rejects(getClipboard('http://clipboard.local'), error =>
     error instanceof Error && error.message.includes('/api/v1/clipboard') && error.cause instanceof SyntaxError);
+});
+
+test('clipboard requests and previews identify the snapshot version and work with older nodes', async t => {
+  const calls: string[] = [];
+  const snapshot = {
+    event_id: 'image & text',
+    clock: { physical_ms: 12, logical: 3, node_id: 'peer/a' },
+    text: '共享',
+  };
+  t.mock.method(globalThis, 'fetch', (url: string) => {
+    calls.push(url);
+    return url.startsWith('http://new.local') ? new Response(null, { status: 204 }) : Response.json(snapshot);
+  });
+  assert.equal(await getClipboard('http://new.local', new AbortController(), snapshot), undefined);
+  assert.deepEqual(await getClipboard('http://old.local', new AbortController(), { ...snapshot, event_id: 'older' }), snapshot);
+  assert.deepEqual(calls, [
+    'http://new.local/api/v1/clipboard?known_event_id=image%20%26%20text&known_clock=12%3A3%3Apeer%2Fa',
+    'http://old.local/api/v1/clipboard?known_event_id=older&known_clock=12%3A3%3Apeer%2Fa',
+  ]);
+  assert.equal(clipboardPreviewPath(snapshot), '/api/v1/clipboard/preview/image%20%26%20text?clock=12%3A3%3Apeer%2Fa');
+});
+
+test('clipboard responses use the node clock ordering when they reach the interface out of order', () => {
+  const snapshot = (physical_ms: number, logical: number, node_id: string) =>
+    ({ event_id: 'event', clock: { physical_ms, logical, node_id } });
+  const current = snapshot(100, 5, 'peer');
+  assert.equal(isNewerClipboardSnapshot(current, null), true);
+  assert.equal(isNewerClipboardSnapshot(current, current), false);
+  assert.equal(isNewerClipboardSnapshot(snapshot(101, 0, 'a'), current), true);
+  assert.equal(isNewerClipboardSnapshot(snapshot(99, 8, 'z'), current), false);
+  assert.equal(isNewerClipboardSnapshot(snapshot(100, 6, 'a'), current), true);
+  assert.equal(isNewerClipboardSnapshot(snapshot(100, 4, 'z'), current), false);
+  assert.equal(isNewerClipboardSnapshot(snapshot(100, 5, '😺'), snapshot(100, 5, '豈')), true);
+  assert.equal(isNewerClipboardSnapshot(snapshot(100, 5, 'peer-2'), current), true);
 });
 
 test('prepare status and cancellation stay on their creating node across target changes', async (t) => {

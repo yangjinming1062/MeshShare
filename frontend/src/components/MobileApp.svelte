@@ -4,6 +4,7 @@
   import { canOpenTerminal } from '../terminal';
   import AndroidUpdatePanel from './AndroidUpdatePanel.svelte';
   import ClipboardImage from './ClipboardImage.svelte';
+  import { clipboardPreviewPath } from '../api';
   import DeviceIdentity from './DeviceIdentity.svelte';
   import Icon from './Icon.svelte';
   import {
@@ -44,6 +45,7 @@
   export let onOpenLocation: (entry: TransferHistoryEntry) => void = () => {};
   export let clipboard: ClipboardSnapshot | null = null;
   export let draft = '';
+  export let onDraftBlur: () => void;
   export let historyCount = 0;
   export let metrics: HardwareMetrics | null = null;
   export let canChooseDirectory = false;
@@ -487,9 +489,9 @@
         <span class="muted">{clipboard ? clipboard.source_name + ' · ' + formatTime(clipboard.updated_at_ms) : '仅手动读取和发布'}</span>
       {/if}
     </div>
-    <textarea class="field clip-editor" id="clipboard-editor" bind:value={draft} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
+    <textarea class="field clip-editor" id="clipboard-editor" bind:value={draft} on:blur={onDraftBlur} placeholder={mode === 'web' ? '在任意设备复制文字或图片，这里会显示最近内容' : '输入或粘贴文字，然后手动发布'}></textarea>
     {#if clipboard?.image_png}
-      <ClipboardImage imagePng={clipboard.image_png} />
+      <ClipboardImage imagePng={clipboard.image_png} previewPath={clipboardPreviewPath(clipboard)} />
     {/if}
     <div class="phone-actions phone-actions--stack">
       <button type="button" class="btn btn-primary" on:click={onPublish}>同步到设备</button>

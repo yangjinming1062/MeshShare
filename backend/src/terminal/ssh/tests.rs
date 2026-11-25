@@ -355,13 +355,13 @@ async fn authentication_requires_both_keys_from_a_registered_node_channel() {
         Some(format!("ws://{addr}/api/v1/ws")),
     )
     .unwrap();
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (tx, _rx) = crate::runtime::peer_channel(1);
     let _session = caller.attach_peer_session(peer, tx).unwrap();
     let connect = || caller.connect_terminal(host.node_id(), 80, 25);
     assert!(connect().await.is_err());
     let mut peer = crate::server::peer_from_hello(caller.node_info(), &host, None).unwrap();
     peer.terminal.as_mut().unwrap().client_fingerprint = host.ssh.client_fingerprint();
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (tx, _rx) = crate::runtime::peer_channel(1);
     let _registered = host.attach_peer_session(peer, tx).unwrap();
     assert!(connect().await.is_err());
     host.peers

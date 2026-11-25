@@ -47,7 +47,7 @@ export function apiUrl(path: string, target = baseUrl): string {
 }
 
 export function websocketUrl(target = baseUrl): string {
-  return apiUrl('/api/v1/ws', target).replace(/^http/, 'ws');
+  return apiUrl('/api/v1/ws?clipboard_updates=notice', target).replace(/^http/, 'ws');
 }
 
 async function fetchNode(path: string, options: RequestInit, target: RequestTarget): Promise<Response> {
@@ -179,9 +179,40 @@ async function requestList<T>(path: string, target = baseUrl): Promise<T[]> {
 export const getInfo = (target = baseUrl) => requestWithTimeout<NodeInfo>('/api/v1/info', {}, target);
 export const getPeers = (target = baseUrl) => requestList<PeerInfo>('/api/v1/peers', target);
 export const getMetrics = (target = baseUrl) => requestWithTimeout<HardwareMetrics | null>('/api/v1/metrics', {}, target);
+
+type ClipboardVersion = Pick<ClipboardSnapshot, 'event_id' | 'clock'>;
+
+export function isNewerClipboardSnapshot(next: ClipboardVersion, current: ClipboardVersion | null): boolean {
+  if (!current) return true;
+  const a = next.clock;
+  const b = current.clock;
+  if (a.physical_ms !== b.physical_ms) return a.physical_ms > b.physical_ms;
+  if (a.logical !== b.logical) return a.logical > b.logical;
+  if (a.node_id === b.node_id) return false;
+  // 节点按 Rust 字符串的 UTF-8 顺序打破时钟平局。
+  const encoder = new TextEncoder();
+  const nextId = encoder.encode(a.node_id);
+  const currentId = encoder.encode(b.node_id);
+  const sharedLength = Math.min(nextId.length, currentId.length);
+  for (let i = 0; i < sharedLength; i += 1) {
+    if (nextId[i] !== currentId[i]) return nextId[i] > currentId[i];
+  }
+  return nextId.length > currentId.length;
+}
+
+function clipboardClockKey({ physical_ms, logical, node_id }: ClipboardVersion['clock']): string {
+  return encodeURIComponent(`${physical_ms}:${logical}:${node_id}`);
+}
+
+export function clipboardPreviewPath(event: ClipboardVersion): string {
+  return `/api/v1/clipboard/preview/${encodeURIComponent(event.event_id)}?clock=${clipboardClockKey(event.clock)}`;
+}
+
 /** 大快照按读取空闲时间超时，收到响应头或下一块内容即重新计时。 */
-export async function getClipboard(target = baseUrl, controller = new AbortController()): Promise<ClipboardSnapshot | null> {
-  const path = '/api/v1/clipboard';
+export async function getClipboard(target = baseUrl, controller = new AbortController(), known?: ClipboardVersion): Promise<ClipboardSnapshot | null | undefined> {
+  const path = known
+    ? `/api/v1/clipboard?known_event_id=${encodeURIComponent(known.event_id)}&known_clock=${clipboardClockKey(known.clock)}`
+    : '/api/v1/clipboard';
   const abort = () => controller.abort(new DOMException('读取剪贴板超时', 'AbortError'));
   let timer = setTimeout(abort, READ_TIMEOUT_MS);
   const resetTimer = () => {
@@ -190,6 +221,7 @@ export async function getClipboard(target = baseUrl, controller = new AbortContr
   };
   try {
     const response = await fetchNode(path, { signal: controller.signal }, target);
+    if (response.status === 204) return undefined;
     resetTimer();
     const body = response.body?.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, output) {

@@ -1,45 +1,33 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import QRCode from 'qrcode';
   import { open } from '@tauri-apps/plugin-dialog';
   import { invoke, isTauri } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { getCurrentWindow } from '@tauri-apps/api/window';
   import { buildOffer, uploadItems, randomId, uploadFileWithRetry } from './upload';
   import { snapshotRead } from './snapshotRead';
   import { filesFromDataTransfer } from './drop';
   import { HEADLESS_CAPABILITY, REMOTE_MANAGEMENT_CAPABILITY, canOpenRemoteSettings, peerTargetBase, peerTargetCandidates, type PeerWebContext } from './peers';
-  import { ApiError, NODE_PROTOCOL_VERSION, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, sendManagedPathsToMobile, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restartService, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl, type ManagedRequestTarget, type RequestTarget } from './api';
+  import { ApiError, NODE_PROTOCOL_VERSION, responseError, isTransportFailure, withPeerAddress, apiUrl, cancelOutgoingStaging, clearClipboardHistory, clearTransferHistory, completeMobileItem, createMobileSession, createMobileTransfer, sendManagedPathsToMobile, createOutgoingStaging, dismissMobileTransfer, dismissTransfer, getClipboard, isNewerClipboardSnapshot, getClipboardHistory, getClipboardHistoryDetail, getInfo, getMetrics, getMobileSessions, getMobileTransfers, getPeers, getSettings, getTransferHistory, getTransfers, initApi, mobileDownloadUrl, patchSettings, request, requestUpdateCheck, restartService, requestWithTimeout, outgoingPathsApi, restoreClipboardHistory, setApiTarget, startOutgoingStaging, websocketUrl, type ManagedRequestTarget, type RequestTarget } from './api';
   import { saveMobileResponse, type MobileDirectoryHandle } from './mobileSave';
   import { mergeTransferProgress } from './transferProgress';
   import type { AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileSession, MobileTransferView, MonitorCapabilities, NodeInfo, NodeSettings, PeerInfo, PhoneTransfer, ReceiveMode, ReceiveSettings, TransferFailure, TransferHistoryEntry, TransferItem, TransferOffer, TransferPrepare, TransferProgress, UpdateFrequency, UpdateStatus, WireMessage } from './types';
-  import { clipboardHistoryRetentionLabel, formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isActiveTransferStatus, isMetricsStale, memoryPercent, transferHistoryForSessionView, transferHistoryLocation, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
-  import TerminalWorkspace from './components/TerminalWorkspace.svelte';
+  import { clipboardHistoryRetentionLabel, isActiveTransferStatus, transferHistoryForSessionView, transferHistoryLocation, transferItemKey, updateFrequencyLabel, webSessionLabel } from './format';
+  import type TerminalWorkspace from './components/TerminalWorkspace.svelte';
   import { canOpenTerminal } from './terminal';
-  import AppHeader from './components/AppHeader.svelte';
-  import DevicePanel from './components/DevicePanel.svelte';
-  import HardwarePanel from './components/HardwarePanel.svelte';
-  import ClipboardPanel from './components/ClipboardPanel.svelte';
-  import TransferPanel from './components/TransferPanel.svelte';
-  import MobileApp from './components/MobileApp.svelte';
-  import SettingsDialog from './components/SettingsDialog.svelte';
-  import RemoteFileBrowser from './components/RemoteFileBrowser.svelte';
-  import MobileAccessDialog from './components/MobileAccessDialog.svelte';
   import ClipboardHistoryDialog from './components/ClipboardHistoryDialog.svelte';
-  import MetricsDetailDialog from './components/MetricsDetailDialog.svelte';
   import ConfirmDialog from './components/ConfirmDialog.svelte';
-  import PromptDialog from './components/PromptDialog.svelte';
 
-  const isMonitor = document.documentElement.dataset.window === 'monitor';
   const inTauri = isTauri();
   const isAndroidApp = inTauri && /Android/i.test(navigator.userAgent);
-  // 浏览器访问（根地址或 /mobile）一律渲染网页临时加入界面，Tauri 窗口按窗口类型区分
-  const isWeb = !inTauri && !isMonitor;
-  const isDesktopWindow = inTauri && !isMonitor && !isAndroidApp;
+  // 浏览器访问（根地址或 /mobile）渲染网页临时加入界面。
+  const isWeb = !inTauri;
+  const isDesktopWindow = inTauri && !isAndroidApp;
   const isPhone = isWeb || isAndroidApp;
+  const desktopUi = isDesktopWindow ? import('./desktopUi') : null;
+  const mobileUi = isPhone ? import('./components/MobileApp.svelte') : null;
   // 原生界面可以把源文件交给本机节点，上传因此不再依赖页面存活。
   const isNativeSender = isDesktopWindow || isAndroidApp;
-  document.documentElement.dataset.shell = isMonitor ? 'monitor' : isPhone ? (isWeb ? 'web' : 'android') : 'desktop';
+  document.documentElement.dataset.shell = isPhone ? (isWeb ? 'web' : 'android') : 'desktop';
   let node: NodeInfo | null = null;
   let activeBaseUrl = '';
   let remoteTarget: PeerInfo | null = null;
@@ -61,6 +49,8 @@
   let metrics: HardwareMetrics | null = null;
   let selectedMetricsPeer: PeerInfo | null = null;
   let clipboardDraft = '';
+  let clipboardDraftEdited = false;
+  let clipboardDraftRevision = 0;
   let status = '正在连接…';
   let statusKind: 'ok' | 'warn' | 'error' = 'warn';
   let mobileAddresses: AddressInfo[] = [];
@@ -238,7 +228,6 @@
   $: phoneTransferHistory = isWeb
     ? transferHistory.map((entry) => transferHistoryForSessionView(entry, node?.node_id ?? entry.peer_node_id, node?.node_name ?? '接入节点'))
     : transferHistory;
-  $: monitorMetrics = isMetricsStale(metrics) ? null : metrics;
   $: remoteMode = !!remoteTarget;
   $: headless = remoteMode && !!(node ?? remoteTarget)?.capabilities.includes(HEADLESS_CAPABILITY);
   $: settingsDisabled = !settingsReady || !node || settingsWrites.has(node.node_id);
@@ -253,7 +242,7 @@
   };
   // 远程管理页的发送由目标机器选文件，需要目标节点声明对应的管理能力。
   $: managedFilesSupported = remoteMode && !!node?.capabilities.includes(REMOTE_FILES_CAPABILITY);
-  $: if (!isWeb && !isMonitor) void refreshQr(mobileUrl);
+  $: if (isDesktopWindow && mobileAccessOpen && mobileQr?.url !== mobileUrl) void refreshQr(mobileUrl);
   $: mobileTargets = node ? [{
     node_id: node.node_id,
     node_name: node.node_name,
@@ -467,10 +456,6 @@
       savedNodeUrls = [];
     }
     let timer: number | undefined;
-    let monitorPositionTimer: number | undefined;
-    let pendingMonitorPosition: { x: number; y: number } | null = null;
-    let monitorPositionWriteInFlight = false;
-    let monitorPositionUnlisten: (() => void) | undefined;
     let updateStatusUnlisten: (() => void) | undefined;
     if (isDesktopWindow) {
       void listen<UpdateStatus>('update-status', ({ payload }) => {
@@ -479,38 +464,6 @@
         if (pageStopped) unlisten();
         else updateStatusUnlisten = unlisten;
       }).catch((error) => console.error('监听更新状态失败', error));
-    }
-    const flushMonitorPosition = async () => {
-      if (!pendingMonitorPosition || monitorPositionWriteInFlight) return;
-      const position = pendingMonitorPosition;
-      monitorPositionWriteInFlight = true;
-      try {
-        await invoke('set_monitor_position', position);
-        if (pendingMonitorPosition?.x === position.x && pendingMonitorPosition?.y === position.y) {
-          pendingMonitorPosition = null;
-        }
-      } catch (error) {
-        console.error('保存悬浮监控条位置失败', error);
-      } finally {
-        monitorPositionWriteInFlight = false;
-        if (!pageStopped && pendingMonitorPosition && (pendingMonitorPosition.x !== position.x || pendingMonitorPosition.y !== position.y)) {
-          void flushMonitorPosition();
-        }
-      }
-    };
-    if (inTauri && isMonitor) {
-      void getCurrentWindow().onMoved(({ payload }) => {
-        if (!monitorCapabilities.can_persist_position) return;
-        pendingMonitorPosition = { x: payload.x, y: payload.y };
-        if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
-        monitorPositionTimer = window.setTimeout(() => {
-          monitorPositionTimer = undefined;
-          void flushMonitorPosition();
-        }, 200);
-      }).then((unlisten) => {
-        if (pageStopped) unlisten();
-        else monitorPositionUnlisten = unlisten;
-      }).catch((error) => console.error('监听悬浮监控条移动失败', error));
     }
     const start = async () => {
       if (pageStopped) return;
@@ -566,10 +519,7 @@
       wsPingTimer = undefined;
       ws?.close();
       ws = null;
-      if (monitorPositionTimer) window.clearTimeout(monitorPositionTimer);
-      monitorPositionUnlisten?.();
       updateStatusUnlisten?.();
-      void flushMonitorPosition();
     };
   });
 
@@ -599,16 +549,6 @@
       return;
     }
     const current = () => !pageStopped && generation === targetGeneration;
-    if (isMonitor) {
-      const [nextNode, nextMetrics] = await Promise.all([getInfo(target), getMetrics(target)]);
-      if (!current()) return;
-      node = nextNode;
-      metrics = nextMetrics;
-      status = '节点在线';
-      statusKind = 'ok';
-      await refreshSettings(generation, target);
-      return;
-    }
 
     const nextNode = await getInfo(target);
     if (!current()) return;
@@ -632,7 +572,7 @@
   async function refreshOverview(current: () => boolean, generation: number, target: string, nextNode: NodeInfo) {
     const [nextPeers, nextMetrics, sessions] = await Promise.all([
       getPeers(target), getMetrics(target),
-      isWeb ? [] : getMobileSessions(target),
+      isDesktopWindow ? getMobileSessions(target) : [],
     ]);
     if (!current()) return;
     mobileSessions = sessions;
@@ -1012,8 +952,8 @@
       void refresh().catch(() => { /* 定期刷新负责重新发现并报告离线。 */ });
       return;
     }
-    if (type === 'ClipboardUpdate' || type === 'ClipboardSnapshot') {
-      if (!isMonitor) void clipboardRead.refresh(true).catch(() => {});
+    if (type === 'ClipboardChanged' || type === 'ClipboardUpdate' || type === 'ClipboardSnapshot') {
+      void clipboardRead.refresh(true).catch(() => {});
       return;
     }
     if (type === 'MetricsUpdate') {
@@ -1050,6 +990,7 @@
   async function refreshQr(url: string): Promise<void> {
     if (!url) return;
     try {
+      const { default: QRCode } = await import('qrcode');
       const image = await QRCode.toDataURL(url, { width: 192, margin: 1, color: { dark: '#111827', light: '#ffffff' } });
       if (url === mobileUrl) mobileQr = { url, image };
     } catch (error) {
@@ -1199,20 +1140,36 @@
     }
   }
 
+  function editClipboardDraft(text: string) {
+    clipboardDraft = text;
+    clipboardDraftEdited = true;
+    clipboardDraftRevision += 1;
+  }
+
+  function syncClipboardDraft() {
+    if (!clipboardDraftEdited) clipboardDraft = clipboard?.text ?? '';
+  }
+
   async function readSharedClipboard() {
     const generation = targetGeneration;
     const target = activeBaseUrl;
+    const knownSnapshot = clipboard;
     const controller = new AbortController();
     clipboardRequest = controller;
-    const [snapshot, response] = await Promise.all([getClipboard(target, controller), getClipboardHistory(target)]).finally(() => {
+    const [snapshot, response] = await Promise.all([
+      getClipboard(target, controller, knownSnapshot ?? undefined),
+      getClipboardHistory(target),
+    ]).finally(() => {
       // 历史请求可能先失败，此时快照仍在传输。
       controller.abort();
       if (clipboardRequest === controller) clipboardRequest = undefined;
     });
     if (generation !== targetGeneration || pageStopped) return;
     clipboardReadError = '';
-    clipboard = snapshot;
-    if (snapshot && document.activeElement?.id !== 'clipboard-editor') clipboardDraft = snapshot.text ?? '';
+    if (snapshot !== undefined && (clipboard === knownSnapshot || (snapshot && isNewerClipboardSnapshot(snapshot, clipboard)))) {
+      clipboard = snapshot;
+    }
+    if (document.activeElement?.id !== 'clipboard-editor') syncClipboardDraft();
     if (isWeb) webHistorySettings = response.settings;
     clipboardHistory = response.items;
     if (selectedClipboardHistory && !clipboardHistory.some((item) => item.event_id === selectedClipboardHistory?.item.event_id)) {
@@ -1294,26 +1251,28 @@
     );
   }
 
-  async function openMonitorMenu(event: MouseEvent) {
-    event.preventDefault();
-    if (!inTauri || monitorLocked) return;
-    try {
-      await invoke('popup_monitor_menu');
-    } catch (error) {
-      console.warn('打开悬浮监控条菜单失败', error);
-    }
-  }
-
   async function publishClipboard() {
-    if (!node || !clipboardDraft.trim()) return;
+    const draft = clipboardDraft;
+    if (!node || !draft.trim()) return;
     const generation = targetGeneration;
+    const draftRevision = clipboardDraftRevision;
+    const knownSnapshot = clipboard;
     try {
       const published = await request<ClipboardSnapshot>('/api/v1/clipboard', {
         method: 'POST',
-        body: JSON.stringify({ text: clipboardDraft, source_name: node.node_name }),
+        body: JSON.stringify({ text: draft, source_name: node.node_name }),
       });
-      if (generation !== targetGeneration) return;
-      clipboard = published;
+      if (generation !== targetGeneration || pageStopped) return;
+      if (clipboard === knownSnapshot || isNewerClipboardSnapshot(published, clipboard)) {
+        clipboard = published;
+      } else {
+        // 发布期间缓存已经更新，向节点补读一次以确定最新事件。
+        void clipboardRead.refresh(true).catch(() => {});
+      }
+      if (clipboardDraftRevision === draftRevision) {
+        clipboardDraftEdited = false;
+        if (document.activeElement?.id !== 'clipboard-editor') syncClipboardDraft();
+      }
       showTransientNotice('已同步到在线设备');
     } catch (error) {
       if (generation === targetGeneration) showTransientNotice(error instanceof Error ? error.message : '剪贴板同步失败', 6000);
@@ -1351,11 +1310,16 @@
     if (!eventId || clipboardHistoryBusy) return;
     clipboardHistoryBusy = true;
     const generation = targetGeneration;
+    const draftRevision = clipboardDraftRevision;
+    const knownSnapshot = clipboard;
     try {
       const restored = await restoreClipboardHistory(eventId);
       if (generation !== targetGeneration) return;
-      clipboard = restored;
-      clipboardDraft = clipboard.text ?? '';
+      if (clipboard === knownSnapshot || isNewerClipboardSnapshot(restored, clipboard)) clipboard = restored;
+      if (clipboardDraftRevision === draftRevision) {
+        clipboardDraftEdited = false;
+        syncClipboardDraft();
+      }
       await clipboardRead.refresh(true);
       if (generation === targetGeneration && !pageStopped) showTransientNotice('已恢复并同步剪贴板内容');
     } catch (error) {
@@ -1411,8 +1375,12 @@
   }
 
   async function readMobileClipboard() {
+    const generation = targetGeneration;
+    const draftRevision = clipboardDraftRevision;
     try {
-      clipboardDraft = await navigator.clipboard.readText();
+      const text = await navigator.clipboard.readText();
+      if (generation !== targetGeneration || draftRevision !== clipboardDraftRevision || pageStopped) return;
+      editClipboardDraft(text);
       showTransientNotice('已读取本机剪贴板');
     } catch {
       showTransientNotice('浏览器未授权读取剪贴板，请手动粘贴', 6000);
@@ -1725,6 +1693,7 @@
     clipboard = null;
     clipboardReadError = '';
     clipboardDraft = '';
+    clipboardDraftEdited = false;
     clipboardHistoryBusy = false;
     metrics = null;
     mobileAccessOpen = false;
@@ -2380,208 +2349,205 @@
 </script>
 
 <svelte:head>
-  <title>{isMonitor ? 'MeshShare · 硬件监控' : isWeb ? 'MeshShare · 临时加入' : 'MeshShare · 局域网共享'}</title>
+  <title>{isWeb ? 'MeshShare · 临时加入' : 'MeshShare · 局域网共享'}</title>
 </svelte:head>
 
-<div class:phone-shell={isPhone} class:monitor-shell={isMonitor} class:app-shell={!isPhone && !isMonitor} class:app-shell--remote={remoteMode && !terminalVisible}>
-  {#if isMonitor}
-    <main class="monitor-main" data-tauri-drag-region="deep" on:contextmenu={openMonitorMenu}>
-      <div class="monitor-metric"><b>CPU</b><span>{formatPercent(monitorMetrics?.cpu_usage_percent)}</span></div>
-      <div class="monitor-metric"><b>GPU</b><span>{formatPercent(gpuUtilization(monitorMetrics))}</span></div>
-      <div class="monitor-metric"><b>↑</b><span>{formatRate(monitorMetrics?.network_up_bytes_per_sec)}</span></div>
-      <div class="monitor-metric"><b>内存</b><span>{formatPercent(memoryPercent(monitorMetrics))}</span></div>
-      <div class="monitor-metric"><b>显存</b><span>{formatPercent(gpuMemoryPercent(monitorMetrics))}</span></div>
-      <div class="monitor-metric"><b>↓</b><span>{formatRate(monitorMetrics?.network_down_bytes_per_sec)}</span></div>
-    </main>
-  {:else if isPhone}
-    <MobileApp
-      mode={isWeb ? 'web' : 'android'}
-      {node}
-      {status}
-      {statusKind}
-      peers={isWeb ? mobileTargets : peers}
-      transfers={phoneTransfers}
-      prepares={prepares}
-      {failures}
-      transferHistory={phoneTransferHistory}
-      {transferHistoryReady}
-      {transferHistoryBusy}
-      onClearTransferHistory={requestClearTransferHistory}
-      {clipboard}
-      bind:draft={clipboardDraft}
-      historyCount={clipboardHistory.length}
-      {metrics}
-      canChooseDirectory={mobileDirectoryPickerAvailable()}
-      receiveDirectoryName={mobileReceiveDirectoryName}
-      actionBusyId={transferActionBusy}
-      downloadingIds={[...mobileDownloading]}
-      startedDownloadKeys={[...mobileBrowserDownloadStarted]}
-      onSendFile={(peer) => startChoose(peer)}
-      onSendFolder={(peer) => startChoose(peer, true)}
-      receiveStorage={androidReceiveStorage}
-      onRequestReceiveStorage={requestAndroidReceiveStorage}
-      onAcceptTransfer={(transfer) => transfer.web ? acceptMobileTransfer(transfer.web) : acceptTransfer(transfer)}
-      onRejectTransfer={(transfer) => transfer.web ? rejectMobileTransfer(transfer.web) : rejectTransfer(transfer)}
-      onCancelTransfer={(transfer) => transfer.web ? cancelMobileTransfer(transfer.web) : cancelTransfer(transfer)}
-      onCancelPrepare={cancelPrepare}
-      onSaveToDirectory={(transfer) => transfer.web && chooseAndDownloadMobileTransfer(transfer.web)}
-      onStartDownload={(transfer, item) => transfer.web && startMobileBrowserDownload(transfer.web, item)}
-      onRetryFailure={retryFailure}
-      onDismissFailure={dismissFailure}
-      onPublish={publishClipboard}
-      onReadLocal={readMobileClipboard}
-      onWriteLocal={writeMobileClipboard}
-      onChooseDirectory={chooseMobileReceiveDirectory}
-      onOpenHistory={openClipboardHistoryBrowser}
-      onOpenLocation={openHistoryLocation}
-    />
-  {:else}
-    <AppHeader
-      {node}
-      {remoteTarget}
-      {remoteAddress}
-      remoteAddressLive={!!activeBaseUrl && statusKind !== 'error'}
-      {headless}
-      {serviceControlError}
-      {status}
-      {statusKind}
-      {syncEnabled}
-      {autostartEnabled}
-      {settingsReady}
-      {settingsDisabled}
-      onSync={() => toggleSync()}
-      onAutostart={() => toggleAutostart()}
-      onSettings={openSettings}
-      {terminalCount}
-      {terminalVisible}
-      onTerminal={() => {
-        if (terminalVisible) terminalVisible = false;
-        else if (headless && remoteTarget) terminalWorkspace.showPeer({ peerId: remoteTarget.node_id, name: remoteTarget.node_name });
-        else terminalWorkspace.showWorkspace();
-      }}
-      onOpenProject={openProjectPage}
-      onBack={returnToLocal}
-      onCopyAddress={copyAccessAddress}
-    />
-    {#if isDesktopWindow && node && !headless && !clipboardStatus.available}
-      <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
-    {/if}
-    <TerminalWorkspace bind:this={terminalWorkspace} bind:visible={terminalVisible} bind:count={terminalCount} peers={remoteMode ? null : peers} />
-    <main class="app-main" hidden={terminalVisible || (remoteMode && !node)}>
-      <DevicePanel
-        peers={peers}
-        homeNodeId={localNodeId}
-        activePeerIds={activeLinkPeers}
-        {mobileSessions}
-        savedAddresses={savedNodeUrls}
-        draggingKey={dragPeer}
-        addOpen={addDeviceOpen}
-        bind:manualAddress
-        onToggleAdd={() => (addDeviceOpen = !addDeviceOpen)}
-        onConnect={connectManualPeer}
-        onConnectSaved={connectSavedPeer}
-        onOpenPeer={openRemotePeer}
-        onSettings={remoteMode ? null : openPeerSettings}
-        onTerminal={remoteMode ? null : openPeerTerminal}
-        onMobileAccess={openMobileAccess}
-        onSendPeer={(peer) => startChoose(peer)}
-        onSendPeerFolder={(peer) => startChoose(peer, true)}
-        onDetails={selectMetricsPeer}
-        onSendMobile={(session) => startChooseMobile(session)}
-        onSendMobileFolder={(session) => startChooseMobile(session, true)}
-        onDragEnter={(key) => (dragPeer = key)}
-        onDragLeave={(key) => { if (dragPeer === key) dragPeer = ''; }}
-        onDropPeer={(peer, event) => dropFiles({ peer }, event)}
-        onDropMobile={(mobile, event) => dropFiles({ mobile }, event)}
-        allowFolderSend={!remoteMode}
-      />
-      <HardwarePanel
-        remote={remoteMode}
-        showMonitorControls={!headless}
-        metrics={metrics}
-        {monitorLocked}
-        {monitorVisible}
-        {settingsDisabled}
-        canClickThrough={monitorCapabilities.can_click_through}
-        onToggleLock={() => toggleMonitorLock()}
-        onToggleVisible={() => toggleMonitorVisibility()}
-      />
-      <ClipboardPanel
-        {headless}
+<div class:phone-shell={isPhone} class:app-shell={!isPhone} class:app-shell--remote={remoteMode && !terminalVisible}>
+  {#if mobileUi}
+    {#await mobileUi then mobile}
+      <mobile.default
+        mode={isWeb ? 'web' : 'android'}
+        {node}
+        {status}
+        {statusKind}
+        peers={isWeb ? mobileTargets : peers}
+        transfers={phoneTransfers}
+        prepares={prepares}
+        {failures}
+        transferHistory={phoneTransferHistory}
+        {transferHistoryReady}
+        {transferHistoryBusy}
+        onClearTransferHistory={requestClearTransferHistory}
         {clipboard}
-        bind:draft={clipboardDraft}
+        bind:draft={() => clipboardDraft, editClipboardDraft}
+        onDraftBlur={syncClipboardDraft}
         historyCount={clipboardHistory.length}
+        {metrics}
+        canChooseDirectory={mobileDirectoryPickerAvailable()}
+        receiveDirectoryName={mobileReceiveDirectoryName}
+        actionBusyId={transferActionBusy}
+        downloadingIds={[...mobileDownloading]}
+        startedDownloadKeys={[...mobileBrowserDownloadStarted]}
+        onSendFile={(peer) => startChoose(peer)}
+        onSendFolder={(peer) => startChoose(peer, true)}
+        receiveStorage={androidReceiveStorage}
+        onRequestReceiveStorage={requestAndroidReceiveStorage}
+        onAcceptTransfer={(transfer) => transfer.web ? acceptMobileTransfer(transfer.web) : acceptTransfer(transfer)}
+        onRejectTransfer={(transfer) => transfer.web ? rejectMobileTransfer(transfer.web) : rejectTransfer(transfer)}
+        onCancelTransfer={(transfer) => transfer.web ? cancelMobileTransfer(transfer.web) : cancelTransfer(transfer)}
+        onCancelPrepare={cancelPrepare}
+        onSaveToDirectory={(transfer) => transfer.web && chooseAndDownloadMobileTransfer(transfer.web)}
+        onStartDownload={(transfer, item) => transfer.web && startMobileBrowserDownload(transfer.web, item)}
+        onRetryFailure={retryFailure}
+        onDismissFailure={dismissFailure}
         onPublish={publishClipboard}
+        onReadLocal={readMobileClipboard}
+        onWriteLocal={writeMobileClipboard}
+        onChooseDirectory={chooseMobileReceiveDirectory}
         onOpenHistory={openClipboardHistoryBrowser}
+        onOpenLocation={openHistoryLocation}
       />
-      <TransferPanel {transfers} {prepares} {failures} {transferHistory} {transferHistoryBusy} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} onClearTransferHistory={requestClearTransferHistory} onOpenLocation={openHistoryLocation} onViewLocation={viewHistoryLocation} />
-    </main>
-    <SettingsDialog
-      open={settingsOpen}
-      node={dialogNode}
-      snapshot={dialogSnapshot}
-      remote={dialogRemote}
-      settingsDisabled={dialogSettingsDisabled}
-      connectionError={remoteSettings?.error ?? ''}
-      feedback={settingsFeedback}
-      {restartBusy}
-      onReconnect={() => remoteSettings && connectRemoteSettings(remoteSettings.peer, true)}
-      onSync={() => toggleSync(true)}
-      onAutostart={() => toggleAutostart(true)}
-      onToggleMonitor={() => toggleMonitorVisibility(true)}
-      onToggleMonitorLock={() => toggleMonitorLock(true)}
-      onRestart={restartManagedNode}
-      {remoteFileAccess}
-      {remoteFileAccessBusy}
-      onFrequency={setUpdateFrequency}
-      onCheckUpdates={checkForUpdates}
-      onReceiveMode={setReceiveMode}
-      onChooseDirectory={() => chooseReceiveDirectory()}
-      onHistoryMode={setClipboardHistoryMode}
-      onHistoryValue={setClipboardHistoryValue}
-      onRemoteFileAccess={setRemoteFileAccess}
-      onAllowRemoteTerminal={isDesktopWindow && !remoteSettings ? allowRemoteTerminal : null}
-      onClose={() => closeSettings()}
-    />
+    {/await}
+  {:else if desktopUi}
+    {#await desktopUi then desktop}
+      <desktop.AppHeader
+        {node}
+        {remoteTarget}
+        {remoteAddress}
+        remoteAddressLive={!!activeBaseUrl && statusKind !== 'error'}
+        {headless}
+        {serviceControlError}
+        {status}
+        {statusKind}
+        {syncEnabled}
+        {autostartEnabled}
+        {settingsReady}
+        {settingsDisabled}
+        onSync={() => toggleSync()}
+        onAutostart={() => toggleAutostart()}
+        onSettings={openSettings}
+        {terminalCount}
+        {terminalVisible}
+        onTerminal={() => {
+          if (terminalVisible) terminalVisible = false;
+          else if (headless && remoteTarget) terminalWorkspace.showPeer({ peerId: remoteTarget.node_id, name: remoteTarget.node_name });
+          else terminalWorkspace.showWorkspace();
+        }}
+        onOpenProject={openProjectPage}
+        onBack={returnToLocal}
+        onCopyAddress={copyAccessAddress}
+      />
+      {#if isDesktopWindow && node && !headless && !clipboardStatus.available}
+        <div class="platform-notice" role="status">{clipboardStatus.message ?? '系统剪贴板暂不可用'}{clipboardStatus.retrying ? '（正在重试）' : ''}；共享内容仍可在设备间同步。</div>
+      {/if}
+      <desktop.TerminalWorkspace bind:this={terminalWorkspace} bind:visible={terminalVisible} bind:count={terminalCount} peers={remoteMode ? null : peers} />
+      <main class="app-main" hidden={terminalVisible || (remoteMode && !node)}>
+        <desktop.DevicePanel
+          peers={peers}
+          homeNodeId={localNodeId}
+          activePeerIds={activeLinkPeers}
+          {mobileSessions}
+          savedAddresses={savedNodeUrls}
+          draggingKey={dragPeer}
+          addOpen={addDeviceOpen}
+          bind:manualAddress
+          onToggleAdd={() => (addDeviceOpen = !addDeviceOpen)}
+          onConnect={connectManualPeer}
+          onConnectSaved={connectSavedPeer}
+          onOpenPeer={openRemotePeer}
+          onSettings={remoteMode ? null : openPeerSettings}
+          onTerminal={remoteMode ? null : openPeerTerminal}
+          onMobileAccess={openMobileAccess}
+          onSendPeer={(peer) => startChoose(peer)}
+          onSendPeerFolder={(peer) => startChoose(peer, true)}
+          onDetails={selectMetricsPeer}
+          onSendMobile={(session) => startChooseMobile(session)}
+          onSendMobileFolder={(session) => startChooseMobile(session, true)}
+          onDragEnter={(key) => (dragPeer = key)}
+          onDragLeave={(key) => { if (dragPeer === key) dragPeer = ''; }}
+          onDropPeer={(peer, event) => dropFiles({ peer }, event)}
+          onDropMobile={(mobile, event) => dropFiles({ mobile }, event)}
+          allowFolderSend={!remoteMode}
+        />
+        <desktop.HardwarePanel
+          remote={remoteMode}
+          showMonitorControls={!headless}
+          metrics={metrics}
+          {monitorLocked}
+          {monitorVisible}
+          {settingsDisabled}
+          canClickThrough={monitorCapabilities.can_click_through}
+          onToggleLock={() => toggleMonitorLock()}
+          onToggleVisible={() => toggleMonitorVisibility()}
+        />
+        <desktop.ClipboardPanel
+          {headless}
+          {clipboard}
+          bind:draft={() => clipboardDraft, editClipboardDraft}
+          onDraftBlur={syncClipboardDraft}
+          historyCount={clipboardHistory.length}
+          onPublish={publishClipboard}
+          onOpenHistory={openClipboardHistoryBrowser}
+        />
+        <desktop.TransferPanel {transfers} {prepares} {failures} {transferHistory} {transferHistoryBusy} {remoteMode} onAccept={acceptTransfer} onReject={rejectTransfer} onRetry={retryFailure} onDismissFailure={dismissFailure} onCancelPrepare={cancelPrepare} onClearTransferHistory={requestClearTransferHistory} onOpenLocation={openHistoryLocation} onViewLocation={viewHistoryLocation} />
+      </main>
+      <desktop.SettingsDialog
+        open={settingsOpen}
+        node={dialogNode}
+        snapshot={dialogSnapshot}
+        remote={dialogRemote}
+        settingsDisabled={dialogSettingsDisabled}
+        connectionError={remoteSettings?.error ?? ''}
+        feedback={settingsFeedback}
+        {restartBusy}
+        onReconnect={() => remoteSettings && connectRemoteSettings(remoteSettings.peer, true)}
+        onSync={() => toggleSync(true)}
+        onAutostart={() => toggleAutostart(true)}
+        onToggleMonitor={() => toggleMonitorVisibility(true)}
+        onToggleMonitorLock={() => toggleMonitorLock(true)}
+        onRestart={restartManagedNode}
+        {remoteFileAccess}
+        {remoteFileAccessBusy}
+        onFrequency={setUpdateFrequency}
+        onCheckUpdates={checkForUpdates}
+        onReceiveMode={setReceiveMode}
+        onChooseDirectory={() => chooseReceiveDirectory()}
+        onHistoryMode={setClipboardHistoryMode}
+        onHistoryValue={setClipboardHistoryValue}
+        onRemoteFileAccess={setRemoteFileAccess}
+        onAllowRemoteTerminal={isDesktopWindow && !remoteSettings ? allowRemoteTerminal : null}
+        onClose={() => closeSettings()}
+      />
 
-    <MobileAccessDialog
-      open={mobileAccessOpen}
-      nodeReady={!!node}
-      addresses={mobileAddresses}
-      {selectedAddress}
-      {mobileUrl}
-      qrImage={mobileQr && mobileQr.url === mobileUrl ? mobileQr.image : ''}
-      secureUrl={secureMobileUrl ?? ''}
-      caUrl={mobileAddress ? apiUrl('/api/v1/mobile/ca', mobileAddress.url) : ''}
-      onSelect={(url) => (selectedAddress = url)}
-      onClose={() => (mobileAccessOpen = false)}
-    />
-    <MetricsDetailDialog
-      open={metricsPeerOpen && !!selectedMetricsPeer}
-      peer={selectedMetricsPeer}
-      onClose={() => (metricsPeerOpen = false)}
-    />
-    <RemoteFileBrowser
-      open={browseOpen}
-      mode={browseMode}
-      target={browseReceiveSettings?.scope.target ?? activeBaseUrl}
-      targetLabel={browseReceiveSettings ? dialogRemote?.name ?? '' : node?.node_name ?? remoteTarget?.node_name ?? ''}
-      targetAddress={browseReceiveSettings ? dialogRemote?.address ?? '' : remoteAddress}
-      startPath={browseStartPath}
-      onConfirm={confirmBrowse}
-      onFallback={browseMode === 'directory' ? requestManualAcceptPath : null}
-      onClose={closeBrowse}
-    />
-    <PromptDialog
-      open={!!pathPrompt}
-      title={pathPrompt?.title ?? ''}
-      subtitle={pathPrompt?.settings ? dialogRemote?.address ?? '' : remoteAddress}
-      remote={!!pathPrompt && (pathPrompt.settings || remoteMode)}
-      label="接收目录"
-      initialValue={pathPrompt?.initial ?? ''}
-      onSubmit={(value) => resolvePathPrompt(value)}
-      onClose={() => resolvePathPrompt(null)}
-    />
+      <desktop.MobileAccessDialog
+        open={mobileAccessOpen}
+        nodeReady={!!node}
+        addresses={mobileAddresses}
+        {selectedAddress}
+        {mobileUrl}
+        qrImage={mobileQr && mobileQr.url === mobileUrl ? mobileQr.image : ''}
+        secureUrl={secureMobileUrl ?? ''}
+        caUrl={mobileAddress ? apiUrl('/api/v1/mobile/ca', mobileAddress.url) : ''}
+        onSelect={(url) => (selectedAddress = url)}
+        onClose={() => (mobileAccessOpen = false)}
+      />
+      <desktop.MetricsDetailDialog
+        open={metricsPeerOpen && !!selectedMetricsPeer}
+        peer={selectedMetricsPeer}
+        onClose={() => (metricsPeerOpen = false)}
+      />
+      <desktop.RemoteFileBrowser
+        open={browseOpen}
+        mode={browseMode}
+        target={browseReceiveSettings?.scope.target ?? activeBaseUrl}
+        targetLabel={browseReceiveSettings ? dialogRemote?.name ?? '' : node?.node_name ?? remoteTarget?.node_name ?? ''}
+        targetAddress={browseReceiveSettings ? dialogRemote?.address ?? '' : remoteAddress}
+        startPath={browseStartPath}
+        onConfirm={confirmBrowse}
+        onFallback={browseMode === 'directory' ? requestManualAcceptPath : null}
+        onClose={closeBrowse}
+      />
+      <desktop.PromptDialog
+        open={!!pathPrompt}
+        title={pathPrompt?.title ?? ''}
+        subtitle={pathPrompt?.settings ? dialogRemote?.address ?? '' : remoteAddress}
+        remote={!!pathPrompt && (pathPrompt.settings || remoteMode)}
+        label="接收目录"
+        initialValue={pathPrompt?.initial ?? ''}
+        onSubmit={(value) => resolvePathPrompt(value)}
+        onClose={() => resolvePathPrompt(null)}
+      />
+    {/await}
   {/if}
   <ClipboardHistoryDialog
     open={clipboardHistoryOpen}

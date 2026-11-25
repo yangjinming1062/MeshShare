@@ -1,10 +1,10 @@
 use super::{
     bind_addresses, bindable_addresses, default_node_name, interface_rank, is_cellular_interface,
     is_placeholder_node_name, load_or_create_config, load_or_create_config_with_hostname,
-    mobile_ca_url, network_addresses, network_addresses_for_bound,
+    mobile_ca_url, network_addresses, network_addresses_for_bound, peer_channel,
     prune_clipboard_history_records_with_limit, sync_node_name, valid_history_delete_ids,
-    NodeProfile, NodeRuntime, PeerEndpoint, PeerEndpointSource, UpdateFrequency,
-    CLIPBOARD_HISTORY_FILE, CLIPBOARD_PAYLOAD_DIR, DESKTOP_TEMP_REGISTRY_FILE,
+    ClipboardSnapshotRead, NodeProfile, NodeRuntime, PeerEndpoint, PeerEndpointSource,
+    UpdateFrequency, CLIPBOARD_HISTORY_FILE, CLIPBOARD_PAYLOAD_DIR, DESKTOP_TEMP_REGISTRY_FILE,
     MAX_MOBILE_TRANSFER_RECORDS, TRANSFER_ACCEPTED_IDLE_TIMEOUT_MS, TRANSFER_ACTIVITY_TIMEOUT_MS,
     TRANSFER_HISTORY_FILE, TRANSFER_HISTORY_LIMIT,
 };
@@ -12,16 +12,15 @@ use crate::model::{
     AddressInfo, ClipboardEvent, ClipboardHistoryMode, ClipboardSnapshot, DiskMetrics,
     GpuMemoryKind, GpuMetrics, HardwareMetrics, Hlc, LoadAverage, NodeInfo, PeerInfo, ReceiveMode,
     TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
-    CLIPBOARD_VIEW_CAPABILITY, MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS, MAX_TRANSFER_RECORDS,
-    METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY, METRICS_SYSTEM_CAPABILITY,
-    METRICS_SYSTEM_VIEW_CAPABILITY, TRANSFER_HISTORY_CAPABILITY,
+    CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY, MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS,
+    MAX_TRANSFER_RECORDS, METRICS_GPU_VIEW_CAPABILITY, METRICS_NETWORK_CAPABILITY,
+    METRICS_SYSTEM_CAPABILITY, METRICS_SYSTEM_VIEW_CAPABILITY, TRANSFER_HISTORY_CAPABILITY,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 fn test_peer(node_id: &str, capabilities: Vec<String>) -> PeerInfo {
@@ -820,7 +819,7 @@ fn monitor_position_lock_and_visibility_are_persisted() {
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
     runtime
-        .set_monitor_position(crate::model::MonitorPosition { x: 123, y: 456 })
+        .set_monitor_position(crate::model::MonitorPosition::new(123, 456))
         .expect("save monitor position");
     runtime.set_monitor_locked(true).expect("save monitor lock");
     runtime
@@ -831,7 +830,7 @@ fn monitor_position_lock_and_visibility_are_persisted() {
         .expect("restore runtime");
     assert_eq!(
         restored.monitor_position(),
-        Some(crate::model::MonitorPosition { x: 123, y: 456 })
+        Some(crate::model::MonitorPosition::new(123, 456))
     );
     assert!(restored.monitor_locked());
     assert!(!restored.monitor_visible());
@@ -850,7 +849,7 @@ fn failed_monitor_settings_write_does_not_mutate_runtime_state() {
     assert!(runtime.set_monitor_locked(true).is_err());
     assert!(!runtime.monitor_locked());
     assert!(runtime
-        .set_monitor_position(crate::model::MonitorPosition { x: 10, y: 20 })
+        .set_monitor_position(crate::model::MonitorPosition::new(10, 20))
         .is_err());
     assert_eq!(runtime.monitor_position(), None);
     assert!(runtime.set_autostart_enabled(false).is_err());
@@ -871,14 +870,14 @@ fn metrics_are_only_sent_to_capable_peers() {
     let path = temp_data_dir();
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     runtime.set_peer(test_peer(
         "capable",
         vec![METRICS_SYSTEM_CAPABILITY.to_string()],
     ));
     runtime.add_peer_channel("capable".to_string(), tx);
     runtime.set_peer(test_peer("no-metrics", Vec::new()));
-    let (no_metrics_tx, mut no_metrics_rx) = mpsc::channel(8);
+    let (no_metrics_tx, mut no_metrics_rx) = peer_channel(8);
     runtime.add_peer_channel("no-metrics".to_string(), no_metrics_tx);
     runtime.publish_metrics(HardwareMetrics {
         node_id: runtime.node_id(),
@@ -917,7 +916,7 @@ fn network_metric_peers_receive_only_network_fields() {
     let path = temp_data_dir();
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     runtime.set_peer(test_peer(
         "network-only",
         vec![METRICS_NETWORK_CAPABILITY.to_string()],
@@ -984,7 +983,7 @@ fn android_view_peers_receive_desktop_system_and_gpu_metrics() {
     let path = temp_data_dir();
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     runtime.set_peer(test_peer(
         "android",
         vec![
@@ -1612,7 +1611,7 @@ fn history_deletions_queue_for_offline_peer_and_flush_on_reconnect() {
             .cloned(),
         Some(vec!["offline-one".to_string()])
     );
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     restored.set_peer(named_peer(
         "peer-offline",
         "离线电脑",
@@ -1730,7 +1729,7 @@ fn disconnect_removes_peer_and_channel_state() {
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
     runtime.set_peer(test_peer("peer", Vec::new()));
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = peer_channel(1);
     runtime.add_peer_channel("peer".to_string(), tx);
     runtime.remove_peer("peer");
     assert!(runtime.peers_snapshot().is_empty());
@@ -1771,11 +1770,11 @@ fn competing_peer_session_preserves_the_active_endpoint() {
         .expect("create runtime");
     let mut first = test_peer("peer", Vec::new());
     first.endpoint = Some("ws://100.64.0.20:37880/api/v1/ws".to_string());
-    let (first_tx, _first_rx) = mpsc::channel(1);
+    let (first_tx, _first_rx) = peer_channel(1);
     let session = runtime
         .attach_peer_session(first.clone(), first_tx)
         .expect("first session");
-    let (second_tx, _second_rx) = mpsc::channel(1);
+    let (second_tx, _second_rx) = peer_channel(1);
     assert!(runtime
         .attach_peer_session(test_peer("peer", Vec::new()), second_tx)
         .is_none());
@@ -2300,7 +2299,7 @@ fn clipboard_queue_overflow_schedules_latest_snapshot_resync() {
     let event = runtime
         .create_local_clipboard_named(Some("latest".to_string()), None, "local".to_string())
         .expect("create clipboard event");
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, mut rx) = peer_channel(1);
     runtime.set_peer(test_peer("peer", vec!["clipboard.text".to_string()]));
     runtime.add_peer_channel("peer".to_string(), tx);
     assert!(runtime.send_to_peer("peer", WireMessage::Ping { at_ms: 1 }));
@@ -2322,6 +2321,41 @@ fn clipboard_queue_overflow_schedules_latest_snapshot_resync() {
 }
 
 #[test]
+fn clipboard_queue_bounds_payload_bytes_and_recovers_the_latest_snapshot() {
+    let path = temp_data_dir();
+    let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into()).unwrap();
+    let latest = runtime
+        .create_local_clipboard_named(Some("latest".to_string()), None, "local".to_string())
+        .unwrap();
+    let (tx, mut rx) = peer_channel(8);
+    runtime.set_peer(test_peer("peer", vec!["clipboard.text".to_string()]));
+    runtime.add_peer_channel("peer".to_string(), tx);
+    let mut large: ClipboardEvent = latest.clone().into();
+    large.text = Some("x".repeat(CLIPBOARD_TEXT_LIMIT).into());
+    let update = WireMessage::ClipboardUpdate { event: large };
+    assert!(runtime.send_to_peer("peer", update.clone()));
+    assert!(runtime.send_to_peer("peer", update.clone()));
+    assert!(!runtime.send_to_peer("peer", update));
+    assert!(!runtime.flush_clipboard_resync("peer"));
+    assert!(runtime.send_to_peer("peer", WireMessage::Ping { at_ms: 1 }));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(WireMessage::ClipboardUpdate { .. })
+    ));
+    assert!(runtime.flush_clipboard_resync("peer"));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(WireMessage::ClipboardUpdate { .. })
+    ));
+    assert!(matches!(rx.try_recv(), Ok(WireMessage::Ping { at_ms: 1 })));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(WireMessage::ClipboardSnapshot { snapshot }) if snapshot.event_id == latest.event_id
+    ));
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
 fn clipboard_messages_skip_peers_without_clipboard_capability() {
     let path = temp_data_dir();
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
@@ -2329,7 +2363,7 @@ fn clipboard_messages_skip_peers_without_clipboard_capability() {
     let event = runtime
         .create_local_clipboard_named(Some("manual".to_string()), None, "local".to_string())
         .expect("create clipboard event");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     runtime.set_peer(test_peer(
         "android",
         vec![
@@ -2364,7 +2398,7 @@ fn clipboard_messages_reach_view_only_peers() {
     let event = runtime
         .create_local_clipboard_named(Some("view".to_string()), None, "local".to_string())
         .expect("create clipboard event");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     runtime.set_peer(test_peer(
         "android",
         vec![CLIPBOARD_VIEW_CAPABILITY.to_string()],
@@ -2390,7 +2424,7 @@ fn concurrent_clipboard_updates_keep_the_newest_hlc() {
     let path = temp_data_dir();
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
-    let mut updates = runtime.subscribe();
+    let mut updates = runtime.subscribe_clipboard();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let older = ClipboardEvent {
         event_id: "older".to_string(),
@@ -2400,7 +2434,7 @@ fn concurrent_clipboard_updates_keep_the_newest_hlc() {
             logical: 0,
             node_id: "peer-a".to_string(),
         },
-        text: Some("older".to_string()),
+        text: Some("older".into()),
         image_png: None,
         updated_at_ms: 1,
     };
@@ -2412,7 +2446,7 @@ fn concurrent_clipboard_updates_keep_the_newest_hlc() {
             logical: 0,
             node_id: "peer-b".to_string(),
         },
-        text: Some("newer".to_string()),
+        text: Some("newer".into()),
         image_png: None,
         updated_at_ms: 2,
     };
@@ -2439,14 +2473,12 @@ fn concurrent_clipboard_updates_keep_the_newest_hlc() {
             .as_deref(),
         Some("newer")
     );
-    let mut delivered = Vec::new();
-    while let Ok(WireMessage::ClipboardUpdate { event }) = updates.try_recv() {
-        delivered.push(event);
-    }
-    assert!(delivered
-        .windows(2)
-        .all(|pair| pair[0].clock.compare(&pair[1].clock).is_lt()));
-    assert_eq!(delivered.last().unwrap().event_id, "newer");
+    assert!(updates.has_changed().unwrap());
+    assert_eq!(
+        updates.borrow_and_update().as_ref().unwrap().event_id,
+        "newer"
+    );
+    assert!(!updates.has_changed().unwrap());
     let _ = std::fs::remove_dir_all(path);
 }
 
@@ -2527,7 +2559,7 @@ fn persisted_current_snapshot_advances_clock_after_restart() {
             event_id: "future-event".to_string(),
             source_node_id: "peer".to_string(),
             clock: future_clock,
-            text: Some("future".to_string()),
+            text: Some("future".into()),
             image_png: None,
             updated_at_ms: crate::clock::now_millis(),
         },
@@ -2580,7 +2612,15 @@ fn replaying_current_snapshot_does_not_recreate_cleared_history() {
     restored
         .clear_clipboard_history()
         .expect("clear clipboard history");
-    assert!(!restored.receive_clipboard("peer", current));
+    assert!(!restored.receive_clipboard("peer", current.clone()));
+    let mut replay = current;
+    replay.clock = restored.clock.tick();
+    replay.text = Some("changed under the same ID".into());
+    assert!(!restored.receive_clipboard("peer", replay));
+    assert_eq!(
+        restored.clipboard_snapshot().unwrap().text.as_deref(),
+        Some("current")
+    );
     assert!(restored.clipboard_history_list().items.is_empty());
     let _ = std::fs::remove_dir_all(path);
 }
@@ -2621,6 +2661,72 @@ fn clipboard_history_persists_deduplicates_and_restores_current() {
     assert_eq!(cleared, 2);
     assert!(restored.clipboard_history_list().items.is_empty());
     assert!(restored.clipboard_snapshot().is_some());
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
+fn clipboard_preview_does_not_block_snapshots_or_cache_a_replaced_image() {
+    let path = temp_data_dir();
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    executor.block_on(async {
+        let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into()).unwrap();
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgba8(800, 400)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let image = runtime
+            .create_local_clipboard_named(None, Some(png), "local".into())
+            .unwrap();
+        // 暂停阻塞线程池，使快照替换发生在预览取得载荷之后、编码完成之前。
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = wait.recv();
+        });
+        let known_clock = format!(
+            "{}:{}:{}",
+            image.clock.physical_ms, image.clock.logical, image.clock.node_id
+        );
+        let known = Some((image.event_id.as_str(), known_clock.as_str()));
+        let mut preview = std::pin::pin!(
+            runtime.clipboard_preview_png(image.event_id.clone(), Some(&known_clock))
+        );
+        assert!(futures_util::poll!(&mut preview).is_pending());
+        let mut duplicate = std::pin::pin!(
+            runtime.clipboard_preview_png(image.event_id.clone(), Some(&known_clock))
+        );
+        assert!(futures_util::poll!(&mut duplicate).is_pending());
+        assert!(runtime.clipboard.try_lock().is_some());
+        assert!(matches!(
+            runtime.read_clipboard_snapshot(known),
+            ClipboardSnapshotRead::Unchanged
+        ));
+        let mut text = runtime
+            .create_local_clipboard_named(Some("new".into()), None, "local".into())
+            .unwrap();
+        // 模拟事件 ID 已离开短期去重表后被复用，旧快照版本仍应失效。
+        runtime.seen_events.lock().remove(&image.event_id);
+        text.event_id.clone_from(&image.event_id);
+        text.clock = runtime.clock.tick();
+        assert!(runtime.receive_clipboard("peer", text.clone()));
+        assert!(matches!(
+            runtime.read_clipboard_snapshot(known),
+            ClipboardSnapshotRead::Current(Some(snapshot)) if snapshot.clock == text.clock
+        ));
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(preview.await.unwrap().is_none());
+        assert!(duplicate.await.unwrap().is_none());
+        assert!(runtime
+            .clipboard_preview_png(text.event_id, None)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(runtime.clipboard.lock().preview_png.is_none());
+    });
     let _ = std::fs::remove_dir_all(path);
 }
 
@@ -2802,7 +2908,7 @@ fn older_hlc_event_is_kept_in_history_without_replacing_current() {
                 logical: 0,
                 node_id: "peer".to_string(),
             },
-            text: Some("old".to_string()),
+            text: Some("old".into()),
             image_png: None,
             updated_at_ms: 1,
         },
@@ -3119,7 +3225,7 @@ async fn accepted_transfer_without_upload_fails_and_notifies_source() {
     let data_dir = std::env::temp_dir().join(format!("meshshare-accepted-idle-{}", Uuid::new_v4()));
     let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     assert!(runtime.add_peer_channel("source".to_string(), tx));
     let item = outgoing_test_item("payload.bin", b"staged");
     let offer = TransferOffer {
@@ -3333,7 +3439,7 @@ async fn outgoing_paths_stream_original_files_without_copying() {
     hasher.update(&payload);
     let expected_digest = format!("{:x}", hasher.finalize());
 
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     assert!(sender.add_peer_channel(receiver.node_id(), tx));
     let view = sender
         .begin_outgoing_paths(
@@ -3406,7 +3512,7 @@ async fn outgoing_paths_expand_directory_relative_paths() {
     std::fs::write(root.join("sub/b.txt"), b"beta").expect("write second file");
 
     let target = "folder-peer";
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     assert!(sender.add_peer_channel(target.to_string(), tx));
     let view = sender
         .begin_outgoing_paths(
@@ -3447,7 +3553,7 @@ async fn outgoing_paths_fail_when_source_changes() {
     let (receiver, sender, _address, server, sender_dir) = outgoing_receiver_fixture().await;
     let source_file = sender_dir.join("changing.bin");
     std::fs::write(&source_file, b"stable").expect("write source file");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = peer_channel(8);
     assert!(sender.add_peer_channel(receiver.node_id(), tx));
     let view = sender
         .begin_outgoing_paths(
@@ -3517,7 +3623,7 @@ async fn headless_stores_and_relays_a_remote_event_once_without_writing_a_system
             updated_at_ms: 1,
         },
     };
-    let (sender, mut second) = mpsc::channel(4);
+    let (sender, mut second) = peer_channel(4);
     nas.set_peer(test_peer("b", vec!["clipboard.text".into()]));
     assert!(nas.add_peer_channel("b".into(), sender));
     for source in ["a", "a", "b"] {

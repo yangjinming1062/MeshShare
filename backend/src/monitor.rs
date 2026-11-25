@@ -1,7 +1,11 @@
 //! 桌面悬浮条的临时显示状态；用户偏好仍由节点配置持有。
 
+#[cfg(not(target_os = "linux"))]
+use crate::desktop::monitor_window;
 #[cfg(target_os = "linux")]
 use crate::linux::fullscreen as platform;
+#[cfg(target_os = "linux")]
+use crate::linux::monitor_window;
 #[cfg(target_os = "macos")]
 use crate::macos::fullscreen as platform;
 use crate::runtime::NodeRuntime;
@@ -86,7 +90,6 @@ struct Presentation {
 pub(crate) struct Controller(Mutex<Presentation>);
 
 impl Presentation {
-    #[cfg(target_os = "windows")]
     fn reset_placement(&mut self) {
         self.applied = None;
         self.target = None;
@@ -126,10 +129,9 @@ fn log_change(previous: &mut Option<String>, error: Option<String>, context: &st
 
 /// 仅在主线程调用；不要用 GTK 的 is_visible() 判断异步 show/hide 是否完成。
 fn reconcile(app: &AppHandle, reapply: bool) {
-    let (Some(controller), Some(node), Some(window)) = (
+    let (Some(controller), Some(node)) = (
         app.try_state::<Controller>(),
         app.try_state::<Arc<NodeRuntime>>(),
-        app.get_webview_window("monitor"),
     ) else {
         return;
     };
@@ -137,10 +139,30 @@ fn reconcile(app: &AppHandle, reapply: bool) {
         return;
     }
     let mut state = controller.0.lock();
-    let desired = state.fullscreen.presentation(
-        node.monitor_visible(),
-        crate::effective_monitor_locked(app, &node),
-    );
+    let visible = node.monitor_visible();
+    if !visible {
+        state.reset_placement();
+        if let Some(window) = monitor_window::get(app) {
+            #[cfg(target_os = "linux")]
+            monitor_window::release_window(&window, &node);
+            #[cfg(not(target_os = "linux"))]
+            if let Err(error) = monitor_window::release_window(&window, &node) {
+                let _ = window.hide();
+                eprintln!("释放悬浮条窗口失败：{error:#}");
+            }
+        }
+        return;
+    }
+    let Some(window) = monitor_window::get(app) else {
+        return;
+    };
+    let desired = state
+        .fullscreen
+        .presentation(visible, crate::effective_monitor_locked(app, &node));
+    #[cfg(target_os = "linux")]
+    if desired.0 {
+        monitor_window::refresh(&window, &node);
+    }
     if reapply {
         state.applied = None;
     }
@@ -149,6 +171,9 @@ fn reconcile(app: &AppHandle, reapply: bool) {
     }
     let result = (|| -> Result<()> {
         if crate::current_monitor_capabilities(app).can_click_through {
+            #[cfg(target_os = "linux")]
+            monitor_window::set_click_through(&window, desired.1);
+            #[cfg(not(target_os = "linux"))]
             window.set_ignore_cursor_events(desired.1)?;
         }
         // Win32 的穿透样式变更也可能按 Tao 的初始隐藏标记隐藏窗口，因此每次都提交显隐。
@@ -157,7 +182,7 @@ fn reconcile(app: &AppHandle, reapply: bool) {
         #[cfg(not(target_os = "windows"))]
         if state.applied.map(|value| value.0) != Some(desired.0) {
             #[cfg(target_os = "linux")]
-            platform::set_visible(&window, desired.0)?;
+            platform::set_visible(&window, desired.0);
             #[cfg(not(target_os = "linux"))]
             if desired.0 {
                 window.show()?;
@@ -212,9 +237,9 @@ fn on_main<T: Send + 'static>(
 }
 
 fn capture(app: &AppHandle, restore_position: bool) -> Result<Option<Target>> {
-    let window = app
-        .get_webview_window("monitor")
-        .context("悬浮条窗口不存在")?;
+    let Some(window) = monitor_window::get(app) else {
+        return Ok(None);
+    };
     #[cfg(target_os = "windows")]
     if restore_position && platform::needs_repositioning(&window)? {
         let controller = app
@@ -225,12 +250,34 @@ fn capture(app: &AppHandle, restore_position: bool) -> Result<Option<Target>> {
             .context("本机节点不存在")?;
         // 重新定位后，即使仍是同一块屏幕，也要重新检测后再显示。
         controller.0.lock().reset_placement();
-        crate::desktop::monitor_window::position_monitor_window(&window, &node)
-            .context("恢复悬浮条位置")?;
+        monitor_window::position_monitor_window(&window, &node).context("恢复悬浮条位置")?;
     }
     #[cfg(not(target_os = "windows"))]
     let _ = restore_position;
     platform::capture(&window)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_window(app: &AppHandle, runtime: &NodeRuntime) -> Result<()> {
+    on_main(app, runtime, monitor_window::ensure_window)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_window(app: &AppHandle, runtime: &NodeRuntime) -> Result<()> {
+    if monitor_window::get(app).is_some() {
+        return Ok(());
+    }
+    // 从检测线程创建窗口，让主线程继续处理原生 WebView 的初始化消息。
+    crate::desktop::create_window(app, "monitor")?;
+    on_main(app, runtime, |app| {
+        let node = app.state::<Arc<NodeRuntime>>();
+        if !node.monitor_visible() {
+            reconcile(app, false);
+        } else if let Some(window) = monitor_window::get(app) {
+            app.state::<Controller>().0.lock().reset_placement();
+            monitor_window::initialize(&window, &node);
+        }
+    })
 }
 
 pub(crate) fn start(app: AppHandle, runtime: Arc<NodeRuntime>) -> Result<()> {
@@ -238,8 +285,24 @@ pub(crate) fn start(app: AppHandle, runtime: Arc<NodeRuntime>) -> Result<()> {
         .name("meshshare-monitor".into())
         .spawn(move || {
             let mut probe = platform::Probe::default();
+            let mut creation_error = None;
             while !runtime.stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 let started = Instant::now();
+                if !runtime.monitor_visible() {
+                    std::thread::sleep(SAMPLE_INTERVAL);
+                    continue;
+                }
+                let creation = ensure_window(&app, &runtime);
+                let failed = creation.is_err();
+                log_change(
+                    &mut creation_error,
+                    creation.err().map(|error| format!("{error:#}")),
+                    "创建悬浮条窗口",
+                );
+                if failed {
+                    std::thread::sleep(SAMPLE_INTERVAL);
+                    continue;
+                }
                 let captured = match on_main(&app, &runtime, |app| capture(app, true)) {
                     Ok(value) => value,
                     Err(error) => {

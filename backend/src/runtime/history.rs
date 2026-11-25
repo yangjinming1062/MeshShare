@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 const CLIPBOARD_THUMBNAIL_WIDTH: u32 = 96;
 const CLIPBOARD_THUMBNAIL_HEIGHT: u32 = 72;
 
+fn clipboard_clock_key(clock: &crate::model::Hlc) -> String {
+    format!("{}:{}:{}", clock.physical_ms, clock.logical, clock.node_id)
+}
+
 pub(super) fn clipboard_payload_dir(data_dir: &Path) -> PathBuf {
     data_dir.join(CLIPBOARD_PAYLOAD_DIR)
 }
@@ -208,10 +212,7 @@ pub(super) fn persist_clipboard_current(
     data_dir: &Path,
     snapshot: &ClipboardSnapshot,
 ) -> anyhow::Result<()> {
-    crate::fsutil::atomic_write(
-        &data_dir.join(CLIPBOARD_CURRENT_FILE),
-        &serde_json::to_vec(snapshot)?,
-    )
+    crate::fsutil::atomic_write_json(&data_dir.join(CLIPBOARD_CURRENT_FILE), snapshot)
 }
 
 pub(super) fn load_clipboard_current(data_dir: &Path) -> Option<ClipboardSnapshot> {
@@ -264,7 +265,7 @@ pub(super) fn write_clipboard_history_record(
         content_hash,
         text_path,
         image_path,
-        text_len: snapshot.text.as_ref().map_or(0, String::len),
+        text_len: snapshot.text.as_deref().map_or(0, str::len),
         image_len: image.map_or(0, |bytes| bytes.len()),
     })
 }
@@ -293,8 +294,8 @@ pub(super) fn load_history_snapshot(
         source_node_id: record.source_node_id.clone(),
         source_name: record.source_name.clone(),
         clock: record.clock.clone(),
-        text,
-        image_png,
+        text: text.map(Into::into),
+        image_png: image_png.map(Into::into),
         updated_at_ms: record.updated_at_ms,
     })
 }
@@ -562,6 +563,12 @@ impl NodeRuntime {
         snapshot: ClipboardSnapshot,
         source: ClipboardSource<'_>,
     ) -> Option<ClipboardSnapshot> {
+        let newer = match self.clipboard.lock().snapshot.as_ref() {
+            // 当前事件在重启或去重窗口过期后仍只应用一次。
+            Some(current) if current.event_id == snapshot.event_id => return None,
+            Some(current) => snapshot.clock.compare(&current.clock).is_gt(),
+            None => true,
+        };
         let now = now_millis();
         let mut seen = self.seen_events.lock();
         seen.retain(|_, timestamp| now.saturating_sub(*timestamp) < 10 * 60 * 1000);
@@ -588,23 +595,8 @@ impl NodeRuntime {
             seen.remove(&oldest);
         }
         drop(seen);
-        let (replayed_current, newer) =
-            self.clipboard
-                .lock()
-                .snapshot
-                .as_ref()
-                .map_or((false, true), |current| {
-                    (
-                        current.event_id == snapshot.event_id,
-                        snapshot.clock.compare(&current.clock).is_gt(),
-                    )
-                });
-        if !replayed_current {
-            if let Err(error) =
-                self.upsert_clipboard_history_locked(&snapshot, image.as_deref(), now)
-            {
-                eprintln!("保存剪贴板历史失败：{error}");
-            }
+        if let Err(error) = self.upsert_clipboard_history_locked(&snapshot, image.as_deref(), now) {
+            eprintln!("保存剪贴板历史失败：{error}");
         }
         if !newer {
             return None;
@@ -616,6 +608,7 @@ impl NodeRuntime {
         {
             let mut clipboard = self.clipboard.lock();
             clipboard.snapshot = Some(snapshot.clone());
+            clipboard.preview_png = None;
             #[cfg(not(target_os = "android"))]
             {
                 clipboard.pending_system_write = self.profile == NodeProfile::Desktop
@@ -625,10 +618,9 @@ impl NodeRuntime {
                 }
             }
         }
-        let update = WireMessage::ClipboardUpdate {
-            event: snapshot.clone().into(),
-        };
-        self.publish_event(update.clone());
+        let event: ClipboardEvent = snapshot.clone().into();
+        self.clipboard_changes.send_replace(Some(event.clone()));
+        let update = WireMessage::ClipboardUpdate { event };
         match source {
             ClipboardSource::Peer(_) if self.is_android_profile() => {}
             ClipboardSource::Peer(peer_id) => self.send_to_peers_except(Some(peer_id), update),
@@ -731,8 +723,8 @@ impl NodeRuntime {
             source_node_id: self.node_id(),
             source_name,
             clock: self.clock.tick(),
-            text,
-            image_png,
+            text: text.map(Into::into),
+            image_png: image_png.map(Into::into),
             updated_at_ms: now_millis(),
         })
     }
@@ -745,11 +737,79 @@ impl NodeRuntime {
             .as_deref()
             .and_then(|value| BASE64.decode(value).ok());
         let source_name = self.node.read().node_name.clone();
-        self.create_local_clipboard_named(detail.snapshot.text, image, source_name)
+        self.create_local_clipboard_named(
+            detail
+                .snapshot
+                .text
+                .map(crate::model::ClipboardValue::into_string),
+            image,
+            source_name,
+        )
     }
 
     pub fn clipboard_snapshot(&self) -> Option<ClipboardSnapshot> {
         self.clipboard.lock().snapshot.clone()
+    }
+
+    pub(crate) async fn clipboard_preview_png(
+        self: &Arc<Self>,
+        event_id: String,
+        expected_clock: Option<&str>,
+    ) -> Result<Option<axum::body::Bytes>, tokio::task::JoinError> {
+        let worker = self.clipboard_preview_worker.clone().lock_owned().await;
+        let (image, clock) = {
+            let clipboard = self.clipboard.lock();
+            let Some(snapshot) = clipboard
+                .snapshot
+                .as_ref()
+                .filter(|s| s.event_id == event_id)
+            else {
+                return Ok(None);
+            };
+            if expected_clock
+                .is_some_and(|expected| clipboard_clock_key(&snapshot.clock) != expected)
+            {
+                return Ok(None);
+            }
+            if let Some(preview) = &clipboard.preview_png {
+                return Ok(Some(preview.clone()));
+            }
+            let Some(image) = snapshot.image_png.clone() else {
+                return Ok(None);
+            };
+            (image, snapshot.clock.clone())
+        };
+        let runtime = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            // 请求中途断开时，已开始的解码仍持有唯一的预览处理名额。
+            let _worker = worker;
+            let bytes = BASE64.decode(image.as_bytes()).ok()?;
+            let preview = axum::body::Bytes::from(crate::clipboard::clipboard_preview_png(&bytes)?);
+            let mut clipboard = runtime.clipboard.lock();
+            let current = clipboard.snapshot.as_ref()?;
+            if current.event_id != event_id || current.clock != clock {
+                return None;
+            }
+            clipboard.preview_png = Some(preview.clone());
+            Some(preview)
+        })
+        .await
+    }
+
+    pub(crate) fn read_clipboard_snapshot(
+        &self,
+        known: Option<(&str, &str)>,
+    ) -> ClipboardSnapshotRead {
+        let clipboard = self.clipboard.lock();
+        if clipboard.snapshot.as_ref().zip(known).is_some_and(
+            |(snapshot, (known_event_id, known_clock))| {
+                snapshot.event_id == known_event_id
+                    && clipboard_clock_key(&snapshot.clock) == known_clock
+            },
+        ) {
+            return ClipboardSnapshotRead::Unchanged;
+        }
+        ClipboardSnapshotRead::Current(clipboard.snapshot.clone())
     }
 
     #[cfg(all(any(feature = "gui", test), not(target_os = "android")))]

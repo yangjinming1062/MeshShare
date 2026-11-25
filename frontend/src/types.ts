@@ -334,6 +334,7 @@ export type WireMessage =
   | { type: 'Ping'; payload: { at_ms: number } }
   | { type: 'Pong'; payload: { at_ms: number } }
   | { type: 'ClipboardUpdate'; payload: { event: unknown } }
+  | { type: 'ClipboardChanged'; payload: { event_id: string } }
   | { type: 'ClipboardSnapshot'; payload: { snapshot: ClipboardSnapshot } }
   | { type: 'TransferOffer'; payload: { offer: TransferOffer } }
   | { type: 'TransferAction'; payload: { transfer_id: string; action: 'accept' | 'reject' | 'cancel' | 'fail'; reason?: string | null; retry_count: number } }

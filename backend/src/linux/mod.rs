@@ -2,4 +2,5 @@
 
 pub(crate) mod autostart;
 pub(crate) mod fullscreen;
+pub(crate) mod monitor_window;
 pub(crate) mod update;

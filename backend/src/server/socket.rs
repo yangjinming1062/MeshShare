@@ -7,14 +7,13 @@ use crate::runtime::{is_allowed_peer_address, valid_history_delete_ids, NodeRunt
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        ConnectInfo, State, WebSocketUpgrade,
+        ConnectInfo, Query, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap},
     response::IntoResponse,
 };
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::sync::mpsc;
 
 pub(super) const PEER_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_METRIC_GPU_COUNT: usize = 64;
@@ -36,9 +35,15 @@ async fn send_message(writer: &mut SplitSink<WebSocket, Message>, message: WireM
     )
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct WebsocketQuery {
+    clipboard_updates: Option<String>,
+}
+
 pub(super) async fn websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    Query(query): Query<WebsocketQuery>,
     headers: HeaderMap,
     connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> impl IntoResponse {
@@ -50,6 +55,7 @@ pub(super) async fn websocket(
                 state.runtime,
                 connect_info.map(|info| info.0),
                 !headers.contains_key(header::ORIGIN),
+                query.clipboard_updates.as_deref() == Some("notice"),
             )
         })
 }
@@ -59,10 +65,12 @@ async fn handle_socket(
     runtime: Arc<NodeRuntime>,
     remote_address: Option<SocketAddr>,
     native_peer: bool,
+    clipboard_notices: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<WireMessage>(64);
+    let (outgoing_tx, mut outgoing_rx) = crate::runtime::peer_channel(64);
     let mut events = runtime.subscribe();
+    let mut clipboard_changes = runtime.subscribe_clipboard();
     let mut host_changes = runtime.ssh.subscribe_host();
     let hello = WireMessage::Hello {
         node: runtime.node_info(),
@@ -123,6 +131,17 @@ async fn handle_socket(
             }
             _ = host_changes.changed(), if peer_id.is_some() || ui_client => {
                 if !send_message(&mut sender, WireMessage::Hello { node: runtime.node_info() }).await { break; }
+            }
+            _ = clipboard_changes.changed(), if ui_client => {
+                let event = clipboard_changes.borrow_and_update().clone();
+                if let Some(event) = event {
+                    let message = if clipboard_notices {
+                        WireMessage::ClipboardChanged { event_id: event.event_id }
+                    } else {
+                        WireMessage::ClipboardUpdate { event }
+                    };
+                    if !send_message(&mut sender, message).await { break; }
+                }
             }
             outbound = outgoing_rx.recv() => {
                 let Some(message) = outbound else { break };
@@ -257,7 +276,9 @@ pub(crate) async fn handle_wire_message(
             }
             current_peer.map(str::to_string)
         }
-        WireMessage::Pong { .. } => current_peer.map(str::to_string),
+        WireMessage::Pong { .. } | WireMessage::ClipboardChanged { .. } => {
+            current_peer.map(str::to_string)
+        }
         WireMessage::ClipboardUpdate { event } => {
             let peer_id = current_peer?;
             runtime.receive_clipboard(peer_id, event.into_snapshot(String::new()));

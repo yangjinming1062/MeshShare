@@ -36,5 +36,6 @@ export default defineConfig({
   },
   build: {
     target: 'es2022',
+    rollupOptions: { input: { index: 'index.html', monitor: 'monitor.html' } },
   },
 });

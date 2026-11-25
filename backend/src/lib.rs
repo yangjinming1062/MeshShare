@@ -225,7 +225,6 @@ async fn start_node(app: &AppHandle, data_dir: PathBuf) -> anyhow::Result<Arc<No
     #[cfg(target_os = "android")]
     android::network::observe(app, runtime.clone());
     start_workers(&runtime);
-    clipboard::start_monitor(runtime.clone());
     app.manage(runtime.clone());
     Ok(runtime)
 }
@@ -289,6 +288,7 @@ pub fn run() {
             let data_dir = node_data_dir(app.handle());
             let runtime =
                 tauri::async_runtime::block_on(start_node(app.handle(), data_dir.clone()))?;
+            clipboard::start_monitor(runtime.clone());
             if let Err(error) = android::update::app::start(app.handle(), runtime, &data_dir) {
                 eprintln!("启动 Android 更新服务失败：{error:#}");
             }

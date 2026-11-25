@@ -1,4 +1,6 @@
 use anyhow::Result;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// 同目录临时文件名：清理逻辑按 `.tmp-` 后缀识别残留。
@@ -33,44 +35,49 @@ pub(crate) fn remove_dir_if_exists(path: &Path) -> Result<()> {
 
 /// 先写同目录临时文件再重命名，读取方不会看到半份数据。
 pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
-    let temporary = temp_path(path);
-    write_temporary(&temporary, contents, false)?;
-    commit(&temporary, path)
+    atomic_write_with(path, false, |mut file| Ok(file.write_all(contents)?))
+}
+
+pub(crate) fn atomic_write_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    atomic_write_with(path, false, |file| {
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, value)?;
+        Ok(writer.flush()?)
+    })
 }
 
 /// 私钥等敏感文件：写入时把权限收紧到仅当前用户可读写（仅 Unix 生效）。
 pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    atomic_write_with(path, true, |mut file| Ok(file.write_all(contents)?))
+}
+
+fn atomic_write_with(
+    path: &Path,
+    private: bool,
+    write: impl FnOnce(File) -> Result<()>,
+) -> Result<()> {
     let temporary = temp_path(path);
-    write_temporary(&temporary, contents, true)?;
+    if let Err(error) = open_temporary(&temporary, private)
+        .map_err(anyhow::Error::from)
+        .and_then(write)
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
     commit(&temporary, path)
 }
 
-fn write_temporary(temporary: &Path, contents: &[u8], private: bool) -> Result<()> {
-    if let Err(error) = write_contents(temporary, contents, private) {
-        let _ = std::fs::remove_file(temporary);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn write_contents(path: &Path, contents: &[u8], private: bool) -> Result<()> {
+fn open_temporary(path: &Path, private: bool) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     if private {
-        use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.write_all(contents)?;
-        return Ok(());
+        options.mode(0o600);
     }
     #[cfg(not(unix))]
     let _ = private;
-    std::fs::write(path, contents)?;
-    Ok(())
+    options.open(path)
 }
 
 /// 提交临时文件。Windows 上临时文件可能被杀毒或索引服务短暂占用，

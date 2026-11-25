@@ -30,12 +30,17 @@ Headless 的 `autostart_enabled` 读写 systemd 自启状态。如果无法读�
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | `GET` | `/api/v1/clipboard` | 当前共享快照 |
+| `GET` | `/api/v1/clipboard/preview/{event_id}` | 当前图片的等比 PNG 预览，最长边为 720 像素 |
 | `POST` | `/api/v1/clipboard` | 发布文字或 PNG，网页端发送文字 |
 | `GET` | `/api/v1/clipboard/history` | 历史元数据和保留设置 |
 | `GET` | `/api/v1/clipboard/history/{event_id}` | 单条历史的完整内容 |
 | `GET` | `/api/v1/clipboard/history/{event_id}/thumbnail` | 图片历史的 96×72 PNG 缩略图；无图片或记录不存在时返回 404 |
 | `POST` | `/api/v1/clipboard/history/{event_id}/restore` | 恢复单条历史并发布新事件 |
 | `DELETE` | `/api/v1/clipboard/history` | 清空历史，保留当前快照 |
+
+读取当前快照时可同时带上已持有快照的 `known_event_id` 与 `known_clock`。后者为快照时钟的 `physical_ms:logical:node_id`。两者均与当前快照一致时返回无正文的 204，其他情况返回 200 和最新快照。空快照用 JSON `null` 表示，旧节点可能始终返回 200。
+
+预览接口只服务当前事件中的非隔行 PNG。可用 `clock` 传入与 `known_clock` 同格式的时钟以绑定图片版本。事件已被替换、时钟不匹配、图片已经足够小或无法生成预览时返回 404，界面可用已读取的快照生成预览。快照接口仍返回原图。
 
 历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容；两者都只访问目标节点本机记录，不改变节点间的快照交换。
 
@@ -138,9 +143,11 @@ Headless 的 `autostart_enabled` 读写 systemd 自启状态。如果无法读�
 
 能力声明决定消息是否发送：`clipboard.text` 表示接收剪贴板事件并允许写入本机系统剪贴板，`clipboard.view` 表示只展示快照；发送端跳过未声明两者的对端。Android 声明 `clipboard.view`，但通过本地 HTTP 主动发布的文字仍会发给声明 `clipboard.text` 的桌面节点。`transfer.history.v1` 表示可处理 `TransferHistoryDeleted`；只向声明该能力的对端发送此消息。对端离线时待删除标识写入节点数据目录，重连后补发；已知不支持时丢弃队列。
 
-桌面和浏览器界面也使用该 WebSocket 接收本节点事件，但不发送 `Hello`。界面连接建立后立即发送 `Ping`，之后每 15 秒一次；节点返回 `Pong` 并保持界面流，不把界面注册为对端设备。没有界面心跳且未完成节点握手的普通连接在超时后关闭。
+桌面、Android 和浏览器界面也使用该 WebSocket 接收本节点事件。界面连接建立后立即发送 `Ping`，之后每 15 秒一次。节点返回 `Pong` 并保持界面流，只有原生节点握手才注册对端设备。没有界面心跳且未完成节点握手的连接在超时后关闭。
 
-接收端只接受与当前清单总量一致且进度不回退的 `TransferProgress`；同一重试代次内终态不会被旧消息覆盖。剪贴板事件 ID 在内存去重十分钟，历史按内容哈希去重并持久化；节点重启后从本机历史和当前快照恢复，不从其他节点批量拉取历史。
+界面连接可使用 `GET /api/v1/ws?clipboard_updates=notice`。节点以 `ClipboardChanged` 通知最新剪贴板变更，`payload.event_id` 标识事件，界面再通过快照接口取内容。未指定此参数的旧界面仍接收带内容的 `ClipboardUpdate`，连续更新可合并为最新一项。新界面兼容旧节点的带内容消息。原生节点的发送队列同时受条数和剪贴板内容字节数限制，队列满后重发当前快照。
+
+接收端只接受与当前清单总量一致且进度不回退的 `TransferProgress`。同一重试代次内终态不会被旧消息覆盖。剪贴板事件 ID 在内存去重十分钟，当前事件也始终拒绝重复应用。历史按内容哈希去重并持久化。节点重启后只使用本机历史和当前快照恢复。
 
 ## 硬件指标
 

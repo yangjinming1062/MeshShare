@@ -1,8 +1,7 @@
 use crate::monitor::{visible_fullscreen, Rect, Target, Window};
-use crate::{current_monitor_capabilities, MonitorBackend};
+use crate::MonitorBackend;
 use anyhow::{Context, Result};
-use gtk::prelude::{DisplayExtManual, GtkWindowExt, MonitorExt, WidgetExt};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use gtk::prelude::*;
 use std::{
     cell::Cell,
     io,
@@ -10,7 +9,6 @@ use std::{
     os::unix::net::UnixStream,
     time::{Duration, Instant},
 };
-use tauri::{Manager, PhysicalPosition, WebviewWindow};
 use x11rb::reexports::x11rb_protocol::{
     parse_display::{parse_display, ConnectAddress},
     xauth::get_auth,
@@ -28,84 +26,50 @@ use x11rb::{
 
 const PROBE_BUDGET: Duration = Duration::from_millis(400);
 
-pub(crate) fn prepare(window: &WebviewWindow) -> tauri::Result<MonitorBackend> {
-    let native = window.gtk_window()?;
-    let backend = native.display().backend();
+pub(crate) fn backend() -> MonitorBackend {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return MonitorBackend::Unknown;
+    };
+    let backend = display.backend();
     if backend.is_x11() {
-        // 初次检测需要 XID。仅创建 GDK 资源，此时悬浮条仍未映射。
-        native.realize();
-        Ok(MonitorBackend::X11)
-    } else if backend.is_wayland() {
-        Ok(MonitorBackend::Wayland)
-    } else {
-        Ok(MonitorBackend::Unknown)
-    }
-}
-
-pub(crate) fn set_initial_position(
-    window: &WebviewWindow,
-    position: PhysicalPosition<i32>,
-) -> tauri::Result<()> {
-    let native = window.gtk_window()?;
-    let (x, y) = position
-        .to_logical::<i32>(f64::from(native.scale_factor()))
-        .into();
-    // GTK 的异步窗口请求可能在首个检测回调之后处理，初始位置在主线程直接设置。
-    native.move_(x, y);
-    Ok(())
-}
-
-pub(crate) fn set_visible(window: &WebviewWindow, visible: bool) -> tauri::Result<()> {
-    if !matches!(
-        current_monitor_capabilities(window.app_handle()).backend,
         MonitorBackend::X11
-    ) {
-        return if visible {
-            window.show()
-        } else {
-            window.hide()
-        };
+    } else if backend.is_wayland() {
+        MonitorBackend::Wayland
+    } else {
+        MonitorBackend::Unknown
     }
+}
 
-    let native = window.gtk_window()?;
+pub(crate) fn set_visible(window: &gtk::Window, visible: bool) {
     if visible {
-        native.show_all();
+        window.show_all();
     } else {
         // 拖动由窗口管理器完成。隐藏后显式保留实际位置，供未映射时的检测和恢复使用。
-        let position = native.is_mapped().then(|| native.position());
-        native.hide();
+        let position =
+            (window.display().backend().is_x11() && window.is_mapped()).then(|| window.position());
+        window.hide();
         if let Some((x, y)) = position {
-            native.move_(x, y);
+            window.move_(x, y);
         }
     }
-    Ok(())
 }
 
-pub(crate) fn capture(window: &WebviewWindow) -> Result<Option<Target>> {
-    if !matches!(
-        current_monitor_capabilities(window.app_handle()).backend,
-        MonitorBackend::X11
-    ) {
+pub(crate) fn capture(window: &gtk::Window) -> Result<Option<Target>> {
+    let display = window.display();
+    if !display.backend().is_x11() {
         return Ok(None);
     }
-    let handle = window
-        .window_handle()
-        .map_err(|error| anyhow::anyhow!("无法读取 X11 窗口句柄：{error}"))?;
-    let window_id = match handle.as_raw() {
-        RawWindowHandle::Xlib(handle) => u64::from(u32::try_from(handle.window)?),
-        RawWindowHandle::Xcb(handle) => u64::from(handle.window.get()),
-        _ => anyhow::bail!("无法读取 X11 悬浮条窗口标识"),
-    };
-    let native = window.gtk_window()?;
-    let display = native.display();
-    let monitor = if native.is_mapped() {
-        native
-            .window()
-            .and_then(|window| display.monitor_at_window(&window))
+    let native = window.window().context("悬浮条尚未实现 GDK 窗口")?;
+    let x11 = native
+        .downcast_ref::<gdkx11::X11Window>()
+        .context("无法读取 X11 悬浮条窗口标识")?;
+    let window_id = u64::from(u32::try_from(x11.xid())?);
+    let monitor = if window.is_mapped() {
+        display.monitor_at_window(&native)
     } else {
         // 未映射时用 GTK 将应用的位置。GDK 窗口此时可能仍在默认坐标。
-        let (x, y) = native.position();
-        let (width, height) = native.size();
+        let (x, y) = window.position();
+        let (width, height) = window.size();
         display.monitor_at_point(x + width / 2, y + height / 2)
     }
     .or_else(|| display.primary_monitor())

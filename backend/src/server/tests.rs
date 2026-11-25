@@ -14,7 +14,6 @@ use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use uuid::Uuid;
 
@@ -304,6 +303,67 @@ async fn management_file_endpoints_read_directories_and_reject_bad_targets() {
 }
 
 #[tokio::test]
+async fn clipboard_snapshot_read_omits_only_the_known_version() {
+    use super::{
+        clipboard_state, AppState, ClipboardQuery, ControlPlane, Query, State, StatusCode,
+    };
+
+    let dir = std::env::temp_dir().join(format!("meshshare-clipboard-known-{}", Uuid::new_v4()));
+    let runtime = NodeRuntime::new(dir.clone(), 0, "test".into()).unwrap();
+    let state = AppState {
+        control: ControlPlane::runtime_only(runtime.clone()),
+        runtime: runtime.clone(),
+    };
+    let read = |known_event_id: Option<String>, known_clock: Option<String>| {
+        clipboard_state(
+            State(state.clone()),
+            Query(ClipboardQuery {
+                known_event_id,
+                known_clock,
+            }),
+        )
+    };
+
+    assert_eq!(read(None, None).await.status(), StatusCode::OK);
+    let current = runtime
+        .create_local_clipboard_named(Some("clipboard content".into()), None, "test".into())
+        .unwrap();
+    let clock = format!(
+        "{}:{}:{}",
+        current.clock.physical_ms, current.clock.logical, current.clock.node_id
+    );
+    let unchanged = read(Some(current.event_id.clone()), Some(clock.clone())).await;
+    assert_eq!(unchanged.status(), StatusCode::NO_CONTENT);
+    assert!(axum::body::to_bytes(unchanged.into_body(), 1024)
+        .await
+        .unwrap()
+        .is_empty());
+    for unknown_clock in [None, Some("0:0:obsolete".into())] {
+        assert_eq!(
+            read(Some(current.event_id.clone()), unknown_clock)
+                .await
+                .status(),
+            StatusCode::OK,
+        );
+    }
+
+    let next = runtime
+        .create_local_clipboard_named(Some("new content".into()), None, "test".into())
+        .unwrap();
+    for known_event_id in [None, Some(current.event_id)] {
+        let response = read(known_event_id, Some(clock.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let snapshot = serde_json::from_slice::<ClipboardSnapshot>(&body).unwrap();
+        assert_eq!(snapshot.event_id, next.event_id);
+        assert_eq!(snapshot.text.as_deref(), Some("new content"));
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
 async fn settings_and_remote_accept_endpoints_update_runtime_state() {
     let data_dir = std::env::temp_dir().join(format!("meshshare-settings-api-{}", Uuid::new_v4()));
     let static_root = data_dir.join("web");
@@ -524,7 +584,7 @@ async fn incoming_websocket_uses_the_verified_remote_address_for_http_peer_endpo
         Some("100.64.0.8:43122".parse().expect("remote socket address")),
     )
     .expect("valid incoming hello");
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::runtime::peer_channel(1);
     let session = runtime
         .attach_peer_session(peer, tx)
         .expect("attach incoming peer");
@@ -557,7 +617,7 @@ async fn duplicate_transfer_offer_replays_current_progress_to_source() {
     std::fs::create_dir_all(&data_dir).expect("create data directory");
     let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::runtime::peer_channel(8);
     assert!(runtime.add_peer_channel("source".to_string(), tx));
     let destination = data_dir.join("received");
     std::fs::create_dir_all(&destination).expect("create destination");
@@ -621,7 +681,7 @@ async fn outgoing_progress_tracks_the_receivers_decision_for_each_offer() {
     .expect("create receiver");
     let sender_id = sender.node_id();
     let receiver_id = receiver.node_id();
-    let (tx, mut replies) = mpsc::channel(8);
+    let (tx, mut replies) = crate::runtime::peer_channel(8);
     assert!(receiver.add_peer_channel(sender_id.clone(), tx));
 
     let new_offer = |id, expected_status| {
@@ -807,7 +867,7 @@ async fn invalid_remote_clipboard_payload_is_ignored() {
             node_id: "peer".to_string(),
         },
         text: None,
-        image_png: Some("not-base64".to_string()),
+        image_png: Some("not-base64".into()),
         updated_at_ms: 1,
     };
     handle_wire_message(
@@ -830,7 +890,7 @@ async fn clipboard_history_thumbnail_route_serves_png_and_hides_missing() {
     let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into())
         .expect("create runtime");
     let mut png = Vec::new();
-    image::DynamicImage::new_rgba8(200, 100)
+    image::DynamicImage::new_rgba8(1440, 960)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .expect("encode png");
     let event = runtime
@@ -867,6 +927,40 @@ async fn clipboard_history_thumbnail_route_serves_png_and_hides_missing() {
     assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     let thumbnail = image::load_from_memory(&bytes).expect("decode thumbnail");
     assert_eq!((thumbnail.width(), thumbnail.height()), (96, 72));
+
+    let preview_url = format!(
+        "http://{address}/api/v1/clipboard/preview/{}",
+        event.event_id
+    );
+    let clock = format!(
+        "{}:{}:{}",
+        event.clock.physical_ms, event.clock.logical, event.clock.node_id
+    );
+    let response = runtime
+        .http
+        .get(&preview_url)
+        .query(&[("clock", &clock)])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(response.headers()["content-type"], "image/png");
+    let preview = image::load_from_memory(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!((preview.width(), preview.height()), (720, 480));
+    let wrong_clock = runtime
+        .http
+        .get(&preview_url)
+        .query(&[("clock", "0:0:obsolete")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_clock.status(), reqwest::StatusCode::NOT_FOUND);
+    runtime
+        .create_local_clipboard_named(Some("new clipboard".into()), None, "local".into())
+        .unwrap();
+    let previous = runtime.http.get(&preview_url).send().await.unwrap();
+    assert_eq!(previous.status(), reqwest::StatusCode::NOT_FOUND);
 
     let missing = runtime
         .http
@@ -905,7 +999,7 @@ async fn android_view_only_peer_stores_remote_clipboard_without_system_write() {
             logical: 0,
             node_id: "peer".to_string(),
         },
-        text: Some("from desktop".to_string()),
+        text: Some("from desktop".into()),
         image_png: None,
         updated_at_ms: 1,
     };
@@ -916,10 +1010,8 @@ async fn android_view_only_peer_stores_remote_clipboard_without_system_write() {
     )
     .await;
     assert_eq!(
-        runtime
-            .clipboard_snapshot()
-            .and_then(|snapshot| snapshot.text),
-        Some("from desktop".to_string())
+        runtime.clipboard_snapshot().unwrap().text.as_deref(),
+        Some("from desktop")
     );
     let _ = std::fs::remove_dir_all(data_dir);
 }
@@ -939,7 +1031,7 @@ async fn oversized_remote_clipboard_text_is_ignored() {
             logical: 0,
             node_id: "peer".to_string(),
         },
-        text: Some("x".repeat(CLIPBOARD_TEXT_LIMIT + 1)),
+        text: Some("x".repeat(CLIPBOARD_TEXT_LIMIT + 1).into()),
         image_png: None,
         updated_at_ms: 1,
     };
@@ -1108,7 +1200,7 @@ async fn duplicate_hello_does_not_replace_existing_peer_metadata() {
             .as_deref(),
         Some("peer")
     );
-    let (tx, _rx) = mpsc::channel(1);
+    let (tx, _rx) = crate::runtime::peer_channel(1);
     assert!(runtime.add_peer_channel("peer".to_string(), tx));
     assert!(handle_wire_message(hello("duplicate"), &runtime, None)
         .await
@@ -2060,7 +2152,7 @@ async fn remote_metrics_update_is_not_rebroadcast() {
         metrics_received_at_ms: None,
         metrics_stale: false,
     });
-    let (tx, mut rx) = mpsc::channel(8);
+    let (tx, mut rx) = crate::runtime::peer_channel(8);
     runtime.add_peer_channel("peer".to_string(), tx);
     let metrics = HardwareMetrics {
         node_id: "peer".to_string(),
@@ -2123,7 +2215,7 @@ async fn forwarded_clipboard_events_keep_their_original_source() {
             logical: 0,
             node_id: "origin".to_string(),
         },
-        text: Some("forwarded".to_string()),
+        text: Some("forwarded".into()),
         image_png: None,
         updated_at_ms: 10,
     };
@@ -2150,7 +2242,7 @@ async fn forwarded_clipboard_events_keep_their_original_source() {
                 logical: 0,
                 node_id: "origin".to_string(),
             },
-            text: Some("snapshot-forwarded".to_string()),
+            text: Some("snapshot-forwarded".into()),
             image_png: None,
             updated_at_ms: 20,
         },
@@ -2262,7 +2354,7 @@ async fn websocket_keeps_one_channel_for_normal_peer_messages() {
                         logical: 0,
                         node_id: "peer".to_string(),
                     },
-                    text: Some("hello".to_string()),
+                    text: Some("hello".into()),
                     image_png: None,
                     updated_at_ms: 30,
                 },
@@ -2283,7 +2375,7 @@ async fn websocket_keeps_one_channel_for_normal_peer_messages() {
                         logical: 0,
                         node_id: "peer".to_string(),
                     },
-                    text: Some("snapshot".to_string()),
+                    text: Some("snapshot".into()),
                     image_png: None,
                     updated_at_ms: 31,
                 },
@@ -2338,6 +2430,57 @@ async fn websocket_keeps_one_channel_for_normal_peer_messages() {
     runtime
         .stopping
         .store(true, std::sync::atomic::Ordering::SeqCst);
+    server_task.abort();
+    let _ = std::fs::remove_dir_all(data_dir);
+}
+
+#[tokio::test]
+async fn clipboard_websocket_notices_are_opt_in() {
+    let data_dir = std::env::temp_dir().join(format!("meshshare-clipboard-ws-{}", Uuid::new_v4()));
+    let runtime = NodeRuntime::new(data_dir.clone(), 0, env!("CARGO_PKG_VERSION").into()).unwrap();
+    let app = super::router(runtime.clone(), data_dir.join("web"));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for query in ["", "?clipboard_updates=notice"] {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut socket, _) = connect_async(format!("ws://{address}/api/v1/ws{query}"))
+                .await
+                .unwrap();
+            socket.next().await.unwrap().unwrap(); // Hello
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::to_string(&WireMessage::Ping { at_ms: 1 }).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let pong = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            assert!(matches!(
+                serde_json::from_str::<WireMessage>(&pong).unwrap(),
+                WireMessage::Pong { .. }
+            ));
+            let snapshot = runtime
+                .create_local_clipboard_named(Some("clipboard".to_string()), None, "local".into())
+                .unwrap();
+            let body = socket.next().await.unwrap().unwrap().into_text().unwrap();
+            match (
+                query.is_empty(),
+                serde_json::from_str::<WireMessage>(&body).unwrap(),
+            ) {
+                (true, WireMessage::ClipboardUpdate { event }) => {
+                    assert_eq!(event.event_id, snapshot.event_id);
+                    assert_eq!(event.text.as_deref(), Some("clipboard"));
+                }
+                (false, WireMessage::ClipboardChanged { event_id }) => {
+                    assert_eq!(event_id, snapshot.event_id);
+                    assert!(!body.contains("\"text\""));
+                }
+                (_, message) => panic!("unexpected message: {message:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
     server_task.abort();
     let _ = std::fs::remove_dir_all(data_dir);
 }

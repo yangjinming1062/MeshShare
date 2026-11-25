@@ -7,7 +7,7 @@ use std::sync::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, TrayIconEvent},
-    AppHandle, Manager,
+    AppHandle, Manager, WebviewWindow,
 };
 
 struct TrayHandles {
@@ -18,19 +18,19 @@ struct TrayHandles {
 }
 
 // Linux 下 show/hide 由 GTK 主循环异步执行，is_visible() 会读到变更前的状态，因此托盘文字以命令意图为准。
-pub(super) struct MainWindowVisibility(AtomicBool);
+#[derive(Default)]
+pub(super) struct MainWindowVisibility {
+    visible: AtomicBool,
+    creating: AtomicBool,
+}
 
 impl MainWindowVisibility {
-    pub(super) fn new(visible: bool) -> Self {
-        Self(AtomicBool::new(visible))
-    }
-
     fn get(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.visible.load(Ordering::SeqCst)
     }
 
     fn set(&self, visible: bool) {
-        self.0.store(visible, Ordering::SeqCst);
+        self.visible.store(visible, Ordering::SeqCst);
     }
 }
 
@@ -93,19 +93,48 @@ pub(crate) fn sync_tray_labels(app: &AppHandle) {
 }
 
 pub(super) fn set_main_window_visible(app: &AppHandle, visible: bool) {
-    if let Some(state) = app.try_state::<MainWindowVisibility>() {
-        state.set(visible);
-    }
+    let Some(state) = app.try_state::<MainWindowVisibility>() else {
+        return;
+    };
+    state.set(visible);
     if let Some(window) = app.get_webview_window("main") {
-        if visible {
-            let _ = window.show();
-            let _ = window.unminimize();
-            let _ = window.set_focus();
-        } else {
-            let _ = window.hide();
-        }
+        apply_main_window_visibility(&window, visible);
+    } else if visible && !state.creating.swap(true, Ordering::SeqCst) {
+        let app = app.clone();
+        // WebView2 创建时需要主线程继续处理消息。
+        tauri::async_runtime::spawn_blocking(move || {
+            let result = super::create_window(&app, "main");
+            let handle = app.clone();
+            if let Err(error) = app.run_on_main_thread(move || {
+                let state = handle.state::<MainWindowVisibility>();
+                state.creating.store(false, Ordering::SeqCst);
+                match result {
+                    Ok(window) => apply_main_window_visibility(&window, state.get()),
+                    Err(error) => {
+                        state.set(false);
+                        eprintln!("无法创建主窗口：{error:#}");
+                    }
+                }
+                sync_tray_labels(&handle);
+            }) {
+                app.state::<MainWindowVisibility>()
+                    .creating
+                    .store(false, Ordering::SeqCst);
+                eprintln!("无法显示主窗口：{error}");
+            }
+        });
     }
     sync_tray_labels(app);
+}
+
+fn apply_main_window_visibility(window: &WebviewWindow, visible: bool) {
+    if visible {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    } else {
+        let _ = window.hide();
+    }
 }
 
 fn handle_tray_icon_event(app: &AppHandle, event: TrayIconEvent) {
@@ -209,7 +238,7 @@ mod tests {
 
     #[test]
     fn main_window_visibility_keeps_last_command() {
-        let state = MainWindowVisibility::new(false);
+        let state = MainWindowVisibility::default();
         assert!(!state.get());
         state.set(true);
         assert!(state.get());

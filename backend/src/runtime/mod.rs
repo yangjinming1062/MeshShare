@@ -1,11 +1,11 @@
 use crate::clock::{now_millis, LogicalClock};
 use crate::model::{
-    AddressInfo, ClipboardHistoryDetail, ClipboardHistoryItem, ClipboardHistoryList,
-    ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSession, ClipboardSnapshot,
-    ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession, MobileTransferView,
-    MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings, TransferHistoryEntry,
-    TransferItem, TransferOffer, TransferProgress, TransferStatus, WireMessage,
-    CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY,
+    AddressInfo, ClipboardEvent, ClipboardHistoryDetail, ClipboardHistoryItem,
+    ClipboardHistoryList, ClipboardHistoryMode, ClipboardHistorySettings, ClipboardSession,
+    ClipboardSnapshot, ClipboardStatus, HardwareMetrics, MobileAccessInfo, MobileSession,
+    MobileTransferView, MonitorPosition, NodeInfo, PeerInfo, ReceiveMode, ReceiveSettings,
+    TransferHistoryEntry, TransferItem, TransferOffer, TransferProgress, TransferStatus,
+    WireMessage, CLIPBOARD_IMAGE_LIMIT, CLIPBOARD_TEXT_LIMIT, CLIPBOARD_VIEW_CAPABILITY,
     DEFAULT_CLIPBOARD_HISTORY_COUNT, DEFAULT_CLIPBOARD_HISTORY_DAYS, MAX_CLIPBOARD_HISTORY_COUNT,
     MAX_CLIPBOARD_HISTORY_DAYS, MAX_HISTORY_DELETE_BATCH, MAX_MOBILE_SESSIONS,
     MAX_TRANSFER_HISTORY_PATHS, MAX_TRANSFER_RECORDS, METRICS_GPU_CAPABILITY,
@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, watch};
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -49,6 +49,7 @@ use transfer_history::*;
 pub use config::UpdateFrequency;
 pub(crate) use outgoing::ManagedMobilePath;
 pub use outgoing::OutgoingPrepareView;
+pub(crate) use peers::peer_channel;
 
 pub use config::validate_receive_directory;
 pub use network::bind_addresses;
@@ -77,8 +78,14 @@ struct MobileCa {
 
 struct ClipboardState {
     snapshot: Option<ClipboardSnapshot>,
+    preview_png: Option<axum::body::Bytes>,
     #[cfg(not(target_os = "android"))]
     pending_system_write: bool,
+}
+
+pub(crate) enum ClipboardSnapshotRead {
+    Unchanged,
+    Current(Option<ClipboardSnapshot>),
 }
 
 pub(crate) struct TerminalActivity(std::sync::Weak<NodeRuntime>);
@@ -104,6 +111,8 @@ pub struct NodeRuntime {
     pub node: RwLock<NodeInfo>,
     pub clock: LogicalClock,
     clipboard: Mutex<ClipboardState>,
+    clipboard_preview_worker: Arc<tokio::sync::Mutex<()>>,
+    clipboard_changes: watch::Sender<Option<ClipboardEvent>>,
     #[cfg(not(target_os = "android"))]
     system_clipboard_ready: Condvar,
     clipboard_status: RwLock<ClipboardStatus>,
@@ -299,13 +308,6 @@ fn short_node_id(node_id: &str) -> String {
     node_id.chars().take(8).collect()
 }
 
-fn is_clipboard_message(message: &WireMessage) -> bool {
-    matches!(
-        message,
-        WireMessage::ClipboardUpdate { .. } | WireMessage::ClipboardSnapshot { .. }
-    )
-}
-
 impl NodeRuntime {
     #[cfg(test)]
     pub fn new(data_dir: PathBuf, port: u16, version: String) -> anyhow::Result<Arc<Self>> {
@@ -380,6 +382,7 @@ impl NodeRuntime {
             }),
         };
         let (events, _) = broadcast::channel(256);
+        let (clipboard_changes, _) = watch::channel(None);
         Ok(Arc::new(Self {
             ssh,
             #[cfg(feature = "gui")]
@@ -391,9 +394,12 @@ impl NodeRuntime {
             node: RwLock::new(node),
             clipboard: Mutex::new(ClipboardState {
                 snapshot: clipboard,
+                preview_png: None,
                 #[cfg(not(target_os = "android"))]
                 pending_system_write: false,
             }),
+            clipboard_preview_worker: Default::default(),
+            clipboard_changes,
             #[cfg(not(target_os = "android"))]
             system_clipboard_ready: Condvar::new(),
             clipboard_status: RwLock::new(if profile == NodeProfile::Headless {
@@ -554,6 +560,10 @@ impl NodeRuntime {
 
     pub fn subscribe(&self) -> broadcast::Receiver<WireMessage> {
         self.events.subscribe()
+    }
+
+    pub(crate) fn subscribe_clipboard(&self) -> watch::Receiver<Option<ClipboardEvent>> {
+        self.clipboard_changes.subscribe()
     }
 
     pub fn has_active_transfers(&self) -> bool {

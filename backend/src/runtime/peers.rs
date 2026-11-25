@@ -1,20 +1,90 @@
 use super::*;
+use tokio::sync::{mpsc, mpsc::error::TrySendError, OwnedSemaphorePermit, Semaphore};
 #[cfg(not(target_os = "android"))]
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 pub(super) struct PeerChannel {
-    sender: mpsc::Sender<WireMessage>,
+    sender: PeerMessageSender,
     #[cfg(not(target_os = "android"))]
     terminal_client: DropGuard,
 }
 
 impl PeerChannel {
-    fn new(sender: mpsc::Sender<WireMessage>) -> Self {
+    fn new(sender: PeerMessageSender) -> Self {
         Self {
             sender,
             #[cfg(not(target_os = "android"))]
             terminal_client: CancellationToken::new().drop_guard(),
         }
+    }
+}
+
+const MAX_QUEUED_CLIPBOARD_BYTES: usize = 32 * 1024 * 1024;
+
+struct QueuedMessage {
+    message: WireMessage,
+    _clipboard_budget: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PeerMessageSender {
+    sender: mpsc::Sender<QueuedMessage>,
+    clipboard_budget: Arc<Semaphore>,
+}
+
+pub(crate) struct PeerMessageReceiver(mpsc::Receiver<QueuedMessage>);
+
+pub(crate) fn peer_channel(capacity: usize) -> (PeerMessageSender, PeerMessageReceiver) {
+    let (sender, receiver) = mpsc::channel(capacity);
+    (
+        PeerMessageSender {
+            sender,
+            clipboard_budget: Arc::new(Semaphore::new(MAX_QUEUED_CLIPBOARD_BYTES)),
+        },
+        PeerMessageReceiver(receiver),
+    )
+}
+
+fn clipboard_payload_size(message: &WireMessage) -> Option<usize> {
+    let (text, image) = match message {
+        WireMessage::ClipboardUpdate { event } => (&event.text, &event.image_png),
+        WireMessage::ClipboardSnapshot { snapshot } => (&snapshot.text, &snapshot.image_png),
+        _ => return None,
+    };
+    Some(text.as_deref().map_or(0, str::len) + image.as_deref().map_or(0, str::len))
+}
+
+impl PeerMessageSender {
+    fn try_send(&self, message: WireMessage) -> Result<(), TrySendError<()>> {
+        let clipboard_budget = clipboard_payload_size(&message)
+            .map(|size| {
+                // 允许单条消息使用全部预算。发送衔接仍受原有消息大小和超时约束。
+                self.clipboard_budget
+                    .clone()
+                    .try_acquire_many_owned(size.clamp(1, MAX_QUEUED_CLIPBOARD_BYTES) as u32)
+                    .map_err(|_| TrySendError::Full(()))
+            })
+            .transpose()?;
+        self.sender
+            .try_send(QueuedMessage {
+                message,
+                _clipboard_budget: clipboard_budget,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => TrySendError::Full(()),
+                TrySendError::Closed(_) => TrySendError::Closed(()),
+            })
+    }
+}
+
+impl PeerMessageReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<WireMessage> {
+        self.0.recv().await.map(|queued| queued.message)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<WireMessage, mpsc::error::TryRecvError> {
+        self.0.try_recv().map(|queued| queued.message)
     }
 }
 
@@ -68,7 +138,7 @@ impl NodeRuntime {
     }
 
     #[cfg(test)]
-    pub fn add_peer_channel(&self, node_id: String, channel: mpsc::Sender<WireMessage>) -> bool {
+    pub fn add_peer_channel(&self, node_id: String, channel: PeerMessageSender) -> bool {
         let mut channels = self.peer_channels.lock();
         if channels.contains_key(&node_id) {
             return false;
@@ -84,7 +154,7 @@ impl NodeRuntime {
     pub(crate) fn attach_peer_session(
         &self,
         peer: PeerInfo,
-        channel: mpsc::Sender<WireMessage>,
+        channel: PeerMessageSender,
     ) -> Option<PeerSession<'_>> {
         let node_id = peer.node_id.clone();
         {
@@ -106,7 +176,7 @@ impl NodeRuntime {
     }
 
     pub fn send_to_peer(&self, node_id: &str, message: WireMessage) -> bool {
-        let is_clipboard = is_clipboard_message(&message);
+        let is_clipboard = clipboard_payload_size(&message).is_some();
         if is_clipboard && !self.peer_supports_clipboard(node_id) {
             self.pending_clipboard_resync.lock().remove(node_id);
             return true;
@@ -117,7 +187,7 @@ impl NodeRuntime {
         };
         match channel.try_send(message) {
             Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            Err(TrySendError::Full(())) => {
                 if is_clipboard {
                     self.pending_clipboard_resync
                         .lock()
@@ -125,7 +195,7 @@ impl NodeRuntime {
                 }
                 false
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            Err(TrySendError::Closed(())) => false,
         }
     }
 
@@ -160,31 +230,16 @@ impl NodeRuntime {
     }
 
     pub fn flush_clipboard_resync(&self, node_id: &str) -> bool {
-        if !self.pending_clipboard_resync.lock().contains(node_id) {
-            return false;
-        }
-        if !self.peer_supports_clipboard(node_id) {
-            self.pending_clipboard_resync.lock().remove(node_id);
+        // 先取走待补发标记，避免发送完成时清掉并发更新写入的新标记。
+        if !self.pending_clipboard_resync.lock().remove(node_id)
+            || !self.peer_supports_clipboard(node_id)
+        {
             return false;
         }
         let Some(snapshot) = self.clipboard_snapshot() else {
-            self.pending_clipboard_resync.lock().remove(node_id);
             return false;
         };
-        let Some(channel) = self.peer_sender(node_id) else {
-            return false;
-        };
-        match channel.try_send(WireMessage::ClipboardSnapshot { snapshot }) {
-            Ok(()) => {
-                self.pending_clipboard_resync.lock().remove(node_id);
-                true
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                self.pending_clipboard_resync.lock().remove(node_id);
-                false
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => false,
-        }
+        self.send_to_peer(node_id, WireMessage::ClipboardSnapshot { snapshot })
     }
 
     pub fn set_peer(&self, peer: PeerInfo) {
@@ -238,7 +293,7 @@ impl NodeRuntime {
         }
     }
 
-    fn peer_sender(&self, node_id: &str) -> Option<mpsc::Sender<WireMessage>> {
+    fn peer_sender(&self, node_id: &str) -> Option<PeerMessageSender> {
         self.peer_channels
             .lock()
             .get(node_id)

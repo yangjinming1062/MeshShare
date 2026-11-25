@@ -513,30 +513,6 @@ html[data-shell="android"] {
 @media (pointer: coarse) {
   .phone-shell .btn-sm { min-height: 44px; }
 }
-.monitor-shell { height: 100%; }
-.monitor-main {
-  /* 切屏时 WebView 的实际视口可能暂时小于窗口的标称尺寸。 */
-  --monitor-unit: min(1px, calc(100vw / 220), calc(100vh / 50));
-  height: 100%;
-  display: grid;
-  grid-template-columns: repeat(3, max-content);
-  justify-content: space-between;
-  align-content: center;
-  column-gap: calc(6 * var(--monitor-unit));
-  row-gap: calc(2 * var(--monitor-unit));
-  padding: calc(6 * var(--monitor-unit)) calc(10 * var(--monitor-unit));
-  overflow: hidden;
-  color: #fff;
-  border: 1px solid #b9d0f53d;
-  border-radius: 10px;
-  background: rgba(13, 21, 38, .52);
-  box-shadow: inset 0 1px 0 #ffffff1f;
-  cursor: move;
-  user-select: none;
-}
-.monitor-metric { min-width: 0; display: flex; align-items: baseline; gap: calc(4 * var(--monitor-unit)); white-space: nowrap; }
-.monitor-metric b { color: #9db4d6; font-size: calc(10 * var(--monitor-unit)); font-weight: 700; letter-spacing: .06em; }
-.monitor-metric span { color: #fff; font-family: var(--font-data); font-size: calc(11 * var(--monitor-unit)); font-variant-numeric: tabular-nums; }
 .monitor-lock-toggle { white-space: nowrap; }
 
 @keyframes sheet-in {

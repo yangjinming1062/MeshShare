@@ -19,7 +19,7 @@ async fn inbound_shells_end_with_the_authenticated_peer_session_or_client_key() 
     let url = format!("ws://{addr}/api/v1/ws");
     let target =
         crate::server::peer_from_hello(host.node_info(), &client, Some(url.clone())).unwrap();
-    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (tx, _rx) = crate::runtime::peer_channel(1);
     let _target = client.attach_peer_session(target, tx).unwrap();
     let hello = |node| Message::Text(serde_json::to_string(&WireMessage::Hello { node }).unwrap());
     let mut legacy_disabled = client.node_info();

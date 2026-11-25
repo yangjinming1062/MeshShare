@@ -9,8 +9,8 @@ use crate::model::{
     MAX_WIRE_ERROR_LENGTH,
 };
 use crate::runtime::{
-    validate_receive_directory, NodeRuntime, OutgoingPrepareView, TransferRetryError,
-    TRANSFER_PROGRESS_INTERVAL, UPDATE_INSTALLING_MESSAGE,
+    validate_receive_directory, ClipboardSnapshotRead, NodeRuntime, OutgoingPrepareView,
+    TransferRetryError, TRANSFER_PROGRESS_INTERVAL, UPDATE_INSTALLING_MESSAGE,
 };
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
@@ -262,6 +262,7 @@ pub fn router_with_control(
             get(clipboard_state).post(post_clipboard),
         )
         .route("/api/v1/clipboard/status", get(clipboard_status))
+        .route("/api/v1/clipboard/preview/:id", get(clipboard_preview))
         .route(
             "/api/v1/clipboard/history",
             get(clipboard_history).delete(clear_clipboard_history),
@@ -788,12 +789,50 @@ async fn connect_peer(
         .map_err(ApiError::bad_request)
 }
 
-async fn clipboard_state(State(state): State<AppState>) -> Json<Option<ClipboardSnapshot>> {
-    Json(state.runtime.clipboard_snapshot())
+#[derive(Deserialize)]
+struct ClipboardQuery {
+    known_event_id: Option<String>,
+    known_clock: Option<String>,
+}
+
+async fn clipboard_state(
+    State(state): State<AppState>,
+    Query(query): Query<ClipboardQuery>,
+) -> Response {
+    let known = query
+        .known_event_id
+        .as_deref()
+        .zip(query.known_clock.as_deref());
+    match state.runtime.read_clipboard_snapshot(known) {
+        ClipboardSnapshotRead::Unchanged => StatusCode::NO_CONTENT.into_response(),
+        ClipboardSnapshotRead::Current(snapshot) => Json(snapshot).into_response(),
+    }
 }
 
 async fn clipboard_history(State(state): State<AppState>) -> Json<ClipboardHistoryList> {
     Json(state.runtime.clipboard_history_list())
+}
+
+#[derive(Deserialize)]
+struct ClipboardPreviewQuery {
+    clock: Option<String>,
+}
+
+async fn clipboard_preview(
+    State(state): State<AppState>,
+    AxumPath(event_id): AxumPath<String>,
+    Query(query): Query<ClipboardPreviewQuery>,
+) -> Result<Response, ApiError> {
+    if event_id.is_empty() || event_id.len() > 256 {
+        return Err(ApiError::bad_request("剪贴板事件 ID 无效"));
+    }
+    let preview = state
+        .runtime
+        .clipboard_preview_png(event_id, query.clock.as_deref())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .ok_or_else(|| ApiError::not_found("剪贴板预览不可用"))?;
+    Ok(clipboard_png_response(preview))
 }
 
 async fn clipboard_history_detail(
@@ -821,14 +860,18 @@ async fn clipboard_history_thumbnail(
         .runtime
         .clipboard_history_thumbnail(&event_id)
         .ok_or_else(|| ApiError::not_found("剪贴板历史缩略图不可用"))?;
-    let mut response = bytes.into_response();
+    Ok(clipboard_png_response(bytes))
+}
+
+fn clipboard_png_response(bytes: impl Into<axum::body::Bytes>) -> Response {
+    let mut response = bytes.into().into_response();
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(response)
+    response
 }
 
 async fn restore_clipboard_history(

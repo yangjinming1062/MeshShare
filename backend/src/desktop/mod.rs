@@ -6,7 +6,7 @@ use crate::{
     start_node, terminal, NodeRuntime,
 };
 #[cfg(target_os = "linux")]
-use crate::{linux, MonitorBackend, MonitorCapabilities};
+use crate::{linux, MonitorCapabilities};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
@@ -53,35 +53,67 @@ fn hide_monitor_persisted(app: &AppHandle) {
     }
 }
 
+pub(crate) fn create_window(app: &AppHandle, label: &str) -> anyhow::Result<tauri::WebviewWindow> {
+    use anyhow::Context;
+
+    let config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == label)
+        .with_context(|| format!("缺少窗口配置：{label}"))?;
+    Ok(tauri::WebviewWindowBuilder::from_config(app, config)?.build()?)
+}
+
 pub fn run() {
+    let context = tauri::generate_context!();
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            set_main_window_visible(app, true);
+            let handle = app.clone();
+            if let Err(error) =
+                app.run_on_main_thread(move || set_main_window_visible(&handle, true))
+            {
+                eprintln!("无法重新打开主窗口：{error}");
+            }
         }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .on_page_load(crate::terminal_page_load)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "monitor-lock-now" => {
+                if let Some(state) = app.try_state::<Arc<NodeRuntime>>() {
+                    if let Err(error) = apply_monitor_locked(app, state.as_ref(), true) {
+                        eprintln!("{error}");
+                    }
+                }
+            }
+            "monitor-hide-now" => hide_monitor_persisted(app),
+            _ => {}
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                match window.label() {
+                    "main" => {
+                        api.prevent_close();
+                        set_main_window_visible(window.app_handle(), false);
+                    }
+                    "monitor" => {
+                        api.prevent_close();
+                        hide_monitor_persisted(window.app_handle());
+                    }
+                    _ => {}
+                }
+            }
+        })
         .setup(|app| {
             let autostart_launch = autostart::launched_from_args(std::env::args());
             app.manage(monitor::Controller::default());
-            app.manage(MainWindowVisibility::new(
-                app.get_webview_window("main")
-                    .and_then(|window| window.is_visible().ok())
-                    .unwrap_or(false),
-            ));
-            let monitor_window = app.get_webview_window("monitor");
+            app.manage(MainWindowVisibility::default());
             #[cfg(target_os = "linux")]
-            {
-                let backend = monitor_window
-                    .as_ref()
-                    .map_or(MonitorBackend::Unknown, |window| {
-                        linux::fullscreen::prepare(window).unwrap_or_else(|error| {
-                            eprintln!("准备悬浮条原生窗口失败：{error:#}");
-                            MonitorBackend::Unknown
-                        })
-                    });
-                app.manage(MonitorCapabilities::for_backend(backend));
-            }
+            app.manage(MonitorCapabilities::for_backend(
+                linux::fullscreen::backend(),
+            ));
             let runtime = tauri::async_runtime::block_on(start_node(
                 app.handle(),
                 node_data_dir(app.handle()),
@@ -92,48 +124,10 @@ pub fn run() {
                 }
             }
             tray::setup_tray_menu(app.handle(), runtime.clone())?;
-            if let Some(window) = monitor_window.as_ref() {
-                #[cfg(not(target_os = "windows"))]
-                monitor_window::normalize_monitor_size(window);
-                if let Err(error) = monitor_window::position_monitor_window(window, &runtime) {
-                    eprintln!("设置悬浮条初始位置失败：{error:#}");
-                }
-            }
+            crate::clipboard::start_monitor(runtime.clone());
             monitor::start(app.handle().clone(), runtime.clone())?;
-            if let Some(window) = monitor_window {
-                let app_for_menu = app.handle().clone();
-                window.on_menu_event(move |_window, event| match event.id().as_ref() {
-                    "monitor-lock-now" => {
-                        if let Some(state) = app_for_menu.try_state::<Arc<NodeRuntime>>() {
-                            if let Err(error) =
-                                apply_monitor_locked(&app_for_menu, state.as_ref(), true)
-                            {
-                                eprintln!("{error}");
-                            }
-                        }
-                    }
-                    "monitor-hide-now" => hide_monitor_persisted(&app_for_menu),
-                    _ => {}
-                });
-                let app_for_close = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        hide_monitor_persisted(&app_for_close);
-                    }
-                });
-            }
-            if let Some(window) = app.get_webview_window("main") {
-                if !autostart_launch {
-                    set_main_window_visible(app.handle(), true);
-                }
-                let app_for_close = app.handle().clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        set_main_window_visible(&app_for_close, false);
-                    }
-                });
+            if !autostart_launch {
+                set_main_window_visible(app.handle(), true);
             }
             Ok(())
         })
@@ -142,6 +136,7 @@ pub fn run() {
             save_ca_certificate,
             crate::remote_file_access,
             crate::set_remote_file_access,
+            monitor_window::monitor_view,
             monitor_window::popup_monitor_menu,
             monitor_window::set_monitor_position,
             links::open_project_page,
@@ -153,9 +148,13 @@ pub fn run() {
             terminal::commands::terminal_write,
             terminal::commands::terminal_ack
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building MeshShare")
         .run(|app, event| match event {
+            // Wry 在最后一个窗口释放时请求退出，托盘和节点仍需常驻。
+            RunEvent::ExitRequested {
+                code: None, api, ..
+            } => api.prevent_exit(),
             RunEvent::ExitRequested { .. } | RunEvent::Exit => {
                 crate::stop_node(app, matches!(event, RunEvent::Exit));
             }
