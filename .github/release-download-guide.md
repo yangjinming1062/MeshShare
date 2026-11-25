@@ -1,17 +1,16 @@
 ## 下载指导
 
-请根据系统和处理器架构选择对应的安装包：
+按设备的系统和处理器选择安装包。
 
-| 系统 | 推荐下载 | 其他格式 |
+| 系统 | 安装包 | 其他格式或要求 |
 | --- | --- | --- |
 | Windows x64 | [NSIS 安装程序（`.exe`）]({{WINDOWS_NSIS_URL}}) | [MSI 安装程序]({{WINDOWS_MSI_URL}}) |
-| macOS Apple Silicon | [DMG 安装包]({{MACOS_ARM64_DMG_URL}}) | — |
-| macOS Intel | [DMG 安装包]({{MACOS_X64_DMG_URL}}) | — |
-| Linux x64 | [`.deb`]({{LINUX_DEB_URL}})（Debian/Ubuntu） | [`.rpm`]({{LINUX_RPM_URL}}) · [AppImage]({{LINUX_APPIMAGE_URL}}) |
-| Linux NAS / 无桌面 amd64 | [headless 系统服务（`.deb`）]({{HEADLESS_DEB_URL}}) | glibc 2.35、systemd 249 或更高版本 |
-| Android arm64 | [APK 安装包]({{ANDROID_ARM64_APK_URL}}) | Android 10 及以上、WebView 108 及以上 |
+| macOS Apple 芯片 | [DMG 安装包]({{MACOS_ARM64_DMG_URL}}) | |
+| macOS Intel | [DMG 安装包]({{MACOS_X64_DMG_URL}}) | |
+| Linux 桌面 x64 | [Debian / Ubuntu（`.deb`）]({{LINUX_DEB_URL}}) | [RPM]({{LINUX_RPM_URL}}) · [AppImage]({{LINUX_APPIMAGE_URL}}) |
+| Linux-headless 版（amd64） | [系统服务（`.deb`）]({{HEADLESS_DEB_URL}}) | 以 Ubuntu 22.04 为构建环境，需要 systemd 249 及以上 |
+| Android arm64 | [APK 安装包]({{ANDROID_ARM64_APK_URL}}) | Android 10 及以上、系统 WebView 108 及以上 |
 
-- 若桌面仅在早期版本的系统凭据库中留有终端授权，升级后请在本机「设置」点击「允许远程终端」。已由 MeshShare 确认并保存的授权会继续生效。
-- macOS：在「关于本机」确认芯片，把 DMG 中的应用拖到「应用程序」。安装包为 ad-hoc 签名、未经公证；确认来自本项目 Release 后，可在「系统设置 → 隐私与安全性」选择「仍要打开」。不要关闭系统 Gatekeeper。
-- Linux：AppImage 需要执行权限（`chmod +x MeshShare_*.AppImage`）。若已运行系统包版本，先从托盘退出，再打开 AppImage。
-- Android：下载 APK 后，按系统提示允许该来源安装应用。
+- **macOS**。在「关于本机」确认芯片，把 DMG 中的 MeshShare 拖到「应用程序」。安装包使用 ad-hoc 签名。确认来源后，若 macOS 拦截打开，可在「系统设置 → 隐私与安全性」选择「仍要打开」。
+- **Linux AppImage**。赋予下载的文件执行权限后打开。若其他版本正在运行，先从托盘退出。
+- **Android**。打开下载的 APK，按系统提示允许该来源安装应用。

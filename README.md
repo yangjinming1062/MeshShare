@@ -1,57 +1,48 @@
 <div align="center">
-  <img src="frontend/public/meshshare.svg" width="80" alt="MeshShare 标志" />
+  <img src="frontend/public/meshshare.svg" width="72" alt="" />
   <h1>MeshShare</h1>
-  <p>在一台电脑复制，在另一台粘贴。通过可信局域网或 Tailscale 直接传文件，不需要账号、网盘或中央服务器。</p>
-  <a href="https://github.com/yangjinming1062/MeshShare/releases/latest"><img src="https://img.shields.io/github/v/release/yangjinming1062/MeshShare?label=Release" alt="下载稳定版" /></a>
+  <p>在一台电脑复制，在另一台粘贴。电脑、手机和 Linux 服务器还可以互传文件。</p>
+  <p>通过局域网或 Tailscale 连接设备，无需注册账号，也无需上传到网盘。</p>
+  <p><a href="https://github.com/yangjinming1062/MeshShare/releases/latest"><strong>下载 MeshShare</strong></a> · <a href="docs/DESIGN.md">使用指南</a></p>
 </div>
 
-![两台电脑与手机在局域网内共享剪贴板、文件与硬件指标](.github/assets/hero.svg)
+## 第一次使用
 
-## 可以做什么
-
-| 场景 | 怎么用 |
+| 设备 | 选择哪个版本 |
 | --- | --- |
-| 换台电脑继续工作 | 复制文字或截图，在另一台在线电脑直接粘贴；也可以搜索本机剪贴板历史，预览后恢复。 |
-| 把文件交给其它设备 | 把文件或文件夹拖到设备卡片。接收方确认目录或启用自动接收；按文件校验 SHA-256，不覆盖同名文件，失败可重试。 |
-| 用手机临时收发 | 打开 Android App（Android 10 及以上、WebView 108 及以上），或用浏览器扫节点二维码；手动发送文字、上传或接收文件。 |
-| 查看另一台机器 | 设备列表显示 CPU、内存、GPU 和网速。进入目标节点可查看详情、调整设置；经目标本机授权后，还能让它从自己的磁盘发送文件。 |
-| 操作本机或远程终端 | 在桌面或 Android App 的设备列表中，点击在线电脑旁的终端按钮，即可用那台电脑当前的系统账号运行命令。 |
+| Windows、macOS、Linux 电脑 | **桌面版**。Windows 和 Linux 提供 x64 安装包，macOS 提供 Apple 芯片和 Intel 版本。 |
+| 无桌面的 Linux 服务器 | **Linux-headless 版**。使用 amd64 的 `.deb`，安装后由 systemd 运行，可从桌面版管理。[安装与管理](docs/DESIGN.md#linux-headless-版) |
+| Android 手机 | **Android App**。下载 arm64 APK，需要 Android 10 和系统 WebView 108 或更高版本。 |
+| 手机临时收发 | **手机浏览器**。打开桌面版的「浏览器访问」，用手机扫描二维码，无需安装 App。 |
 
-## 选择使用方式
+1. 让设备连上同一局域网，打开 MeshShare。电脑或 Android App 中，找到「在线设备」。
+2. 没看到对方时，点「+」手动输入对方的地址。跨局域网时，可在同一 Tailscale 组网中连接。
+3. 试着向列表中的设备发送一个文件。两台电脑都开启剪贴板同步时，也可以复制一段文字，然后到另一台粘贴。
 
-| | 桌面节点 | Linux Headless | Android App | 浏览器 |
-| --- | --- | --- | --- | --- |
-| 运行方式 | Windows、macOS、Linux；托盘常驻、可开机自启 | amd64 NAS 或服务器，systemd 常驻 | 打开 App 时运行节点 | 打开在线节点的地址即可，无需安装 |
-| 剪贴板 | 自动同步文字与图片 | 保存并转发共享快照 | 手动读写文字 | 手动同步文字，系统剪贴板受浏览器权限限制 |
-| 文件接收 | 选择目录或设为自动接收 | 桌面远程确认或设置自动接收目录 | 应用专属目录，授权后可用公共下载目录 | HTTP 逐项下载；受信任的 HTTPS 页面在浏览器支持时可选目录 |
-| 硬件监控 | 本机与对端详情、桌面悬浮条 | 由桌面查看服务器指标 | 查看对端详情，本机提供网速 | 不采集本机硬件 |
+## 主要功能
 
-## 安装与首次连接
-
-从 [GitHub Releases](https://github.com/yangjinming1062/MeshShare/releases/latest) 的「下载指导」选择对应系统和芯片的安装包。启动后，按设备类型连接：
+- **同步剪贴板**。在电脑之间自动同步文字和图片，在「历史」里查找并恢复之前复制的内容。
+- **直接传文件**。把文件或文件夹拖到桌面版的设备卡片。接收方可逐次确认或设置自动接收。手机也能收发文件、手动分享文字。
+- **查看硬件指标**。在设备列表查看在线设备提供的 CPU、内存、GPU 和网速。桌面版可用悬浮条查看本机状态。
+- **管理远程设备**。在桌面版点击设备名称查看对方的状态，点击齿轮调整设置。桌面版和 Android App 也能连接已开放的远程终端。
 
 ```mermaid
-flowchart LR
-  App[桌面或 Android App] --> List{在线设备中有对方吗？}
-  List -->|有| Peer[选择设备发送文件]
-  List -->|没有| Addr[手动输入对端显示的 HTTP 地址]
-  Addr --> Peer
-  Web[手机浏览器] --> QR[扫描桌面「浏览器访问」二维码]
-  QR --> Page[在网页收发文件或文字]
+flowchart TD
+    A["桌面版"]
+    B["另一台电脑"]
+    C["Android App / 手机浏览器"]
+    D["Linux-headless 版"]
+    A <-->|"同步剪贴板 · 互传文件"| B
+    A <-->|"收发文件 · 手动分享文字"| C
+    A <-->|"互传文件 · 桌面端管理"| D
 ```
 
-**在 NAS 上安装。** Linux 桌面使用 `MeshShare_版本_amd64.deb`。无界面 NAS 下载 `meshshare-headless_版本_amd64.deb`，在只含该安装包的目录中以管理员身份运行 `apt-get install -y ./meshshare-headless_*_amd64.deb`。服务安装后自动启动。运行 `meshshare-headless status` 查看实际端口，或从桌面「在线设备」点击 NAS 名称管理。首次安装默认允许可信网络中的设备浏览服务账户可读的目录；远程终端也以此账户运行。[NAS 使用与恢复](docs/DESIGN.md#无界面-linux-节点)
+节点端口用于局域网或 Tailscale，请勿转发到公网。新装的桌面版默认允许其他已连接的桌面版或 Android App 打开远程终端，命令以目标机器上的系统账户运行。[远程终端权限](docs/DESIGN.md#桌面终端)
 
-桌面之间无需先选设备：连接后在一端复制文字，即可在另一端粘贴。跨局域网可用 Tailscale；手动连接以对端显示的端口为准，默认是 `37880`。
+## 界面预览
 
-**只在可信网络使用。** 远程终端信任同一网络中其他设备上已连接的原生节点，它们可以用目标电脑当前的系统账号运行命令。本机授权步骤见[桌面终端](docs/DESIGN.md#桌面终端)。剪贴板、文件和设备管理使用明文 HTTP/WebSocket，远程终端使用独立的 SSH 加密连接，浏览器 HTTPS 不保护节点间链路。不要向公网转发节点端口。
+| 桌面版 | 手机浏览器 |
+| :---: | :---: |
+| <a href=".github/assets/screenshots/desktop-overview.webp"><img src=".github/assets/screenshots/desktop-overview.webp" width="710" alt="桌面版的在线设备、硬件指标、共享剪贴板和接收请求" /></a> | <a href=".github/assets/screenshots/mobile-web.webp"><img src=".github/assets/screenshots/mobile-web.webp" width="190" alt="手机浏览器的设备列表、文件发送入口和共享剪贴板" /></a> |
 
-## 界面一览
-
-![桌面主窗口：在线设备、共享剪贴板、本机指标和传输任务](.github/assets/screenshots/desktop-overview.webp)
-
-| 搜索并恢复剪贴板 | 确认接收文件 | 手机浏览器 |
-| :---: | :---: | :---: |
-| [![历史记录与预览](.github/assets/screenshots/desktop-history.webp)](.github/assets/screenshots/desktop-history.webp) | [![传输请求与接收操作](.github/assets/screenshots/desktop-transfer.webp)](.github/assets/screenshots/desktop-transfer.webp) | <img src=".github/assets/screenshots/mobile-web.webp" width="145" alt="手机单列设备列表与发送入口" /> |
-
-[使用指南与平台限制](docs/DESIGN.md) · [源码构建与验证](docs/DEVELOPMENT.md) · [维护导航](AGENTS.md) · [MIT 许可证](LICENSE)
+[使用指南](docs/DESIGN.md) · [源码构建](docs/DEVELOPMENT.md) · [维护导航](AGENTS.md) · [MIT 许可证](LICENSE)

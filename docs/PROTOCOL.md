@@ -1,167 +1,126 @@
 # MeshShare 节点协议
 
+HTTP 和 WebSocket 使用 `/api/v1`，原生节点的当前握手版本为 `2`。请求和响应以[路由及处理函数](../backend/src/server.rs)、[节点消息类型](../backend/src/model.rs)和[设置类型](../backend/src/control.rs)为准。常见业务错误返回 `{"error":"…"}`。节点的地址范围和操作权限见[网络与权限](ARCHITECTURE.md#网络与权限)。
+
 ## HTTP 接口
 
-业务错误使用 `{ "error": "..." }`。远程管理请求可以通过 `X-MeshShare-Target` 指定预期节点 ID；节点在处理请求前校验该值，不匹配时返回 421。远程管理写入前用 `GET /api/v1/info` 核对候选地址。若地址在预检后易主，请求内的目标校验由实际处理写入的节点执行。适用网络与授权条件见[信任边界](ARCHITECTURE.md#信任边界)。
+按节点 ID 选择管理目标。桌面客户端在写入前用 `GET /api/v1/info` 核对候选地址，并用 `X-MeshShare-Target` 指定预期处理请求的节点 ID。节点收到此请求头时会校验，目标不符时返回 421。
 
 ### 节点与设置
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/info` | 节点身份、版本、能力、端口和访问地址 |
-| `GET` | `/api/v1/peers` | 当前在线设备 |
+| `GET` | `/api/v1/info` | 节点身份、版本、能力和地址 |
+| `GET` | `/api/v1/peers` | 当前设备连接 |
+| `POST` | `/api/v1/peers/connect` | 用 `{"url":"…"}` 发起手动连接 |
 | `GET` | `/api/v1/metrics` | 本机最新硬件快照 |
-| `GET` | `/api/v1/clipboard/status` | 本机剪贴板可用性和重试状态 |
-| `GET` | `/api/v1/settings` | 设置、更新状态、监控能力和剪贴板状态 |
-| `PATCH` | `/api/v1/settings` | 修改设置；目录路径由目标节点校验 |
-| `POST` | `/api/v1/settings/update-check` | 让目标节点立即检查更新 |
-| `GET` | `/api/v1/mobile/access` | 网页 HTTP/HTTPS 地址和 CA 指纹 |
-| `GET` | `/api/v1/mobile/ca` | 下载接入节点的本地 CA |
-| `POST` | `/api/v1/peers/connect` | 通过手动地址发起连接 |
+| `GET` / `PATCH` | `/api/v1/settings` | 读取设置与能力 / 修改设置 |
+| `POST` | `/api/v1/settings/update-check` | 请求目标节点检查更新 |
+| `POST` | `/api/v1/management/service/restart` | 请求 Linux-headless 版重启服务 |
 
-支持 `node.headless.v1` 的 Linux 服务沿用握手版本 2。它报告 `clipboard.view`，在保存最新快照后按事件 ID 去重并转发，且不请求写入系统剪贴板。普通只读节点仍按原语义处理。
+Linux-headless 版声明 `node.headless.v1`。它的 `autostart_enabled` 对应 systemd 自启状态，读取失败时设置快照返回 `service_control_error`。重启请求必须携带 `X-MeshShare-Target`，无需请求体。受理后返回 202，目标缺失或不符返回 421，有活动任务时返回 409，服务控制不可用时返回 503。响应中断时按节点 ID 重连，避免重复提交重启请求。
 
-Headless 的 `autostart_enabled` 读写 systemd 自启状态。如果无法读取，设置快照用可选的 `service_control_error` 返回原因，客户端停用服务控制。远程管理通过 `POST /api/v1/management/service/restart` 请求重启，必须使用 `X-MeshShare-Target` 发送预期的节点 ID，无请求体。目标不匹配返回 421，工作进行中返回 409，无法提交给控制助手返回 503，接受后返回无正文的 202。连接可能在重启时中断，客户端按节点 ID 重连，避免重新提交同一重启请求。
-
-设置中的 `monitor.visible` 表示保存的用户显示偏好，不表示窗口当前一定可见。全屏自动隐藏仅在桌面壳内临时生效，不修改该字段；全屏期间设置为 `true` 后仍需等全屏条件解除才显示，设置为 `false` 则解除后也不会自动显示。
+桌面的 `monitor.visible` 保存悬浮条显示偏好，实际显示仍受全屏自动隐藏影响。
 
 ### 剪贴板
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/clipboard` | 当前共享快照 |
-| `GET` | `/api/v1/clipboard/preview/{event_id}` | 当前图片的等比 PNG 预览，最长边为 720 像素 |
-| `POST` | `/api/v1/clipboard` | 发布文字或 PNG，网页端发送文字 |
-| `GET` | `/api/v1/clipboard/history` | 历史元数据和保留设置 |
-| `GET` | `/api/v1/clipboard/history/{event_id}` | 单条历史的完整内容 |
-| `GET` | `/api/v1/clipboard/history/{event_id}/thumbnail` | 图片历史的 96×72 PNG 缩略图；无图片或记录不存在时返回 404 |
-| `POST` | `/api/v1/clipboard/history/{event_id}/restore` | 恢复单条历史并发布新事件 |
-| `DELETE` | `/api/v1/clipboard/history` | 清空历史，保留当前快照 |
+| `GET` / `POST` | `/api/v1/clipboard` | 读取当前快照 / 发布 `text` 或 Base64 编码的 `image_png` |
+| `GET` | `/api/v1/clipboard/status` | 系统剪贴板可用性和重试状态 |
+| `GET` | `/api/v1/clipboard/preview/{event_id}` | 读取当前图片的缩小预览 |
+| `GET` / `DELETE` | `/api/v1/clipboard/history` | 读取本机历史摘要 / 清空历史 |
+| `GET` | `/api/v1/clipboard/history/{event_id}` | 读取完整历史内容 |
+| `GET` | `/api/v1/clipboard/history/{event_id}/thumbnail` | 读取 96×72 PNG 历史缩略图 |
+| `POST` | `/api/v1/clipboard/history/{event_id}/restore` | 用历史内容发布新事件 |
 
-读取当前快照时可同时带上已持有快照的 `known_event_id` 与 `known_clock`。后者为快照时钟的 `physical_ms:logical:node_id`。两者均与当前快照一致时返回无正文的 204，其他情况返回 200 和最新快照。空快照用 JSON `null` 表示，旧节点可能始终返回 200。
+- 读取快照时可同时传入 `known_event_id` 和 `known_clock`。后者格式为 `physical_ms:logical:node_id`。两者均匹配时返回 204，其余返回最新快照或 JSON `null`。
+- 预览的最长边为 720 像素，可用同格式的 `clock` 绑定版本。事件已替换、版本不符或没有可用缩略预览时返回 404，客户端可用快照中的原图生成预览。
+- 文字和 PNG 文件各限 16 MiB，PNG 尺寸上限为 8192×8192。历史在目标节点本地保存，清空历史后仍可读取当前快照。
 
-预览接口只服务当前事件中的非隔行 PNG。可用 `clock` 传入与 `known_clock` 同格式的时钟以绑定图片版本。事件已被替换、时钟不匹配、图片已经足够小或无法生成预览时返回 404，界面可用已读取的快照生成预览。快照接口仍返回原图。
-
-历史列表只返回来源、时间、内容类型和截断预览，详情接口才返回完整内容；两者都只访问目标节点本机记录，不改变节点间的快照交换。
-
-剪贴板文字和 PNG 单项均不超过 16 MiB，图片解码不超过 8192×8192 像素和 128 MiB 分配；历史默认保留 50 条或 30 天，可配置为 1–500 条或 1–365 天，payload 默认上限 512 MiB。事件 ID、来源节点 ID 和来源名称有长度上限，接收端在写入快照、历史索引或去重表前校验。
-
-### 传输
+### 节点文件传输
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/transfers` | 创建接收任务并返回接收端状态 |
-| `GET` | `/api/v1/transfers` | 查询本机任务 |
-| `GET` | `/api/v1/transfers/history` | 最近 10 条终态历史，可用 `session_id` 过滤 |
-| `DELETE` | `/api/v1/transfers/history` | 清空历史并同步删除对端配对记录 |
-| `POST` | `/api/v1/transfers/{id}/accept` | 用目标节点上的绝对路径接受任务 |
-| `POST` | `/api/v1/transfers/{id}/reject` | 拒绝任务 |
-| `POST` | `/api/v1/transfers/{id}/cancel` | 取消任务 |
-| `POST` | `/api/v1/transfers/{id}/fail` | 发送端重试耗尽后标记失败 |
-| `POST` | `/api/v1/transfers/{id}/retry` | 重新打开可恢复的失败任务 |
-| `DELETE` | `/api/v1/transfers/{id}` | 移除失败任务记录 |
-| `GET` | `/api/v1/transfers/{id}/status` | 查询进度 |
-| `PUT` | `/api/v1/transfers/{id}/items/{item_id}` | 写入单个文件流 |
-| `POST` | `/api/v1/outgoing` | 把待发送清单交给本机节点暂存（仅回环） |
-| `PUT` | `/api/v1/outgoing/{id}/items/{item_id}` | 写入暂存区并校验大小，按写入内容回填 SHA-256（仅回环） |
-| `POST` | `/api/v1/outgoing/{id}/start` | 登记出站任务并发送清单（仅回环） |
-| `POST` | `/api/v1/outgoing/{id}/cancel` | 取消暂存并清理目录（仅回环） |
-| `POST` | `/api/v1/outgoing/paths` | 按原路径读取并计算摘要（仅回环） |
-| `GET` | `/api/v1/outgoing/{id}` | 查询准备进度；结束或取消后 404（仅回环） |
+| `POST` / `GET` | `/api/v1/transfers` | 提交 `TransferOffer` / 查询本机任务 |
+| `GET` / `DELETE` | `/api/v1/transfers/history` | 查询最近 10 条终态历史 / 清空历史 |
+| `POST` | `/api/v1/transfers/{id}/accept` | 用 `{"destination":"…"}` 接收 |
+| `POST` | `/api/v1/transfers/{id}/{reject,cancel,fail,retry}` | 拒绝、取消、标记失败或重开失败任务 |
+| `GET` | `/api/v1/transfers/{id}/status` | 查询任务进度与清单 |
+| `PUT` | `/api/v1/transfers/{id}/items/{item_id}` | 上传单个文件流 |
+| `DELETE` | `/api/v1/transfers/{id}` | 移除失败任务 |
 
-传输历史路径属于返回记录的节点。接收记录可携带 `item_root`，表示在所记录接收目录中首个已提交条目的顶层名称。重试更换接收目录时，定位项也以新目录的提交为准。字段缺失或定位项已移除时，仍可打开存在的接收目录。
+`destination` 必须是接收节点可用的现有绝对目录。建单时 `target_node_id` 须与接收节点一致，地址变更时先用 `/api/v1/info` 核对身份，再对已确认的地址查询状态、上传或重试。失败任务移除时，记录不存在返回 404，记录处于其他状态返回 409。
 
-`accept` 的 `destination` 必须是目标节点上已存在且通过目录校验的路径，管理端不会把本机文件选择器的路径当作远程路径。只有 `failed` 记录可以被删除：删除后立即从节点状态移除，记录不存在返回 404，任务不处于失败状态返回 409。历史按结束时间倒序；`session_id` 只匹配网页会话记录，清空只删除历史，不影响活动与失败任务。
+历史按结束时间倒序，`GET` 和 `DELETE` 均可带 `session_id` 过滤网页会话记录。历史里的绝对路径属于返回记录的节点。接收记录可带 `item_root` 表示接收目录下的首个已提交顶层条目，打开目录前按本机实际路径检查。
 
-普通直传清单中的 `target_node_id` 必须等于接收节点标识，否则返回 421。地址回退通过 `GET /api/v1/info` 核对端点身份，后续状态查询、上传和重试共用已验证地址；已验证的 WebSocket 端点优先，其他受限私网候选在有限预算内依次尝试。节点安装更新期间，失败任务重试返回 425。
-
-### 远程管理
+### 发送准备与远程文件访问
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `GET` | `/api/v1/management/files/roots` | 可浏览的起始位置 |
-| `GET` | `/api/v1/management/files?path=...` | 列出目标目录一层内容，只返回名称、类型、大小和时间 |
-| `POST` | `/api/v1/management/outgoing/paths` | 用目标机器绝对路径建立发送任务 |
-| `POST` | `/api/v1/management/mobile/outgoing/paths` | 从目标机器的路径发送到其网页会话（要求能力 `management.mobile-paths.v1` 和远程文件访问授权），传入 `session_id` 和 `paths`，返回待确认的网页传输 |
-| `GET` | `/api/v1/management/outgoing/{id}` | 查询远程准备进度；结束或取消后 404 |
-| `POST` | `/api/v1/management/outgoing/{id}/cancel` | 取消远程准备任务 |
+| `POST` | `/api/v1/outgoing` | 向本机提交暂存清单 |
+| `PUT` | `/api/v1/outgoing/{id}/items/{item_id}` | 上传到本机暂存区，校验大小并回填摘要 |
+| `POST` | `/api/v1/outgoing/{id}/start` | 启动已暂存的发送任务 |
+| `POST` | `/api/v1/outgoing/paths` | 按本机路径准备发送 |
+| `GET` / `POST` | `/api/v1/outgoing/{id}` / `/api/v1/outgoing/{id}/cancel` | 查询按路径发送的准备进度 / 取消准备或清理暂存 |
+| `GET` | `/api/v1/management/files/roots` | 获取目标机器的浏览入口 |
+| `GET` | `/api/v1/management/files?path=…` | 查看目标目录一层元数据，支持 `offset` 与 `limit` |
+| `POST` | `/api/v1/management/outgoing/paths` | 按被管理机器的路径准备发送 |
+| `GET` / `POST` | `/api/v1/management/outgoing/{id}` / `/api/v1/management/outgoing/{id}/cancel` | 查询 / 取消远程准备任务 |
+| `POST` | `/api/v1/management/mobile/outgoing/paths` | 用 `session_id` 和 `paths` 从被管理机器向其网页会话发送 |
 
-远程管理需要目标声明 `management.remote.v1`。从目标磁盘选择文件还需要 `management.files.v1`。管理接口只返回目录元数据，路径发送的 `target_node_id` 必须是目标已连接的 peer，发送源固定为目标节点自身。这组接口要求目标机器开启 `remote_file_access`（桌面默认关闭，新安装的 Headless 服务默认开启），关闭时统一返回 403；该设置不出现在 `GET/PATCH /api/v1/settings` 中。相对路径返回 400，不可访问路径返回 404。
+`/outgoing` 仅允许回环请求。按路径发往另一节点时提交 `target_node_id` 和 `paths`，由持有文件的节点读取绝对路径并发往已连接的接收方。准备任务退出后，查询返回 404。
 
-### 桌面终端
-
-原生节点在首次 WebSocket `Hello` 的可选 `node.terminal` 中通告进程级 Ed25519 客户端公钥指纹 `client_fingerprint`。允许入站终端的桌面同时通告 `terminal.ssh.v3` 和独立的 `host_fingerprint`。等待本机授权的桌面只通告客户端指纹，授权后向已有连接发送新的 `Hello`。指纹使用 OpenSSH SHA-256 格式。客户端按当前连接最新一次 `Hello` 更新终端入口。`GET /api/v1/info` 和 `GET /api/v1/peers` 提供相应快照。仅支持 v2 终端的设备可交换其他节点消息，远程终端要求两端支持 v3。
-
-发起端按已连接的目标节点 ID 选择可达地址，对 `GET /api/v1/terminal/ssh` 发送 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v3` 和 `X-MeshShare-Terminal-Target`（目标节点 ID）。返回 101 后，同一连接承载 SSH。请求带有浏览器 Origin、目标尚未允许入站终端、实际来源缺失或不属于其他设备上的节点网络地址时返回 403。回环和本机各网卡地址均属于本机来源。目标 ID 不符返回 421，升级协议不符返回 426。入站连接已满返回 429，节点正在退出返回 503。
-
-节点 WebSocket 只允许原生连接登记终端身份。发起端校验主机密钥，目标端按 SSH 用户名查找当前节点通道，校验客户端指纹和公钥签名后才接受交互 shell。
-
-通过公钥认证的入站 SSH 绑定到当时的节点 WebSocket 和客户端指纹。该 WebSocket 断开、超时，或后续 `Hello` 更换或撤下客户端指纹时，目标端立即关闭相应的 SSH 连接并回收 shell。同一节点重新连接后需要重新打开终端。
-
-终端的输入、输出与尺寸变更各自属于对应的 SSH 会话。发起端通过 SSH 心跳确认连接，目标端根据入站流量检测断线。shell 正常退出时，目标端先送完剩余输出，再发送 EOF 并关闭通道。
-
-目标端分批发送终端输出。每批结束时，目标端通过 SSH 通道的私用扩展数据类型 `0xFE000000` 发送单个 `0x00` 字节。发起端将此前的输出排入有界界面队列后原样回复，目标端随后可以发送下一批。界面暂停消费时，目标端暂停读取后续输出，SSH 仍处理心跳和关闭请求。
+桌面界面按 `management.remote.v1` 开放远程管理，按 `management.files.v1` 开放远程文件浏览；从被管理机器按路径直接发送到网页使用 `management.mobile-paths.v1`。远程浏览和路径发送均要求在被管理节点启用远程文件访问，否则返回 403。桌面版通过本机界面启用，Linux-headless 版随新建配置启用。
 
 ### 网页会话
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/mobile/sessions` | 创建网页接收会话 |
-| `GET` | `/api/v1/mobile/sessions` | 查询本机活跃会话 |
-| `POST` | `/api/v1/mobile/transfers` | 为会话创建待下载清单 |
-| `GET` | `/api/v1/mobile/transfers?session_id=...` | 查询下载任务并续期会话 |
-| `POST` | `/api/v1/mobile/transfers/{id}/accept` | 网页端确认接收 |
-| `POST` | `/api/v1/mobile/transfers/{id}/reject` | 网页端拒绝 |
-| `POST` | `/api/v1/mobile/transfers/{id}/cancel` | 取消未完成或待下载任务 |
-| `POST` | `/api/v1/mobile/transfers/{id}/fail` | 桌面端上传无法恢复时标记失败 |
-| `DELETE` | `/api/v1/mobile/transfers/{id}` | 移除失败记录并清理暂存目录 |
-| `PUT` | `/api/v1/mobile/transfers/{id}/items/{item_id}` | 桌面端写入网页临时文件区 |
-| `GET` | `/api/v1/mobile/transfers/{id}/items/{item_id}/download?session_id=...` | 网页端流式下载；`auto_complete=true` 在提供全部内容时确认 |
-| `POST` | `/api/v1/mobile/transfers/{id}/items/{item_id}/complete` | 网页端本地写入后确认 |
-| `GET` | `/api/v1/mobile/peers/{peer_id}/api/v1/info` | HTTPS 网页核对目标设备标识 |
-| `POST/GET/PUT` | `/api/v1/mobile/peers/{peer_id}/api/v1/transfers/...` | HTTPS 网页经接入节点代理访问其他桌面节点 |
+| `GET` | `/api/v1/mobile/access` | 查询网页地址和本地 CA 指纹 |
+| `GET` | `/api/v1/mobile/ca` | 下载接入节点的本地 CA |
+| `POST` / `GET` | `/api/v1/mobile/sessions` | 建立 / 查询活跃会话 |
+| `POST` | `/api/v1/mobile/transfers` | 用 `session_id` 和 `offer` 登记下载任务 |
+| `GET` | `/api/v1/mobile/transfers?session_id=…` | 查询下载任务并续期会话 |
+| `POST` | `/api/v1/mobile/transfers/{id}/{accept,reject,cancel}` | 用 `session_id` 确认接收、拒绝或取消 |
+| `POST` / `DELETE` | `/api/v1/mobile/transfers/{id}/fail` / `/api/v1/mobile/transfers/{id}` | 标记上传失败 / 移除失败记录 |
+| `PUT` | `/api/v1/mobile/transfers/{id}/items/{item_id}` | 上传文件到接入节点的网页暂存区 |
+| `GET` | `/api/v1/mobile/transfers/{id}/items/{item_id}/download?session_id=…` | 流式下载 |
+| `POST` | `/api/v1/mobile/transfers/{id}/items/{item_id}/complete` | 用 `session_id` 确认项目已保存 |
 
-`TransferStatus::ready` 表示网页清单的项目已在接入节点暂存并校验。
+`ready` 表示清单内容已暂存并校验。浏览器默认下载使用 `auto_complete=true`，节点在提供完整响应内容时确认项目，并在 `retryable_download_item_ids` 标记仍可重新下载的项目。使用 HTTPS 网页选择目录时，浏览器在本地流式写入和校验后调用 `complete`。若确认请求失败，可以补发确认。
+
+HTTPS 网页向其他节点传文件时，以 `/api/v1/mobile/peers/{peer_id}` 为前缀调用目标 `/api/v1/info`，以及建单、查询状态、上传项目、拒绝、取消、失败标记和重试接口。客户端对代理请求指定接入节点 ID，代理转发时指定最终接收节点 ID。
 
 ## WebSocket 消息
 
-客户端连接 `GET /api/v1/ws` 升级会话。进度错误、目标字段、地址元数据和 GPU 描述有长度或数量上限，超限消息会被忽略。
+通过 `GET /api/v1/ws` 建立连接。消息形如 `{"type":"Ping","payload":{"at_ms":0}}`，结构见 [`WireMessage`](../backend/src/model.rs)。原生节点用 `Hello` 交换身份、版本和能力，当前连接地址、协议版本和通告有效时才登记对端。界面在连接建立时发送 `Ping`，之后每 15 秒保活，节点回复 `Pong`。用 `?clipboard_updates=notice` 订阅 `ClipboardChanged`，收到事件 ID 后通过 HTTP 获取快照。省略参数时，界面接收带内容的 `ClipboardUpdate`。
 
-消息使用 `{ "type": "VariantName", "payload": ... }`，结构以 `backend/src/model.rs` 中的 `WireMessage` 为准。
+| 消息 | 调用方需要遵守的约定 |
+| --- | --- |
+| `ClipboardUpdate` / `ClipboardSnapshot` | 更新携带 `event`，重连交换 `snapshot`。按事件 ID 去重，按混合逻辑时钟选最新快照，转发保留原始来源。 |
+| `TransferOffer` | `offer` 的发送方须等于连接对端，目标须等于接收节点。 |
+| `TransferAction` | `accept`、`reject`、`cancel`、`fail` 只对当前 `retry_count` 生效。 |
+| `TransferProgress` | 节点直传的在途进度可省略 `offer`，沿用已有清单。字节包含当前在途数据，项目数只计已提交项目。进度须在清单总量内单调增长，同代终态禁止回到活动状态。 |
+| `TransferHistoryDeleted` | 仅在声明 `transfer.history.v1` 的节点间同步删除配对记录。离线时暂存待通知的 ID，重连后补发。 |
+| `MetricsUpdate` | 携带采集节点的最新快照。快照 `node_id` 须等于连接对端。 |
 
-- `Hello` 携带节点身份、能力和 `protocol_version`。当前节点握手版本为 `2`。实际连接对端属于节点监听支持的 IPv4 范围、双方版本一致且通告有效时，节点才会注册并出现在设备列表。HTTP 和 WebSocket 路径使用 `/api/v1`。
-- `Ping` / `Pong` 用于保活。
-- `ClipboardUpdate` 的 `payload.event` 包含事件 ID、原始来源节点、HLC 和内容。接收端用当前 Peer Channel 确认发送方；多跳转发时来源可以与当前发送方不同。
-- `ClipboardSnapshot` 的 `payload.snapshot` 用于新连接交换最新快照，保留原始 `source_node_id`；接收端按 HLC 比较新旧并按事件 ID 去重。
-- `TransferOffer` 的 `payload.offer` 包含清单、总大小和发送节点。
-- `TransferAction` 支持 `accept`、`reject`、`cancel` 和 `fail`，每条消息携带 `retry_count`。接收端只应用当前代次的操作。重试由目标节点的 HTTP `retry` 接口发起，通过 `TransferProgress` 同步新代次。接收目录仅由接收节点本地选择。
-- `TransferProgress` 的 `payload.progress` 包含状态、已完成字节、错误和可选的 `retry_count`。在途字节更新省略 `offer`，客户端沿用该任务清单；建单、项目提交和列表或状态查询提供完整清单。只有代次递增才允许失败任务回到活动状态，旧失败消息不能覆盖新进度。传输进行中，节点本地进度与状态接口返回的 `completed_bytes` 还包含当前条目已接收但尚未提交的字节，`completed_items` 仍只统计已提交条目；两者都不回退且不超过总量。
-- `MetricsUpdate` 的 `payload.metrics` 包含节点最新硬件快照。
-- `TransferHistoryDeleted` 的 `payload.transfer_ids` 请求对端删除配对记录；接收端只接受有限数量，只删除当前 Peer 自己的记录，不反向转发。
+原生节点向声明 `clipboard.text` 或 `clipboard.view` 的对端发送剪贴板消息。桌面支持写入系统剪贴板。Android 和 Linux-headless 版使用 `clipboard.view`，均可主动发布共享剪贴板，Linux-headless 版还会转发新的快照。
 
-发送端的本地出站进度在收到清单回复前为 `waiting`，同时标记 `awaiting_offer_reply: true`。接收节点通过 HTTP 建单响应或 WebSocket 进度返回任务状态，`accepted` 表示已确定接收目录，`waiting` 表示仍需确认。收到接收端状态后，发送端将该标记设为 `false`。
-
-能力声明决定消息是否发送：`clipboard.text` 表示接收剪贴板事件并允许写入本机系统剪贴板，`clipboard.view` 表示只展示快照；发送端跳过未声明两者的对端。Android 声明 `clipboard.view`，但通过本地 HTTP 主动发布的文字仍会发给声明 `clipboard.text` 的桌面节点。`transfer.history.v1` 表示可处理 `TransferHistoryDeleted`；只向声明该能力的对端发送此消息。对端离线时待删除标识写入节点数据目录，重连后补发；已知不支持时丢弃队列。
-
-桌面、Android 和浏览器界面也使用该 WebSocket 接收本节点事件。界面连接建立后立即发送 `Ping`，之后每 15 秒一次。节点返回 `Pong` 并保持界面流，只有原生节点握手才注册对端设备。没有界面心跳且未完成节点握手的连接在超时后关闭。
-
-界面连接可使用 `GET /api/v1/ws?clipboard_updates=notice`。节点以 `ClipboardChanged` 通知最新剪贴板变更，`payload.event_id` 标识事件，界面再通过快照接口取内容。未指定此参数的旧界面仍接收带内容的 `ClipboardUpdate`，连续更新可合并为最新一项。新界面兼容旧节点的带内容消息。原生节点的发送队列同时受条数和剪贴板内容字节数限制，队列满后重发当前快照。
-
-接收端只接受与当前清单总量一致且进度不回退的 `TransferProgress`。同一重试代次内终态不会被旧消息覆盖。剪贴板事件 ID 在内存去重十分钟，当前事件也始终拒绝重复应用。历史按内容哈希去重并持久化。节点重启后只使用本机历史和当前快照恢复。
-
-## 硬件指标
-
-`HardwareMetrics` 包含本机采样时间、系统资源、网络速率及各磁盘与 GPU 的指标。没有磁盘或 GPU 数据时，相应列表为空。字段定义见 [HardwareMetrics](../backend/src/model.rs)。
-
-显存只统计独立显存，共享内存与统一内存不折算，没有独立显存的核显字段为空；平台无法读取时附 `unavailable_reason`。Windows 不提供系统负载均值时该字段为空；Android 只填充网络上下行速率。`PeerInfo.metrics_received_at_ms` 是本地收到快照的时间，`metrics_stale` 由服务端按 5 秒阈值计算。
-
-节点通过 `Hello` 的 `capabilities` 声明指标能力：`metrics.system`、`metrics.network`、`metrics.gpu` 表示可提供对应本机字段，`metrics.view.system`、`metrics.view.gpu` 表示希望接收对端字段。发送端只向声明提供或查看相应指标的对端发送 `MetricsUpdate`；对端未声明系统能力时 CPU、内存、交换分区、负载、运行时间和磁盘为空，未声明 GPU 时列表为空，未声明 `metrics.network` 时速率为空。接收端校验快照中的 `node_id` 与当前对端一致后更新本地缓存并通知界面。
-
-节点约每秒生成快照；磁盘容量每个周期刷新，磁盘列表约每十秒刷新；GPU 采集需要调用系统性能计数器，实际间隔可能略长。
+指标能力按 `metrics.system`、`metrics.gpu`、`metrics.network` 声明，接收系统和 GPU 数据也可声明相应 `metrics.view.*`。消息按接收方能力省略数据。硬件或平台缺少数据时使用空字段或空列表，显存字段采用专用显存数据。Android 提供网络速率。对端指标在本地接收超过 5 秒后标为 `metrics_stale`。
 
 ## 传输安全约束
 
-- **路径。** `relative_path` 必须是目标目录下的相对路径，禁止盘符、分隔符穿越、`.` 和 `..`，同一清单不能出现归一化后的重复路径。清单和内容没有固定业务上限，但受控制面解析预算、网页清单内存预算、`u64` 溢出检查、磁盘安全余量和运行时清理约束。运行时最多保留有限条桌面传输记录，优先淘汰终态；失败记录最长保留 24 小时且数量受限。
-- **写入。** 接收端逐级检查目录并拒绝符号链接，同一项目加锁避免并发写入。先在同目录创建随机 `.part` 文件并登记，校验清单大小；清单携带 SHA-256 时核对内容摘要，留空时以写入内容的摘要回填清单（页面创建的清单留空，节点直传的清单必须携带），随后提交为最终文件名，不覆盖已有文件。节点启动时清理仍登记的遗留 `.part`；读取、写入、校验或提交报错，以及请求被取消时都会尝试清理，提交成功后才移除登记。
-- **网页。** 接入节点持有短期会话，桌面先把文件上传到暂存区。HTTP 页面逐项流式下载，`Content-Disposition` 同时提供 ASCII `filename` 和 UTF-8 `filename*` 并过滤路径分隔符与控制字符；`auto_complete=true` 在节点提供完整响应时确认项目，空文件在响应准备好时确认。`retryable_download_item_ids` 标记仍可重新下载的项目，暂存文件随会话到期、终态任务回收或显式确认清理。HTTPS 页面校验并流式写入本地目录后调用 `complete`，网页选择的目录只保留在浏览器的 `FileSystemDirectoryHandle` 中，不通过接口发送路径；HTTPS 网页经接入节点同源代理向其他桌面节点流式上传。每一跳按实际接收节点核对目标 ID，接入节点转发时使用最终接收节点的 ID。会话空闲 90 秒后后台清理任务和临时目录，活动传输五分钟无进展也会失败并清理。
-- **原生态发送。** 桌面上传前比对源文件大小与修改时间，变化时直接失败。发送端只接受与清单总量和当前代次一致的 PUT 确认。网络中断、响应丢失或服务端暂时不可用时按项目退避重试，耗尽后通过 `fail` 标记失败。手动重试递增代次并保留已提交项目。重复 PUT 会重新校验已落盘的文件，返回当前代次的 `uploading` 或 `completed` 确认，已提交项目只计数一次。接收目录失效时回到等待确认。已接受但迟迟未开始上传的传输约 90 秒后失败并通知对端，上传中仍按五分钟无进展判定停滞。
+- **清单与提交。** `relative_path` 必须是接收目录内的相对路径，拒绝路径穿越、归一化后重复的路径和符号链接。接收方先写临时文件，核对大小和 SHA-256，再提交最终文件，避免覆盖已有文件。原生节点经 WebSocket 发布的清单须有文件摘要，允许从 HTTP 建单中省略摘要，首次写入后由节点计算回填。
+- **失败与重试。** 发送端尚未收到建单回复时用 `awaiting_offer_reply` 标识。收到 `accepted` 可开始上传，`waiting` 表示仍需接收方确认。暂时失败可按项目重试，重复 PUT 会校验已提交文件并返回当前进度。手动重试由接收方的 HTTP `retry` 发起，`retry_count` 加一并保留已提交项目。目录失效时回到等待确认，正在安装更新时返回 425。
+- **超时与清理。** 已接受的节点传输在约 90 秒内仍未开始上传时失败，传输五分钟无进度时失败。网页会话闲置 90 秒后到期，节点回收相应暂存文件。启动时回收已登记的临时文件和上次运行的暂存区。
+
+## 远程终端
+
+原生节点用 `Hello` 的 `node.terminal.client_fingerprint` 通告进程级 Ed25519 客户端指纹。Android 可发起远程终端。已开放入站终端的桌面版和 Linux-headless 版同时声明 `terminal.ssh.v3` 和独立的 `host_fingerprint`。桌面版确认授权后会在现有连接上发送新的 `Hello`。指纹使用 OpenSSH SHA-256 格式。
+
+发起端请求 `GET /api/v1/terminal/ssh`，携带 `Connection: Upgrade`、`Upgrade: meshshare-ssh-v3` 和 `X-MeshShare-Terminal-Target`。101 后同一连接承载 SSH。来源或入站授权校验失败返回 403，目标错误返回 421，升级协议错误返回 426，连接已满返回 429，节点退出时返回 503。
+
+发起端用当前节点连接通告的指纹核对主机密钥。接收方以客户端节点 ID 为 SSH 用户名，按该节点当前连接校验客户端密钥。节点连接断开或客户端指纹变更会关闭对应 SSH 会话，重连后需重新打开终端。
+
+SSH 通道使用私有扩展数据类型 `0xFE000000` 和单字节 `0x00` 标记一批输出结束。客户端将此前输出纳入有界队列后原样确认，服务端继续发送下一批。shell 正常退出时，服务端送完剩余输出后发送 EOF。

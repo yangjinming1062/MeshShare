@@ -1,30 +1,21 @@
-# Svelte 客户端模块指南
+# Svelte 客户端维护指南
 
-## 界面入口
+## 代码入口
 
-`src/main.ts` 加载 `src/App.svelte`，按运行环境加载桌面控制台或移动界面的组件。桌面侧在打开移动接入弹窗时加载二维码生成模块。Windows 和 macOS 的悬浮条由 `monitor.html` 加载 `src/components/Monitor.svelte`，通过本机 IPC 读取指标和悬浮条设置。`src/components/MobileApp.svelte` 通过回调复用上传、接收与剪贴板操作，不自行判断节点归属。
-
-## 请求与状态
-
-- `src/api.ts` 统一处理节点地址、JSON、缓存、重定向与 `ApiError`。本机地址来自 Tauri 或页面来源，远程目标由 `setApiTarget` 切换。错误分支按状态码与类型判断，不匹配错误文案。
-- 主界面按目标节点持有设置快照。概览、剪贴板和传输历史分别合并并发读取。读取期间的变更共用一次补读，每个调用只等待它请求的那次读取。剪贴板按接收数据的空闲时间超时，独立于传输轮询和网页会话续期。切换目标或关闭窗口后丢弃原界面的读取结果。
-- 编辑框有焦点时保留草稿，失焦后从已缓存的快照更新未修改的内容。发布成功按提交时的编辑修订号确认草稿。并发读取和写入响应到达顺序不一致时，以节点时钟决定快照先后。
-- 大尺寸当前剪贴板图片优先显示节点生成的预览，旧节点由浏览器缩放。打开图片放大弹窗时加载原图，关闭弹窗时释放原图视图。
-- 远程设置弹窗持有独立的目标地址、节点 ID 和设置快照。设置读写与远程目录选择显式绑定弹窗会话，主界面与弹窗按节点串行写入。
-- `src/types.ts` 映射线协议，保留 snake_case。`src/App.svelte` 编排状态与事件，组件通过 props 和回调交互；可独立验证的计算放在同级 TypeScript 模块。
-
-## 按任务定位
-
-| 任务 | 代码入口 |
+| 工作内容 | 入口 |
 | --- | --- |
-| 设备地址与同源代理 | `src/peers.ts` 选择候选，`src/api.ts` 在操作前核对节点身份。 |
-| 文件发送 | `src/upload.ts` 构造清单并上传文件。`src/App.svelte` 按本机任务状态推进发往网页会话的上传，切换管理目标时继续轮询本机。页面直发任务向接收节点查询。 |
-| 递归收集拖放目录、保留相对路径 | `src/drop.ts` |
-| 流式下载、摘要与本地目录保存 | `src/mobileSave.ts`、`src/sha256.ts` |
-| 传输进度与显示格式 | `src/transferProgress.ts`、`src/format.ts` |
-| 历史预览的子序列匹配与排序 | `src/clipboardSearch.ts` |
-| 桌面与 Android 终端入口和标签 | `src/terminal.ts` 按在线状态、v3 能力和主机指纹判断入口，`src/components/TerminalWorkspace.svelte` 管理标签。 |
-| 终端输入输出 | `src/terminal.ts` 每个会话独立排队，通过 `src/terminalNative.ts` 调用本机 IPC。xterm 渲染完数据块后确认序号。 |
-| 图标与共享样式 | `src/icons.ts`、`src/app.css` |
+| 主界面、目标切换和事件协调 | [`src/main.ts`](src/main.ts) · [`src/App.svelte`](src/App.svelte) |
+| 节点请求、地址选择与协议类型 | [`src/api.ts`](src/api.ts) · [`src/peers.ts`](src/peers.ts) · [`src/types.ts`](src/types.ts) |
+| 移动界面与目录保存 | [`src/components/MobileApp.svelte`](src/components/MobileApp.svelte) · [`src/mobileSave.ts`](src/mobileSave.ts) |
+| 文件收集、上传与进度 | [`src/drop.ts`](src/drop.ts) · [`src/upload.ts`](src/upload.ts) · [`src/transferProgress.ts`](src/transferProgress.ts) |
+| 剪贴板图片与历史查询 | [`src/components/ClipboardImage.svelte`](src/components/ClipboardImage.svelte) · [`src/clipboardSearch.ts`](src/clipboardSearch.ts) |
+| 终端标签、会话和渲染 | [`src/components/TerminalWorkspace.svelte`](src/components/TerminalWorkspace.svelte) · [`src/terminal.ts`](src/terminal.ts) · [`src/terminalRenderer.ts`](src/terminalRenderer.ts) |
+| Windows、macOS 悬浮条 | [`monitor.html`](monitor.html) · [`src/components/Monitor.svelte`](src/components/Monitor.svelte) |
 
-`tests/` 使用 `node:test` 验证数据处理与客户端状态。启动、类型检查、测试与打包命令统一见[开发指南](../docs/DEVELOPMENT.md)。
+## 修改时核对
+
+- 节点请求复用 `api.ts` 的目标校验和错误类型。远程设置与远程目录操作绑定打开时的节点及界面会话。切换管理目标后，后台上传仍跟踪原任务所在的节点。
+- 刷新复用 [`snapshotRead`](src/snapshotRead.ts) 合并并发读和补读。切换目标后忽略旧响应。剪贴板按节点时钟应用快照，用户正在编辑的草稿由界面维护。
+- 升级 xterm 时核对 [Vite 配置](vite.config.ts)中的真彩色补丁，并在安装包中验证渲染。
+
+前端单元测试位于 [`tests/`](tests/)，启动、类型检查、测试和构建命令见[开发指南](../docs/DEVELOPMENT.md)。
