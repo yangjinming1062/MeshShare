@@ -3,9 +3,11 @@ use anyhow::Context;
 use axum::Router;
 use axum_server::tls_rustls::RustlsConfig;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,6 +17,20 @@ use tokio::task::JoinHandle;
 
 const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug)]
+pub(crate) struct HttpPortsUnavailable(RangeInclusive<u16>);
+
+impl fmt::Display for HttpPortsUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "无法监听本机 HTTP，端口 {}–{} 均不可用",
+            self.0.start(),
+            self.0.end()
+        )
+    }
+}
 
 struct Listener {
     handle: axum_server::Handle<SocketAddr>,
@@ -45,7 +61,6 @@ pub async fn start(
     data_dir: PathBuf,
     static_root: PathBuf,
     version: String,
-    preferred_port: u16,
     profile: runtime::NodeProfile,
     make_control: impl FnOnce(Arc<runtime::NodeRuntime>) -> Arc<ControlPlane>,
 ) -> anyhow::Result<(Arc<runtime::NodeRuntime>, JoinHandle<()>)> {
@@ -54,7 +69,7 @@ pub async fn start(
         data_dir,
         static_root,
         version,
-        preferred_port,
+        crate::NODE_PORTS,
         &addresses,
         profile,
         make_control,
@@ -78,27 +93,62 @@ pub async fn start(
     Ok((runtime, listener_task))
 }
 
+async fn bind_http_listeners(
+    addresses: &BTreeSet<Ipv4Addr>,
+    ports: RangeInclusive<u16>,
+) -> anyhow::Result<(u16, BTreeMap<Ipv4Addr, TcpListener>)> {
+    let local = Ipv4Addr::LOCALHOST;
+    let mut best: Option<(u16, BTreeMap<Ipv4Addr, TcpListener>)> = None;
+    let mut last_error = None;
+    for candidate in ports.clone() {
+        let loopback = match TcpListener::bind((local, candidate)).await {
+            Ok(listener) => listener,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let port = loopback.local_addr()?.port();
+        let mut sockets = BTreeMap::from([(local, loopback)]);
+        for &ip in addresses.iter().filter(|&&ip| ip != local) {
+            if let Ok(listener) = TcpListener::bind((ip, port)).await {
+                sockets.insert(ip, listener);
+            }
+        }
+        if addresses.iter().all(|ip| sockets.contains_key(ip)) {
+            return Ok((port, sockets));
+        }
+        // Keep the sockets for the best port bound until startup takes ownership of them.
+        if best
+            .as_ref()
+            .is_none_or(|(_, bound)| sockets.len() > bound.len())
+        {
+            best = Some((port, sockets));
+        }
+    }
+    if let Some(bound) = best {
+        return Ok(bound);
+    }
+    let error = last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "没有候选端口"));
+    Err(error).context(HttpPortsUnavailable(ports))
+}
+
 impl Listeners {
     async fn start(
         data_dir: PathBuf,
         static_root: PathBuf,
         version: String,
-        preferred_port: u16,
+        ports: RangeInclusive<u16>,
         addresses: &BTreeSet<Ipv4Addr>,
         profile: runtime::NodeProfile,
         make_control: impl FnOnce(Arc<runtime::NodeRuntime>) -> Arc<ControlPlane>,
     ) -> anyhow::Result<(Self, Arc<runtime::NodeRuntime>)> {
         let local = Ipv4Addr::LOCALHOST;
-        let http = match TcpListener::bind((local, preferred_port)).await {
-            Ok(listener) => listener,
-            Err(_) => TcpListener::bind((local, 0))
-                .await
-                .context("无法监听本机 HTTP")?,
-        };
+        let (http_port, http) = bind_http_listeners(addresses, ports).await?;
         let https = TcpListener::bind((local, 0))
             .await
             .context("无法监听本机 HTTPS")?;
-        let http_port = http.local_addr()?.port();
         let https_port = https.local_addr()?.port();
         let certificate_addresses = addresses.iter().copied().collect::<Vec<_>>();
         let runtime =
@@ -109,8 +159,12 @@ impl Listeners {
         runtime.set_mobile_ca(tls.ca_certificate_path, tls.fingerprint);
         let control = make_control(runtime.clone());
         let app = server::router_with_control(runtime.clone(), static_root, control);
+        let http = http
+            .into_iter()
+            .map(|(ip, socket)| Ok((ip, serve_listener(socket, app.clone(), None)?)))
+            .collect::<io::Result<_>>()?;
         let listeners = Self {
-            http: BTreeMap::from([(local, serve_listener(http, app.clone(), None)?)]),
+            http,
             https: BTreeMap::from([(
                 local,
                 serve_listener(https, app.clone(), Some(config.clone()))?,
@@ -316,6 +370,62 @@ mod tests {
     use crate::model::NodeInfo;
     use crate::runtime::NodeProfile;
 
+    async fn consecutive_listeners(ip: Ipv4Addr) -> (TcpListener, TcpListener) {
+        for _ in 0..16 {
+            // Keep released test ports away from concurrent ephemeral test listeners.
+            let port = rand::random_range(20000..30000);
+            if let Ok(first) = TcpListener::bind((ip, port)).await {
+                if let Ok(second) = TcpListener::bind((ip, port + 1)).await {
+                    return (first, second);
+                }
+            }
+        }
+        panic!("no consecutive test ports available on {ip}");
+    }
+
+    #[tokio::test]
+    async fn http_port_selection_uses_a_backup_and_reports_range_exhaustion() {
+        let local = Ipv4Addr::LOCALHOST;
+        let (occupied, backup) = consecutive_listeners(local).await;
+        let first = occupied.local_addr().unwrap().port();
+        let last = backup.local_addr().unwrap().port();
+        let addresses = BTreeSet::from([local]);
+        let error = bind_http_listeners(&addresses, first..=last)
+            .await
+            .expect_err("the whole range is occupied");
+        assert!(error.is::<HttpPortsUnavailable>());
+        assert!(error.to_string().contains(&format!("{first}–{last}")));
+
+        drop(backup);
+        let (port, listeners) = bind_http_listeners(&addresses, first..=last)
+            .await
+            .expect("bind the backup port");
+        assert_eq!(port, last);
+        assert_eq!(listeners[&local].local_addr().unwrap().port(), port);
+    }
+
+    #[tokio::test]
+    async fn http_port_selection_checks_conflicts_on_network_interfaces() {
+        let Some(ip) = runtime::bind_addresses()
+            .into_iter()
+            .find(|ip| !ip.is_loopback())
+        else {
+            return;
+        };
+        let local = Ipv4Addr::LOCALHOST;
+        let (occupied, backup) = consecutive_listeners(ip).await;
+        let first = occupied.local_addr().unwrap().port();
+        let last = backup.local_addr().unwrap().port();
+        let addresses = BTreeSet::from([local, ip]);
+        drop(backup);
+        let (port, listeners) = bind_http_listeners(&addresses, first..=last)
+            .await
+            .expect("bind the backup port on both interfaces");
+        assert_eq!(port, last);
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[&ip].local_addr().unwrap().port(), port);
+    }
+
     #[tokio::test]
     async fn new_interface_is_retried_served_and_removed_without_restarting() {
         let local = Ipv4Addr::LOCALHOST;
@@ -333,7 +443,7 @@ mod tests {
             path.clone(),
             path.clone(),
             "test".into(),
-            0,
+            0..=0,
             &local_only,
             NodeProfile::current(),
             ControlPlane::runtime_only,

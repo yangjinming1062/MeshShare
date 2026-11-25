@@ -53,7 +53,6 @@ pub(crate) async fn fetch_node_info(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PeerEndpointSource {
-    Manual,
     Mdns,
     #[cfg(not(target_os = "android"))]
     Tailscale,
@@ -66,33 +65,47 @@ pub(crate) struct PeerEndpoint {
 }
 
 impl NodeRuntime {
-    /// The first endpoint starts a dialer. Later candidates update its watch channel.
-    pub(crate) fn offer_peer_endpoint(
+    /// Replace a resolved mDNS address set, or add independently verified Tailscale addresses.
+    pub(crate) fn offer_peer_endpoints(
         &self,
         node_id: &str,
-        endpoint: PeerEndpoint,
+        source: PeerEndpointSource,
+        urls: Vec<String>,
     ) -> Option<watch::Receiver<Vec<PeerEndpoint>>> {
+        let mut offered: Vec<_> = urls
+            .into_iter()
+            .map(|url| PeerEndpoint { source, url })
+            .collect();
         let mut dials = self.peer_dials.lock();
         if self.stopping.load(Ordering::SeqCst) {
             return None;
         }
         if let Some(sender) = dials.get(node_id).filter(|sender| !sender.is_closed()) {
             sender.send_if_modified(|endpoints| {
-                if endpoints.contains(&endpoint) {
-                    return false;
+                if source == PeerEndpointSource::Mdns {
+                    if endpoints
+                        .iter()
+                        .filter(|previous| previous.source == source)
+                        .eq(offered.iter())
+                    {
+                        return false;
+                    }
+                    endpoints.retain(|previous| previous.source != source);
+                } else {
+                    offered.retain(|endpoint| !endpoints.contains(endpoint));
+                    if offered.is_empty() {
+                        return false;
+                    }
                 }
-                if matches!(
-                    endpoint.source,
-                    PeerEndpointSource::Manual | PeerEndpointSource::Mdns
-                ) {
-                    endpoints.retain(|previous| previous.source != endpoint.source);
-                }
-                endpoints.push(endpoint);
+                endpoints.extend(offered);
                 true
             });
             return None;
         }
-        let (sender, receiver) = watch::channel(vec![endpoint]);
+        if offered.is_empty() {
+            return None;
+        }
+        let (sender, receiver) = watch::channel(offered);
         dials.insert(node_id.to_string(), sender);
         Some(receiver)
     }

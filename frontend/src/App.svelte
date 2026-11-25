@@ -102,8 +102,6 @@
   let mobileSessionId = '';
   let creatingMobileSession: Promise<string> | null = null;
   let transferActionBusy = '';
-  let manualAddress = '';
-  let savedNodeUrls: string[] = [];
   let settingsOpen = false;
   type RemoteSettingsSession = {
     peer: PeerInfo;
@@ -138,7 +136,6 @@
   let mobileAccessOpen = false;
   // 打开二维码窗口时已知的网页会话；之后出现新会话说明有浏览器临时加入。
   let mobileAccessKnownSessions = new Set<string>();
-  let addDeviceOpen = false;
   let clipboardHistoryOpen = false;
   let historyDetailLoading = false;
   let historyDetailToken = 0;
@@ -173,7 +170,6 @@
   const pendingMobileCompletions = new Map<string, PendingMobileCompletion>();
   let mobileBrowserDownloadStarted = new Set<string>();
   const MAX_UPLOAD_ATTEMPTS = 6;
-  const SAVED_NODE_URLS_KEY = 'meshshare-saved-node-urls';
   const MOBILE_SESSION_KEY = 'meshshare-mobile-session';
   const REMOTE_FILES_CAPABILITY = 'management.files.v1';
   const WS_RECONNECT_BASE_MS = 1500;
@@ -444,17 +440,6 @@
     };
     document.addEventListener('visibilitychange', resumeNotice);
     window.addEventListener('focus', resumeNotice);
-    try {
-      const stored = window.localStorage.getItem(SAVED_NODE_URLS_KEY);
-      const parsed = stored ? JSON.parse(stored) : [];
-      if (Array.isArray(parsed)) {
-        savedNodeUrls = parsed
-          .filter((value): value is string => typeof value === 'string')
-          .slice(0, 8);
-      }
-    } catch {
-      savedNodeUrls = [];
-    }
     let timer: number | undefined;
     let updateStatusUnlisten: (() => void) | undefined;
     if (isDesktopWindow) {
@@ -1349,31 +1334,6 @@
     }
   }
 
-  async function connectManualPeer() {
-    const url = manualAddress.trim().replace(/\/$/, '');
-    if (!url) return;
-    await connectSavedPeer(url);
-  }
-
-  async function connectSavedPeer(url: string) {
-    try {
-      await request('/api/v1/peers/connect', { method: 'POST', body: JSON.stringify({ url }) });
-      const next = [url, ...savedNodeUrls.filter((item) => item !== url)].slice(0, 8);
-      savedNodeUrls = next;
-      try {
-        window.localStorage.setItem(SAVED_NODE_URLS_KEY, JSON.stringify(next));
-      } catch {
-        // Persisting a convenience shortcut must not block the connection.
-      }
-      manualAddress = '';
-      addDeviceOpen = false;
-      await refresh();
-      showTransientNotice('已发起节点连接');
-    } catch (error) {
-      showTransientNotice(error instanceof Error ? error.message : '无法连接节点', 6000);
-    }
-  }
-
   async function readMobileClipboard() {
     const generation = targetGeneration;
     const draftRevision = clipboardDraftRevision;
@@ -1697,7 +1657,6 @@
     clipboardHistoryBusy = false;
     metrics = null;
     mobileAccessOpen = false;
-    addDeviceOpen = false;
     clearHistoryOpen = false;
     clipboardHistoryOpen = false;
     historyDetailToken += 1;
@@ -2437,13 +2396,7 @@
           homeNodeId={localNodeId}
           activePeerIds={activeLinkPeers}
           {mobileSessions}
-          savedAddresses={savedNodeUrls}
           draggingKey={dragPeer}
-          addOpen={addDeviceOpen}
-          bind:manualAddress
-          onToggleAdd={() => (addDeviceOpen = !addDeviceOpen)}
-          onConnect={connectManualPeer}
-          onConnectSaved={connectSavedPeer}
           onOpenPeer={openRemotePeer}
           onSettings={remoteMode ? null : openPeerSettings}
           onTerminal={remoteMode ? null : openPeerTerminal}

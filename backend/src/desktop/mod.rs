@@ -114,10 +114,13 @@ pub fn run() {
             app.manage(MonitorCapabilities::for_backend(
                 linux::fullscreen::backend(),
             ));
-            let runtime = tauri::async_runtime::block_on(start_node(
+            let Some(runtime) = tauri::async_runtime::block_on(start_node(
                 app.handle(),
                 node_data_dir(app.handle()),
-            ))?;
+            ))?
+            else {
+                return Ok(());
+            };
             if !cfg!(debug_assertions) {
                 if let Err(error) = autostart::set_enabled(runtime.autostart_enabled()) {
                     eprintln!("同步开机自启动失败：{error}");

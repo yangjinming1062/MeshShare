@@ -1,7 +1,6 @@
 mod socket;
 use crate::clipboard;
 use crate::control::{accept_transfer_at, ControlPlane, SettingsPatch, SettingsSnapshot};
-use crate::discovery;
 use crate::model::{
     ClipboardHistoryDetail, ClipboardHistoryList, ClipboardSnapshot, HardwareMetrics,
     MobileSession, MobileTransferView, NodeInfo, PeerInfo, TransferAction, TransferHistoryEntry,
@@ -148,11 +147,6 @@ pub struct ClipboardRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct PeerConnectionRequest {
-    pub url: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct TransferHistoryQuery {
     pub session_id: Option<String>,
 }
@@ -256,7 +250,6 @@ pub fn router_with_control(
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/settings", get(settings).patch(patch_settings))
         .route("/api/v1/settings/update-check", post(request_update_check))
-        .route("/api/v1/peers/connect", post(connect_peer))
         .route(
             "/api/v1/clipboard",
             get(clipboard_state).post(post_clipboard),
@@ -774,19 +767,6 @@ async fn proxy_upload_item(
             .body(reqwest::Body::wrap_stream(stream)),
     )
     .await
-}
-
-async fn connect_peer(
-    State(state): State<AppState>,
-    Json(payload): Json<PeerConnectionRequest>,
-) -> Result<Json<PeerInfo>, ApiError> {
-    if payload.url.len() > 4_096 {
-        return Err(ApiError::bad_request("节点地址过长"));
-    }
-    discovery::connect_manual(state.runtime, payload.url)
-        .await
-        .map(Json)
-        .map_err(ApiError::bad_request)
 }
 
 #[derive(Deserialize)]
@@ -2495,12 +2475,8 @@ async fn prepare_target(destination: &Path, relative_path: &str) -> Result<PathB
 
 /// 提交一份校验通过的上传，且不覆盖已存在的文件。
 ///
-/// 桌面端实现用硬链接，使最终文件名原子出现，
-/// 临时文件守卫也能清掉未完成的提交。
-/// Android 的应用专属 Download 存储通常由模拟/FUSE 存储支撑，
-/// 这类存储会拒绝硬链接，尽管普通文件写入可以成功。
-/// 因此 Android 退化为不覆盖的 rename 原语
-/// （在较旧文件系统上是串行化的检查后 rename 回退）。
+/// 硬链接使最终文件名原子出现，临时文件守卫可以清理未完成的提交。
+/// Android 存储拒绝硬链接时使用防覆盖重命名。
 async fn commit_desktop_temp_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
     match fs::hard_link(temp, target).await {
         Ok(()) => Ok(()),
@@ -2519,11 +2495,8 @@ async fn commit_desktop_temp_file(temp: &Path, target: &Path) -> Result<(), std:
     }
 }
 
-/// Android 的应用专属 Download 存储可能拒绝硬链接。
-/// 回退提交保持串行化，避免两个传输都看到目标不存在、
-/// 随后并发执行覆盖式 `rename`。
-/// 对提供 `renameat2(RENAME_NOREPLACE)` 的内核/文件系统，
-/// 改用该原语，即使其他进程触碰目标也能维持不覆盖保证。
+/// 串行化 Android 回退提交的存在性检查与重命名。
+/// 支持 `renameat2(RENAME_NOREPLACE)` 时，内核也能防止提交覆盖其他进程创建的目标。
 static ANDROID_COMMIT_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
 
 async fn commit_android_temp_file(temp: &Path, target: &Path) -> Result<(), std::io::Error> {
@@ -2546,9 +2519,7 @@ async fn commit_android_temp_file(temp: &Path, target: &Path) -> Result<(), std:
         }
     }
 
-    // 较旧的 Android 内核与部分模拟/FUSE 文件系统没有 renameat2。
-    // 进程级锁仍能为本节点所有 MeshShare 传输闭合
-    // 存在性检查与 rename 之间的竞态。
+    // 防覆盖重命名不可用时，在提交锁内检查目标是否存在再重命名。
     match fs::symlink_metadata(target).await {
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,

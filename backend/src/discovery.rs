@@ -1,11 +1,10 @@
-use crate::model::{NodeInfo, PeerInfo, WireMessage, PROTOCOL_VERSION};
-use crate::runtime::{
-    fetch_node_info, is_allowed_peer_address, NodeRuntime, PeerEndpoint, PeerEndpointSource,
-};
+use crate::model::{NodeInfo, WireMessage, PROTOCOL_VERSION};
+use crate::runtime::{is_allowed_peer_address, NodeRuntime, PeerEndpoint, PeerEndpointSource};
 use crate::server;
 use futures_util::{SinkExt, StreamExt};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
@@ -29,6 +28,8 @@ pub fn start(runtime: Arc<NodeRuntime>) {
     thread::Builder::new()
         .name("meshshare-mdns".to_string())
         .spawn(move || {
+            let own_id = runtime.node_id();
+            let fullname = format!("{own_id}.{SERVICE_TYPE}");
             let mut observed_addresses = crate::runtime::bind_addresses();
             let mut observed_network_rebind_generation = runtime.network_rebind_generation();
             while !runtime.stopping.load(Ordering::SeqCst) {
@@ -36,9 +37,6 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     thread::sleep(Duration::from_secs(1));
                     continue;
                 };
-                let node = runtime.node_info();
-                let mut registered_address = register_service(&daemon, &node);
-                let mut registered_capabilities = node.capabilities;
                 let Ok(receiver) = daemon.browse(SERVICE_TYPE) else {
                     if let Ok(status) = daemon.shutdown() {
                         let _ = status.recv_timeout(Duration::from_secs(1));
@@ -47,10 +45,11 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                     continue;
                 };
                 let mut restart = false;
+                let mut registered_addresses = Vec::new();
+                let mut registered_capabilities = Vec::new();
                 while !runtime.stopping.load(Ordering::SeqCst) {
-                    // mdns-sd 为每个接口持有一个 socket。
-                    // 网络变化（VPN/Wi-Fi）后重建守护进程，
-                    // 避免它原有的物理 socket 留在旧的进程网络绑定上。
+                    // VPN 或 Wi-Fi 变化时重建 mDNS 守护进程，
+                    // 让每个接口的 socket 使用当前进程的网络绑定。
                     let current_addresses = crate::runtime::bind_addresses();
                     let current_network_rebind_generation = runtime.network_rebind_generation();
                     if current_addresses != observed_addresses
@@ -59,54 +58,37 @@ pub fn start(runtime: Arc<NodeRuntime>) {
                         restart = true;
                         break;
                     }
-                    let event = receiver.recv_timeout(Duration::from_secs(1));
-                    let current_node = runtime.node_info();
-                    let current_address = service_address(&current_node);
-                    if current_address != registered_address
-                        || current_node.capabilities != registered_capabilities
+                    let node = runtime.node_info();
+                    let addresses: Vec<_> = node
+                        .addresses
+                        .iter()
+                        .filter_map(|address| address.address.parse().ok())
+                        .filter(|address| current_addresses.contains(address))
+                        .map(IpAddr::V4)
+                        .collect();
+                    if addresses != registered_addresses
+                        || (!addresses.is_empty() && node.capabilities != registered_capabilities)
                     {
-                        // 地址变化直接重新注册：mdns-sd 对同一实例名做更新，
-                        // 且 fullname 由 "<实例>.<服务类型>" 组成，手动拼接容易漏分隔点。
-                        registered_address = register_service(&daemon, &current_node);
-                        registered_capabilities = current_node.capabilities;
+                        // Re-register the same instance to publish the new listener set.
+                        let result = if addresses.is_empty() {
+                            daemon.unregister(&fullname).map(|_| ())
+                        } else {
+                            service_info(&node, &addresses).and_then(|info| daemon.register(info))
+                        };
+                        if result.is_ok() {
+                            registered_addresses = addresses;
+                            registered_capabilities = node.capabilities;
+                        }
                     }
-                    if let Ok(ServiceEvent::ServiceResolved(info)) = event {
-                        let Some(node_id) = info.get_property_val_str("node_id") else {
-                            continue;
-                        };
-                        let protocol = info
-                            .get_property_val_str("protocol")
-                            .and_then(|value| value.parse::<u32>().ok());
-                        if protocol != Some(PROTOCOL_VERSION) {
-                            continue;
-                        }
-                        // 在 Wi-Fi、VPN 与访客网络之间，mDNS 可见性可能是不对称的。
-                        // 因此允许任意一方发起拨号；add_peer_channel 会拒绝重复会话，
-                        // 同时发现也能收敛到一条稳定的 WebSocket 通道。
-                        if node_id == node.node_id
-                            || node_id.trim().is_empty()
-                            || node_id.len() > 256
-                        {
-                            continue;
-                        }
-                        let Some(address) = info
-                            .get_addresses()
-                            .iter()
-                            .copied()
-                            .find(|ip| is_allowed_peer_address(*ip))
-                        else {
-                            continue;
-                        };
-                        let endpoint = format!("ws://{}:{}/api/v1/ws", address, info.get_port());
-                        queue_peer_connection(
-                            &handle,
-                            &runtime,
-                            node_id.to_owned(),
-                            PeerEndpoint {
-                                source: PeerEndpointSource::Mdns,
-                                url: endpoint,
-                            },
-                        );
+                    if let Ok(ServiceEvent::ServiceResolved(info)) =
+                        receiver.recv_timeout(Duration::from_secs(1))
+                    {
+                        offer_mdns_service(&handle, &runtime, &own_id, &info);
+                    }
+                }
+                if !registered_addresses.is_empty() {
+                    if let Ok(status) = daemon.unregister(&fullname) {
+                        let _ = status.recv_timeout(Duration::from_secs(1));
                     }
                 }
                 if let Ok(status) = daemon.shutdown() {
@@ -123,14 +105,7 @@ pub fn start(runtime: Arc<NodeRuntime>) {
         .expect("mDNS discovery thread");
 }
 
-fn service_address(node: &NodeInfo) -> Option<String> {
-    node.addresses
-        .first()
-        .map(|address| address.address.clone())
-}
-
-fn register_service(daemon: &ServiceDaemon, node: &NodeInfo) -> Option<String> {
-    let address = service_address(node)?;
+fn service_info(node: &NodeInfo, addresses: &[IpAddr]) -> mdns_sd::Result<ServiceInfo> {
     let host = format!("{}.local.", node.node_id.replace('-', ""));
     let protocol = PROTOCOL_VERSION.to_string();
     let features = node.capabilities.join(",");
@@ -140,86 +115,63 @@ fn register_service(daemon: &ServiceDaemon, node: &NodeInfo) -> Option<String> {
         ("protocol", protocol.as_str()),
         ("features", features.as_str()),
     ];
-    let info = ServiceInfo::new(
+    ServiceInfo::new(
         SERVICE_TYPE,
         &node.node_id,
         &host,
-        address.as_str(),
+        addresses,
         node.port,
         &properties[..],
     )
-    .ok()?;
-    daemon.register(info).ok()?;
-    Some(address)
 }
 
-pub async fn connect_manual(
-    runtime: Arc<NodeRuntime>,
-    base_url: String,
-) -> Result<PeerInfo, String> {
-    let base_url = normalize_http_base_url(&base_url)?;
-    let node = fetch_node_info(&runtime.http, &base_url)
-        .await
-        .map_err(|error| error.to_string())?;
-    if node.node_id == runtime.node_id() {
-        return Err("不能连接本机地址".to_string());
-    }
-    if node.protocol_version != PROTOCOL_VERSION {
-        return Err(format!(
-            "协议版本不兼容：对端 {}，本机 {}",
-            node.protocol_version, PROTOCOL_VERSION
-        ));
-    }
-    let endpoint = websocket_endpoint(&base_url)?;
-    let mut peer = server::peer_from_hello(node, &runtime, Some(endpoint.clone()))
-        .ok_or_else(|| "节点信息无效".to_string())?;
-    peer.source = "manual".to_string();
-    queue_peer_connection(
-        &Handle::current(),
-        &runtime,
-        peer.node_id.clone(),
-        PeerEndpoint {
-            source: PeerEndpointSource::Manual,
-            url: endpoint,
-        },
-    );
-    Ok(runtime.peer(&peer.node_id).unwrap_or(peer))
-}
-
-fn normalize_http_base_url(value: &str) -> Result<String, String> {
-    let candidate = reqwest::Url::parse(value.trim())
-        .map_err(|_| "节点地址必须使用有效的 http:// 或 https:// 地址".to_string())?;
-    let path = candidate.path().trim_end_matches('/');
-    if !path.is_empty() && path != "/mobile" {
-        return Err("节点地址只能包含根路径或 /mobile".to_string());
-    }
-    crate::runtime::normalize_peer_http_base(candidate.as_str()).ok_or_else(|| {
-        "节点地址必须是不含凭据与查询参数的本机、局域网、链路本地或 Tailscale 地址".to_string()
-    })
-}
-
-fn websocket_endpoint(base_url: &str) -> Result<String, String> {
-    let mut url = reqwest::Url::parse(base_url)
-        .map_err(|_| "节点地址必须使用 http:// 或 https://".to_string())?;
-    let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        _ => return Err("节点地址必须使用 http:// 或 https://".to_string()),
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| "节点地址必须使用 http:// 或 https://".to_string())?;
-    url.set_path("/api/v1/ws");
-    Ok(url.to_string())
-}
-
-fn queue_peer_connection(
+fn offer_mdns_service(
     handle: &Handle,
     runtime: &Arc<NodeRuntime>,
-    node_id: String,
-    endpoint: PeerEndpoint,
+    own_id: &str,
+    info: &ServiceInfo,
 ) {
-    if let Some(candidates) = runtime.offer_peer_endpoint(&node_id, endpoint) {
-        handle.spawn(dial_peer(runtime.clone(), node_id, candidates));
+    let Some(node_id) = info.get_property_val_str("node_id") else {
+        return;
+    };
+    let protocol = info
+        .get_property_val_str("protocol")
+        .and_then(|value| value.parse::<u32>().ok());
+    let port = info.get_port();
+    if node_id == own_id
+        || node_id.trim().is_empty()
+        || node_id.len() > 256
+        || protocol != Some(PROTOCOL_VERSION)
+        || port == 0
+    {
+        return;
+    }
+    let addresses: BTreeSet<_> = info
+        .get_addresses()
+        .iter()
+        .copied()
+        .filter(|ip| is_allowed_peer_address(*ip))
+        .collect();
+    if addresses.is_empty() {
+        return;
+    }
+    let urls = addresses
+        .into_iter()
+        .map(|ip| format!("ws://{}/api/v1/ws", SocketAddr::new(ip, port)))
+        .collect();
+    // Either peer can dial when multicast visibility is asymmetric.
+    queue_peer_connection(handle, runtime, node_id, PeerEndpointSource::Mdns, urls);
+}
+
+pub(crate) fn queue_peer_connection(
+    handle: &Handle,
+    runtime: &Arc<NodeRuntime>,
+    node_id: &str,
+    source: PeerEndpointSource,
+    urls: Vec<String>,
+) {
+    if let Some(candidates) = runtime.offer_peer_endpoints(node_id, source, urls) {
+        handle.spawn(dial_peer(runtime.clone(), node_id.to_owned(), candidates));
     }
 }
 
@@ -419,11 +371,13 @@ async fn send_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::{dial_peer, normalize_http_base_url, websocket_endpoint};
+    use super::{dial_peer, service_info};
     use crate::model::WireMessage;
-    use crate::runtime::{NodeProfile, NodeRuntime, PeerEndpoint, PeerEndpointSource};
+    use crate::runtime::{NodeProfile, NodeRuntime, PeerEndpointSource};
     use crate::server;
     use futures_util::{SinkExt, StreamExt};
+    use std::collections::HashSet;
+    use std::net::IpAddr;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -432,44 +386,24 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn manual_http_address_becomes_ws_endpoint() {
-        let base = normalize_http_base_url(" http://192.168.1.10:37880/mobile/ ")
-            .expect("normalize http address");
-        assert_eq!(base, "http://192.168.1.10:37880");
+    fn mdns_service_advertises_each_address_on_the_selected_port() {
+        let data = std::env::temp_dir().join(format!("meshshare-mdns-service-{}", Uuid::new_v4()));
+        let runtime =
+            NodeRuntime::new_with_profile(data.clone(), 37881, "test".into(), NodeProfile::Android)
+                .expect("create runtime");
+        let addresses = [
+            IpAddr::from([192, 168, 1, 2]),
+            IpAddr::from([192, 168, 2, 2]),
+        ];
+        let node = runtime.node_info();
+        let info = service_info(&node, &addresses).expect("compose mDNS service");
+        assert_eq!(info.get_port(), 37881);
         assert_eq!(
-            websocket_endpoint(&base).expect("convert websocket address"),
-            "ws://192.168.1.10:37880/api/v1/ws"
+            info.get_property_val_str("node_id"),
+            Some(node.node_id.as_str())
         );
-    }
-
-    #[test]
-    fn manual_https_address_becomes_wss_endpoint() {
-        let base = normalize_http_base_url("https://100.64.0.2").expect("normalize https address");
-        assert_eq!(
-            websocket_endpoint(&base).expect("convert websocket address"),
-            "wss://100.64.0.2/api/v1/ws"
-        );
-    }
-
-    #[test]
-    fn manual_address_accepts_trailing_dot_mdns_host() {
-        let base = normalize_http_base_url("http://meshshare-device.local.:37880")
-            .expect("normalize trailing-dot mdns host");
-        assert_eq!(base, "http://meshshare-device.local.:37880");
-        assert_eq!(
-            websocket_endpoint(&base).expect("convert websocket address"),
-            "ws://meshshare-device.local.:37880/api/v1/ws"
-        );
-    }
-
-    #[test]
-    fn manual_address_rejects_non_http_schemes() {
-        assert!(normalize_http_base_url("ws://192.168.1.10:37880").is_err());
-        assert!(websocket_endpoint("ftp://192.168.1.10:37880").is_err());
-        assert!(normalize_http_base_url("http://8.8.8.8").is_err());
-        assert!(normalize_http_base_url("http://[::1]").is_err());
-        assert!(normalize_http_base_url("http://meshshare.example.test").is_err());
-        assert!(normalize_http_base_url("http://meshshare.local/mobile/mobile").is_err());
+        assert_eq!(info.get_addresses(), &HashSet::from(addresses));
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[tokio::test]
@@ -490,12 +424,10 @@ mod tests {
         peer.port = address.port();
         let peer_id = peer.node_id.clone();
         let candidates = runtime
-            .offer_peer_endpoint(
+            .offer_peer_endpoints(
                 &peer_id,
-                PeerEndpoint {
-                    source: PeerEndpointSource::Mdns,
-                    url: working_url.clone(),
-                },
+                PeerEndpointSource::Mdns,
+                vec![working_url.clone()],
             )
             .expect("start dialer");
         let dialer = tokio::spawn(dial_peer(runtime.clone(), peer_id.clone(), candidates));
@@ -507,12 +439,10 @@ mod tests {
         .expect("connect to initial address");
 
         assert!(runtime
-            .offer_peer_endpoint(
+            .offer_peer_endpoints(
                 &peer_id,
-                PeerEndpoint {
-                    source: PeerEndpointSource::Mdns,
-                    url: format!("ws://{stale_address}/api/v1/ws"),
-                },
+                PeerEndpointSource::Mdns,
+                vec![format!("ws://{stale_address}/api/v1/ws")],
             )
             .is_none());
         let hello =
@@ -577,13 +507,23 @@ mod tests {
         });
         let peer_id = server_runtime.node_id();
         let working_url = format!("ws://{address}/api/v1/ws");
+        let unavailable = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind unreachable WebSocket route");
+        let rejected_url = format!(
+            "ws://{}/api/v1/ws",
+            unavailable.local_addr().expect("unreachable route address")
+        );
+        let rejecting_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = unavailable.accept().await {
+                drop(socket);
+            }
+        });
         let candidates = client_runtime
-            .offer_peer_endpoint(
+            .offer_peer_endpoints(
                 &peer_id,
-                PeerEndpoint {
-                    source: PeerEndpointSource::Mdns,
-                    url: working_url.clone(),
-                },
+                PeerEndpointSource::Mdns,
+                vec![rejected_url.clone(), working_url.clone()],
             )
             .expect("start dialer");
         let client_task = tokio::spawn(dial_peer(
@@ -608,17 +548,9 @@ mod tests {
         .await
         .expect("peer should connect");
 
-        for ip in ["127.0.0.2", "127.0.0.3"] {
-            assert!(client_runtime
-                .offer_peer_endpoint(
-                    &peer_id,
-                    PeerEndpoint {
-                        source: PeerEndpointSource::Mdns,
-                        url: format!("ws://{ip}:{}/api/v1/ws", address.port()),
-                    },
-                )
-                .is_none());
-        }
+        assert!(client_runtime
+            .offer_peer_endpoints(&peer_id, PeerEndpointSource::Mdns, vec![rejected_url],)
+            .is_none());
 
         assert_eq!(
             client_runtime.peer(&peer_id).and_then(|peer| peer.endpoint),
@@ -688,10 +620,6 @@ mod tests {
             Some(working_url),
         );
 
-        let peer = super::connect_manual(client_runtime.clone(), format!("http://{address}"))
-            .await
-            .expect("manual connection resolves the same peer");
-        assert_eq!(peer.node_id, peer_id);
         assert_eq!(client_runtime.peers_snapshot().len(), 1);
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -712,8 +640,10 @@ mod tests {
         server_runtime.stopping.store(true, Ordering::SeqCst);
         client_task.abort();
         server_task.abort();
+        rejecting_task.abort();
         let _ = client_task.await;
         let _ = server_task.await;
+        let _ = rejecting_task.await;
         let _ = std::fs::remove_dir_all(server_data);
         let _ = std::fs::remove_dir_all(client_data);
     }

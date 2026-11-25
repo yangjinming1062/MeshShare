@@ -1,7 +1,7 @@
 mod liveness;
 
 use super::*;
-use crate::runtime::NodeRuntime;
+use crate::runtime::{NodeRuntime, PeerEndpointSource};
 use crate::terminal::{Input, Output, SessionIo};
 use std::fs;
 use std::net::SocketAddr;
@@ -38,9 +38,13 @@ async fn wait_for_peer(node: &NodeRuntime, peer: &NodeRuntime, offers_host: bool
 }
 
 async fn connect_nodes(dialer: &Arc<NodeRuntime>, other: &Arc<NodeRuntime>, address: SocketAddr) {
-    crate::discovery::connect_manual(dialer.clone(), format!("http://{address}"))
-        .await
-        .unwrap();
+    crate::discovery::queue_peer_connection(
+        &tokio::runtime::Handle::current(),
+        dialer,
+        &other.node_id(),
+        PeerEndpointSource::Mdns,
+        vec![format!("ws://{address}/api/v1/ws")],
+    );
     wait_for_peer(dialer, other, other.ssh.host_fingerprint().is_some()).await;
     wait_for_peer(other, dialer, dialer.ssh.host_fingerprint().is_some()).await;
 }

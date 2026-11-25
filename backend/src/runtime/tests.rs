@@ -1747,18 +1747,48 @@ fn duplicate_discovery_keeps_one_dialer_and_updates_its_candidates() {
         url: "ws://192.168.1.20:37880/api/v1/ws".to_string(),
     };
     let candidates = runtime
-        .offer_peer_endpoint("peer", mdns.clone())
+        .offer_peer_endpoints("peer", PeerEndpointSource::Mdns, vec![mdns.url.clone()])
         .expect("dialer");
-    assert!(runtime.offer_peer_endpoint("peer", mdns.clone()).is_none());
-    assert!(!candidates.has_changed().expect("dialer still registered"));
-    let manual = PeerEndpoint {
-        source: PeerEndpointSource::Manual,
-        url: "ws://100.64.0.20:37880/api/v1/ws".to_string(),
-    };
     assert!(runtime
-        .offer_peer_endpoint("peer", manual.clone())
+        .offer_peer_endpoints("peer", PeerEndpointSource::Mdns, vec![mdns.url.clone()])
         .is_none());
-    assert_eq!(&*candidates.borrow(), &[mdns, manual]);
+    assert!(!candidates.has_changed().expect("dialer still registered"));
+    let alternate = "ws://192.168.2.20:37881/api/v1/ws".to_string();
+    assert!(runtime
+        .offer_peer_endpoints(
+            "peer",
+            PeerEndpointSource::Mdns,
+            vec![mdns.url.clone(), alternate.clone()],
+        )
+        .is_none());
+    let alternate = PeerEndpoint {
+        source: PeerEndpointSource::Mdns,
+        url: alternate,
+    };
+    assert_eq!(&*candidates.borrow(), &[mdns, alternate.clone()]);
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let tailscale = PeerEndpoint {
+            source: PeerEndpointSource::Tailscale,
+            url: "ws://100.64.0.20:37880/api/v1/ws".to_string(),
+        };
+        assert!(runtime
+            .offer_peer_endpoints(
+                "peer",
+                PeerEndpointSource::Tailscale,
+                vec![tailscale.url.clone()],
+            )
+            .is_none());
+        assert!(runtime
+            .offer_peer_endpoints(
+                "peer",
+                PeerEndpointSource::Mdns,
+                vec![alternate.url.clone()]
+            )
+            .is_none());
+        assert_eq!(&*candidates.borrow(), &[tailscale, alternate]);
+    }
     assert!(!runtime.retire_peer_dialer("peer"));
     let _ = std::fs::remove_dir_all(path);
 }

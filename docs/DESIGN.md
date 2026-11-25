@@ -2,8 +2,8 @@
 
 ## 连接设备
 
-- 同一局域网内启动 MeshShare，设备会出现在「在线设备」中。同一节点即使有多个可用地址也只显示一次。找不到设备时，点击「+」输入对方的节点地址，支持根地址或 `/mobile` 地址。互连的原生节点需要使用兼容版本。
-- 跨局域网可通过 Tailscale 地址手动连接。桌面和 Linux-headless 版可通过 Tailscale CLI 自动发现其他桌面和 Linux-headless 节点，探测使用默认端口 `37880`。文件双向直传需要两端都能访问对方的实际端口。
+- 在允许 mDNS 的同一局域网中运行 MeshShare，桌面、Android App 和 Linux-headless 节点会自动建立连接。每个节点在「在线设备」中只显示一次。互连的原生节点需要使用兼容版本。
+- 跨局域网时，在同一 Tailscale 组网中运行桌面或 Linux-headless 节点。至少一端需能运行 Tailscale CLI 并访问对方的节点端口，文件双向直传需要双方端口都可达。在组网规则中允许[节点的 TCP 端口范围](ARCHITECTURE.md#网络与权限)。
 - 临时使用浏览器时，点击桌面的「浏览器访问」，扫码或打开显示的地址。网页可收发文件、使用接入节点的共享剪贴板。接入节点的设备列表会显示该网页会话。
 - Android App 要求 Android 10 及以上、Chromium 108 及以上的系统 WebView。收到版本提示时，更新 Android System WebView 或提供 WebView 的 Chrome，再重新打开 App。
 
@@ -34,7 +34,7 @@ sudo apt install ./meshshare-headless_*_amd64.deb
 | 查看版本、地址和更新状态 | 在服务器运行 `meshshare-headless status`。 |
 | 设置自启或重启 | 「开机自启」影响下次启动系统。在远程设置里点击「重启节点服务」，有文件准备、传输或终端会话时需等空闲后重试。服务已停止时，由管理员运行 `systemctl start meshshare-headless`。 |
 | 检查更新 | 在远程设置点击「立即检查」，或在服务器运行 `meshshare-headless update`。 |
-| 排查或恢复 | 用 `journalctl -u meshshare-headless -u 'meshshare-headless-control@*'` 查看日志。需恢复旧版本时，由管理员用 apt 重新安装保留的可用 deb，允许降级后重启服务。 |
+| 排查或恢复 | 用 `journalctl -u meshshare-headless -u 'meshshare-headless-control@*'` 查看日志。管理员可用 apt 重新安装目标版本的 `.deb` 并重启服务。降级时需允许 apt 安装较低版本。 |
 
 状态目录默认是 `/var/lib/meshshare-headless`，保存节点身份、网页 CA、历史和设置。迁移时停止服务，完整复制目录并保留属主与权限，在 systemd 服务覆盖配置中将 `MESHSHARE_DATA_DIR` 设为新目录的绝对路径，然后启动服务。接收目录需单独设置。
 
@@ -42,7 +42,7 @@ sudo apt install ./meshshare-headless_*_amd64.deb
 
 桌面可从页头打开本机终端。桌面和 Android App 可从在线设备的终端按钮连接桌面或 Linux-headless 版。允许入站终端的节点接受同一局域网或 Tailscale 中已连接的原生设备，命令以目标系统账户执行。
 
-新装桌面默认允许入站终端。升级后若目标桌面未显示终端入口，在目标电脑本机的「设置」中检查「允许远程终端」授权。此前关闭、仅允许配对或仅保留旧系统凭据的安装需要在本机确认后开放，确认结果会保留。两端的终端协议需兼容。
+桌面版的初始配置允许入站终端。当目标电脑的「设置」显示「允许远程终端」时，在该电脑本机确认授权。授权记录保存在本机。两端的终端协议需兼容。
 
 以标签上的「本机」或目标节点名确认命令执行位置。每个标签从目标账户的主目录打开独立 shell，Windows 使用 Windows PowerShell。Android 支持软键盘及 Ctrl+C、Tab、Esc 快捷键，返回设备列表后可从页首回到终端。关闭标签会结束该会话，断线后可查看已显示的输出，重新连接时会打开新 shell。
 

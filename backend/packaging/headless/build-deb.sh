@@ -1,5 +1,5 @@
 #!/bin/bash
-# Package an already-built x86_64 Linux binary on Linux; fail if it needs a newer ZOS ABI.
+# Package the Linux amd64 binary and check its glibc 2.35 compatibility.
 set -euo pipefail
 if [[ $# != 3 || ! $1 =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
     echo "usage: build-deb.sh MAJOR.MINOR.PATCH LINUX_AMD64_BINARY OUTPUT_DIRECTORY" >&2

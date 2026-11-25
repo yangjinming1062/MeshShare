@@ -67,17 +67,11 @@ async fn serve() -> Result<()> {
         .open(data_dir.join("service.lock"))?;
     lock.try_lock()
         .context("数据目录已被另一节点占用或不可加锁")?;
-    let port = match std::env::var("MESHSHARE_PORT") {
-        Ok(value) => value.parse().context("MESHSHARE_PORT 无效")?,
-        Err(std::env::VarError::NotPresent) => crate::DEFAULT_NODE_PORT,
-        Err(error) => return Err(error.into()),
-    };
     let mut terminate = signal(SignalKind::terminate())?;
     let (node, listener_task) = listeners::start(
         data_dir,
         WEB_DIR.into(),
         VERSION.into(),
-        port,
         NodeProfile::Headless,
         ControlPlane::with_headless,
     )

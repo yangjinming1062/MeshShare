@@ -9,13 +9,7 @@
   export let homeNodeId = '';
   export let mobileSessions: MobileSession[] = [];
   export let activePeerIds: Set<string> = new Set();
-  export let savedAddresses: string[] = [];
   export let draggingKey = '';
-  export let addOpen = false;
-  export let manualAddress = '';
-  export let onToggleAdd: () => void = () => {};
-  export let onConnect: () => void = () => {};
-  export let onConnectSaved: (address: string) => void = () => {};
   export let onMobileAccess: () => void = () => {};
   export let onSendPeer: (peer: PeerInfo) => void = () => {};
   export let onSendPeerFolder: (peer: PeerInfo) => void = () => {};
@@ -44,36 +38,12 @@
         <span class="chip">{total}</span>
       </div>
       <div class="surface-actions">
-        <button type="button" class="btn-icon" aria-label="手动连接设备" title="手动连接设备" aria-expanded={addOpen} on:click={onToggleAdd}>
-          <Icon name="plus" size={16} />
-        </button>
         <button type="button" class="btn btn-sm" on:click={onMobileAccess}>
           <Icon name="phone" size={14} />
           浏览器访问
         </button>
       </div>
     </div>
-    {#if addOpen}
-      <div class="add-device">
-        <input
-          class="field"
-          bind:value={manualAddress}
-          placeholder="手动输入节点地址"
-          aria-label="手动输入节点地址"
-          on:keydown={(event) => event.key === 'Enter' && onConnect()}
-        />
-        <button type="button" class="btn btn-primary btn-sm" on:click={onConnect}>连接</button>
-        <button type="button" class="btn btn-ghost btn-sm" on:click={onToggleAdd}>取消</button>
-      </div>
-      {#if savedAddresses.length}
-        <div class="saved-addresses" aria-label="已保存的节点">
-          <span class="muted">最近连接</span>
-          {#each savedAddresses as address (address)}
-            <button type="button" class="btn btn-ghost btn-sm mono" on:click={() => onConnectSaved(address)}>{address}</button>
-          {/each}
-        </div>
-      {/if}
-    {/if}
     <div class="surface-body">
       <ul class="device-list" class:device-list--with-settings={hasSettingsActions} role="list">
         {#each peers as peer (peer.node_id)}
@@ -112,10 +82,9 @@
           />
         {/each}
         {#if !total}
-          <li class="empty">还没有其他设备在线。</li>
+          <li class="empty">同一局域网内运行 MeshShare 的设备会自动出现在这里。</li>
         {/if}
       </ul>
     </div>
   </section>
-  <p class="panel-footnote">同一局域网中的 MeshShare 会自动出现；也可用 + 手动连接，或让手机用「浏览器访问」加入。</p>
 </div>

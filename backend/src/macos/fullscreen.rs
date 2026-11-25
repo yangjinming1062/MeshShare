@@ -47,7 +47,7 @@ pub(crate) fn capture(window: &tauri::WebviewWindow) -> Result<Option<Target>> {
         visible.size.height,
     ));
     let mut fullscreen_area = bounds;
-    // safeAreaInsets 从 macOS 12 开始提供，旧系统仍按完整显示器检测。
+    // 系统提供 safeAreaInsets 时使用安全区，否则按完整显示器检测。
     if screen.respondsToSelector(sel!(safeAreaInsets)) {
         let insets = screen.safeAreaInsets();
         fullscreen_area = Rect {

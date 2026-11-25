@@ -126,7 +126,7 @@ impl Coordinator {
     }
 
     pub async fn restart(self: &Arc<Self>) -> Result<(), RestartError> {
-        // HTTP 调用者断开也必须保留维护锁，直到旧进程退出或 systemd 操作失败。
+        // 后台任务持有维护锁，HTTP 调用者断开时它仍会继续执行。
         let runtime = self.runtime.clone();
         let (result, response) = oneshot::channel();
         tokio::spawn(async move {

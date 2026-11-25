@@ -18,8 +18,8 @@ import java.io.File
 import java.io.IOException
 
 /**
- * 接收文件默认写入应用私有目录；授予「所有文件访问权限」后改为写入
- * 手机公共的 Download/MeshShare，方便在文件管理器里找到。
+ * 接收文件默认使用应用私有目录。获得「所有文件访问权限」时，
+ * 接收文件保存到公共的 Download/MeshShare。
  */
 @TauriPlugin
 class StoragePlugin(activity: Activity) : Plugin(activity) {

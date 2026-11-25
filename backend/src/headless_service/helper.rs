@@ -133,7 +133,7 @@ pub(super) async fn run() -> Result<()> {
         .err()
         .map(|e| format!("{e:#}"))
         .unwrap_or_default();
-    // 安装器独立于旧节点，旧进程在成功升级时会先于结果通知退出。
+    // 安装由独立控制助手执行。重启服务时，请求进程可能在收到结果前退出。
     let _ = write_frame(&mut stream, error.as_bytes()).await;
     result
 }
@@ -166,7 +166,7 @@ async fn handle(stream: &mut UnixStream) -> Result<()> {
             short_command(systemctl(operation), "修改开机自启").await?;
         }
         Action::Restart => {
-            // 先登记延迟任务，将确认留给仍在运行的旧 HTTP 节点。
+            // 延时重启为当前 HTTP 节点留出返回确认的时间。
             let mut cmd = Command::new("/usr/bin/systemd-run");
             cmd.args([
                 "--collect",

@@ -12,5 +12,5 @@
 | Android arm64 | [APK 安装包]({{ANDROID_ARM64_APK_URL}}) | Android 10 及以上、系统 WebView 108 及以上 |
 
 - **macOS**。在「关于本机」确认芯片，把 DMG 中的 MeshShare 拖到「应用程序」。安装包使用 ad-hoc 签名。确认来源后，若 macOS 拦截打开，可在「系统设置 → 隐私与安全性」选择「仍要打开」。
-- **Linux AppImage**。赋予下载的文件执行权限后打开。若其他版本正在运行，先从托盘退出。
+- **Linux AppImage**。赋予下载的文件执行权限后打开。若 MeshShare 正在运行，先从托盘退出。
 - **Android**。打开下载的 APK，按系统提示允许该来源安装应用。

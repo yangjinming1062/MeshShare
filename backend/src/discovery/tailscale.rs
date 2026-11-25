@@ -1,10 +1,10 @@
-use super::{fetch_node_info, queue_peer_connection};
+use super::queue_peer_connection;
 use crate::model::{NodeInfo, PROTOCOL_VERSION};
 use crate::runtime::{
-    is_tailscale_ipv4, node_http_client, NodeRuntime, PeerEndpoint, PeerEndpointSource,
+    fetch_node_info, is_tailscale_ipv4, node_http_client, NodeRuntime, PeerEndpointSource,
 };
 use crate::server::validate_node_info;
-use crate::DEFAULT_NODE_PORT;
+use crate::NODE_PORTS;
 use anyhow::{ensure, Context, Result};
 use futures_util::{stream, StreamExt};
 use serde::Deserialize;
@@ -45,7 +45,7 @@ struct TailscalePeer {
 }
 
 impl TailscaleStatus {
-    fn online_ipv4_peers(self, listeners: &BTreeSet<Ipv4Addr>) -> BTreeSet<Ipv4Addr> {
+    fn online_endpoints(self, listeners: &BTreeSet<Ipv4Addr>) -> BTreeSet<SocketAddrV4> {
         let local_ips: BTreeSet<_> = self
             .tailscale_ips
             .iter()
@@ -62,6 +62,7 @@ impl TailscaleStatus {
             .flat_map(|peer| peer.tailscale_ips.into_iter().flatten())
             .filter_map(|address| tailscale_ipv4(&address))
             .filter(|ip| !local_ips.contains(ip) && !listeners.contains(ip))
+            .flat_map(|ip| NODE_PORTS.map(move |port| SocketAddrV4::new(ip, port)))
             .collect()
     }
 }
@@ -77,9 +78,15 @@ fn listening_ipv4s(node: &NodeInfo) -> BTreeSet<Ipv4Addr> {
         .collect()
 }
 
+fn probe_order(address: &SocketAddrV4) -> (u16, Ipv4Addr) {
+    (address.port(), *address.ip())
+}
+
 #[derive(Default)]
 struct PeerProbe {
     node_id: Option<String>,
+    // Allow one recovery scan after HTTP verification or an active peer channel.
+    recheck_ports_on_disconnect: bool,
     failures: u8,
     retry_at: Option<Instant>,
 }
@@ -103,6 +110,51 @@ impl TailnetDiscovery {
         });
     }
 
+    fn due_endpoints(
+        &mut self,
+        runtime: &NodeRuntime,
+        mut endpoints: BTreeSet<SocketAddrV4>,
+        now: Instant,
+    ) -> Vec<SocketAddrV4> {
+        let mut recovery_ips = BTreeSet::new();
+        for (address, probe) in &mut self.probes {
+            let Some(node_id) = &probe.node_id else {
+                continue;
+            };
+            if runtime.has_peer_channel(node_id) {
+                probe.recheck_ports_on_disconnect = true;
+                endpoints.remove(address);
+            } else if std::mem::take(&mut probe.recheck_ports_on_disconnect) {
+                recovery_ips.insert(*address.ip());
+            }
+        }
+        let mut due: Vec<_> = endpoints
+            .into_iter()
+            .filter(|address| {
+                self.probes.get_mut(address).is_none_or(|probe| {
+                    // A restarted node can make a previously unavailable port reachable.
+                    if recovery_ips.contains(address.ip()) {
+                        probe.failures = 0;
+                        probe.retry_at = None;
+                    }
+                    probe.retry_at.is_none_or(|deadline| now >= deadline)
+                })
+            })
+            .collect();
+        // Try the preferred port across peers first. Rotation also reaches the backup ports
+        // when a round ends before all candidates have been probed.
+        due.sort_unstable_by_key(probe_order);
+        if let Some(last_started) = self.last_started {
+            let start =
+                due.partition_point(|address| probe_order(address) <= probe_order(&last_started));
+            due.rotate_left(start);
+        }
+        if !recovery_ips.is_empty() {
+            due.sort_by_key(|address| !recovery_ips.contains(address.ip()));
+        }
+        due
+    }
+
     async fn refresh(
         &mut self,
         runtime: &Arc<NodeRuntime>,
@@ -113,22 +165,7 @@ impl TailnetDiscovery {
         let now = Instant::now();
         let deadline = now + budget;
         self.retain_endpoints(runtime, &endpoints);
-        let mut due: Vec<_> = endpoints
-            .into_iter()
-            .filter(|address| {
-                self.probes.get(address).is_none_or(|probe| {
-                    probe.retry_at.is_none_or(|deadline| now >= deadline)
-                        && probe
-                            .node_id
-                            .as_deref()
-                            .is_none_or(|id| !runtime.has_peer_channel(id))
-                })
-            })
-            .collect();
-        if let Some(last_started) = self.last_started {
-            let start = due.partition_point(|address| *address <= last_started);
-            due.rotate_left(start);
-        }
+        let due = self.due_endpoints(runtime, endpoints, now);
         let own_id = runtime.node_id();
         let own_id = own_id.as_str();
         // Give every admitted request its full timeout and resume after the last one started.
@@ -149,29 +186,27 @@ impl TailnetDiscovery {
             let probe = self.probes.entry(address).or_default();
             let url = websocket_url(address);
             if probe.node_id != found {
-                if let Some(previous) = probe.node_id.take() {
-                    runtime.forget_tailscale_endpoint(&previous, &url);
+                if let Some(previous) = &probe.node_id {
+                    runtime.forget_tailscale_endpoint(previous, &url);
                 }
+                probe.recheck_ports_on_disconnect = found.is_some();
             }
-            if let Some(node_id) = found {
+            if let Some(node_id) = &found {
                 queue_peer_connection(
                     &Handle::current(),
                     runtime,
-                    node_id.clone(),
-                    PeerEndpoint {
-                        source: PeerEndpointSource::Tailscale,
-                        url,
-                    },
+                    node_id,
+                    PeerEndpointSource::Tailscale,
+                    vec![url],
                 );
-                *probe = PeerProbe {
-                    node_id: Some(node_id),
-                    ..PeerProbe::default()
-                };
+                probe.failures = 0;
+                probe.retry_at = None;
             } else {
                 probe.failures = (probe.failures + 1).min(3);
                 probe.retry_at =
                     Some(Instant::now() + Duration::from_secs(30 * (1 << (probe.failures - 1))));
             }
+            probe.node_id = found;
         }
     }
 }
@@ -194,11 +229,11 @@ pub(super) async fn discover(runtime: Arc<NodeRuntime>) {
             break;
         }
         let listeners = listening_ipv4s(&runtime.node_info());
-        let mut peers = BTreeSet::new();
+        let mut endpoints = BTreeSet::new();
         if !listeners.is_empty() {
             match read_status().await {
                 Ok(status) => {
-                    peers = status.online_ipv4_peers(&listening_ipv4s(&runtime.node_info()));
+                    endpoints = status.online_endpoints(&listening_ipv4s(&runtime.node_info()));
                     last_error = None;
                 }
                 Err(error) => {
@@ -214,15 +249,7 @@ pub(super) async fn discover(runtime: Arc<NodeRuntime>) {
             break;
         }
         discovery
-            .refresh(
-                &runtime,
-                &client,
-                peers
-                    .into_iter()
-                    .map(|ip| SocketAddrV4::new(ip, DEFAULT_NODE_PORT))
-                    .collect(),
-                PROBE_ROUND_BUDGET,
-            )
+            .refresh(&runtime, &client, endpoints, PROBE_ROUND_BUDGET)
             .await;
     }
     discovery.retain_endpoints(&runtime, &BTreeSet::new());
@@ -324,7 +351,7 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn status_selects_unique_online_peer_ips_for_a_listening_tailnet() {
+    fn status_selects_the_port_range_on_unique_online_peers() {
         let status = |state| {
             serde_json::from_value::<TailscaleStatus>(serde_json::json!({
                 "BackendState": state,
@@ -344,12 +371,14 @@ mod tests {
         let listeners =
             BTreeSet::from([Ipv4Addr::new(100, 64, 0, 1), Ipv4Addr::new(100, 64, 0, 9)]);
         assert_eq!(
-            status("Running").online_ipv4_peers(&listeners),
-            BTreeSet::from([Ipv4Addr::new(100, 64, 0, 2)])
+            status("Running").online_endpoints(&listeners),
+            (37880..=37884)
+                .map(|port| SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, 2), port))
+                .collect()
         );
-        assert!(status("Stopped").online_ipv4_peers(&listeners).is_empty());
+        assert!(status("Stopped").online_endpoints(&listeners).is_empty());
         assert!(status("Running")
-            .online_ipv4_peers(&BTreeSet::from([Ipv4Addr::new(100, 64, 0, 9)]))
+            .online_endpoints(&BTreeSet::from([Ipv4Addr::new(100, 64, 0, 9)]))
             .is_empty());
     }
 
@@ -358,6 +387,56 @@ mod tests {
             panic!("expected IPv4 listener");
         };
         address
+    }
+
+    #[test]
+    fn a_disconnected_peer_gets_one_priority_retry_without_resetting_other_peers() {
+        let data = std::env::temp_dir().join(format!("meshshare-tailnet-retry-{}", Uuid::new_v4()));
+        let runtime =
+            NodeRuntime::new_with_profile(data.clone(), 0, "test".into(), NodeProfile::Android)
+                .expect("create runtime");
+        let other = Ipv4Addr::new(100, 64, 0, 1);
+        let peer = Ipv4Addr::new(100, 64, 0, 2);
+        let normal = SocketAddrV4::new(other, 37880);
+        let other_backup = SocketAddrV4::new(other, 37881);
+        let known = SocketAddrV4::new(peer, 37880);
+        let backup = SocketAddrV4::new(peer, 37881);
+        let endpoints = BTreeSet::from([normal, other_backup, known, backup]);
+        let now = Instant::now();
+        let retry_at = now + Duration::from_secs(60);
+        let mut discovery = TailnetDiscovery::default();
+        discovery.probes.insert(
+            known,
+            PeerProbe {
+                node_id: Some("known-peer".into()),
+                recheck_ports_on_disconnect: true,
+                ..PeerProbe::default()
+            },
+        );
+        for address in [backup, other_backup] {
+            discovery.probes.insert(
+                address,
+                PeerProbe {
+                    failures: 2,
+                    retry_at: Some(retry_at),
+                    ..PeerProbe::default()
+                },
+            );
+        }
+        assert_eq!(
+            discovery.due_endpoints(&runtime, endpoints.clone(), now),
+            vec![known, backup, normal]
+        );
+        assert_eq!(discovery.probes[&backup].failures, 0);
+        assert_eq!(discovery.probes[&other_backup].retry_at, Some(retry_at));
+
+        // A failed recovery probe resumes backoff even if the known port still answers HTTP.
+        discovery.probes.get_mut(&backup).unwrap().retry_at = Some(retry_at);
+        assert_eq!(
+            discovery.due_endpoints(&runtime, endpoints, now),
+            vec![normal, known]
+        );
+        let _ = std::fs::remove_dir_all(data);
     }
 
     #[tokio::test]
@@ -531,12 +610,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tailnet_discovery_recovers_after_lan_failure_and_peer_reappearing() {
+    async fn tailnet_discovery_recovers_after_lan_failure_and_peer_port_change() {
         let data = std::env::temp_dir().join(format!("meshshare-tailnet-{}", Uuid::new_v4()));
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind tailnet test peer");
         let address = listen_address(&listener);
+        let replacement = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("allocate a different port for the restarted peer");
+        let new_address = listen_address(&replacement);
+        let endpoints = BTreeSet::from([address, new_address]);
         let unavailable = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind failed LAN route");
@@ -563,10 +647,18 @@ mod tests {
         .expect("local runtime");
         let app = crate::server::router(remote.clone(), data.join("web"));
         let first_app = app.clone();
-        let mut server_task = tokio::spawn(async move {
+        let server_task = tokio::spawn(async move {
             axum::serve(
                 listener,
                 first_app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+        });
+        // The backup probe fails while the advertised port still points to the first listener.
+        let replacement_task = tokio::spawn(async move {
+            axum::serve(
+                replacement,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .await
         });
@@ -576,23 +668,19 @@ mod tests {
             queue_peer_connection(
                 &Handle::current(),
                 &local,
-                id.clone(),
-                PeerEndpoint {
-                    source: PeerEndpointSource::Mdns,
-                    url: lan_url.clone(),
-                },
+                &id,
+                PeerEndpointSource::Mdns,
+                vec![lan_url.clone()],
             );
         }
         let client = probe_client().expect("probe client");
         let mut discovery = TailnetDiscovery::default();
         discovery
-            .refresh(
-                &local,
-                &client,
-                BTreeSet::from([address]),
-                PROBE_ROUND_BUDGET,
-            )
+            .refresh(&local, &client, endpoints.clone(), PROBE_ROUND_BUDGET)
             .await;
+        let backup_retry_at = discovery.probes[&new_address]
+            .retry_at
+            .expect("backup port is in backoff");
 
         let expected_base = format!("http://{address}");
         wait_for("both peers connected", || {
@@ -602,52 +690,49 @@ mod tests {
         .await;
         assert_eq!(local.peers_snapshot().len(), 1);
         discovery
-            .refresh(&local, &client, BTreeSet::new(), PROBE_ROUND_BUDGET)
+            .refresh(&local, &client, endpoints.clone(), PROBE_ROUND_BUDGET)
             .await;
         assert_eq!(
-            local.peer_http_base(&id).as_deref(),
-            Some(expected_base.as_str())
+            discovery.probes[&new_address].retry_at,
+            Some(backup_retry_at)
         );
 
         remote.stopping.store(true, Ordering::SeqCst);
         server_task.abort();
-        let _ = (&mut server_task).await;
+        let _ = server_task.await;
         wait_for("old channel closed", || {
             !local.has_peer_channel(&id) && !remote.has_peer_channel(&local_id)
         })
         .await;
 
-        let listener = TcpListener::bind(address)
-            .await
-            .expect("restore tailnet peer");
+        remote.node.write().port = new_address.port();
         remote.stopping.store(false, Ordering::SeqCst);
-        server_task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-        });
+        assert!(Instant::now() < backup_retry_at);
         discovery
-            .refresh(
-                &local,
-                &client,
-                BTreeSet::from([address]),
-                PROBE_ROUND_BUDGET,
-            )
+            .refresh(&local, &client, endpoints, PROBE_ROUND_BUDGET)
             .await;
+        assert_eq!(
+            discovery.probes[&new_address].node_id.as_deref(),
+            Some(id.as_str())
+        );
+        let new_base = format!("http://{new_address}");
         wait_for("tailnet peer rediscovered", || {
-            local.peer_http_base(&id).as_deref() == Some(&expected_base)
+            local.peer_http_base(&id).as_deref() == Some(&new_base)
                 && remote.has_peer_channel(&local_id)
         })
         .await;
         assert_eq!(local.peers_snapshot().len(), 1);
+        discovery.retain_endpoints(&local, &BTreeSet::new());
+        assert_eq!(
+            local.peer_http_base(&id).as_deref(),
+            Some(new_base.as_str())
+        );
 
         local.stopping.store(true, Ordering::SeqCst);
         remote.stopping.store(true, Ordering::SeqCst);
-        server_task.abort();
+        replacement_task.abort();
         unavailable_task.abort();
-        let _ = server_task.await;
+        let _ = replacement_task.await;
         let _ = unavailable_task.await;
         let _ = std::fs::remove_dir_all(data);
     }

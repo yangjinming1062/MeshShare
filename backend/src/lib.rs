@@ -48,8 +48,10 @@ use std::sync::Arc;
 use std::time::Duration;
 #[cfg(feature = "gui")]
 use tauri::{AppHandle, Manager, State};
+#[cfg(feature = "gui")]
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
-const DEFAULT_NODE_PORT: u16 = 37880;
+const NODE_PORTS: std::ops::RangeInclusive<u16> = 37880..=37884;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -208,25 +210,36 @@ fn stop_node(app: &AppHandle, wait: bool) {
 }
 
 #[cfg(feature = "gui")]
-async fn start_node(app: &AppHandle, data_dir: PathBuf) -> anyhow::Result<Arc<NodeRuntime>> {
-    let preferred_port = std::env::var("MESHSHARE_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_NODE_PORT);
-    let (runtime, _listener_task) = listeners::start(
+async fn start_node(
+    app: &AppHandle,
+    data_dir: PathBuf,
+) -> anyhow::Result<Option<Arc<NodeRuntime>>> {
+    let started = listeners::start(
         data_dir,
         static_root(app),
         app.package_info().version.to_string(),
-        preferred_port,
         runtime::NodeProfile::current(),
         |runtime| control::ControlPlane::with_app(runtime, app.clone()),
     )
-    .await?;
+    .await;
+    let (runtime, _listener_task) = match started {
+        Err(error) if error.is::<listeners::HttpPortsUnavailable>() => {
+            eprintln!("节点启动失败：{error:#}");
+            let handle = app.clone();
+            app.dialog()
+                .message(error.to_string())
+                .title("MeshShare 无法启动")
+                .kind(MessageDialogKind::Error)
+                .show(move |_| handle.exit(1));
+            return Ok(None);
+        }
+        result => result?,
+    };
     #[cfg(target_os = "android")]
     android::network::observe(app, runtime.clone());
     start_workers(&runtime);
     app.manage(runtime.clone());
-    Ok(runtime)
+    Ok(Some(runtime))
 }
 
 fn start_workers(runtime: &Arc<NodeRuntime>) {
@@ -286,8 +299,11 @@ pub fn run() {
         .plugin(android::update::app::plugin())
         .setup(|app| {
             let data_dir = node_data_dir(app.handle());
-            let runtime =
-                tauri::async_runtime::block_on(start_node(app.handle(), data_dir.clone()))?;
+            let Some(runtime) =
+                tauri::async_runtime::block_on(start_node(app.handle(), data_dir.clone()))?
+            else {
+                return Ok(());
+            };
             clipboard::start_monitor(runtime.clone());
             if let Err(error) = android::update::app::start(app.handle(), runtime, &data_dir) {
                 eprintln!("启动 Android 更新服务失败：{error:#}");

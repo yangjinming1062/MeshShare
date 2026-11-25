@@ -35,7 +35,7 @@ async fn inbound_shells_end_with_the_authenticated_peer_session_or_client_key() 
     };
     let mut ws = connect().await;
     let mut first = open_shell(&client, &host).await;
-    // 旧版 v3 可以在同一通道更新主机能力，出站 shell 仍绑定原客户端密钥。
+    // 同一通道的 Hello 可以更新主机能力，出站 shell 仍绑定会话对应的客户端密钥。
     ws.send(hello(client.node_info())).await.unwrap();
     wait_for_peer(&host, &client, true).await;
     ws.send(hello(legacy_disabled.clone())).await.unwrap();

@@ -340,6 +340,7 @@ impl NodeRuntime {
         })
     }
 
+    #[cfg(test)]
     pub fn peer(&self, node_id: &str) -> Option<PeerInfo> {
         self.peers.read().get(node_id).cloned()
     }

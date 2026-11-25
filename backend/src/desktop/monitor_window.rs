@@ -232,7 +232,7 @@ pub(crate) fn position_monitor_window(
                 monitor.clone(),
             ));
         }
-        // 缺少比例的旧配置沿用所在工作区判断。
+        // 未记录缩放比例时，按坐标所在的显示器工作区匹配。
         monitors
             .iter()
             .find(|monitor| point_is_in_work_area(&position, monitor.work_area()))

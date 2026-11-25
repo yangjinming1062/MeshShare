@@ -272,7 +272,7 @@ pub(super) struct PersistedConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum TerminalAccessMigration {
-    // 已有 node.json 缺少此字段时按旧版处理。旧版从未启用终端也不会创建授权文件。
+    // 配置缺少授权状态时，入站终端在本机确认前保持关闭。
     #[default]
     Pending,
     NoLegacyPolicy,
