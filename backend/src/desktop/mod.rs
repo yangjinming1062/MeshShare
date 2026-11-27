@@ -159,6 +159,8 @@ pub fn run() {
                 code: None, api, ..
             } => api.prevent_exit(),
             RunEvent::ExitRequested { .. } | RunEvent::Exit => {
+                #[cfg(target_os = "windows")]
+                monitor::stop_unlock(app);
                 crate::stop_node(app, matches!(event, RunEvent::Exit));
             }
             #[cfg(target_os = "macos")]

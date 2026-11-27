@@ -126,6 +126,8 @@ pub struct NodeRuntime {
     pub local_metrics: RwLock<Option<HardwareMetrics>>,
     mobile_ca: RwLock<Option<MobileCa>>,
     config: Mutex<PersistedConfig>,
+    #[cfg(all(feature = "gui", target_os = "windows"))]
+    monitor_revision: AtomicU64,
     data_dir: PathBuf,
     clipboard_update: Mutex<()>,
     seen_events: Mutex<HashMap<String, i64>>,
@@ -423,6 +425,8 @@ impl NodeRuntime {
             local_metrics: RwLock::new(None),
             mobile_ca: RwLock::new(None),
             config: Mutex::new(config),
+            #[cfg(all(feature = "gui", target_os = "windows"))]
+            monitor_revision: AtomicU64::new(0),
             data_dir,
             clipboard_update: Mutex::new(()),
             seen_events: Mutex::new(HashMap::new()),

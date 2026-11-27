@@ -341,6 +341,13 @@ pub(super) fn history_settings(config: &PersistedConfig) -> ClipboardHistorySett
     }
 }
 
+#[cfg(all(feature = "gui", target_os = "windows"))]
+pub(crate) struct MonitorPreferences {
+    pub(crate) visible: bool,
+    pub(crate) locked: bool,
+    pub(crate) revision: u64,
+}
+
 impl NodeRuntime {
     #[cfg(all(feature = "gui", not(target_os = "android")))]
     pub(crate) fn allow_remote_terminal(&self) -> anyhow::Result<()> {
@@ -371,15 +378,63 @@ impl NodeRuntime {
         let mut config = self.config.lock();
         let mut next = config.clone();
         change(&mut next)?;
+        self.save_config(&mut config, next)
+    }
+
+    fn save_config(
+        &self,
+        config: &mut PersistedConfig,
+        next: PersistedConfig,
+    ) -> anyhow::Result<PersistedConfig> {
         persist_config(&self.data_dir, &next)?;
         *config = next.clone();
         Ok(next)
     }
 
+    fn update_monitor_config(
+        &self,
+        change: impl FnOnce(&mut PersistedConfig) -> bool,
+    ) -> anyhow::Result<bool> {
+        let mut config = self.config.lock();
+        let mut next = config.clone();
+        if !change(&mut next) {
+            return Ok(false);
+        }
+        self.save_config(&mut config, next)?;
+        // 窗口设置和代次都在配置锁内读取及提交。
+        #[cfg(all(feature = "gui", target_os = "windows"))]
+        self.monitor_revision.fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    #[cfg(all(feature = "gui", target_os = "windows"))]
+    pub(crate) fn monitor_preferences(&self) -> MonitorPreferences {
+        let config = self.config.lock();
+        MonitorPreferences {
+            visible: config.monitor_visible,
+            locked: config.monitor_locked,
+            revision: self.monitor_revision.load(Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(all(feature = "gui", target_os = "windows"))]
+    pub(crate) fn unlock_monitor_if_current(&self, revision: u64) -> anyhow::Result<bool> {
+        self.update_monitor_config(|config| {
+            if self.monitor_revision.load(Ordering::Relaxed) != revision
+                || !config.monitor_visible
+                || !config.monitor_locked
+            {
+                return false;
+            }
+            config.monitor_locked = false;
+            true
+        })
+    }
+
     pub fn set_monitor_visible(&self, visible: bool) -> anyhow::Result<()> {
-        self.update_config(|config| {
+        self.update_monitor_config(|config| {
             config.monitor_visible = visible;
-            Ok(())
+            true
         })
         .map(|_| ())
     }
@@ -390,9 +445,9 @@ impl NodeRuntime {
     }
 
     pub fn set_monitor_locked(&self, locked: bool) -> anyhow::Result<()> {
-        self.update_config(|config| {
+        self.update_monitor_config(|config| {
             config.monitor_locked = locked;
-            Ok(())
+            true
         })
         .map(|_| ())
     }

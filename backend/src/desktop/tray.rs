@@ -150,7 +150,7 @@ fn handle_tray_icon_event(app: &AppHandle, event: TrayIconEvent) {
         return;
     }
 
-    set_main_window_visible(app, !main_window_visible(app));
+    set_main_window_visible(app, true);
 }
 
 pub(super) fn setup_tray_menu(app: &AppHandle, node: Arc<NodeRuntime>) -> anyhow::Result<()> {

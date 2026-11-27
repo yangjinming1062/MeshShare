@@ -838,6 +838,39 @@ fn monitor_position_lock_and_visibility_are_persisted() {
 }
 
 #[test]
+#[cfg(all(feature = "gui", target_os = "windows"))]
+fn monitor_unlock_applies_only_to_the_current_lock_and_visibility() {
+    let path = temp_data_dir();
+    let node = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into()).unwrap();
+    node.set_monitor_locked(true).unwrap();
+    let before_relocking = node.monitor_preferences().revision;
+    node.set_monitor_locked(false).unwrap();
+    node.set_monitor_locked(true).unwrap();
+    assert!(!node.unlock_monitor_if_current(before_relocking).unwrap());
+    assert!(node.monitor_locked());
+
+    let before_hiding = node.monitor_preferences().revision;
+    node.set_monitor_visible(false).unwrap();
+    assert!(!node
+        .unlock_monitor_if_current(node.monitor_preferences().revision)
+        .unwrap());
+    node.set_monitor_visible(true).unwrap();
+    assert!(!node.unlock_monitor_if_current(before_hiding).unwrap());
+
+    let before_confirming = node.monitor_preferences().revision;
+    node.set_monitor_locked(true).unwrap();
+    assert!(!node.unlock_monitor_if_current(before_confirming).unwrap());
+    let current = node.monitor_preferences().revision;
+    node.set_monitor_position(crate::model::MonitorPosition::new(20, 30))
+        .unwrap();
+    assert!(node.unlock_monitor_if_current(current).unwrap());
+    assert!(!node.monitor_locked());
+    let restored = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into()).unwrap();
+    assert!(!restored.monitor_locked());
+    let _ = std::fs::remove_dir_all(path);
+}
+
+#[test]
 fn failed_monitor_settings_write_does_not_mutate_runtime_state() {
     let path = temp_data_dir();
     let runtime = NodeRuntime::new(path.clone(), 0, env!("CARGO_PKG_VERSION").into())

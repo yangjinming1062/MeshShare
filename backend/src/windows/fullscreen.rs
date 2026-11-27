@@ -1,12 +1,10 @@
+use super::window::{frame_bounds, is_cloaked};
 use crate::model::MonitorPosition;
 use crate::monitor::{visible_fullscreen, Rect, Target, Window};
 use anyhow::{Context, Result};
 use std::mem::size_of;
 use tauri::{PhysicalSize, WebviewWindow};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, POINT, RECT};
-use windows_sys::Win32::Graphics::Dwm::{
-    DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
-};
 use windows_sys::Win32::Graphics::Gdi::{
     ClientToScreen, GetMonitorInfoW, MonitorFromRect, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONULL,
 };
@@ -173,29 +171,10 @@ unsafe fn describe(hwnd: HWND, target: Target) -> Option<Window> {
         if style & WS_EX_TOOLWINDOW != 0 && !taskbar {
             return None;
         }
-        let mut cloaked = 0u32;
-        if DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_CLOAKED as u32,
-            (&mut cloaked as *mut u32).cast(),
-            size_of::<u32>() as u32,
-        ) >= 0
-            && cloaked != 0
-        {
+        if is_cloaked(hwnd) {
             return None;
         }
-        let mut bounds = RECT::default();
-        if DwmGetWindowAttribute(
-            hwnd,
-            DWMWA_EXTENDED_FRAME_BOUNDS as u32,
-            (&mut bounds as *mut RECT).cast(),
-            size_of::<RECT>() as u32,
-        ) < 0
-            && GetWindowRect(hwnd, &mut bounds) == 0
-        {
-            return None;
-        }
-        let bounds = rect(bounds);
+        let bounds = rect(frame_bounds(hwnd)?);
         bounds.intersection(target.screen)?;
         // 普通最大化窗口与前方任务栏可共同完全遮住后台全屏窗口。
         // 任务栏只参与遮挡，不能被自身的屏幕边缘几何判为全屏。

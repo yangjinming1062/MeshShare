@@ -3,12 +3,12 @@
   import { invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { formatPercent, formatRate, gpuMemoryPercent, gpuUtilization, isMetricsStale, memoryPercent } from '../format';
+  import monitorCornerRadius from '../monitorCornerRadius.json';
   import type { HardwareMetrics, MonitorCapabilities } from '../types';
 
   type MonitorView = {
     metrics: HardwareMetrics | null;
     capabilities: MonitorCapabilities;
-    locked: boolean;
   };
 
   let view: MonitorView | null = null;
@@ -71,7 +71,6 @@
 
   async function openMenu(event: MouseEvent) {
     event.preventDefault();
-    if (view?.locked) return;
     try {
       await invoke('popup_monitor_menu');
     } catch (error) {
@@ -80,7 +79,7 @@
   }
 </script>
 
-<main data-tauri-drag-region="deep" on:contextmenu={openMenu}>
+<main data-tauri-drag-region="deep" on:contextmenu={openMenu} style:border-radius={`${monitorCornerRadius}px`}>
   <div><b>CPU</b><span>{formatPercent(metrics?.cpu_usage_percent)}</span></div>
   <div><b>GPU</b><span>{formatPercent(gpuUtilization(metrics))}</span></div>
   <div><b>↑</b><span>{formatRate(metrics?.network_up_bytes_per_sec)}</span></div>
@@ -105,7 +104,6 @@
     overflow: hidden;
     color: #fff;
     border: 1px solid #b9d0f53d;
-    border-radius: 10px;
     background: rgba(13, 21, 38, .52);
     box-shadow: inset 0 1px 0 #ffffff1f;
     font-family: system-ui, sans-serif;

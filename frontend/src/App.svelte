@@ -441,14 +441,17 @@
     document.addEventListener('visibilitychange', resumeNotice);
     window.addEventListener('focus', resumeNotice);
     let timer: number | undefined;
-    let updateStatusUnlisten: (() => void) | undefined;
+    const eventUnlisteners: (() => void)[] = [];
     if (isDesktopWindow) {
+      const saveUnlisten = (unlisten: () => void) => {
+        if (pageStopped) unlisten();
+        else eventUnlisteners.push(unlisten);
+      };
       void listen<UpdateStatus>('update-status', ({ payload }) => {
         if (!remoteTarget && settingsSnapshot) settingsSnapshot = { ...settingsSnapshot, update_status: payload };
-      }).then((unlisten) => {
-        if (pageStopped) unlisten();
-        else updateStatusUnlisten = unlisten;
-      }).catch((error) => console.error('监听更新状态失败', error));
+      }).then(saveUnlisten).catch((error) => console.error('监听更新状态失败', error));
+      void listen('monitor-unlocked', () => void refreshLocalMonitorSettings())
+        .then(saveUnlisten).catch((error) => console.error('监听悬浮条解锁失败', error));
     }
     const start = async () => {
       if (pageStopped) return;
@@ -504,7 +507,7 @@
       wsPingTimer = undefined;
       ws?.close();
       ws = null;
-      updateStatusUnlisten?.();
+      for (const unlisten of eventUnlisteners) unlisten();
     };
   });
 
@@ -674,6 +677,15 @@
     } finally {
       if (settingsRead === read) settingsRead = null;
     }
+  }
+
+  async function refreshLocalMonitorSettings() {
+    if (pageStopped || remoteTarget || !node) return;
+    const generation = targetGeneration;
+    const target = activeBaseUrl;
+    settingsRead = null;
+    await settingsWrites.get(node.node_id)?.catch(() => undefined);
+    await refreshSettings(generation, target);
   }
 
   function openSettings(trigger: HTMLButtonElement, peer = remoteTarget) {
@@ -1219,7 +1231,11 @@
     if (!scope?.snapshot.monitor.capabilities.can_click_through) return;
     await saveSettings(
       scope,
-      (target) => patchSettings({ monitor: { locked: !scope.snapshot.monitor.locked } }, target),
+      async (target) => {
+        const { monitor } = await getSettings(target);
+        if (!scope.isCurrent()) return;
+        return patchSettings({ monitor: { locked: !monitor.locked } }, target);
+      },
       (settings) => settings.monitor.locked ? '悬浮监控条已锁定，鼠标交互已忽略' : '悬浮监控条已解锁，可以拖动',
       '无法更新悬浮监控条状态',
     );

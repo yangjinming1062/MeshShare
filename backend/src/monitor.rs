@@ -11,10 +11,14 @@ use crate::macos::fullscreen as platform;
 use crate::runtime::NodeRuntime;
 #[cfg(target_os = "windows")]
 use crate::windows::fullscreen as platform;
+#[cfg(target_os = "windows")]
+use crate::windows::monitor_unlock;
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
+#[cfg(target_os = "windows")]
+use tauri::Emitter;
 use tauri::{AppHandle, Manager};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
@@ -84,6 +88,10 @@ struct Presentation {
     applied: Option<(bool, bool)>,
     detection_error: Option<String>,
     window_error: Option<String>,
+    #[cfg(target_os = "windows")]
+    unlock: monitor_unlock::Listener,
+    #[cfg(target_os = "windows")]
+    unlock_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -91,9 +99,32 @@ pub(crate) struct Controller(Mutex<Presentation>);
 
 impl Presentation {
     fn reset_placement(&mut self) {
+        #[cfg(target_os = "windows")]
+        self.stop_unlock();
         self.applied = None;
         self.target = None;
         self.fullscreen = FullscreenState::default();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn update_unlock(&mut self, window: &tauri::WebviewWindow, revision: u64) {
+        const CONTEXT: &str = "悬浮条双击解锁监听";
+        match self.unlock.poll(
+            window,
+            revision,
+            monitor_window::MONITOR_CORNER_RADIUS,
+            unlock_if_current,
+        ) {
+            Ok(true) => log_change(&mut self.unlock_error, None, CONTEXT),
+            Ok(false) => {}
+            Err(error) => log_change(&mut self.unlock_error, Some(format!("{error:#}")), CONTEXT),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn stop_unlock(&mut self) {
+        self.unlock.stop();
+        self.unlock_error = None;
     }
 
     fn observe_sample(
@@ -168,6 +199,11 @@ fn reconcile(app: &AppHandle, reapply: bool) {
         return;
     }
     let mut state = controller.0.lock();
+    #[cfg(target_os = "windows")]
+    let preferences = node.monitor_preferences();
+    #[cfg(target_os = "windows")]
+    let visible = preferences.visible;
+    #[cfg(not(target_os = "windows"))]
     let visible = node.monitor_visible();
     if !visible {
         state.reset_placement();
@@ -183,11 +219,15 @@ fn reconcile(app: &AppHandle, reapply: bool) {
         return;
     }
     let Some(window) = monitor_window::get(app) else {
+        #[cfg(target_os = "windows")]
+        state.stop_unlock();
         return;
     };
-    let desired = state
-        .fullscreen
-        .presentation(visible, crate::effective_monitor_locked(app, &node));
+    #[cfg(target_os = "windows")]
+    let locked = preferences.locked && crate::current_monitor_capabilities(app).can_click_through;
+    #[cfg(not(target_os = "windows"))]
+    let locked = crate::effective_monitor_locked(app, &node);
+    let desired = state.fullscreen.presentation(visible, locked);
     #[cfg(target_os = "linux")]
     if desired.0 {
         monitor_window::refresh(&window, &node);
@@ -195,23 +235,50 @@ fn reconcile(app: &AppHandle, reapply: bool) {
     if reapply {
         state.applied = None;
     }
-    if state.applied == Some(desired) {
-        return;
+    if state.applied != Some(desired) {
+        let result = apply_window_presentation(
+            app,
+            &window,
+            state.applied.map(|(visible, _)| visible),
+            desired,
+        );
+        if result.is_ok() {
+            state.applied = Some(desired);
+        }
+        log_change(
+            &mut state.window_error,
+            result.err().map(|error| error.to_string()),
+            "悬浮条窗口更新",
+        );
     }
-    let result = apply_window_presentation(
-        app,
-        &window,
-        state.applied.map(|(visible, _)| visible),
-        desired,
-    );
-    if result.is_ok() {
-        state.applied = Some(desired);
+    #[cfg(target_os = "windows")]
+    if desired.1 && state.applied == Some(desired) {
+        // 钩子安装和窗口显隐独立。安装失败后由下一轮采样重试。
+        state.update_unlock(&window, preferences.revision);
+    } else {
+        state.stop_unlock();
     }
-    log_change(
-        &mut state.window_error,
-        result.err().map(|error| error.to_string()),
-        "悬浮条窗口更新",
-    );
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn stop_unlock(app: &AppHandle) {
+    if let Some(controller) = app.try_state::<Controller>() {
+        controller.0.lock().stop_unlock();
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn unlock_if_current(app: &AppHandle, revision: u64) -> Result<()> {
+    let node = app.state::<Arc<NodeRuntime>>();
+    if !node.stopping.load(std::sync::atomic::Ordering::SeqCst)
+        && node.unlock_monitor_if_current(revision)?
+    {
+        refresh(app).map_err(anyhow::Error::msg)?;
+        if let Err(error) = app.emit_to("main", "monitor-unlocked", ()) {
+            eprintln!("通知主窗口刷新悬浮条设置失败：{error}");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn refresh(app: &AppHandle) -> Result<(), String> {

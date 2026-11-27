@@ -21,7 +21,6 @@ use tauri::{LogicalSize, WebviewWindow};
 pub(super) struct MonitorView {
     metrics: Option<HardwareMetrics>,
     capabilities: MonitorCapabilities,
-    locked: bool,
 }
 
 #[tauri::command]
@@ -29,7 +28,6 @@ pub(super) fn monitor_view(app: AppHandle, state: State<'_, Arc<NodeRuntime>>) -
     MonitorView {
         metrics: state.local_metrics(),
         capabilities: current_monitor_capabilities(&app),
-        locked: effective_monitor_locked(&app, &state),
     }
 }
 
@@ -90,18 +88,22 @@ fn current_position(window: &WebviewWindow) -> anyhow::Result<Option<MonitorPosi
 }
 
 #[tauri::command]
-pub(super) fn popup_monitor_menu(app: AppHandle) -> Result<(), String> {
+pub(super) fn popup_monitor_menu(
+    app: AppHandle,
+    state: State<'_, Arc<NodeRuntime>>,
+) -> Result<(), String> {
+    if effective_monitor_locked(&app, &state) {
+        return Ok(());
+    }
     let Some(window) = app.get_webview_window("monitor") else {
         return Err("悬浮监控条尚未创建".to_string());
     };
-    let lock = MenuItem::with_id(
-        &app,
-        "monitor-lock-now",
-        "锁定悬浮条（忽略鼠标）",
-        true,
-        None::<&str>,
-    )
-    .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "windows")]
+    let lock_label = "锁定悬浮条（双击解锁）";
+    #[cfg(not(target_os = "windows"))]
+    let lock_label = "锁定悬浮条（忽略鼠标）";
+    let lock = MenuItem::with_id(&app, "monitor-lock-now", lock_label, true, None::<&str>)
+        .map_err(|error| error.to_string())?;
     let hide = MenuItem::with_id(&app, "monitor-hide-now", "隐藏悬浮条", true, None::<&str>)
         .map_err(|error| error.to_string())?;
     let menu = Menu::with_items(&app, &[&lock, &hide]).map_err(|error| error.to_string())?;
@@ -147,6 +149,10 @@ const MONITOR_MARGIN_PX: i32 = 16;
 pub(crate) const MONITOR_WIDTH: i32 = 220;
 
 pub(crate) const MONITOR_HEIGHT: i32 = 50;
+
+#[cfg(target_os = "windows")]
+pub(crate) const MONITOR_CORNER_RADIUS: u32 =
+    include!("../../../frontend/src/monitorCornerRadius.json");
 
 pub(crate) fn point_is_in_work_area(
     position: &MonitorPosition,
